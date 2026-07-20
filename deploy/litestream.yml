@@ -1,0 +1,17 @@
+# Litestream: непрерывная репликация SQLite в Cloudflare R2 (S3-совместимо).
+# ${VAR} подставляются из окружения контейнера (env_file .env в compose).
+# Точка восстановления — секунды: шлёт кадры WAL, а не весь файл (важно для
+# растущей БД с 1m-свечами и для невосполнимых ликвидаций/OI).
+dbs:
+  - path: /app/data/crypto.db
+    replicas:
+      - type: s3
+        endpoint: ${R2_ENDPOINT}          # https://<accountid>.r2.cloudflarestorage.com
+        bucket: ${R2_BUCKET}
+        path: crypto-ideas                # префикс внутри бакета
+        region: auto                      # R2 игнорирует регион, но поле обязательно
+        access-key-id: ${LITESTREAM_ACCESS_KEY_ID}
+        secret-access-key: ${LITESTREAM_SECRET_ACCESS_KEY}
+        # Полный снапшот раз в сутки + хранить WAL 72ч → PITR на трое суток назад.
+        snapshot-interval: 24h
+        retention: 72h

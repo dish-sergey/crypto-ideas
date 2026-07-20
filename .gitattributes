@@ -1,0 +1,6 @@
+# Скрипты и конфиги, исполняемые на Linux-сервере, всегда с LF —
+# иначе CRLF в shebang/парсинге ломает их при чекауте на Windows.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+gradlew     text eol=lf

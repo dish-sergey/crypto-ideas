@@ -1,0 +1,31 @@
+name: crypto-ideas
+
+services:
+  # Слой данных: планировщик коллекторов + WS-ликвидации (без аргументов).
+  app:
+    build:
+      context: ..                     # корень репозитория
+      dockerfile: deploy/Dockerfile
+    image: crypto-ideas:latest
+    container_name: crypto-app
+    restart: unless-stopped
+    stop_grace_period: 30s            # дать закрыть SQLite (checkpoint WAL) и WS
+    volumes:
+      # РЕАЛЬНАЯ БД на хосте (../data = data/ в корне репо). Никогда — внутри образа.
+      - ../data:/app/data
+
+  # Непрерывный бэкап SQLite в Cloudflare R2. Профиль backup: локальный
+  # smoke-test поднимает только app, а Litestream включается, когда настроен R2.
+  litestream:
+    image: litestream/litestream:0.3
+    container_name: crypto-litestream
+    profiles: ["backup"]
+    restart: unless-stopped
+    depends_on:
+      - app
+    env_file:
+      - .env                          # R2-креды (см. .env.example)
+    volumes:
+      - ../data:/app/data             # rw: Litestream ведёт свой shadow-WAL рядом с БД
+      - ./litestream.yml:/etc/litestream.yml:ro
+    command: replicate -config /etc/litestream.yml

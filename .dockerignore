@@ -1,0 +1,10 @@
+# Контекст сборки = корень репозитория (compose: context: ..).
+# Не тащим в daemon тяжёлое и ненужное — особенно data/ (растущая БД).
+.git
+.gradle
+build
+data
+.idea
+*.log
+deploy/data
+deploy/snapshots
