@@ -101,6 +101,31 @@ CREATE TABLE IF NOT EXISTS liquidations (
     PRIMARY KEY (exchange, symbol, ts, side, price, qty)
 );
 
+-- Kraken Futures funding — ЧАСОВОЙ (док. 09 §2.9, §4.7): не 8-часовой, как OKX/Binance.
+-- Держим отдельно: для S1-lite решения принимаются по ставкам площадки шорт-ноги.
+CREATE TABLE IF NOT EXISTS kraken_funding (
+    symbol       TEXT    NOT NULL,              -- 'PF_XBTUSD'
+    funding_time INTEGER NOT NULL,
+    rate         REAL    NOT NULL,              -- fundingRate (абсолютный, за час)
+    rel_rate     REAL,                          -- relativeFundingRate (относительный за час)
+    available_at INTEGER NOT NULL,              -- = funding_time
+    PRIMARY KEY (symbol, funding_time)
+);
+
+-- Снапшот тикера Kraken Futures (каждые 5 мин): mark, текущий и предиктивный funding, OI.
+-- Закрывает предиктивный funding (док. 09 §1 #4) и живую историю OI Kraken.
+CREATE TABLE IF NOT EXISTS kraken_ticker (
+    symbol        TEXT    NOT NULL,
+    ts            INTEGER NOT NULL,             -- момент снапшота (получен нами)
+    mark_price    REAL,
+    funding_rate  REAL,                         -- текущая часовая ставка
+    funding_pred  REAL,                         -- fundingRatePrediction
+    open_interest REAL,                         -- в контрактах
+    vol24h        REAL,
+    available_at  INTEGER NOT NULL,             -- = ts
+    PRIMARY KEY (symbol, ts)
+);
+
 CREATE INDEX IF NOT EXISTS idx_candles_avail ON candles(available_at);
 CREATE INDEX IF NOT EXISTS idx_liq_symbol_ts ON liquidations(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_news_pub ON news_items(published_ts);

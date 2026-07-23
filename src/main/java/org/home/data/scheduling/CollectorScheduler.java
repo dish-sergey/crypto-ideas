@@ -4,6 +4,7 @@ import org.home.data.cli.CliMode;
 import org.home.data.collectors.CalendarCollector;
 import org.home.data.collectors.Collector;
 import org.home.data.collectors.FundingCollector;
+import org.home.data.collectors.KrakenCollector;
 import org.home.data.collectors.MacroCollector;
 import org.home.data.collectors.NewsRssCollector;
 import org.home.data.collectors.OhlcvCollector;
@@ -34,11 +35,13 @@ public class CollectorScheduler {
     private final MacroCollector macro;
     private final CalendarCollector calendar;
     private final NewsRssCollector news;
+    private final KrakenCollector kraken;
 
     public CollectorScheduler(CliMode mode, OhlcvCollector ohlcv, FundingCollector funding,
                               OpenInterestCollector oi, OnchainCollector onchain,
                               UniverseCollector universe, MacroCollector macro,
-                              CalendarCollector calendar, NewsRssCollector news) {
+                              CalendarCollector calendar, NewsRssCollector news,
+                              KrakenCollector kraken) {
         this.mode = mode;
         this.ohlcv = ohlcv;
         this.funding = funding;
@@ -48,6 +51,7 @@ public class CollectorScheduler {
         this.macro = macro;
         this.calendar = calendar;
         this.news = news;
+        this.kraken = kraken;
     }
 
     // OI — самый частый: Binance хранит только 30 дней, пропуски невосполнимы
@@ -89,6 +93,12 @@ public class CollectorScheduler {
     @Scheduled(initialDelay = 15_000, fixedDelay = 10 * 60_000)
     public void news() {
         run(news);
+    }
+
+    // Kraken: tickers каждые 5 мин; часовой funding гейтится внутри коллектора
+    @Scheduled(initialDelay = 25_000, fixedDelay = 5 * 60_000)
+    public void kraken() {
+        run(kraken);
     }
 
     private void run(Collector collector) {

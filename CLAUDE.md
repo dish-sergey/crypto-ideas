@@ -15,9 +15,11 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun                                   # планировщик + WS-ликвидации
 ./gradlew bootRun --args='--collect=all'            # разовый сбор всего и выход
 ./gradlew bootRun --args='--collect=funding,oi'
+./gradlew bootRun --args='--collect=kraken'                      # Kraken Futures: часовой funding + tickers
 ./gradlew bootRun --args='--backfill=ohlcv --symbols=BTCUSDT --interval=1m --from=2023-01-01'
 ./gradlew bootRun --args='--backfill=funding-okx'
 ./gradlew bootRun --args='--backfill=onchain --from=2015-07-01'
+./gradlew bootRun --args='--backfill=oi-archive --symbols=BTCUSDT,ETHUSDT --from=2021-01-01'  # ретро-OI из bulk-архива
 ```
 
 База: `data/crypto.db` (WAL). Схема: `src/main/resources/schema.sql`.
@@ -66,12 +68,19 @@ Drive «Trading Bot — Спецификация», ключевые докум�
   спот-WS `data-stream.binance.vision` работают. Binance-ликвидации отсюда
   не собрать — реальный поток даёт только Bybit WS (подписка на 5 символов
   вселенной); для Binance-потока нужен хост в другом регионе.
+- **Kraken Futures** — публичный API без geo-блока и ключа. Funding здесь
+  **ЧАСОВОЙ** (не 8ч), берётся через `historicalfundingrates` **API v4** (v3 →
+  404), ~12 мес в одном ответе. Ставки Kraken невзаимозаменяемы с OKX/Binance
+  (док. 09 §4.7) — храним отдельно в `kraken_funding` / `kraken_ticker`.
 
 ## Структура
 
 - `core/Db` — единственный writer-connection SQLite, upsert/batch/queryLong
 - `core/ApiClient` — GET с пер-хостовым rate limit и ретраями (429/5xx/IO)
-- `collectors/*` — 8 REST-коллекторов, интерфейс `Collector` (name + collect)
+- `collectors/*` — 9 REST-коллекторов, интерфейс `Collector` (name + collect):
+  ohlcv, funding, oi, onchain, universe, macro, calendar, news, kraken
+- `collectors/OiArchiveImporter` — не Collector, а one-shot импортёр ретро-OI
+  из bulk-архива Binance Vision (`--backfill=oi-archive`)
 - `ws/LiquidationWsCollector` — Binance !forceOrder + Bybit allLiquidation,
   реконнект, отдельные daemon-потоки
 - `scheduling/CollectorScheduler` — расписание (док. 09 §5)
@@ -79,9 +88,11 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 
 ## Что дальше (по док. 09)
 
-- Импортёр zip-дампов `metrics` из bulk-архива (OI daily с 2020-09-01) —
-  закрывает ретроспективу OI; liquidationSnapshot из архива удалён, для
-  ликвидаций ретроспективы нет.
+- Ретро-OI: импортёр `metrics` из bulk-архива **готов** (`--backfill=oi-archive`);
+  осталось прогнать полный backfill 2021→ по BTC/ETH и топ-парам (проверен на 7 днях).
+  liquidationSnapshot из архива удалён — для ликвидаций ретроспективы нет.
+- Kraken-коллектор **готов** (часовой funding + tickers); осталось при желании —
+  `instruments` (спецификации/лотность) и спот-OHLC (резерв), низкий приоритет.
 - Разлоки для S5: DefiLlama emissions стал платным — найти замену
   (CryptoRank / Tokenomist) или отложить.
 - Ретро-капитализации для survivorship-free вселенной (док. 09 §4.3) — решить

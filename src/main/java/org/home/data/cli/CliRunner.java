@@ -3,6 +3,7 @@ package org.home.data.cli;
 import org.home.data.collectors.Collector;
 import org.home.data.collectors.FundingCollector;
 import org.home.data.collectors.OhlcvCollector;
+import org.home.data.collectors.OiArchiveImporter;
 import org.home.data.collectors.OnchainCollector;
 import org.home.data.ws.LiquidationWsCollector;
 import org.slf4j.Logger;
@@ -40,13 +41,15 @@ public class CliRunner implements ApplicationRunner {
     private final OhlcvCollector ohlcv;
     private final FundingCollector funding;
     private final OnchainCollector onchain;
+    private final OiArchiveImporter oiArchive;
     private final LiquidationWsCollector liquidations;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
 
     public CliRunner(ConfigurableApplicationContext context, CliMode mode,
                      List<Collector> collectors, OhlcvCollector ohlcv, FundingCollector funding,
-                     OnchainCollector onchain, LiquidationWsCollector liquidations,
+                     OnchainCollector onchain, OiArchiveImporter oiArchive,
+                     LiquidationWsCollector liquidations,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
         this.context = context;
@@ -55,6 +58,7 @@ public class CliRunner implements ApplicationRunner {
         this.ohlcv = ohlcv;
         this.funding = funding;
         this.onchain = onchain;
+        this.oiArchive = oiArchive;
         this.liquidations = liquidations;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
@@ -121,8 +125,13 @@ public class CliRunner implements ApplicationRunner {
                 }
             }
             case "onchain" -> onchain.backfill(firstOr(args, "from", "2015-01-01"));
+            case "oi-archive" -> {
+                String symbolsArg = firstOr(args, "symbols", null);
+                List<String> list = symbolsArg != null ? List.of(symbolsArg.split(",")) : defaultSymbols;
+                oiArchive.backfill(list, firstOr(args, "from", "2021-01-01"));
+            }
             default -> throw new IllegalArgumentException(
-                    "Неизвестная цель backfill: " + target + " (ohlcv | funding-okx | onchain)");
+                    "Неизвестная цель backfill: " + target + " (ohlcv | funding-okx | onchain | oi-archive)");
         }
     }
 

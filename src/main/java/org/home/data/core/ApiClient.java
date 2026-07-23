@@ -88,6 +88,43 @@ public class ApiClient {
         throw new ApiException("Не удалось получить " + url + " за " + MAX_RETRIES + " попыток", lastIo);
     }
 
+    /** Бинарная загрузка (zip-дампы bulk-архива Binance Vision). 404/4xx -> ApiException. */
+    public byte[] getBytes(String url) {
+        URI uri = URI.create(url);
+        throttle(uri.getHost());
+        HttpRequest request = HttpRequest.newBuilder(uri)
+                .timeout(Duration.ofSeconds(60))
+                .header("User-Agent", HOST_USER_AGENT.getOrDefault(uri.getHost(), DEFAULT_USER_AGENT))
+                .header("Accept", "*/*")
+                .GET()
+                .build();
+
+        IOException lastIo = null;
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                int code = response.statusCode();
+                if (code >= 200 && code < 300) {
+                    return response.body();
+                }
+                if (code == 429 || code >= 500) {
+                    log.warn("HTTP {} от {} (попытка {}/{})", code, uri.getHost(), attempt, MAX_RETRIES);
+                    sleep(backoffMs(attempt, code));
+                    continue;
+                }
+                throw new ApiException("HTTP " + code + " для " + url);
+            } catch (IOException e) {
+                lastIo = e;
+                log.warn("IO-ошибка к {} (попытка {}/{}): {}", uri.getHost(), attempt, MAX_RETRIES, e.getMessage());
+                sleep(backoffMs(attempt, 0));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new ApiException("Прервано: " + url, e);
+            }
+        }
+        throw new ApiException("Не удалось получить " + url + " за " + MAX_RETRIES + " попыток", lastIo);
+    }
+
     private void throttle(String host) {
         long minInterval = HOST_MIN_INTERVAL_MS.getOrDefault(host, DEFAULT_MIN_INTERVAL_MS);
         while (true) {
