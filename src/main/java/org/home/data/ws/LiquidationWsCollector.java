@@ -30,7 +30,13 @@ public class LiquidationWsCollector {
 
     private static final Logger log = LoggerFactory.getLogger(LiquidationWsCollector.class);
 
-    private static final String BINANCE_URL = "wss://fstream.binance.com/ws/!forceOrder@arr";
+    // Binance liquidations: !forceOrder@arr — объединённый UM+CM поток (поле st: 1=UM, 2=CM,
+    // после CM-миграции). Рабочий эндпоинт — /market/stream + SUBSCRIBE, combined-формат
+    // {"stream":..,"data":{"o":..}}. Устаревшие /ws и /stream отдают только ack без данных
+    // (проверено с micro 2026-07-23) — отсюда прежние нули по Binance-ликвидациям.
+    private static final String BINANCE_URL = "wss://fstream.binance.com/market/stream";
+    private static final String BINANCE_SUBSCRIBE =
+            "{\"method\":\"SUBSCRIBE\",\"params\":[\"!forceOrder@arr\"],\"id\":1}";
     private static final String BYBIT_URL = "wss://stream.bybit.com/v5/public/linear";
     private static final long RECONNECT_DELAY_MS = 5000;
 
@@ -62,7 +68,7 @@ public class LiquidationWsCollector {
         }
         running = true;
         if (binanceEnabled) {
-            startLoop("liq-binance", () -> connect(BINANCE_URL, null, this::handleBinance));
+            startLoop("liq-binance", () -> connect(BINANCE_URL, BINANCE_SUBSCRIBE, this::handleBinance));
         }
         if (!bybitSymbols.isEmpty()) {
             String subscribe = bybitSubscribeMessage(bybitSymbols);
@@ -151,9 +157,10 @@ public class LiquidationWsCollector {
         }
     }
 
-    /** Binance: {"e":"forceOrder","o":{"s","S","q","ap","T",...}} */
+    /** Combined: {"stream":"!forceOrder@arr","data":{"o":{...}}}; ack {"result":null,"id":1} пропускаем. */
     private void handleBinance(String message) throws Exception {
-        JsonNode o = mapper.readTree(message).path("o");
+        JsonNode root = mapper.readTree(message);
+        JsonNode o = root.has("data") ? root.path("data").path("o") : root.path("o");
         if (o.isMissingNode()) {
             return;
         }

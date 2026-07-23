@@ -62,12 +62,14 @@ Drive «Trading Bot — Спецификация», ключевые докум�
   (с OI) — daily с 2020-09-01; `fundingRate` — monthly с 2020-01;
   `bookDepth` — daily с 2023-01-01; **`liquidationSnapshot` удалён совсем**
   (папки нет) — история ликвидаций бесплатно недоступна, принцип 4 в силе.
-- **`fstream.binance.com` (futures WS) заблокирован с этой машины «молча»**:
-  WS-handshake проходит, но фреймы не приходят даже на `btcusdt@aggTrade`;
-  REST-пинг на том же хосте — 403. При этом `fapi.binance.com` (REST) и
-  спот-WS `data-stream.binance.vision` работают. Binance-ликвидации отсюда
-  не собрать — реальный поток даёт только Bybit WS (подписка на 5 символов
-  вселенной); для Binance-потока нужен хост в другом регионе.
+- **Binance futures WS — рабочий путь `wss://fstream.binance.com/market/stream` + SUBSCRIBE**
+  (combined-формат `{"stream":..,"data":{..}}`). Устаревшие `/ws/<stream>` и `/stream`
+  отдают только ack `{"result":null,"id":1}` **без данных** — это была причина нулей
+  по Binance-ликвидациям (исправлено 2026-07-23). `!forceOrder@arr` — объединённый
+  UM+CM поток (поле `st`: 1=UM, 2=CM). С Frankfurt-micro (ЕС) работает; с локальной
+  машины хост fstream раньше молчал (geo) — сбор ликвидаций перенесён на micro.
+  Bybit WS `allLiquidation` — второй, полный рыночный источник. Диагностика WS —
+  `websocat` (musl-бинарь с github vi/websocat).
 - **Kraken Futures** — публичный API без geo-блока и ключа. Funding здесь
   **ЧАСОВОЙ** (не 8ч), берётся через `historicalfundingrates` **API v4** (v3 →
   404), ~12 мес в одном ответе. Ставки Kraken невзаимозаменяемы с OKX/Binance
