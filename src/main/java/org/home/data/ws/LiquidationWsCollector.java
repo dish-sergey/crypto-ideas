@@ -38,6 +38,10 @@ public class LiquidationWsCollector {
     private static final String BINANCE_SUBSCRIBE =
             "{\"method\":\"SUBSCRIBE\",\"params\":[\"!forceOrder@arr\"],\"id\":1}";
     private static final String BYBIT_URL = "wss://stream.bybit.com/v5/public/linear";
+    // OKX: публичный канал liquidation-orders по всем SWAP-инструментам (третий CEX-источник).
+    private static final String OKX_URL = "wss://ws.okx.com:8443/ws/v5/public";
+    private static final String OKX_SUBSCRIBE =
+            "{\"op\":\"subscribe\",\"args\":[{\"channel\":\"liquidation-orders\",\"instType\":\"SWAP\"}]}";
     private static final long RECONNECT_DELAY_MS = 5000;
 
     private static final String INSERT = """
@@ -68,12 +72,15 @@ public class LiquidationWsCollector {
         }
         running = true;
         if (binanceEnabled) {
-            startLoop("liq-binance", () -> connect(BINANCE_URL, BINANCE_SUBSCRIBE, this::handleBinance));
+            // Binance сам шлёт ping-фреймы, JDK отвечает pong — app-ping не нужен (null).
+            startLoop("liq-binance", () -> connect(BINANCE_URL, BINANCE_SUBSCRIBE, null, this::handleBinance));
         }
         if (!bybitSymbols.isEmpty()) {
             String subscribe = bybitSubscribeMessage(bybitSymbols);
-            startLoop("liq-bybit", () -> connect(BYBIT_URL, subscribe, this::handleBybit));
+            startLoop("liq-bybit", () -> connect(BYBIT_URL, subscribe, "{\"op\":\"ping\"}", this::handleBybit));
         }
+        // OKX закрывает соединение без активности ~30с — шлём его raw-ping "ping".
+        startLoop("liq-okx", () -> connect(OKX_URL, OKX_SUBSCRIBE, "ping", this::handleOkx));
     }
 
     private void startLoop(String threadName, Runnable session) {
@@ -100,8 +107,8 @@ public class LiquidationWsCollector {
         void accept(String message) throws Exception;
     }
 
-    /** Одна WS-сессия: блокируется до разрыва соединения. */
-    private void connect(String url, String subscribeMessage, MessageHandler handler) {
+    /** Одна WS-сессия: блокируется до разрыва соединения. pingMessage=null — app-ping не слать. */
+    private void connect(String url, String subscribeMessage, String pingMessage, MessageHandler handler) {
         CountDownLatch closed = new CountDownLatch(1);
         StringBuilder buffer = new StringBuilder();
         WebSocket.Listener listener = new WebSocket.Listener() {
@@ -141,13 +148,13 @@ public class LiquidationWsCollector {
             ws.sendText(subscribeMessage, true);
         }
         try {
-            // Bybit требует ping каждые ~20с; Binance пингует сам (JDK отвечает pong автоматически)
+            // Bybit/OKX требуют app-ping каждые ~20с; у Binance pingMessage=null (пингует сам).
             while (closed.getCount() > 0 && running) {
                 if (closed.await(20, TimeUnit.SECONDS)) {
                     break;
                 }
-                if (subscribeMessage != null) {
-                    ws.sendText("{\"op\":\"ping\"}", true);
+                if (pingMessage != null) {
+                    ws.sendText(pingMessage, true);
                 }
             }
         } catch (InterruptedException e) {
@@ -181,6 +188,23 @@ public class LiquidationWsCollector {
             db.upsert(INSERT, "bybit", n.path("s").asText(), n.path("T").asLong(),
                     n.path("S").asText().toUpperCase(), n.path("p").asDouble(),
                     n.path("v").asDouble(), now);
+        }
+    }
+
+    /** OKX: {"arg":{..},"data":[{"instId":..,"details":[{"side","sz","bkPx","ts"},..]}]}. */
+    private void handleOkx(String message) throws Exception {
+        JsonNode data = mapper.readTree(message).path("data");
+        if (!data.isArray()) {
+            return; // ack/pong/event — не данные
+        }
+        long now = System.currentTimeMillis();
+        for (JsonNode inst : data) {
+            String symbol = inst.path("instId").asText().replace("-SWAP", "").replace("-", "");
+            for (JsonNode d : inst.path("details")) {
+                db.upsert(INSERT, "okx", symbol, d.path("ts").asLong(),
+                        d.path("side").asText().toUpperCase(), d.path("bkPx").asDouble(),
+                        d.path("sz").asDouble(), now);
+            }
         }
     }
 

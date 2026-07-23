@@ -83,8 +83,9 @@ Drive «Trading Bot — Спецификация», ключевые докум�
   ohlcv, funding, oi, onchain, universe, macro, calendar, news, kraken
 - `collectors/OiArchiveImporter` — не Collector, а one-shot импортёр ретро-OI
   из bulk-архива Binance Vision (`--backfill=oi-archive`)
-- `ws/LiquidationWsCollector` — Binance !forceOrder + Bybit allLiquidation,
-  реконнект, отдельные daemon-потоки
+- `ws/LiquidationWsCollector` — ликвидации с 3 бирж: Binance !forceOrder@arr
+  (все символы), OKX liquidation-orders (все SWAP), Bybit allLiquidation (5 символов
+  из конфига); реконнект, пер-биржевой ping, отдельные daemon-потоки
 - `scheduling/CollectorScheduler` — расписание (док. 09 §5)
 - `cli/CliRunner` — one-shot команды; `cli/CliMode` — переключатель режимов
 
