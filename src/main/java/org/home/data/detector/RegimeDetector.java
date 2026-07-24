@@ -8,7 +8,10 @@ import org.springframework.stereotype.Component;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
+import java.util.ArrayDeque;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Детектор режима рынка (док. 01): по BTC-прокси считает суточный композит C1–C5,
@@ -39,6 +42,7 @@ public class RegimeDetector {
 
     private record Candle(LocalDate day, double high, double low, double close, long closeTime) {}
     private record Onchain(long availableAt, double mvrv, double mc) {}
+    private record SymClose(String symbol, LocalDate day, double close) {}
 
     /** Разметка с fromDay до последней дневной свечи BTC. */
     public void backfill(String fromDay) {
@@ -52,6 +56,7 @@ public class RegimeDetector {
         double[] sma = sma(c);
         double[] atr = atr(c);
         List<Onchain> oc = loadOnchain(); // отсортирован по available_at
+        Map<LocalDate, long[]> breadth = loadBreadth(); // день -> {выше SMA200, всего}
 
         // Экспандинг-статистика market cap (масштабирована) для MVRV Z-score.
         int ocIdx = 0;
@@ -76,11 +81,12 @@ public class RegimeDetector {
             }
             Double c1 = computeC1(cur.close(), sma[i], sma[i - SLOPE_N], atr[i]);
             Double c2 = computeC2(curMvrv, curMc, mcSum, mcSumSq, mcCount);
-            db.upsert("INSERT OR REPLACE INTO regime_daily(day, c1, c2, available_at) VALUES(?,?,?,?)",
-                    cur.day().toString(), c1, c2, cur.closeTime());
+            Double c5 = computeC5(breadth.get(cur.day()));
+            db.upsert("INSERT OR REPLACE INTO regime_daily(day, c1, c2, c5, available_at) VALUES(?,?,?,?,?)",
+                    cur.day().toString(), c1, c2, c5, cur.closeTime());
             written++;
         }
-        log.info("detector: C1+C2 рассчитаны по {} дням (с {})", written, from);
+        log.info("detector: C1+C2+C5 рассчитаны по {} дням (с {})", written, from);
     }
 
     private List<Candle> loadCandles() {
@@ -101,6 +107,52 @@ public class RegimeDetector {
                         + "GROUP BY day HAVING mvrv IS NOT NULL AND mc IS NOT NULL AND mvrv>0 "
                         + "ORDER BY av",
                 rs -> new Onchain(rs.getLong("av"), rs.getDouble("mvrv"), rs.getDouble("mc")));
+    }
+
+    /**
+     * Breadth: по всем топ-100 символам считаем посимвольно SMA200 и агрегируем по дню
+     * {сколько выше своей SMA200, сколько всего с определённой SMA200}. Свеча дня доступна
+     * на его закрытии — детектор дня D берёт свечи дня D, look-ahead нет.
+     */
+    private Map<LocalDate, long[]> loadBreadth() {
+        List<SymClose> rows = db.query(
+                "SELECT symbol, open_time, close FROM candles WHERE interval='1d' ORDER BY symbol, open_time",
+                rs -> new SymClose(rs.getString(1),
+                        Instant.ofEpochMilli(rs.getLong(2)).atZone(ZoneOffset.UTC).toLocalDate(),
+                        rs.getDouble(3)));
+        Map<LocalDate, long[]> out = new HashMap<>();
+        String curSym = null;
+        ArrayDeque<Double> win = new ArrayDeque<>();
+        double sum = 0;
+        for (SymClose r : rows) {
+            if (!r.symbol().equals(curSym)) {
+                curSym = r.symbol();
+                win.clear();
+                sum = 0;
+            }
+            win.addLast(r.close());
+            sum += r.close();
+            if (win.size() > SMA_N) {
+                sum -= win.removeFirst();
+            }
+            if (win.size() == SMA_N) {
+                long[] agg = out.computeIfAbsent(r.day(), k -> new long[2]);
+                agg[1]++;                          // всего с SMA200
+                if (r.close() > sum / SMA_N) {
+                    agg[0]++;                      // выше своей SMA200
+                }
+            }
+        }
+        return out;
+    }
+
+    /** C5 breadth: доля топ-100 выше SMA200. >70% → +1, <30% → −1, линейно между. */
+    private static Double computeC5(long[] agg) {
+        if (agg == null || agg[1] < 20) {
+            return null; // мало символов с определённой SMA200
+        }
+        double frac = (double) agg[0] / agg[1];
+        return clip((frac - 0.5) / 0.2, -1, 1);
     }
 
     /** C1: расстояние до SMA200 (70%) + наклон SMA200 за 30д (30%), нормировка через ATR. */
