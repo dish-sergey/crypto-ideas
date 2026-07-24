@@ -84,8 +84,9 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 - `collectors/OiArchiveImporter` — не Collector, а one-shot импортёр ретро-OI
   из bulk-архива Binance Vision (`--backfill=oi-archive`)
 - `ws/LiquidationWsCollector` — ликвидации с 3 бирж: Binance !forceOrder@arr
-  (все символы), OKX liquidation-orders (все SWAP), Bybit allLiquidation (5 символов
-  из конфига); реконнект, пер-биржевой ping, отдельные daemon-потоки
+  (весь рынок), OKX liquidation-orders (все SWAP), Bybit allLiquidation (все ~758
+  linear-перпов — список тянется с REST на каждом коннекте, батчи по 100, форс-
+  реконнект раз в 6ч для новых листингов); пер-биржевой ping, daemon-потоки
 - `scheduling/CollectorScheduler` — расписание (док. 09 §5)
 - `cli/CliRunner` — one-shot команды; `cli/CliMode` — переключатель режимов
 

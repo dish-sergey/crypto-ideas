@@ -3,6 +3,7 @@ package org.home.data.ws;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PreDestroy;
+import org.home.data.core.ApiClient;
 import org.home.data.core.Db;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -12,6 +13,7 @@ import org.springframework.stereotype.Component;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
@@ -20,9 +22,8 @@ import java.util.concurrent.TimeUnit;
 /**
  * Forward-only запись ликвидаций (док. 09 §5, поток №9). Исторических данных
  * бесплатно нет — каждый день без работающего коллектора потерян навсегда.
- * Binance: !forceOrder@arr — поток урезан биржей до ~1 события/сек/инструмент,
- * нормировка на собственный фид уже заложена в док. 08 §8. Bybit allLiquidation —
- * полный поток, второй источник.
+ * Три CEX-источника: Binance !forceOrder@arr (весь рынок, UM+CM), OKX
+ * liquidation-orders (все SWAP), Bybit allLiquidation (пер-символьно).
  * available_at = момент получения из WS.
  */
 @Component
@@ -42,6 +43,12 @@ public class LiquidationWsCollector {
     private static final String OKX_URL = "wss://ws.okx.com:8443/ws/v5/public";
     private static final String OKX_SUBSCRIBE =
             "{\"op\":\"subscribe\",\"args\":[{\"channel\":\"liquidation-orders\",\"instType\":\"SWAP\"}]}";
+    private static final String BYBIT_INSTRUMENTS =
+            "https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000";
+    // Bybit: allLiquidation.<symbol> пер-символьный, wildcard'а нет. Тянем весь список
+    // инструментов и подписываемся батчами; реконнект раз в 6ч подхватывает новые листинги.
+    private static final long BYBIT_SESSION_MS = 6 * 3600_000L;
+    private static final int BYBIT_BATCH = 100;
     private static final long RECONNECT_DELAY_MS = 5000;
 
     private static final String INSERT = """
@@ -50,18 +57,23 @@ public class LiquidationWsCollector {
             """;
 
     private final Db db;
+    private final ApiClient api;
     private final boolean binanceEnabled;
+    private final boolean bybitAllSymbols;
     private final List<String> bybitSymbols;
     private final ObjectMapper mapper = new ObjectMapper();
     private final HttpClient client = HttpClient.newHttpClient();
 
     private volatile boolean running;
 
-    public LiquidationWsCollector(Db db,
+    public LiquidationWsCollector(Db db, ApiClient api,
                                   @Value("${collectors.liq-binance-enabled}") boolean binanceEnabled,
+                                  @Value("${collectors.liq-bybit-all-symbols:true}") boolean bybitAllSymbols,
                                   @Value("${collectors.liq-bybit-symbols}") List<String> bybitSymbols) {
         this.db = db;
+        this.api = api;
         this.binanceEnabled = binanceEnabled;
+        this.bybitAllSymbols = bybitAllSymbols;
         this.bybitSymbols = bybitSymbols;
     }
 
@@ -73,14 +85,12 @@ public class LiquidationWsCollector {
         running = true;
         if (binanceEnabled) {
             // Binance сам шлёт ping-фреймы, JDK отвечает pong — app-ping не нужен (null).
-            startLoop("liq-binance", () -> connect(BINANCE_URL, BINANCE_SUBSCRIBE, null, this::handleBinance));
+            startLoop("liq-binance", () -> connect(BINANCE_URL, List.of(BINANCE_SUBSCRIBE), null, 0, this::handleBinance));
         }
-        if (!bybitSymbols.isEmpty()) {
-            String subscribe = bybitSubscribeMessage(bybitSymbols);
-            startLoop("liq-bybit", () -> connect(BYBIT_URL, subscribe, "{\"op\":\"ping\"}", this::handleBybit));
-        }
+        // Bybit: список символов пересобирается на каждом коннекте (свежие листинги).
+        startLoop("liq-bybit", () -> connect(BYBIT_URL, bybitSubscribes(), "{\"op\":\"ping\"}", BYBIT_SESSION_MS, this::handleBybit));
         // OKX закрывает соединение без активности ~30с — шлём его raw-ping "ping".
-        startLoop("liq-okx", () -> connect(OKX_URL, OKX_SUBSCRIBE, "ping", this::handleOkx));
+        startLoop("liq-okx", () -> connect(OKX_URL, List.of(OKX_SUBSCRIBE), "ping", 0, this::handleOkx));
     }
 
     private void startLoop(String threadName, Runnable session) {
@@ -107,8 +117,12 @@ public class LiquidationWsCollector {
         void accept(String message) throws Exception;
     }
 
-    /** Одна WS-сессия: блокируется до разрыва соединения. pingMessage=null — app-ping не слать. */
-    private void connect(String url, String subscribeMessage, String pingMessage, MessageHandler handler) {
+    /**
+     * Одна WS-сессия: блокируется до разрыва соединения. pingMessage=null — app-ping не слать.
+     * sessionMaxMs>0 — завершить сессию через это время (форс-реконнект для обновления подписок).
+     */
+    private void connect(String url, List<String> subscribeMessages, String pingMessage,
+                         long sessionMaxMs, MessageHandler handler) {
         CountDownLatch closed = new CountDownLatch(1);
         StringBuilder buffer = new StringBuilder();
         WebSocket.Listener listener = new WebSocket.Listener() {
@@ -144,17 +158,19 @@ public class LiquidationWsCollector {
         WebSocket ws = client.newWebSocketBuilder()
                 .buildAsync(URI.create(url), listener)
                 .join();
-        if (subscribeMessage != null) {
-            ws.sendText(subscribeMessage, true);
+        // JDK-требование: не слать следующий text, пока предыдущий не завершился — join().
+        for (String s : subscribeMessages) {
+            ws.sendText(s, true).join();
         }
+        long deadline = sessionMaxMs > 0 ? System.currentTimeMillis() + sessionMaxMs : Long.MAX_VALUE;
         try {
             // Bybit/OKX требуют app-ping каждые ~20с; у Binance pingMessage=null (пингует сам).
-            while (closed.getCount() > 0 && running) {
+            while (closed.getCount() > 0 && running && System.currentTimeMillis() < deadline) {
                 if (closed.await(20, TimeUnit.SECONDS)) {
                     break;
                 }
                 if (pingMessage != null) {
-                    ws.sendText(pingMessage, true);
+                    ws.sendText(pingMessage, true).join();
                 }
             }
         } catch (InterruptedException e) {
@@ -179,6 +195,10 @@ public class LiquidationWsCollector {
     /** Bybit: {"topic":"allLiquidation.BTCUSDT","data":[{"T","s","S","v","p"}]} */
     private void handleBybit(String message) throws Exception {
         JsonNode root = mapper.readTree(message);
+        if ("subscribe".equals(root.path("op").asText()) && !root.path("success").asBoolean(true)) {
+            log.warn("bybit subscribe отклонён: {}", root.path("ret_msg").asText());
+            return;
+        }
         JsonNode data = root.path("data");
         if (!root.path("topic").asText("").startsWith("allLiquidation") || !data.isArray()) {
             return;
@@ -206,6 +226,36 @@ public class LiquidationWsCollector {
                         d.path("sz").asDouble(), now);
             }
         }
+    }
+
+    /** Батчи subscribe-сообщений для Bybit (все символы рынка или список из конфига). */
+    private List<String> bybitSubscribes() {
+        List<String> symbols = bybitAllSymbols ? fetchBybitSymbols() : bybitSymbols;
+        List<String> messages = new ArrayList<>();
+        for (int i = 0; i < symbols.size(); i += BYBIT_BATCH) {
+            messages.add(bybitSubscribeMessage(symbols.subList(i, Math.min(i + BYBIT_BATCH, symbols.size()))));
+        }
+        return messages;
+    }
+
+    /** Все торгуемые linear-перпы Bybit; при сбое REST — fallback на список из конфига. */
+    private List<String> fetchBybitSymbols() {
+        try {
+            JsonNode list = mapper.readTree(api.get(BYBIT_INSTRUMENTS)).path("result").path("list");
+            List<String> symbols = new ArrayList<>();
+            for (JsonNode n : list) {
+                if ("Trading".equals(n.path("status").asText())) {
+                    symbols.add(n.path("symbol").asText());
+                }
+            }
+            if (!symbols.isEmpty()) {
+                log.info("liq-bybit: подписка на {} символов рынка", symbols.size());
+                return symbols;
+            }
+        } catch (Exception e) {
+            log.warn("liq-bybit: список символов недоступен ({}), fallback на конфиг", e.getMessage());
+        }
+        return bybitSymbols;
     }
 
     public static String bybitSubscribeMessage(List<String> symbols) {
