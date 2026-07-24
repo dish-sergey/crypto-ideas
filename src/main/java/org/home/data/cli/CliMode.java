@@ -13,7 +13,8 @@ public class CliMode {
     private final boolean scheduleMode;
 
     public CliMode(ApplicationArguments args) {
-        this.scheduleMode = !args.containsOption("collect") && !args.containsOption("backfill");
+        this.scheduleMode = !args.containsOption("collect") && !args.containsOption("backfill")
+                && !args.containsOption("report");
     }
 
     public boolean isScheduleMode() {

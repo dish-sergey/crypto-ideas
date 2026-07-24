@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Детектор режима — BTC</title>
+<style>
+  :root{
+    --bg:#ffffff; --panel:#f8fafc; --ink:#0f172a; --muted:#64748b; --grid:#e2e8f0;
+    --price:#0f172a; --score:#2563eb;
+    --bull:#22c55e; --range:#eab308; --bear:#ef4444; --trans:#94a3b8;
+    --band-a:0.14;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0b1120; --panel:#0f172a; --ink:#e2e8f0; --muted:#94a3b8; --grid:#1e293b;
+      --price:#e2e8f0; --score:#60a5fa; --band-a:0.22; }
+  }
+  :root[data-theme="light"]{ --bg:#ffffff; --panel:#f8fafc; --ink:#0f172a; --muted:#64748b;
+    --grid:#e2e8f0; --price:#0f172a; --score:#2563eb; --band-a:0.14; }
+  :root[data-theme="dark"]{ --bg:#0b1120; --panel:#0f172a; --ink:#e2e8f0; --muted:#94a3b8;
+    --grid:#1e293b; --price:#e2e8f0; --score:#60a5fa; --band-a:0.22; }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:1200px;margin:0 auto;padding:20px}
+  header{display:flex;flex-wrap:wrap;align-items:baseline;gap:12px;margin-bottom:4px}
+  h1{font-size:20px;margin:0}
+  .sub{color:var(--muted);font-size:13px}
+  .now{margin-left:auto;font-size:13px;color:var(--muted)}
+  .now b{color:var(--ink);font-size:15px}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin:10px 0 6px;font-size:13px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .sw{width:14px;height:14px;border-radius:3px;display:inline-block}
+  .card{background:var(--panel);border:1px solid var(--grid);border-radius:12px;padding:10px}
+  canvas{display:block;width:100%;touch-action:none}
+  #tip{position:fixed;pointer-events:none;z-index:9;background:var(--panel);
+    border:1px solid var(--grid);border-radius:8px;padding:8px 10px;font-size:12px;
+    box-shadow:0 4px 16px rgba(0,0,0,.18);opacity:0;transition:opacity .08s;min-width:180px}
+  #tip .d{font-weight:600;margin-bottom:4px}
+  #tip .row{display:flex;justify-content:space-between;gap:14px}
+  #tip .row span:last-child{font-variant-numeric:tabular-nums}
+  .st-badge{display:inline-block;padding:0 6px;border-radius:4px;color:#fff;font-weight:600}
+  .foot{color:var(--muted);font-size:12px;margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Детектор режима рынка — BTC</h1>
+    <span class="sub" id="range"></span>
+    <span class="now" id="nowbox"></span>
+  </header>
+  <div class="legend" id="legend"></div>
+  <div class="card"><canvas id="c"></canvas></div>
+  <div class="foot" id="foot"></div>
+</div>
+<div id="tip"></div>
+
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(function(){
+  const RAW = JSON.parse(document.getElementById('data').textContent);
+  const P = RAW.points;                     // [d, price, stIdx, score, c1..c5]
+  const STATES = ["BULL","RANGE","BEAR","TRANSITION"];
+  const css = k => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+  const stColor = i => [css('--bull'),css('--range'),css('--bear'),css('--trans')][i];
+
+  document.getElementById('range').textContent = RAW.from + " — " + RAW.to + " · " + P.length + " дней";
+  const last = P[P.length-1];
+  document.getElementById('nowbox').innerHTML =
+    "сейчас: <b><span class='st-badge' style='background:"+stColor(last[2])+"'>"+STATES[last[2]]+"</span></b> "+
+    "score " + (last[3]>=0?"+":"") + last[3].toFixed(2);
+  document.getElementById('legend').innerHTML = STATES.map((s,i)=>
+    "<span><i class='sw' style='background:"+stColor(i)+"'></i>"+s+"</span>").join("") +
+    "<span style='margin-left:auto'>линия — цена BTC (лог); нижняя панель — score</span>";
+  document.getElementById('foot').textContent =
+    "Пороги FSM: вход ±0.30 (10 дней), выход ±0.10; RANGE ≥15 дней. Разметка по available_at (без look-ahead).";
+
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  const tip = document.getElementById('tip');
+  let W=0, H=0, dpr=1;
+  const PAD={l:58,r:12,t:10,b:22}, GAP=18, SCORE_H=110;
+
+  // масштабы
+  const prices = P.map(p=>p[1]);
+  const pMin=Math.min(...prices), pMax=Math.max(...prices);
+  const lg = v => Math.log10(v);
+  let priceTop, priceBot, scoreTop, scoreBot, plotW;
+
+  function layout(){
+    dpr = window.devicePixelRatio||1;
+    W = cv.clientWidth; H = 520;
+    cv.width = W*dpr; cv.height = H*dpr;
+    cv.style.height = H+"px";
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    priceTop = PAD.t; scoreBot = H-PAD.b; scoreTop = scoreBot-SCORE_H;
+    priceBot = scoreTop-GAP; plotW = W-PAD.l-PAD.r;
+  }
+  const x = i => PAD.l + (P.length<2?0:plotW*i/(P.length-1));
+  const yP = v => priceBot - (priceBot-priceTop)*(lg(v)-lg(pMin))/(lg(pMax)-lg(pMin));
+  const yS = v => (scoreTop+scoreBot)/2 - (SCORE_H/2)*v;   // score ∈[-1,1]
+
+  function hexA(hex,a){const n=parseInt(hex.slice(1),16);return "rgba("+(n>>16&255)+","+(n>>8&255)+","+(n&255)+","+a+")";}
+
+  function draw(){
+    layout();
+    ctx.clearRect(0,0,W,H);
+    const grid=css('--grid'), muted=css('--muted'), a=parseFloat(css('--band-a'));
+
+    // полосы режима
+    let i0=0;
+    for(let i=1;i<=P.length;i++){
+      if(i===P.length || P[i][2]!==P[i0][2]){
+        const c=stColor(P[i0][2]);
+        ctx.fillStyle=hexA(c,a);
+        const xa=x(i0), xb=x(Math.min(i,P.length-1));
+        ctx.fillRect(xa,priceTop,xb-xa,priceBot-priceTop);
+        ctx.fillRect(xa,scoreTop,xb-xa,scoreBot-scoreTop);
+        i0=i;
+      }
+    }
+    // сетка цены (лог)
+    ctx.font="11px system-ui"; ctx.textBaseline="middle";
+    ctx.strokeStyle=grid; ctx.fillStyle=muted; ctx.lineWidth=1;
+    const ticks=priceTicks(pMin,pMax);
+    ticks.forEach(t=>{const y=yP(t);ctx.beginPath();ctx.moveTo(PAD.l,y);ctx.lineTo(W-PAD.r,y);ctx.stroke();
+      ctx.textAlign="right";ctx.fillText(fmtP(t),PAD.l-6,y);});
+    // сетка score
+    [-1,-0.3,0,0.3,1].forEach(v=>{const y=yS(v);
+      ctx.strokeStyle=(v===0)?muted:grid; ctx.beginPath();ctx.moveTo(PAD.l,y);ctx.lineTo(W-PAD.r,y);ctx.stroke();
+      ctx.fillStyle=muted;ctx.textAlign="right";ctx.fillText((v>0?"+":"")+v,PAD.l-6,y);});
+    // оси X — годы
+    let py=-1;
+    for(let i=0;i<P.length;i++){const y=+P[i][0].slice(0,4);if(y!==py){py=y;
+      const xx=x(i);ctx.strokeStyle=grid;ctx.beginPath();ctx.moveTo(xx,priceTop);ctx.lineTo(xx,scoreBot);ctx.stroke();
+      ctx.fillStyle=muted;ctx.textAlign="center";ctx.textBaseline="top";ctx.fillText(y,xx,scoreBot+4);ctx.textBaseline="middle";}}
+
+    // линия цены
+    ctx.strokeStyle=css('--price'); ctx.lineWidth=1.6; ctx.beginPath();
+    P.forEach((p,i)=>{const xx=x(i),yy=yP(p[1]);i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy);});
+    ctx.stroke();
+    // линия score
+    ctx.strokeStyle=css('--score'); ctx.lineWidth=1.4; ctx.beginPath();
+    P.forEach((p,i)=>{const xx=x(i),yy=yS(p[3]);i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy);});
+    ctx.stroke();
+  }
+
+  function priceTicks(lo,hi){const out=[];for(let e=Math.floor(lg(lo));e<=Math.ceil(lg(hi));e++){
+    [1,2,5].forEach(m=>{const v=m*Math.pow(10,e);if(v>=lo*0.9&&v<=hi*1.1)out.push(v);});}return out;}
+  function fmtP(v){return v>=1000?(v/1000)+"k":""+v;}
+
+  // hover
+  function onMove(ev){
+    const r=cv.getBoundingClientRect();
+    const mx=ev.clientX-r.left;
+    if(mx<PAD.l||mx>W-PAD.r){tip.style.opacity=0;draw();return;}
+    let i=Math.round((mx-PAD.l)/plotW*(P.length-1));
+    i=Math.max(0,Math.min(P.length-1,i));
+    const p=P[i];
+    draw();
+    const xx=x(i);
+    ctx.strokeStyle=css('--muted');ctx.lineWidth=1;ctx.setLineDash([4,4]);
+    ctx.beginPath();ctx.moveTo(xx,priceTop);ctx.lineTo(xx,scoreBot);ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle=css('--price');ctx.beginPath();ctx.arc(xx,yP(p[1]),3.5,0,7);ctx.fill();
+    ctx.fillStyle=css('--score');ctx.beginPath();ctx.arc(xx,yS(p[3]),3.5,0,7);ctx.fill();
+    const cc=n=>n==null?"—":(n>=0?"+":"")+n.toFixed(2);
+    tip.innerHTML="<div class='d'>"+p[0]+" · <span class='st-badge' style='background:"+stColor(p[2])+"'>"+STATES[p[2]]+"</span></div>"+
+      row("Цена BTC","$"+p[1].toLocaleString('en-US',{maximumFractionDigits:0}))+
+      row("score",cc(p[3]))+
+      "<hr style='border:none;border-top:1px solid var(--grid);margin:5px 0'>"+
+      row("C1 тренд",cc(p[4]))+row("C2 on-chain",cc(p[5]))+row("C3 деривативы",cc(p[6]))+
+      row("C4 макро",cc(p[7]))+row("C5 breadth",cc(p[8]));
+    tip.style.opacity=1;
+    let tx=ev.clientX+14, ty=ev.clientY+14;
+    if(tx+220>innerWidth)tx=ev.clientX-234; if(ty+200>innerHeight)ty=ev.clientY-200;
+    tip.style.left=tx+"px"; tip.style.top=ty+"px";
+  }
+  function row(k,v){return "<div class='row'><span>"+k+"</span><span>"+v+"</span></div>";}
+
+  cv.addEventListener('mousemove',onMove);
+  cv.addEventListener('mouseleave',()=>{tip.style.opacity=0;draw();});
+  cv.addEventListener('touchmove',e=>{if(e.touches[0])onMove(e.touches[0]);},{passive:true});
+  new ResizeObserver(draw).observe(cv);
+  draw();
+})();
+</script>
+</body>
+</html>
