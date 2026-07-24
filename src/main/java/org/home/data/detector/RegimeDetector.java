@@ -241,7 +241,7 @@ public class RegimeDetector {
 
     // ---- компоненты ----
 
-    private static Double computeC1(double close, double sma, double smaPrev, double atr) {
+    static Double computeC1(double close, double sma, double smaPrev, double atr) {
         if (Double.isNaN(sma) || Double.isNaN(atr) || atr <= 0) {
             return null;
         }
@@ -250,7 +250,7 @@ public class RegimeDetector {
         return 0.7 * main + 0.3 * slope;
     }
 
-    private static Double computeC2(double mvrv, double mc, double mcSum, double mcSumSq, long count) {
+    static Double computeC2(double mvrv, double mc, double mcSum, double mcSumSq, long count) {
         if (Double.isNaN(mvrv) || mvrv <= 0 || count < C2_MIN_HISTORY) {
             return null;
         }
@@ -265,7 +265,7 @@ public class RegimeDetector {
     }
 
     /** C3-часть funding: пик у здорового умеренного положительного, спад у перегрева и негатива. */
-    private static Double computeC3Funding(double a) {
+    static Double computeC3Funding(double a) {
         if (Double.isNaN(a)) {
             return null;
         }
@@ -279,7 +279,7 @@ public class RegimeDetector {
     }
 
     /** C4 макро: баланс ФРС (QE) 0.4 + ставка (смягчение) 0.35 + доллар (падение) 0.25. */
-    private static Double computeC4(double dff, double dffPrev, double wal, double walPrev,
+    static Double computeC4(double dff, double dffPrev, double wal, double walPrev,
                                     double dxy, double dxyPrev) {
         if (Double.isNaN(dff) || Double.isNaN(dffPrev) || Double.isNaN(wal) || Double.isNaN(walPrev)
                 || Double.isNaN(dxy) || Double.isNaN(dxyPrev)) {
@@ -291,7 +291,7 @@ public class RegimeDetector {
         return clip(0.4 * qe + 0.35 * easing + 0.25 * dollar, -1, 1);
     }
 
-    private static Double computeC5(long[] agg) {
+    static Double computeC5(long[] agg) {
         if (agg == null || agg[1] < 20) {
             return null;
         }
@@ -299,7 +299,7 @@ public class RegimeDetector {
     }
 
     /** Взвешенная сумма; null-компоненты выпадают, веса перераспределяются (отказ = нейтраль). */
-    private static Double composite(Double... comp) {
+    static Double composite(Double... comp) {
         double s = 0, wsum = 0;
         for (int i = 0; i < comp.length; i++) {
             if (comp[i] != null) {
