@@ -126,6 +126,24 @@ CREATE TABLE IF NOT EXISTS kraken_ticker (
     PRIMARY KEY (symbol, ts)
 );
 
+-- Детектор режима (док. 01): суточная разметка {BULL,RANGE,BEAR,TRANSITION} + компоненты.
+-- available_at = конец дня (когда расчёт стал бы доступен бэктесту).
+CREATE TABLE IF NOT EXISTS regime_daily (
+    day              TEXT    NOT NULL,          -- 'YYYY-MM-DD'
+    c1               REAL,                      -- тренд
+    c2               REAL,                      -- on-chain (MVRV)
+    c3               REAL,                      -- деривативы
+    c4               REAL,                      -- макро
+    c5               REAL,                      -- breadth
+    score            REAL,
+    state            TEXT,                      -- BULL|RANGE|BEAR|TRANSITION
+    confidence       REAL,
+    days_in_state    INTEGER,
+    leverage_warning INTEGER,                   -- 0/1
+    available_at     INTEGER NOT NULL,
+    PRIMARY KEY (day)
+);
+
 CREATE INDEX IF NOT EXISTS idx_candles_avail ON candles(available_at);
 CREATE INDEX IF NOT EXISTS idx_liq_symbol_ts ON liquidations(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_news_pub ON news_items(published_ts);

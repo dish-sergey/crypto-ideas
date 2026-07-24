@@ -103,6 +103,28 @@ public class Db {
         }
     }
 
+    /** Маппер строки ResultSet в объект. */
+    @FunctionalInterface
+    public interface RowMapper<T> {
+        T map(java.sql.ResultSet rs) throws SQLException;
+    }
+
+    /** Типизированный запрос: список объектов (напр. свечи для детектора). */
+    public synchronized <T> List<T> query(String sql, RowMapper<T> mapper, Object... params) {
+        java.util.List<T> out = new java.util.ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            bind(ps, params);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(mapper.map(rs));
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("query failed: " + sql, e);
+        }
+        return out;
+    }
+
     /** Список строк из первого столбца (напр. символы вселенной по рангу). */
     public synchronized List<String> queryStrings(String sql, Object... params) {
         java.util.List<String> out = new java.util.ArrayList<>();

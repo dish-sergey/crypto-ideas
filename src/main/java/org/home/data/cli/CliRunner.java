@@ -5,6 +5,7 @@ import org.home.data.collectors.FundingCollector;
 import org.home.data.collectors.OhlcvCollector;
 import org.home.data.collectors.OiArchiveImporter;
 import org.home.data.collectors.OnchainCollector;
+import org.home.data.detector.RegimeDetector;
 import org.home.data.ws.LiquidationWsCollector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,6 +43,7 @@ public class CliRunner implements ApplicationRunner {
     private final FundingCollector funding;
     private final OnchainCollector onchain;
     private final OiArchiveImporter oiArchive;
+    private final RegimeDetector detector;
     private final LiquidationWsCollector liquidations;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
@@ -49,7 +51,7 @@ public class CliRunner implements ApplicationRunner {
     public CliRunner(ConfigurableApplicationContext context, CliMode mode,
                      List<Collector> collectors, OhlcvCollector ohlcv, FundingCollector funding,
                      OnchainCollector onchain, OiArchiveImporter oiArchive,
-                     LiquidationWsCollector liquidations,
+                     RegimeDetector detector, LiquidationWsCollector liquidations,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
         this.context = context;
@@ -59,6 +61,7 @@ public class CliRunner implements ApplicationRunner {
         this.funding = funding;
         this.onchain = onchain;
         this.oiArchive = oiArchive;
+        this.detector = detector;
         this.liquidations = liquidations;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
@@ -130,8 +133,10 @@ public class CliRunner implements ApplicationRunner {
                 List<String> list = symbolsArg != null ? List.of(symbolsArg.split(",")) : defaultSymbols;
                 oiArchive.backfill(list, firstOr(args, "from", "2021-01-01"));
             }
+            case "regime" -> detector.backfill(firstOr(args, "from", "2020-01-01"));
             default -> throw new IllegalArgumentException(
-                    "Неизвестная цель backfill: " + target + " (ohlcv | funding-okx | onchain | oi-archive)");
+                    "Неизвестная цель backfill: " + target
+                            + " (ohlcv | funding-okx | onchain | oi-archive | regime)");
         }
     }
 
