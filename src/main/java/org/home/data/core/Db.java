@@ -103,6 +103,22 @@ public class Db {
         }
     }
 
+    /** Список строк из первого столбца (напр. символы вселенной по рангу). */
+    public synchronized List<String> queryStrings(String sql, Object... params) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            bind(ps, params);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(rs.getString(1));
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("query failed: " + sql, e);
+        }
+        return out;
+    }
+
     /** Скалярный запрос (MAX(ts) и т.п.); null, если нет строк или NULL. */
     public synchronized Long queryLong(String sql, Object... params) {
         try (PreparedStatement ps = conn.prepareStatement(sql)) {

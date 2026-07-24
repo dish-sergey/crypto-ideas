@@ -10,7 +10,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Свечи со спот-зеркала Binance data-api.binance.vision (док. 09 §2.1):
@@ -24,7 +26,9 @@ public class OhlcvCollector implements Collector {
     private static final Logger log = LoggerFactory.getLogger(OhlcvCollector.class);
 
     private static final String BASE = "https://data-api.binance.vision/api/v3/klines";
+    private static final String EXCHANGE_INFO = "https://data-api.binance.vision/api/v3/exchangeInfo";
     private static final int PAGE_LIMIT = 1000;
+    private static final long UNIVERSE_TTL_MS = 24 * 3600_000L;
     /** Стартовая точка бэкфилла по умолчанию: 2019-01-01 (док. 04 §1). */
     public static final long DEFAULT_FROM_MS = 1546300800000L;
 
@@ -39,14 +43,20 @@ public class OhlcvCollector implements Collector {
     private final ObjectMapper mapper = new ObjectMapper();
     private final List<String> symbols;
     private final List<String> minuteSymbols;
+    private final int universeTop;
+
+    private volatile List<String> universeCache = List.of();
+    private volatile long universeCachedMs = 0;
 
     public OhlcvCollector(Db db, ApiClient api,
                           @Value("${collectors.symbols}") List<String> symbols,
-                          @Value("${collectors.minute-symbols}") List<String> minuteSymbols) {
+                          @Value("${collectors.minute-symbols}") List<String> minuteSymbols,
+                          @Value("${collectors.universe-candles-top:0}") int universeTop) {
         this.db = db;
         this.api = api;
         this.symbols = symbols;
         this.minuteSymbols = minuteSymbols;
+        this.universeTop = universeTop;
     }
 
     @Override
@@ -64,6 +74,71 @@ public class OhlcvCollector implements Collector {
             // минутный бэкфилл запускается отдельно: --backfill=ohlcv --interval=1m
             long weekAgo = System.currentTimeMillis() - 7L * 24 * 3600 * 1000;
             backfill(symbol, "1m", weekAgo);
+        }
+        // Топ-N вселенной — только дневные свечи (breadth C5 детектора, док. 01).
+        int added = 0;
+        for (String symbol : universeSymbols()) {
+            if (!symbols.contains(symbol)) {
+                backfill(symbol, "1d", DEFAULT_FROM_MS);
+                added++;
+            }
+        }
+        if (added > 0) {
+            log.debug("ohlcv: дневные свечи по {} символам вселенной", added);
+        }
+    }
+
+    /**
+     * Символы для breadth: топ-{@code universeTop} монет из последнего снапшота
+     * вселенной, пересечённые с торгуемыми USDT-парами Binance. Кэш на сутки.
+     * universeTop=0 — фича выключена.
+     */
+    private List<String> universeSymbols() {
+        if (universeTop <= 0) {
+            return List.of();
+        }
+        long now = System.currentTimeMillis();
+        if (!universeCache.isEmpty() && now - universeCachedMs < UNIVERSE_TTL_MS) {
+            return universeCache;
+        }
+        List<String> coins = db.queryStrings(
+                "SELECT symbol FROM universe_snapshot WHERE snap_day="
+                        + "(SELECT MAX(snap_day) FROM universe_snapshot) ORDER BY rank");
+        Set<String> binance = binanceUsdtSymbols();
+        if (coins.isEmpty() || binance.isEmpty()) {
+            return universeCache; // не смогли обновить — отдаём прошлый кэш
+        }
+        List<String> result = new ArrayList<>();
+        for (String coin : coins) {
+            String sym = coin.toUpperCase() + "USDT";
+            if (binance.contains(sym)) {
+                result.add(sym);
+                if (result.size() >= universeTop) {
+                    break;
+                }
+            }
+        }
+        universeCache = result;
+        universeCachedMs = now;
+        log.info("ohlcv: вселенная для breadth — {} символов (топ-{})", result.size(), universeTop);
+        return result;
+    }
+
+    /** Множество торгуемых спот-символов Binance с котировкой USDT. */
+    private Set<String> binanceUsdtSymbols() {
+        try {
+            JsonNode arr = readTree(EXCHANGE_INFO).path("symbols");
+            Set<String> set = new HashSet<>();
+            for (JsonNode s : arr) {
+                if ("TRADING".equals(s.path("status").asText())
+                        && "USDT".equals(s.path("quoteAsset").asText())) {
+                    set.add(s.path("symbol").asText());
+                }
+            }
+            return set;
+        } catch (RuntimeException e) {
+            log.warn("ohlcv: exchangeInfo недоступен: {}", e.getMessage());
+            return Set.of();
         }
     }
 
