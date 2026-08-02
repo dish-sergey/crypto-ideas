@@ -39,6 +39,7 @@ public class RegimeReport {
 
     private record DayClose(String day, double close) {}
     private record Reg(String day, String state, Double score, Double c1, Double c2, Double c3, Double c4, Double c5) {}
+    private record RegCmp(String day, String v1, String v2, Double d, Double t, Double s, String phase) {}
 
     public void generate(String outPath) {
         Map<String, Double> price = new HashMap<>();
@@ -88,11 +89,81 @@ public class RegimeReport {
         }
     }
 
+    /**
+     * Сравнительный отчёт v1 vs v2: цена BTC (лог), фон — состояние v2, лента снизу —
+     * v1, нижняя панель — оси D/T/S. Читает regime_daily (v1) и regime_daily_v2,
+     * джойнит по дню. CLI: --report=regime-compare [--out=path].
+     */
+    public void generateCompare(String outPath) {
+        Map<String, Double> price = new HashMap<>();
+        for (DayClose d : db.query(
+                "SELECT date(open_time/1000,'unixepoch') d, close FROM candles "
+                        + "WHERE symbol='BTCUSDT' AND interval='1d'",
+                rs -> new DayClose(rs.getString(1), rs.getDouble(2)))) {
+            price.put(d.day(), d.close());
+        }
+
+        List<RegCmp> rows = db.query(
+                "SELECT a.day, a.state v1, b.state v2, b.d, b.t, b.s, b.cycle_phase "
+                        + "FROM regime_daily a JOIN regime_daily_v2 b USING(day) ORDER BY a.day",
+                rs -> new RegCmp(rs.getString("day"), rs.getString("v1"), rs.getString("v2"),
+                        d(rs, "d"), d(rs, "t"), d(rs, "s"), rs.getString("cycle_phase")));
+        if (rows.isEmpty()) {
+            log.warn("report: нет пересечения regime_daily и regime_daily_v2 — прогони оба backfill");
+            return;
+        }
+
+        List<Object[]> points = new ArrayList<>();
+        for (RegCmp r : rows) {
+            Double p = price.get(r.day());
+            if (p == null) {
+                continue;
+            }
+            points.add(new Object[]{r.day(), p, stateIdx(r.v1()), stateIdx(r.v2()),
+                    r.d(), r.t(), r.s(), phaseShort(r.phase())});
+        }
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("from", points.get(0)[0]);
+        data.put("to", points.get(points.size() - 1)[0]);
+        data.put("points", points);
+
+        writeReport("regime-compare.template.html", data, outPath, points.size());
+    }
+
+    private void writeReport(String template, Map<String, Object> data, String outPath, int nPoints) {
+        try {
+            String tpl = new String(new ClassPathResource(template)
+                    .getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            String html = tpl.replace("__DATA__", mapper.writeValueAsString(data));
+            Path out = Path.of(outPath);
+            if (out.getParent() != null) {
+                Files.createDirectories(out.getParent());
+            }
+            Files.writeString(out, html);
+            log.info("report: {} точек -> {}", nPoints, out.toAbsolutePath());
+        } catch (IOException e) {
+            throw new IllegalStateException("не удалось записать отчёт: " + outPath, e);
+        }
+    }
+
+    private static String phaseShort(String phase) {
+        return switch (phase == null ? "" : phase) {
+            case "ACCUMULATION" -> "ACC";
+            case "EARLY" -> "EARLY";
+            case "MID" -> "MID";
+            case "LATE" -> "LATE";
+            case "EUPHORIA" -> "EUPH";
+            default -> null;
+        };
+    }
+
     private static int stateIdx(String s) {
         return switch (s == null ? "" : s) {
             case "BULL" -> 0;
             case "RANGE" -> 1;
             case "BEAR" -> 2;
+            case "CRASH" -> 4;
             default -> 3;
         };
     }

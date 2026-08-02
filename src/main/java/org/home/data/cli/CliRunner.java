@@ -6,6 +6,7 @@ import org.home.data.collectors.OhlcvCollector;
 import org.home.data.collectors.OiArchiveImporter;
 import org.home.data.collectors.OnchainCollector;
 import org.home.data.detector.RegimeDetector;
+import org.home.data.detector.RegimeDetectorV2;
 import org.home.data.detector.RegimeReport;
 import org.home.data.ws.LiquidationWsCollector;
 import org.slf4j.Logger;
@@ -45,6 +46,7 @@ public class CliRunner implements ApplicationRunner {
     private final OnchainCollector onchain;
     private final OiArchiveImporter oiArchive;
     private final RegimeDetector detector;
+    private final RegimeDetectorV2 detectorV2;
     private final RegimeReport report;
     private final LiquidationWsCollector liquidations;
     private final List<String> okxInstruments;
@@ -53,7 +55,7 @@ public class CliRunner implements ApplicationRunner {
     public CliRunner(ConfigurableApplicationContext context, CliMode mode,
                      List<Collector> collectors, OhlcvCollector ohlcv, FundingCollector funding,
                      OnchainCollector onchain, OiArchiveImporter oiArchive,
-                     RegimeDetector detector, RegimeReport report,
+                     RegimeDetector detector, RegimeDetectorV2 detectorV2, RegimeReport report,
                      LiquidationWsCollector liquidations,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
@@ -65,6 +67,7 @@ public class CliRunner implements ApplicationRunner {
         this.onchain = onchain;
         this.oiArchive = oiArchive;
         this.detector = detector;
+        this.detectorV2 = detectorV2;
         this.report = report;
         this.liquidations = liquidations;
         this.okxInstruments = okxInstruments;
@@ -88,10 +91,12 @@ public class CliRunner implements ApplicationRunner {
             }
             if (args.containsOption("report")) {
                 String target = first(args, "report");
-                if ("regime".equals(target)) {
-                    report.generate(firstOr(args, "out", "regime-report.html"));
-                } else {
-                    throw new IllegalArgumentException("Неизвестный отчёт: " + target + " (regime)");
+                switch (target) {
+                    case "regime" -> report.generate(firstOr(args, "out", "regime-report.html"));
+                    case "regime-compare" ->
+                            report.generateCompare(firstOr(args, "out", "regime-compare.html"));
+                    default -> throw new IllegalArgumentException(
+                            "Неизвестный отчёт: " + target + " (regime | regime-compare)");
                 }
             }
         } catch (Exception e) {
@@ -146,9 +151,10 @@ public class CliRunner implements ApplicationRunner {
                 oiArchive.backfill(list, firstOr(args, "from", "2021-01-01"));
             }
             case "regime" -> detector.backfill(firstOr(args, "from", "2020-01-01"));
+            case "regime-v2" -> detectorV2.backfill(firstOr(args, "from", "2020-01-01"));
             default -> throw new IllegalArgumentException(
                     "Неизвестная цель backfill: " + target
-                            + " (ohlcv | funding-okx | onchain | oi-archive | regime)");
+                            + " (ohlcv | funding-okx | onchain | oi-archive | regime | regime-v2)");
         }
     }
 

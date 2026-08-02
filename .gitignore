@@ -1,6 +1,7 @@
 .gradle/
 build/
 /data/
+/reports/
 *.log
 .idea/workspace.xml
 .claude/settings.local.json

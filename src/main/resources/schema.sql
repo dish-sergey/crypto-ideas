@@ -144,6 +144,27 @@ CREATE TABLE IF NOT EXISTS regime_daily (
     PRIMARY KEY (day)
 );
 
+-- Детектор режима v2 (док. 01-detektor-rezhima-v2): вместо скаляра score — три
+-- ортогональные оси (D/T/S) плюс модификаторы, состояние из набора
+-- BULL/BEAR/RANGE/TRANSITION/CRASH. available_at = конец дня. Живёт рядом с
+-- regime_daily (v1) для сравнения. NB: без разделителя операторов в тексте
+-- комментариев — Db.initSchema делит схему по нему (как в комментариях выше).
+CREATE TABLE IF NOT EXISTS regime_daily_v2 (
+    day              TEXT    NOT NULL,          -- 'YYYY-MM-DD'
+    d                REAL,                      -- direction ∈[−1,+1]
+    t                REAL,                      -- trendiness ∈[0,1]
+    s                REAL,                      -- stress ∈[0,1]
+    cycle_phase      TEXT,                      -- ACCUMULATION|EARLY|MID|LATE|EUPHORIA
+    macro_flag       INTEGER,                   -- −1|0|+1
+    breadth          REAL,                      -- доля топ-100 > SMA200 ∈[0,1]
+    leverage_warning INTEGER,                   -- 0/1
+    state            TEXT,                      -- BULL|BEAR|RANGE|TRANSITION|CRASH
+    confidence       REAL,
+    days_in_state    INTEGER,
+    available_at     INTEGER NOT NULL,
+    PRIMARY KEY (day)
+);
+
 CREATE INDEX IF NOT EXISTS idx_candles_avail ON candles(available_at);
 CREATE INDEX IF NOT EXISTS idx_liq_symbol_ts ON liquidations(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_news_pub ON news_items(published_ts);
