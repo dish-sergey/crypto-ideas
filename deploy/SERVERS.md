@@ -47,6 +47,20 @@
 - **Поймал?:** `cat ~/arm-catch-SUCCESS.log 2>/dev/null && echo ПОЙМАНО || echo "ещё ловим"`
 - **Настройка политики (Oracle-консоль):** dynamic-group `arm-catcher-dg` + policy `arm-catcher-policy`; при Identity Domains имя группы с префиксом домена: `dynamic-group 'Default'/'arm-catcher-dg'`.
 
+### 4. `dash` — HTML-дашборд детектора (только tailnet)
+- **Что:** `python3 -m http.server 8088 --directory ~/dash --bind <tailscale-ip>` — раздаёт `~/dash/index.html` (визуализация режима). Привязан к tailnet-IP → публично **недоступен**, только устройства твоего Tailscale.
+- **Юнит:** `/etc/systemd/system/dash.service`
+- **Доступ:** `http://100.64.144.85:8088/` или `http://crypto-micro:8088/` (MagicDNS) с любого устройства в tailnet.
+
+### 5. `detector-report.timer` — суточное обновление дашборда
+- **Что:** раз в сутки 08:00 UTC гоняет `~/update-dashboard.sh` = детектор (`--backfill=regime`) + отчёт (`--report=regime --out=~/dash/index.html`) на боевой БД. `Persistent=true`.
+- **Юниты:** `/etc/systemd/system/detector-report.{service,timer}`, скрипт `~/update-dashboard.sh`.
+- **Проверить:** `systemctl list-timers detector-report.timer` · `journalctl -u detector-report`
+- **Обновить вручную:** `sudo systemctl start detector-report.service`
+
+### Tailscale (приватная сеть)
+- Mesh-VPN (WireGuard). Micro = `crypto-micro` (100.64.144.85). Даёт приватный доступ к дашборду без открытия портов и без домена. Бесплатно (personal). Авторизация — по устройствам аккаунта `dish.sergey@`. Проверка: `tailscale status`.
+
 ---
 
 ## Прочее, установленное на micro
