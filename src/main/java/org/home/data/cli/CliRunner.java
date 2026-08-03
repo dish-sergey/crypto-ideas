@@ -8,6 +8,7 @@ import org.home.data.collectors.OnchainCollector;
 import org.home.data.detector.RegimeDetector;
 import org.home.data.detector.RegimeDetectorV2;
 import org.home.data.detector.RegimeReport;
+import org.home.data.eval.AllocationProxy;
 import org.home.data.ws.LiquidationWsCollector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,6 +49,7 @@ public class CliRunner implements ApplicationRunner {
     private final RegimeDetector detector;
     private final RegimeDetectorV2 detectorV2;
     private final RegimeReport report;
+    private final AllocationProxy allocationProxy;
     private final LiquidationWsCollector liquidations;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
@@ -56,6 +58,7 @@ public class CliRunner implements ApplicationRunner {
                      List<Collector> collectors, OhlcvCollector ohlcv, FundingCollector funding,
                      OnchainCollector onchain, OiArchiveImporter oiArchive,
                      RegimeDetector detector, RegimeDetectorV2 detectorV2, RegimeReport report,
+                     AllocationProxy allocationProxy,
                      LiquidationWsCollector liquidations,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
@@ -69,6 +72,7 @@ public class CliRunner implements ApplicationRunner {
         this.detector = detector;
         this.detectorV2 = detectorV2;
         this.report = report;
+        this.allocationProxy = allocationProxy;
         this.liquidations = liquidations;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
@@ -95,8 +99,10 @@ public class CliRunner implements ApplicationRunner {
                     case "regime" -> report.generate(firstOr(args, "out", "regime-report.html"));
                     case "regime-compare" ->
                             report.generateCompare(firstOr(args, "out", "regime-compare.html"));
+                    case "crash-econ" ->
+                            allocationProxy.run(firstOr(args, "out", "reports/crash_econ.md"));
                     default -> throw new IllegalArgumentException(
-                            "Неизвестный отчёт: " + target + " (regime | regime-compare)");
+                            "Неизвестный отчёт: " + target + " (regime | regime-compare | crash-econ)");
                 }
             }
         } catch (Exception e) {

@@ -39,6 +39,18 @@ public class RegimeFsmV2 {
     private int daysInState = DWELL;
     private int calmStreak;
 
+    /** true — штатно; false — состояние CRASH отключено (порог S недостижим). */
+    private final boolean crashEnabled;
+
+    public RegimeFsmV2() {
+        this(true);
+    }
+
+    /** Вариант с отключаемым CRASH — для экономического прокси A4 (док. 18 §2). */
+    public RegimeFsmV2(boolean crashEnabled) {
+        this.crashEnabled = crashEnabled;
+    }
+
     public State step(double d, double t, double s) {
         if (state == State.CRASH) {
             calmStreak = s < S_CRASH_EXIT ? calmStreak + 1 : 0;
@@ -50,7 +62,7 @@ public class RegimeFsmV2 {
             }
             return state;
         }
-        if (s >= S_CRASH) {
+        if (crashEnabled && s >= S_CRASH) {
             enter(State.CRASH);
             calmStreak = 0;
             return state;

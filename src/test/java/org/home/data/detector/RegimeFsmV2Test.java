@@ -85,6 +85,18 @@ class RegimeFsmV2Test {
         assertEquals(RegimeFsmV2.State.BEAR, fsm.step(-0.6, 0.7, 0.1));
     }
 
+    /** Флаг crashEnabled=false: S≥0.80 не переводит в CRASH (вариант A4.3). */
+    @Test
+    void crashDisabledNeverEntersCrash() {
+        RegimeFsmV2 fsm = new RegimeFsmV2(false);
+        RegimeFsmV2.State st = null;
+        for (int i = 0; i < 30; i++) {
+            st = fsm.step(-0.8, 0.9, 1.0);   // сильный стресс + медвежье направление
+        }
+        // без CRASH день классифицируется правилами 3–6: T>=0.4, D<-0.2 -> BEAR
+        assertEquals(RegimeFsmV2.State.BEAR, st);
+    }
+
     /** Правила classifyFresh: T,D -> состояние (без dwell/CRASH). */
     @Test
     void classifyFreshRules() {
