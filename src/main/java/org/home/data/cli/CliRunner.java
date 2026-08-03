@@ -7,6 +7,7 @@ import org.home.data.collectors.OiArchiveImporter;
 import org.home.data.collectors.OnchainCollector;
 import org.home.data.detector.RegimeDetector;
 import org.home.data.detector.RegimeDetectorV2;
+import org.home.data.detector.RegimeDetectorV3;
 import org.home.data.detector.RegimeReport;
 import org.home.data.eval.AllocationProxy;
 import org.home.data.ws.LiquidationWsCollector;
@@ -48,6 +49,7 @@ public class CliRunner implements ApplicationRunner {
     private final OiArchiveImporter oiArchive;
     private final RegimeDetector detector;
     private final RegimeDetectorV2 detectorV2;
+    private final RegimeDetectorV3 detectorV3;
     private final RegimeReport report;
     private final AllocationProxy allocationProxy;
     private final LiquidationWsCollector liquidations;
@@ -57,8 +59,8 @@ public class CliRunner implements ApplicationRunner {
     public CliRunner(ConfigurableApplicationContext context, CliMode mode,
                      List<Collector> collectors, OhlcvCollector ohlcv, FundingCollector funding,
                      OnchainCollector onchain, OiArchiveImporter oiArchive,
-                     RegimeDetector detector, RegimeDetectorV2 detectorV2, RegimeReport report,
-                     AllocationProxy allocationProxy,
+                     RegimeDetector detector, RegimeDetectorV2 detectorV2, RegimeDetectorV3 detectorV3,
+                     RegimeReport report, AllocationProxy allocationProxy,
                      LiquidationWsCollector liquidations,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
@@ -71,6 +73,7 @@ public class CliRunner implements ApplicationRunner {
         this.oiArchive = oiArchive;
         this.detector = detector;
         this.detectorV2 = detectorV2;
+        this.detectorV3 = detectorV3;
         this.report = report;
         this.allocationProxy = allocationProxy;
         this.liquidations = liquidations;
@@ -101,8 +104,13 @@ public class CliRunner implements ApplicationRunner {
                             report.generateCompare(firstOr(args, "out", "regime-compare.html"));
                     case "crash-econ" ->
                             allocationProxy.run(firstOr(args, "out", "reports/crash_econ.md"));
+                    case "crash-maxdd" ->
+                            allocationProxy.maxddCheck(firstOr(args, "out", "reports/maxdd_check.md"));
+                    case "regime-econ" ->
+                            allocationProxy.econOf(firstOr(args, "table", "regime_daily_v3"));
                     default -> throw new IllegalArgumentException(
-                            "Неизвестный отчёт: " + target + " (regime | regime-compare | crash-econ)");
+                            "Неизвестный отчёт: " + target
+                                    + " (regime | regime-compare | crash-econ | crash-maxdd | regime-econ)");
                 }
             }
         } catch (Exception e) {
@@ -158,9 +166,10 @@ public class CliRunner implements ApplicationRunner {
             }
             case "regime" -> detector.backfill(firstOr(args, "from", "2020-01-01"));
             case "regime-v2" -> detectorV2.backfill(firstOr(args, "from", "2020-01-01"));
+            case "regime-v3" -> detectorV3.backfill(firstOr(args, "from", "2020-01-01"));
             default -> throw new IllegalArgumentException(
                     "Неизвестная цель backfill: " + target
-                            + " (ohlcv | funding-okx | onchain | oi-archive | regime | regime-v2)");
+                            + " (ohlcv | funding-okx | onchain | oi-archive | regime | regime-v2 | regime-v3)");
         }
     }
 

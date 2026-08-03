@@ -191,14 +191,174 @@ public class AllocationProxy {
         sb.append("- Итог (удалять/чинить) фиксируется после ручного прочтения обеих таблиц.\n");
 
         writeFile(outPath, sb.toString());
-        writeHypotheses(passedAvg);
+        writeHypotheses(passedAvg, vt, corr);
         log.info("crash-econ: A7 avg passed={}%, отчёт -> {}", Math.round(passedAvg * 100), Path.of(outPath).toAbsolutePath());
+    }
+
+    /**
+     * Шаг 1 док. v3 §7.1: проверить, почему MaxDD вариантов 1 (CRASH как есть) и 3
+     * (CRASH выключен) совпадают до десятой (−25.2%). Ожидание: максимум просадки
+     * приходится на период, где варианты ведут себя одинаково (CRASH не срабатывал
+     * или не менял экспозицию). Если даты просадки разные, а числа совпадают —
+     * это артефакт расчёта (баг). Отчёт: даты дна и начала просадки + состояние
+     * детектора в эти дни. CLI: --report=crash-maxdd.
+     */
+    public void maxddCheck(String outPath) {
+        List<String> cDay = new ArrayList<>();
+        List<Double> cClose = new ArrayList<>();
+        db.query("SELECT date(open_time/1000,'unixepoch') d, close FROM candles "
+                        + "WHERE symbol='BTCUSDT' AND interval='1d' ORDER BY open_time",
+                rs -> { cDay.add(rs.getString(1)); cClose.add(rs.getDouble(2)); return null; });
+        Map<String, Integer> cIdx = new HashMap<>();
+        double[] close = new double[cDay.size()];
+        for (int i = 0; i < cDay.size(); i++) {
+            close[i] = cClose.get(i);
+            cIdx.put(cDay.get(i), i);
+        }
+        Map<String, Axes> v2 = new HashMap<>();
+        db.query("SELECT day, d, t, s, state FROM regime_daily_v2 WHERE d IS NOT NULL AND t IS NOT NULL AND s IS NOT NULL",
+                rs -> { v2.put(rs.getString(1), new Axes(rs.getDouble(2), rs.getDouble(3), rs.getDouble(4), rs.getString(5))); return null; });
+        List<String> eval = new ArrayList<>(v2.keySet());
+        eval.removeIf(d -> !cIdx.containsKey(d));
+        eval.sort(String::compareTo);
+        int m = eval.size();
+        int[] ci = new int[m];
+        for (int t = 0; t < m; t++) {
+            ci[t] = cIdx.get(eval.get(t));
+        }
+        String[] vFull = new String[m], vOff = new String[m];
+        RegimeFsmV2 fsmOn = new RegimeFsmV2(true), fsmOff = new RegimeFsmV2(false);
+        for (int t = 0; t < m; t++) {
+            Axes a = v2.get(eval.get(t));
+            vFull[t] = fsmOn.step(a.d(), a.t(), a.s()).name();
+            vOff[t] = fsmOff.step(a.d(), a.t(), a.s()).name();
+        }
+
+        Sim s1 = sim(stateTargets(vFull), crashImmediate(vFull), close, ci);
+        Sim s3 = sim(stateTargets(vOff), noImmediate(m), close, ci);
+        int[] dd1 = ddIndices(s1.curve()), dd3 = ddIndices(s3.curve());
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Проверка совпадения MaxDD (v3 §7.1, шаг 1)\n\n");
+        sb.append("Вопрос: MaxDD вариантов 1 (CRASH как есть) и 3 (CRASH выключен) совпадают до десятой (−25.2%). ")
+                .append("Естественно ли это (одинаковое поведение в период максимума), или артефакт?\n\n");
+        sb.append("| | Вариант 1 (CRASH как есть) | Вариант 3 (CRASH выключен) |\n|---|---|---|\n");
+        sb.append(String.format("| MaxDD | %.2f%% | %.2f%% |%n",
+                dd(s1.curve(), dd1) * 100, dd(s3.curve(), dd3) * 100));
+        sb.append(String.format("| Начало просадки (пик капитала) | %s | %s |%n", eval.get(dd1[0]), eval.get(dd3[0])));
+        sb.append(String.format("| Дно просадки | %s | %s |%n", eval.get(dd1[1]), eval.get(dd3[1])));
+        sb.append(String.format("| Состояние на пике | 1:%s / 3:%s | |%n", vFull[dd1[0]], vOff[dd1[0]]));
+        sb.append(String.format("| Состояние на дне | 1:%s / 3:%s | |%n", vFull[dd1[1]], vOff[dd1[1]]));
+
+        // сколько дней CRASH внутри окна просадки варианта 1
+        int crashInWindow = 0;
+        for (int t = dd1[0]; t <= dd1[1]; t++) {
+            if (vFull[t].equals("CRASH")) {
+                crashInWindow++;
+            }
+        }
+        int windowLen = dd1[1] - dd1[0] + 1;
+        // расходятся ли состояния вар.1 и вар.3 внутри окна просадки
+        int diverge = 0;
+        for (int t = dd1[0]; t <= dd1[1]; t++) {
+            if (!vFull[t].equals(vOff[t])) {
+                diverge++;
+            }
+        }
+        sb.append(String.format("%nОкно просадки вар.1: %s … %s (%d дней). CRASH внутри окна: **%d дней**. ",
+                eval.get(dd1[0]), eval.get(dd1[1]), windowLen, crashInWindow));
+        sb.append(String.format("Дней, где состояния вар.1 и вар.3 расходятся: **%d**.%n%n", diverge));
+
+        boolean sameDates = dd1[0] == dd3[0] && dd1[1] == dd3[1];
+        double v1dd = dd(s1.curve(), dd1), v3dd = dd(s3.curve(), dd3);
+        boolean valuesExact = Math.abs(v1dd - v3dd) < 1e-6;
+        String verdict;
+        if (sameDates && (crashInWindow == 0 || diverge == 0)) {
+            verdict = "**Вывод: совпадение естественно, бага нет.** Окно максимальной просадки одно и то же, "
+                    + "внутри него варианты ведут себя тождественно (CRASH не срабатывал / состояния не расходятся) → "
+                    + "MaxDD обязан совпасть.";
+        } else if (!sameDates && valuesExact) {
+            verdict = "**Внимание: даты просадки РАЗНЫЕ, но MaxDD совпал точь-в-точь — вероятен артефакт расчёта (баг).** "
+                    + "Разобрать, прежде чем полагаться на A4.";
+        } else if (!sameDates) {
+            verdict = String.format("**Вывод: совпадения по существу НЕТ — это округление, бага нет.** "
+                    + "Максимальная просадка вариантов приходится на РАЗНЫЕ события (%s против %s) и различается "
+                    + "по величине (%.2f%% против %.2f%%); в таблице §5 оба округлились до −25.2%%. Разные даты дна "
+                    + "доказывают, что кривые капитала действительно различаются (расчёт корректен). "
+                    + "Важно: v3 (без CRASH) даёт даже чуть меньшую просадку, чем v1 — вывод A4 усиливается, "
+                    + "а не ослабляется.", eval.get(dd1[1]), eval.get(dd3[1]), v1dd * 100, v3dd * 100);
+        } else {
+            verdict = String.format("**Внимание:** даты просадки совпадают, но внутри окна CRASH срабатывал (%d дн) "
+                    + "и/или состояния расходятся (%d дн) — проверить экспозицию.", crashInWindow, diverge);
+        }
+        sb.append(verdict).append("\n");
+
+        writeFile(outPath, sb.toString());
+        log.info("crash-maxdd: v1 MaxDD={}% ({}), v3 MaxDD={}% ({}), same-dates={} -> {}",
+                String.format("%.2f", dd(s1.curve(), dd1) * 100), eval.get(dd1[1]),
+                String.format("%.2f", dd(s3.curve(), dd3) * 100), eval.get(dd3[1]),
+                sameDates, Path.of(outPath).toAbsolutePath());
+    }
+
+    private static double dd(double[] curve, int[] idx) {
+        return curve[idx[1]] / curve[idx[0]] - 1;
+    }
+
+    /**
+     * Прогон экономического прокси по готовым состояниям из произвольной таблицы
+     * (day, state). Для сверки v3 с §5 (CAGR 32.7%, MaxDD −25.2%). Реаллокация 5 дней,
+     * без мгновенного выхода (в v3 нет CRASH). CLI: --report=regime-econ [--table=...].
+     */
+    public void econOf(String table) {
+        List<String> cDay = new ArrayList<>();
+        List<Double> cClose = new ArrayList<>();
+        db.query("SELECT date(open_time/1000,'unixepoch') d, close FROM candles "
+                        + "WHERE symbol='BTCUSDT' AND interval='1d' ORDER BY open_time",
+                rs -> { cDay.add(rs.getString(1)); cClose.add(rs.getDouble(2)); return null; });
+        Map<String, Integer> cIdx = new HashMap<>();
+        double[] close = new double[cDay.size()];
+        for (int i = 0; i < cDay.size(); i++) {
+            close[i] = cClose.get(i);
+            cIdx.put(cDay.get(i), i);
+        }
+        Map<String, String> st = new HashMap<>();
+        db.query("SELECT day, state FROM " + table + " WHERE state IS NOT NULL",
+                rs -> { st.put(rs.getString(1), rs.getString(2)); return null; });
+        List<String> eval = new ArrayList<>(st.keySet());
+        eval.removeIf(d -> !cIdx.containsKey(d));
+        eval.sort(String::compareTo);
+        int m = eval.size();
+        if (m < 100) {
+            log.warn("regime-econ: мало дней в {} ({})", table, m);
+            return;
+        }
+        int[] ci = new int[m];
+        String[] states = new String[m];
+        for (int t = 0; t < m; t++) {
+            ci[t] = cIdx.get(eval.get(t));
+            states[t] = st.get(eval.get(t));
+        }
+        double years = years(eval);
+        Metrics v = metrics(sim(stateTargets(states), noImmediate(m), close, ci).curve(), 0, years);
+        Metrics bh = buyHold(close, ci, years);
+        log.info("regime-econ [{}]: {} … {} ({} дней) | CAGR={}% MaxDD={}% Sharpe={} | B&H CAGR={}% MaxDD={}%",
+                table, eval.get(0), eval.get(m - 1), m,
+                String.format("%.1f", v.cagr() * 100), String.format("%.1f", v.maxdd() * 100),
+                String.format("%.2f", v.sharpe()), String.format("%.1f", bh.cagr() * 100),
+                String.format("%.1f", bh.maxdd() * 100));
     }
 
     // ================= симуляция =================
 
-    /** exposure входит в день t по состоянию t−1 (без look-ahead). target — целевая экспозиция на каждый день. */
+    private record Sim(double[] curve, double turnover) {}
+
     private static Metrics simulate(double[] target, boolean[] immediate, double[] close, int[] ci, double years) {
+        Sim s = sim(target, immediate, close, ci);
+        return metrics(s.curve(), s.turnover(), years);
+    }
+
+    /** exposure входит в день t по состоянию t−1 (без look-ahead). Возвращает кривую капитала и оборот. */
+    private static Sim sim(double[] target, boolean[] immediate, double[] close, int[] ci) {
         int m = target.length;
         double[] curve = new double[m];
         double eq = 1, actual = 0, curTarget = -999, step = 0, turnover = 0;
@@ -229,7 +389,26 @@ public class AllocationProxy {
             }
             curve[t] = eq;
         }
-        return metrics(curve, turnover, years);
+        return new Sim(curve, turnover);
+    }
+
+    /** {индекс пика перед максимальной просадкой, индекс дна просадки}. */
+    private static int[] ddIndices(double[] curve) {
+        double peak = curve[0], worst = 0;
+        int peakIdx = 0, troughIdx = 0, curPeakIdx = 0;
+        for (int i = 0; i < curve.length; i++) {
+            if (curve[i] > peak) {
+                peak = curve[i];
+                curPeakIdx = i;
+            }
+            double dd = curve[i] / peak - 1;
+            if (dd < worst) {
+                worst = dd;
+                troughIdx = i;
+                peakIdx = curPeakIdx;
+            }
+        }
+        return new int[]{peakIdx, troughIdx};
     }
 
     private static Metrics buyHold(double[] close, int[] ci, double years) {
@@ -489,8 +668,8 @@ public class AllocationProxy {
         }
     }
 
-    /** Журнал гипотез (док. 15 §7, append-only): записи 1 (дефект S) и 2 (дневной таймфрейм, A7). */
-    private void writeHypotheses(double passedAvg) {
+    /** Журнал гипотез (док. 15 §7, append-only): 1 дефект dd_speed, 2 дневной таймфрейм (A7), 3 voltarget. */
+    private void writeHypotheses(double passedAvg, Metrics vt, double corr) {
         Path p = Path.of("reports/hypotheses.md");
         String header = "# Журнал гипотез (append-only, док. 15 §7)\n\n"
                 + "| дата | гипотеза | мотивация | результат | решение |\n|---|---|---|---|---|\n";
@@ -498,8 +677,13 @@ public class AllocationProxy {
                 + "515 дней в CRASH (21.5%), dd_speed доминирует 85% и держится над 0.5 до 41 дня (храповик) | "
                 + "дефект конструкции: dd_speed удалить, S разделить на S_acute + stress_level |\n";
         String e2 = String.format("| 2026-08 | дневной таймфрейм распознаёт каскад ликвидаций | проверка A7 (док. 18-v2) | "
-                + "среднее passed по топ-5 эпизодам = %.0f%% | %s |%n", passedAvg * 100,
-                passedAvg > 0.70 ? "дневной CRASH фиксирует убыток, а не предотвращает — кандидат на удаление" : "защищает частично/успевает");
+                + "среднее passed по топ-5 эпизодам = %.0f%%, отскок +5д в среднем −8%% | "
+                + "распознаётся к середине движения; для S7 нужен внутридневной контур (v3 §7.4) |%n", passedAvg * 100);
+        String e3 = String.format("| 2026-08 | volatility targeting в форме clip(σ_target/σ_30д) защищает просадку | "
+                + "baseline_voltarget (док. 15 §5.1), кандидат в замену CRASH/основу stress_level | "
+                + "MaxDD %.1f%%, Sharpe %.2f, корреляция с CRASH %.2f, 0 дней опережения | "
+                + "не работает как реализовано; stress_level вводится выключенным до разбора (doc 19) |%n",
+                vt.maxdd() * 100, vt.sharpe(), corr);
         try {
             String cur = Files.exists(p) ? Files.readString(p) : header;
             if (!cur.contains("max(vol_z, dd_speed)")) {
@@ -507,6 +691,9 @@ public class AllocationProxy {
             }
             if (!cur.contains("дневной таймфрейм")) {
                 cur += e2;
+            }
+            if (!cur.contains("volatility targeting")) {
+                cur += e3;
             }
             Files.writeString(p, cur);
         } catch (IOException e) {

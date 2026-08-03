@@ -165,6 +165,27 @@ CREATE TABLE IF NOT EXISTS regime_daily_v2 (
     PRIMARY KEY (day)
 );
 
+-- Детектор режима v3 (док. 01-detektor-rezhima-v3): ось S и состояние CRASH
+-- удалены по итогам диагностики залипания (18-v2). Две оси D/T, четыре состояния
+-- BULL/BEAR/RANGE/TRANSITION, vol_z перенесён в модификатор stress_level
+-- (по умолчанию не влияет на экспозицию, флаг stress_multiplier_applied).
+CREATE TABLE IF NOT EXISTS regime_daily_v3 (
+    day                       TEXT    NOT NULL,   -- 'YYYY-MM-DD'
+    d                         REAL,               -- direction ∈[−1,+1]
+    t                         REAL,               -- trendiness ∈[0,1]
+    cycle_phase               TEXT,               -- ACCUMULATION|EARLY|MID|LATE|EUPHORIA
+    macro_flag                INTEGER,            -- −1|0|+1
+    breadth                   REAL,               -- доля топ-100 > SMA200 ∈[0,1]
+    leverage_warning          INTEGER,            -- 0/1
+    stress_level              REAL,               -- vol_z-модификатор ∈[0,1], не валидирован
+    stress_multiplier_applied INTEGER,            -- 0/1, применялся ли множитель фактически
+    state                     TEXT,               -- BULL|BEAR|RANGE|TRANSITION
+    confidence                REAL,
+    days_in_state             INTEGER,
+    available_at              INTEGER NOT NULL,
+    PRIMARY KEY (day)
+);
+
 CREATE INDEX IF NOT EXISTS idx_candles_avail ON candles(available_at);
 CREATE INDEX IF NOT EXISTS idx_liq_symbol_ts ON liquidations(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_news_pub ON news_items(published_ts);
