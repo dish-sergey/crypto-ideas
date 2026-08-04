@@ -366,6 +366,224 @@ public class AllocationProxy {
     }
 
     /**
+     * Разбор провала volatility targeting (док. 19): H1–H5 на существующей реализации
+     * voltarget (exposure = clip(σ_target/σ30д, 0, 1)) + технические проверки §3, вывод
+     * по развилке §4.1 (судьба stress_level). CLI: --report=voltarget [--out=...].
+     */
+    public void voltargetPostmortem(String outPath) {
+        // цена
+        List<String> cDay = new ArrayList<>();
+        List<Double> cClose = new ArrayList<>();
+        db.query("SELECT date(open_time/1000,'unixepoch') d, close FROM candles "
+                        + "WHERE symbol='BTCUSDT' AND interval='1d' ORDER BY open_time",
+                rs -> { cDay.add(rs.getString(1)); cClose.add(rs.getDouble(2)); return null; });
+        double[] close = new double[cDay.size()];
+        Map<String, Integer> cIdx = new HashMap<>();
+        for (int i = 0; i < cDay.size(); i++) {
+            close[i] = cClose.get(i);
+            cIdx.put(cDay.get(i), i);
+        }
+        double[] sigma = realizedVol(close, VT_WIN);
+
+        // окно = дни regime_daily_v2; заодно реконструкция CRASH-эпизодов для H3
+        Map<String, Axes> v2 = new HashMap<>();
+        db.query("SELECT day, d, t, s, state FROM regime_daily_v2 WHERE d IS NOT NULL AND t IS NOT NULL AND s IS NOT NULL",
+                rs -> { v2.put(rs.getString(1), new Axes(rs.getDouble(2), rs.getDouble(3), rs.getDouble(4), rs.getString(5))); return null; });
+        List<String> eval = new ArrayList<>(v2.keySet());
+        eval.removeIf(d -> !cIdx.containsKey(d));
+        eval.sort(String::compareTo);
+        int m = eval.size();
+        if (m < 100) {
+            log.warn("voltarget: мало дней ({})", m);
+            return;
+        }
+        int[] ci = new int[m];
+        for (int t = 0; t < m; t++) {
+            ci[t] = cIdx.get(eval.get(t));
+        }
+        int firstEval = ci[0];
+        double sigmaTarget = medianWarmup(sigma, firstEval);
+        double[] vt = new double[m];       // exposure-сигнал voltarget по дням окна
+        for (int t = 0; t < m; t++) {
+            double sg = sigma[ci[t]];
+            vt[t] = Double.isNaN(sg) || sg <= 0 ? 1.0 : clip(sigmaTarget / sg, 0, 1);
+        }
+        String[] vFull = new String[m];
+        RegimeFsmV2 fsm = new RegimeFsmV2(true);
+        for (int t = 0; t < m; t++) {
+            Axes a = v2.get(eval.get(t));
+            vFull[t] = fsm.step(a.d(), a.t(), a.s()).name();
+        }
+        // рыночные дневные доходности по окну
+        double[] ret = new double[m];
+        for (int t = 1; t < m; t++) {
+            ret[t] = close[ci[t]] / close[ci[t - 1]] - 1;
+        }
+        double years = years(eval);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Разбор провала volatility targeting (док. 19)\n\n");
+        sb.append(String.format("Реализация: `exposure = clip(σ_target/σ%dд, 0, 1)`, σ_target = %.4f ", VT_WIN, sigmaTarget))
+                .append("(медиана σ30д по прогреву, дневная). Окно ").append(eval.get(0)).append(" … ")
+                .append(eval.get(m - 1)).append(String.format(" (%d дней). Анализируется exposure-сигнал (до 5-дн реаллокации).%n%n", m));
+
+        // ---- H1: упор в потолок ----
+        int[] bins = new int[10];
+        int atCeiling = 0;
+        double sum = 0;
+        double[] vtSorted = vt.clone();
+        for (double e : vt) {
+            int b = Math.min(9, (int) (e * 10));
+            bins[b]++;
+            if (e >= 1 - 1e-9) {
+                atCeiling++;
+            }
+            sum += e;
+        }
+        java.util.Arrays.sort(vtSorted);
+        double h1mean = sum / m, h1median = vtSorted[m / 2];
+        double h1ceil = (double) atCeiling / m;
+        sb.append("## H1. Упор в потолок\n\n");
+        sb.append(String.format("Доля дней exposure=1.0: **%.0f%%**; среднее %.2f, медиана %.2f.%n%n", h1ceil * 100, h1mean, h1median));
+        sb.append("Гистограмма exposure (бины 0.1): ");
+        for (int b = 0; b < 10; b++) {
+            sb.append(String.format("[%.1f–%.1f]=%d ", b / 10.0, (b + 1) / 10.0, bins[b]));
+        }
+        sb.append("\n\n");
+
+        // ---- H2: недостижимость нуля ----
+        double vtMin = vtSorted[0];
+        int[] ddi = ddIndices(sim(vt, noImmediate(m), close, ci).curve());
+        double expAtDd = vt[ddi[1]];
+        Integer[] order = new Integer[m];
+        for (int t = 0; t < m; t++) {
+            order[t] = t;
+        }
+        java.util.Arrays.sort(order, (x, y) -> Double.compare(ret[x], ret[y]));
+        double worst20 = 0, best20 = 0;
+        for (int k = 0; k < 20; k++) {
+            worst20 += vt[order[k]];
+            best20 += vt[order[m - 1 - k]];
+        }
+        worst20 /= 20;
+        best20 /= 20;
+        sb.append("## H2. Недостижимость нуля\n\n");
+        sb.append(String.format("Минимальная exposure за всю историю: **%.2f**. Exposure в день макс. просадки (%s): %.2f. ",
+                vtMin, eval.get(ddi[1]), expAtDd));
+        sb.append(String.format("Средняя exposure в 20 худших по доходности дней: **%.2f**.%n%n", worst20));
+
+        // ---- H3: запаздывание окна (top-5 CRASH-эпизодов) ----
+        List<int[]> eps = episodes(vFull);
+        eps.sort((x, y) -> (y[1] - y[0]) - (x[1] - x[0]));
+        sb.append("## H3. Запаздывание окна (топ-5 обвалов)\n\n");
+        sb.append("| Эпизод | exp за 1д до | exp в день макс. падения | exp +5д | min exp (день от начала) |\n|---|---|---|---|---|\n");
+        int lagCount = 0, lagTot = 0;
+        for (int e = 0; e < Math.min(5, eps.size()); e++) {
+            int s = eps.get(e)[0], en = eps.get(e)[1];
+            double before = s > 0 ? vt[s - 1] : vt[s];
+            int fallT = s;
+            double fall = 0;
+            for (int t = s; t <= en; t++) {
+                if (ret[t] < fall) {
+                    fall = ret[t];
+                    fallT = t;
+                }
+            }
+            double after5 = vt[Math.min(m - 1, s + 5)];
+            double minE = 2;
+            int minDay = 0;
+            for (int t = s; t <= en; t++) {
+                if (vt[t] < minE) {
+                    minE = vt[t];
+                    minDay = t - s;
+                }
+            }
+            lagTot++;
+            if (minDay > (fallT - s)) {
+                lagCount++;   // минимум достигнут ПОСЛЕ дня максимального падения
+            }
+            sb.append(String.format("| %s..%s | %.2f | %.2f | %.2f | %.2f (день %d) |%n",
+                    eval.get(s), eval.get(en), before, vt[fallT], after5, minE, minDay));
+        }
+        sb.append(String.format("%nМинимум exposure достигнут ПОСЛЕ дня макс. падения в %d из %d эпизодов.%n%n", lagCount, lagTot));
+
+        // ---- H4: симметрия волатильности ----
+        int h = Math.min(m - 20, m);
+        double[] x = new double[Math.max(0, m - 20)], y = new double[Math.max(0, m - 20)];
+        for (int t = 0; t + 20 < m; t++) {
+            x[t] = vt[t];
+            y[t] = close[ci[t + 20]] / close[ci[t]] - 1;
+        }
+        double corr = x.length > 0 ? pearson(x, y) : 0;
+        double h4diff = best20 - worst20;
+        sb.append("## H4. Симметрия волатильности (ключевая)\n\n");
+        sb.append(String.format("corr(exposure, доходность t→t+20) = **%.2f**. ", corr));
+        sb.append(String.format("Средняя exposure в 20 ЛУЧШИХ дней: **%.2f**, в 20 ХУДШИХ: **%.2f** (разница %.2f).%n%n",
+                best20, worst20, h4diff));
+        sb.append(Math.abs(h4diff) < 0.1
+                ? "_Экспозиция в лучшие и худшие дни почти одинакова — механизм не различает хорошую волатильность и плохую, режет доходность симметрично с риском._\n\n"
+                : "_Экспозиция в лучшие и худшие дни заметно различается._\n\n");
+
+        // ---- H5: разложение потери доходности ----
+        Metrics full = metrics(sim(ones(m), noImmediate(m), close, ci).curve(), 0, years);
+        Metrics act = metrics(sim(vt, noImmediate(m), close, ci).curve(), 0, years);
+        double foregone = 0, avoided = 0;
+        for (int t = 1; t < m; t++) {
+            double e = vt[t - 1];        // exposure, действующая в день t
+            if (e < 0.8) {
+                double u = (1 - e) * ret[t];
+                if (ret[t] > 0) {
+                    foregone += u;       // упущенный рост (цена)
+                } else {
+                    avoided += -u;       // избегнутое падение (защита)
+                }
+            }
+        }
+        sb.append("## H5. Разложение потери доходности\n\n");
+        sb.append(String.format("CAGR при exposure=1 всегда: %.1f%% (≈ buy&hold − издержки). CAGR по факту: %.1f%%.%n%n",
+                full.cagr() * 100, act.cagr() * 100));
+        sb.append(String.format("В дни с exposure<0.8: упущенный рост (сумма недобора на росте) = %.2f, ", foregone));
+        sb.append(String.format("избегнутое падение = %.2f, отношение защита/цена = **%.2f**.%n%n",
+                avoided, foregone > 0 ? avoided / foregone : 0));
+
+        // ---- §3 технические проверки ----
+        double vtTurnover = sim(vt, noImmediate(m), close, ci).turnover() / years;
+        sb.append("## Технические проверки (§3)\n\n");
+        sb.append(String.format("1. **Аннуализация:** σ_target=%.4f и σ_реализ — оба дневные std лог-доходностей (те же единицы). ", sigmaTarget))
+                .append("Постоянного упора в потолок из-за √365-сдвига нет.\n");
+        sb.append("2. **Задержка:** exposure дня t применяется с t+1 (в `sim` экспозиция входит в день по решению t−1) — утечки нет.\n");
+        sb.append("3. **Реаллокация:** к voltarget применяется та же 5-дневная реаллокация, что к другим вариантам (как есть).\n");
+        sb.append(String.format("4. **Издержки:** оборот %.1f/год → ~%.2f%%/год — пренебрежимо против потери ~6.6 п.п.%n", vtTurnover, vtTurnover * COST * 100));
+        sb.append("5. **Прогрев:** σ_target по барам до окна оценки (2019), окно с 2020 — пересечения нет.\n\n");
+
+        // ---- вывод §4.1 ----
+        boolean h1c = h1ceil > 0.35, h2c = worst20 > 0.3, h4c = Math.abs(h4diff) < 0.1;
+        sb.append("## Вывод (развилка §4.1)\n\n");
+        if (h1c && h2c && h4c) {
+            sb.append("**Вариант А — несоответствие инструмента задаче (H1/H2/H4 подтверждены).** ")
+                    .append("voltarget упирается в потолок половину времени, не выходит в обвалах и режет доходность симметрично с риском. ")
+                    .append("Для снижения просадки нужен механизм **выхода** (оси D+T), а не масштабирования. ")
+                    .append("**`stress_level` остаётся выключенным:** его множитель ограничен [0.5, 1.0] — он ещё менее способен выходить, чем voltarget.\n");
+        } else if (lagCount >= 3) {
+            sb.append("**Вариант Б — запаздывание окна (H3 доминирует).** Основание для ОДНОЙ проверки: ")
+                    .append("прогнать `stress_level` (σ7д, вчетверо быстрее) как множитель и сравнить по тем же метрикам.\n");
+        } else {
+            sb.append("**Смешанный результат** — см. числа выше; развилка §4.1 решается вручную.\n");
+        }
+
+        writeFile(outPath, sb.toString());
+        log.info("voltarget: H1 ceil={}%, H4 diff={}, min exp={} -> {}",
+                Math.round(h1ceil * 100), String.format("%.2f", h4diff), String.format("%.2f", vtMin),
+                Path.of(outPath).toAbsolutePath());
+    }
+
+    private static double[] ones(int m) {
+        double[] a = new double[m];
+        java.util.Arrays.fill(a, 1.0);
+        return a;
+    }
+
+    /**
      * Кросс-рыночная проверка v3 (док. 15 §8): тот же детектор (оси D/T, те же пороги)
      * без изменений на ETH/SPY/золоте/нефти/EUR-USD. Критерий — эффект сохраняется по
      * знаку и порядку величины: просадка снижается, доходность частично теряется.

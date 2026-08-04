@@ -111,9 +111,11 @@ public class CliRunner implements ApplicationRunner {
                             allocationProxy.econOf(firstOr(args, "table", "regime_daily_v3"));
                     case "crossmarket" ->
                             allocationProxy.crossMarket(firstOr(args, "out", "reports/crossmarket.md"));
+                    case "voltarget" ->
+                            allocationProxy.voltargetPostmortem(firstOr(args, "out", "reports/voltarget_postmortem.md"));
                     default -> throw new IllegalArgumentException(
                             "Неизвестный отчёт: " + target
-                                    + " (regime | regime-v3 | regime-compare | crash-econ | crash-maxdd | regime-econ | crossmarket)");
+                                    + " (regime | regime-v3 | regime-compare | crash-econ | crash-maxdd | regime-econ | crossmarket | voltarget)");
                 }
             }
         } catch (Exception e) {
