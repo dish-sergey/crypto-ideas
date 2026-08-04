@@ -25,6 +25,7 @@
 - **БД:** `~/crypto-data/data/crypto.db` (SQLite WAL). `WorkingDirectory=~/crypto-data`.
 - **Проверить:** `systemctl status crypto-data` · `journalctl -u crypto-data -f`
 - **Обновить jar:** собрать локально (`./gradlew bootJar`) → `scp build/libs/crypto-ideas-1.0-SNAPSHOT.jar ubuntu@89.168.115.160:~/crypto-data/app.jar` → `sudo systemctl restart crypto-data`.
+  - **Без перезапуска (если сбор не менялся, а нужен только новый детектор для cron):** scp во временный файл → **атомарный `mv app.jar.new app.jar`**. Работающий JVM держит старый inode (сбор не прерывается, без дыры в WS-ликвидациях), а cron берёт новый jar. Так v3 и заводили 2026-08-04 (бэкап старого — `app.jar.bak-jul24`).
 - **NB:** `onchain` (cron 07:00 UTC) и `macro` (cron пн 07:30) на старте не бегут. На свежей БД сеять вручную: `cd ~/crypto-data && ~/jre25/bin/java -jar app.jar --collect=macro --backfill=onchain --from=2015-01-01`.
 
 ### 2. `litestream` — бэкап БД → Backblaze B2
@@ -53,10 +54,14 @@
 - **Доступ:** `http://100.64.144.85:8088/` или `http://crypto-micro:8088/` (MagicDNS) с любого устройства в tailnet.
 
 ### 5. `detector-report.timer` — суточное обновление дашборда
-- **Что:** раз в сутки 08:00 UTC гоняет `~/update-dashboard.sh` = детектор (`--backfill=regime`) + отчёт (`--report=regime --out=~/dash/index.html`) на боевой БД. `Persistent=true`.
-- **Юниты:** `/etc/systemd/system/detector-report.{service,timer}`, скрипт `~/update-dashboard.sh`.
+- **Что:** раз в сутки 08:00 UTC гоняет `~/update-dashboard.sh` на боевой БД (`Persistent=true`).
+  Скрипт делает backfill+report обеих версий детектора:
+  - **v3 (актуальный)** → `--backfill=regime-v3` + `--report=regime-v3 --out=~/dash/index.html` (главный дашборд).
+  - **v1 (наследие)** → `--backfill=regime` + `--report=regime --out=~/dash/regime-v1.html` (для сравнения).
+- **Юниты:** `/etc/systemd/system/detector-report.{service,timer}`, скрипт `~/update-dashboard.sh` (бэкап `.bak`).
 - **Проверить:** `systemctl list-timers detector-report.timer` · `journalctl -u detector-report`
-- **Обновить вручную:** `sudo systemctl start detector-report.service`
+- **Обновить вручную:** `sudo systemctl start detector-report.service` (или `bash ~/update-dashboard.sh` от ubuntu).
+- **Дашборд:** `http://crypto-micro:8088/` = v3, `.../regime-v1.html` = v1.
 
 ### Tailscale (приватная сеть)
 - Mesh-VPN (WireGuard). Micro = `crypto-micro` (100.64.144.85). Даёт приватный доступ к дашборду без открытия портов и без домена. Бесплатно (personal). Авторизация — по устройствам аккаунта `dish.sergey@`. Проверка: `tailscale status`.
