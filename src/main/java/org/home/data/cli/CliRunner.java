@@ -100,6 +100,7 @@ public class CliRunner implements ApplicationRunner {
                 String target = first(args, "report");
                 switch (target) {
                     case "regime" -> report.generate(firstOr(args, "out", "regime-report.html"));
+                    case "regime-v3" -> report.generateV3(firstOr(args, "out", "regime-v3-report.html"));
                     case "regime-compare" ->
                             report.generateCompare(firstOr(args, "out", "regime-compare.html"));
                     case "crash-econ" ->
@@ -108,9 +109,11 @@ public class CliRunner implements ApplicationRunner {
                             allocationProxy.maxddCheck(firstOr(args, "out", "reports/maxdd_check.md"));
                     case "regime-econ" ->
                             allocationProxy.econOf(firstOr(args, "table", "regime_daily_v3"));
+                    case "crossmarket" ->
+                            allocationProxy.crossMarket(firstOr(args, "out", "reports/crossmarket.md"));
                     default -> throw new IllegalArgumentException(
                             "Неизвестный отчёт: " + target
-                                    + " (regime | regime-compare | crash-econ | crash-maxdd | regime-econ)");
+                                    + " (regime | regime-v3 | regime-compare | crash-econ | crash-maxdd | regime-econ | crossmarket)");
                 }
             }
         } catch (Exception e) {

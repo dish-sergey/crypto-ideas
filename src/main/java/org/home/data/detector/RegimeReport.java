@@ -40,6 +40,7 @@ public class RegimeReport {
     private record DayClose(String day, double close) {}
     private record Reg(String day, String state, Double score, Double c1, Double c2, Double c3, Double c4, Double c5) {}
     private record RegCmp(String day, String v1, String v2, Double d, Double t, Double s, String phase) {}
+    private record RegV3(String day, String state, Double d, Double t, String phase, Double stress, Double breadth, Double conf) {}
 
     public void generate(String outPath) {
         Map<String, Double> price = new HashMap<>();
@@ -87,6 +88,48 @@ public class RegimeReport {
         } catch (IOException e) {
             throw new IllegalStateException("не удалось записать отчёт: " + outPath, e);
         }
+    }
+
+    /**
+     * Отчёт детектора v3: цена BTC (лог) + полосы состояния {BULL,RANGE,BEAR,TRANSITION},
+     * нижняя панель — оси D и T с порогами (T=0.40, |D|=0.20). Аналог отчёта v1,
+     * но вместо скаляра score — две оси. Читает regime_daily_v3. CLI: --report=regime-v3.
+     */
+    public void generateV3(String outPath) {
+        Map<String, Double> price = new HashMap<>();
+        for (DayClose d : db.query(
+                "SELECT date(open_time/1000,'unixepoch') d, close FROM candles "
+                        + "WHERE symbol='BTCUSDT' AND interval='1d'",
+                rs -> new DayClose(rs.getString(1), rs.getDouble(2)))) {
+            price.put(d.day(), d.close());
+        }
+
+        List<RegV3> rows = db.query(
+                "SELECT day, state, d, t, cycle_phase, stress_level, breadth, confidence "
+                        + "FROM regime_daily_v3 ORDER BY day",
+                rs -> new RegV3(rs.getString("day"), rs.getString("state"), d(rs, "d"), d(rs, "t"),
+                        rs.getString("cycle_phase"), d(rs, "stress_level"), d(rs, "breadth"), d(rs, "confidence")));
+        if (rows.isEmpty()) {
+            log.warn("report: regime_daily_v3 пуст — сначала --backfill=regime-v3");
+            return;
+        }
+
+        List<Object[]> points = new ArrayList<>();
+        for (RegV3 r : rows) {
+            Double p = price.get(r.day());
+            if (p == null) {
+                continue;
+            }
+            points.add(new Object[]{r.day(), p, stateIdx(r.state()), r.d(), r.t(),
+                    phaseShort(r.phase()), r.stress(), r.breadth(), r.conf()});
+        }
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("from", points.get(0)[0]);
+        data.put("to", points.get(points.size() - 1)[0]);
+        data.put("points", points);
+
+        writeReport("regime-v3-report.template.html", data, outPath, points.size());
     }
 
     /**

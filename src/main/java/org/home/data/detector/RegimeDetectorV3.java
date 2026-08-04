@@ -214,6 +214,48 @@ public class RegimeDetectorV3 {
                 written, from, STRESS_MULTIPLIER_ENABLED);
     }
 
+    /**
+     * Состояния v3 из чистой цены (оси D/T + FSM), без модификаторов — для кросс-рыночной
+     * проверки (док. 15 §8): детектор гоняется на ETH/SPY/золоте/нефти/EUR-USD тем же кодом.
+     * Возвращает имя состояния по каждому дню (null до прогрева, где D или T недоступны).
+     * Логика тождественна {@link #backfill} в части определения состояния.
+     */
+    public static String[] statesFromPrice(double[] high, double[] low, double[] close) {
+        int n = close.length;
+        String[] states = new String[n];
+        if (n < WARMUP + 1) {
+            return states;
+        }
+        double[] sma = sma(close);
+        double[] atr = atr(high, low, close);
+        double[] adx = RegimeDetectorV2.adx(high, low, close);
+        double[] tRaw = new double[n], tRank = new double[n], dAxis = new double[n];
+        Arrays.fill(tRaw, Double.NaN);
+        Arrays.fill(tRank, Double.NaN);
+        Arrays.fill(dAxis, Double.NaN);
+        for (int i = 0; i < n; i++) {
+            if (i >= WARMUP) {
+                RegimeDetectorV2.Direction dir = RegimeDetectorV2.direction(close[i], sma[i], sma[i - SLOPE_N], atr[i]);
+                if (dir != null) {
+                    dAxis[i] = dir.d();
+                }
+            }
+            Double tr = RegimeDetectorV2.trendRaw(close, adx, i);
+            if (tr != null) {
+                tRaw[i] = tr;
+            }
+        }
+        RegimeDetectorV2.percentileRank(tRaw, tRank);
+        RegimeFsmV3 fsm = new RegimeFsmV3();
+        for (int i = 0; i < n; i++) {
+            if (i < WARMUP || Double.isNaN(dAxis[i]) || Double.isNaN(tRank[i])) {
+                continue;
+            }
+            states[i] = fsm.step(dAxis[i], tRank[i]).name();
+        }
+        return states;
+    }
+
     // ---- stress_level (перенесённый vol_z, не влияет на состояние) ----
 
     /** Реализованная волатильность 7д: std дневных лог-доходностей. */
