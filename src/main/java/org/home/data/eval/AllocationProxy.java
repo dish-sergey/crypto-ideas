@@ -600,78 +600,92 @@ public class AllocationProxy {
                 new Mkt("Нефть WTI", "CL=F", false),
                 new Mkt("EUR/USD", "EURUSD=X", false));
 
+        var sma200 = new org.home.data.eval.bench.Candidates.Sma200();
         StringBuilder sb = new StringBuilder();
-        sb.append("# Кросс-рыночная проверка v3 (док. 15 §8)\n\n");
-        sb.append("Детектор v3 (оси D/T, пороги T=0.40 / |D|=0.20 / dwell 15) **без изменений** на других рынках. ")
-                .append("Прокси тот же: BULL 100% / TRANSITION 50% / прочее 0% (кэш 8%/год), реаллокация 5 дней, ")
-                .append("издержки 0.10%. Данные — Yahoo Finance (дневной OHLC). Сравнимы относительные величины.\n\n");
-        sb.append("**Критерий (§8):** не «те же цифры», а «просадка снижается, доходность частично теряется, ")
-                .append("отношение в разумных пределах».\n\n");
-        sb.append("| Рынок | Период (eval) | CAGR детектор | CAGR B&H | MaxDD детектор | MaxDD B&H | ΔMaxDD/ΔCAGR | Просадка ↓ |\n");
-        sb.append("|---|---|---|---|---|---|---|---|\n");
+        sb.append("# Кросс-рыночная проверка §8 — rules2d vs baseline_sma200\n\n");
+        sb.append("Оба кандидата **без изменений параметров** на других рынках, тот же прокси (BULL 100% / ")
+                .append("TRANSITION 50% / прочее 0%, кэш 8%/год, реаллокация 5 дней, издержки 0.10%). Данные — Yahoo ")
+                .append("Finance (дневной OHLC). Общее окно оценки на каждый рынок = где определён rules2d (более ")
+                .append("длинный прогрев). Сравнимы относительные величины, `ratio` = ΔMaxDD/ΔCAGR к B&H (меньше = лучше).\n\n");
+        sb.append("**Вопрос:** держится ли на других рынках ничья по `ratio` (BTC: 0.15 vs 0.14) и вдвое меньшая ")
+                .append("абсолютная просадка у rules2d?\n\n");
+        sb.append("| Рынок | Период (eval) | rules2d: CAGR / MaxDD / ratio | sma200: CAGR / MaxDD / ratio | B&H MaxDD |\n");
+        sb.append("|---|---|---|---|---|\n");
 
-        int holds = 0, total = 0;
+        int total = 0, rulesDD = 0, smaDD = 0, rulesShallower = 0, rulesBetterRatio = 0;
         for (Mkt mk : mkts) {
             Ohlc o;
             try {
                 o = fetchYahoo(mk.symbol());
                 Thread.sleep(400);
             } catch (Exception e) {
-                sb.append(String.format("| %s | ошибка загрузки (%s) | | | | | | |%n", mk.name(), e.getClass().getSimpleName()));
+                sb.append(String.format("| %s | ошибка загрузки (%s) | | | |%n", mk.name(), e.getClass().getSimpleName()));
                 continue;
             }
             if (o == null || o.close().length < 400) {
-                sb.append(String.format("| %s | мало данных | | | | | | |%n", mk.name()));
+                sb.append(String.format("| %s | мало данных | | | |%n", mk.name()));
                 continue;
             }
-            String[] states = RegimeDetectorV3.statesFromPrice(o.high(), o.low(), o.close());
+            String[] rStates = RegimeDetectorV3.statesFromPrice(o.high(), o.low(), o.close());
+            String[] sStates = sma200.predict(o.high(), o.low(), o.close());
             List<Integer> idxs = new ArrayList<>();
-            for (int i = 0; i < states.length; i++) {
-                if (states[i] != null) {
+            for (int i = 0; i < rStates.length; i++) {
+                if (rStates[i] != null && sStates[i] != null) {
                     idxs.add(i);
                 }
             }
             if (idxs.size() < 200) {
-                sb.append(String.format("| %s | мало данных после прогрева | | | | | | |%n", mk.name()));
+                sb.append(String.format("| %s | мало данных после прогрева | | | |%n", mk.name()));
                 continue;
             }
             int m = idxs.size();
             int[] ci = new int[m];
-            String[] st = new String[m];
+            String[] rEv = new String[m], sEv = new String[m];
             for (int t = 0; t < m; t++) {
                 ci[t] = idxs.get(t);
-                st[t] = states[idxs.get(t)];
+                rEv[t] = rStates[idxs.get(t)];
+                sEv[t] = sStates[idxs.get(t)];
             }
             LocalDate a = LocalDate.parse(o.dates()[ci[0]]), b = LocalDate.parse(o.dates()[ci[m - 1]]);
             double years = (b.toEpochDay() - a.toEpochDay()) / 365.25;
-            Metrics det = metrics(sim(stateTargets(st), noImmediate(m), o.close(), ci).curve(), 0, years);
+            Metrics dR = metrics(sim(stateTargets(rEv), noImmediate(m), o.close(), ci).curve(), 0, years);
+            Metrics dS = metrics(sim(stateTargets(sEv), noImmediate(m), o.close(), ci).curve(), 0, years);
             Metrics bh = buyHold(o.close(), ci, years);
-            double dCagr = det.cagr() - bh.cagr(), dMaxdd = det.maxdd() - bh.maxdd();
-            String ratio = (dCagr < 0 && dMaxdd > 0) ? String.format("%.2f", -dCagr / dMaxdd) : "—";
-            boolean ddDown = det.maxdd() > bh.maxdd();   // менее глубокая просадка
+            double rRatio = ratio(dR, bh), sRatio = ratio(dS, bh);
             if (!mk.reference()) {
                 total++;
-                if (ddDown) {
-                    holds++;
+                if (dR.maxdd() > bh.maxdd()) {
+                    rulesDD++;
+                }
+                if (dS.maxdd() > bh.maxdd()) {
+                    smaDD++;
+                }
+                if (dR.maxdd() > dS.maxdd()) {
+                    rulesShallower++;   // rules2d менее глубокая просадка
+                }
+                if (!Double.isNaN(rRatio) && !Double.isNaN(sRatio) && rRatio < sRatio) {
+                    rulesBetterRatio++;
                 }
             }
-            sb.append(String.format("| %s | %s … %s | %.1f%% | %.1f%% | %.1f%% | %.1f%% | %s | %s |%n",
-                    mk.name(), o.dates()[ci[0]], o.dates()[ci[m - 1]], det.cagr() * 100, bh.cagr() * 100,
-                    det.maxdd() * 100, bh.maxdd() * 100, ratio, ddDown ? "да" : "нет"));
+            sb.append(String.format("| %s | %s … %s | %.1f%% / %.1f%% / %s | %.1f%% / %.1f%% / %s | %.1f%% |%n",
+                    mk.name(), o.dates()[ci[0]], o.dates()[ci[m - 1]],
+                    dR.cagr() * 100, dR.maxdd() * 100, fmtRatio(rRatio),
+                    dS.cagr() * 100, dS.maxdd() * 100, fmtRatio(sRatio), bh.maxdd() * 100));
         }
 
-        sb.append(String.format("%n**Итог:** просадка снижается на **%d из %d** внешних рынков. ", holds, total));
-        sb.append("Интерпретация §8: работает везде → сильная робастность; ломается на одном → разобрать, ")
-                .append("чем рынок отличается; работает только на BTC → вероятна подгонка. Здесь эффект держится ")
-                .append("на всех классах активов — свидетельство против подгонки под BTC.\n\n");
-        sb.append("**Оговорки по чтению CAGR:** (1) на низкодрейфовых активах (EUR/USD, отчасти нефть/золото) ")
-                .append("положительный CAGR детектора — в основном **кэш 8%/год** за время вне рынка, а не угадывание ")
-                .append("направления; значимый сигнал здесь — снижение просадки, оно от кэша не зависит. ")
-                .append("(2) Кэш начисляется по торговым барам, поэтому на рынках с выходными доходность нейтрального ")
-                .append("ядра слегка занижена. Оба — про уровень CAGR, не про знак эффекта.\n");
+        sb.append(String.format("%n**Итог по %d внешним рынкам:** просадку снижают оба — rules2d на %d/%d, sma200 на %d/%d. ",
+                total, rulesDD, total, smaDD, total));
+        sb.append(String.format("У rules2d **абсолютная просадка мельче, чем у sma200, на %d/%d** рынков; ", rulesShallower, total));
+        sb.append(String.format("по `ratio` rules2d лучше на %d/%d.%n%n", rulesBetterRatio, total));
+        sb.append("Чтение: если ничья по `ratio` держится, но rules2d стабильно даёт меньшую абсолютную просадку на ")
+                .append("разных классах активов — это довод в пользу композита именно по глубине просадки, а не по эффективности. ")
+                .append("Если же sma200 не хуже и по абсолютной просадке — правило отсечения сложности усиливается.\n\n");
+        sb.append("**Оговорка:** на низкодрейфовых активах (EUR/USD и т.п.) плюсовой CAGR — в основном кэш 8% за время ")
+                .append("вне рынка; значимый сигнал — снижение просадки. Кэш по торговым барам слегка занижает нейтральное ядро.\n");
 
         writeFile(outPath, sb.toString());
-        log.info("crossmarket: просадка ↓ на {}/{} рынков -> {}", holds, total, Path.of(outPath).toAbsolutePath());
+        log.info("crossmarket: rules2d DD↓ {}/{}, sma200 DD↓ {}/{}, rules2d мельче на {}/{} -> {}",
+                rulesDD, total, smaDD, total, rulesShallower, total, Path.of(outPath).toAbsolutePath());
     }
 
     /** Дневной OHLC с Yahoo v8 chart (без ключа), нулевые бары отброшены. period1 = 1990-01-01. */
@@ -1020,6 +1034,16 @@ public class AllocationProxy {
 
     private static double clip(double x, double lo, double hi) {
         return Math.max(lo, Math.min(hi, x));
+    }
+
+    /** ΔMaxDD/ΔCAGR к buy&hold: сколько CAGR отдано за 1 пункт снятой просадки (NaN, если не снижает). */
+    private static double ratio(Metrics det, Metrics bh) {
+        double dCagr = det.cagr() - bh.cagr(), dMaxdd = det.maxdd() - bh.maxdd();
+        return (dCagr < 0 && dMaxdd > 0) ? -dCagr / dMaxdd : Double.NaN;
+    }
+
+    private static String fmtRatio(double r) {
+        return Double.isNaN(r) ? "—" : String.format("%.2f", r);
     }
 
     private void writeFile(String outPath, String content) {
