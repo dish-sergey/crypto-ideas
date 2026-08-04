@@ -10,6 +10,7 @@ import org.home.data.detector.RegimeDetectorV2;
 import org.home.data.detector.RegimeDetectorV3;
 import org.home.data.detector.RegimeReport;
 import org.home.data.eval.AllocationProxy;
+import org.home.data.eval.bench.Bench;
 import org.home.data.ws.LiquidationWsCollector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,6 +53,7 @@ public class CliRunner implements ApplicationRunner {
     private final RegimeDetectorV3 detectorV3;
     private final RegimeReport report;
     private final AllocationProxy allocationProxy;
+    private final Bench bench;
     private final LiquidationWsCollector liquidations;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
@@ -60,7 +62,7 @@ public class CliRunner implements ApplicationRunner {
                      List<Collector> collectors, OhlcvCollector ohlcv, FundingCollector funding,
                      OnchainCollector onchain, OiArchiveImporter oiArchive,
                      RegimeDetector detector, RegimeDetectorV2 detectorV2, RegimeDetectorV3 detectorV3,
-                     RegimeReport report, AllocationProxy allocationProxy,
+                     RegimeReport report, AllocationProxy allocationProxy, Bench bench,
                      LiquidationWsCollector liquidations,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
@@ -76,6 +78,7 @@ public class CliRunner implements ApplicationRunner {
         this.detectorV3 = detectorV3;
         this.report = report;
         this.allocationProxy = allocationProxy;
+        this.bench = bench;
         this.liquidations = liquidations;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
@@ -113,9 +116,11 @@ public class CliRunner implements ApplicationRunner {
                             allocationProxy.crossMarket(firstOr(args, "out", "reports/crossmarket.md"));
                     case "voltarget" ->
                             allocationProxy.voltargetPostmortem(firstOr(args, "out", "reports/voltarget_postmortem.md"));
+                    case "bench" -> bench.run(firstOr(args, "out", "reports/bench"));
                     default -> throw new IllegalArgumentException(
                             "Неизвестный отчёт: " + target
-                                    + " (regime | regime-v3 | regime-compare | crash-econ | crash-maxdd | regime-econ | crossmarket | voltarget)");
+                                    + " (regime | regime-v3 | regime-compare | crash-econ | crash-maxdd"
+                                    + " | regime-econ | crossmarket | voltarget | bench)");
                 }
             }
         } catch (Exception e) {
