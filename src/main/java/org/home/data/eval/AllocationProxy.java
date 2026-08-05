@@ -26,6 +26,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 
 /**
  * Экономический прокси-бэктест детектора + диагностика A4/A6/A7/A8 (док. 18-v2 §2).
@@ -584,6 +585,159 @@ public class AllocationProxy {
     }
 
     /**
+     * Последняя проверка — ансамбль (док. 20 §3). Голосование большинством 3 кандидатов,
+     * равные веса, ноль свободных параметров: in_market = ([sma200=BULL]+[cusum=BULL]+
+     * [rules2d∈{BULL,TRANSITION}]) ≥ 2 → экспозиция 100%, иначе 0%. На ПОЛНЫХ окнах 6
+     * рынков (окно 2020–2026 израсходовано). Плюс контроль с постоянной экспозицией,
+     * равной средней экспозиции ансамбля (§2.1 — отделяет тайминг от снижения риска).
+     * Критерий §3.4 (зафиксирован до прогона): принять, если ансамбль превосходит
+     * sma200 по ratio на ≥4/6 рынков И не проигрывает по абс. просадке >3 п.п. ни на одном.
+     * CLI: --report=ensemble [--out=reports/ensemble.md].
+     */
+    public void ensembleRun(String outPath) {
+        record Mkt(String name, String symbol) {}
+        List<Mkt> mkts = List.of(
+                new Mkt("BTC", "BTC-USD"),
+                new Mkt("ETH", "ETH-USD"),
+                new Mkt("S&P 500", "^GSPC"),
+                new Mkt("Золото", "GC=F"),
+                new Mkt("Нефть WTI", "CL=F"),
+                new Mkt("EUR/USD", "EURUSD=X"));
+        double delta = 0.01, h = 0.15;   // из configs/bench-params.properties (зафиксированы до прогона)
+        try {
+            Properties pr = new Properties();
+            Path cf = Path.of("configs/bench-params.properties");
+            if (Files.exists(cf)) {
+                pr.load(Files.newBufferedReader(cf, StandardCharsets.UTF_8));
+                delta = Double.parseDouble(pr.getProperty("cusum.delta", "0.01"));
+                h = Double.parseDouble(pr.getProperty("cusum.h", "0.15"));
+            }
+        } catch (IOException ignore) {
+            // дефолты соответствуют конфигу
+        }
+        var sma200 = new org.home.data.eval.bench.Candidates.Sma200();
+        var cusum = new org.home.data.eval.bench.Candidates.Cusum(delta, h);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Последняя проверка — ансамбль (док. 20 §3)\n\n");
+        sb.append("Голосование большинством: `in_market = ([sma200=BULL] + [cusum=BULL] + ")
+                .append("[rules2d∈{BULL,TRANSITION}]) ≥ 2` → 100%, иначе 0%. Ноль свободных параметров, ")
+                .append("равные веса, одна конфигурация. **Полные окна** (2020–2026 не используется). ")
+                .append("Прокси как в crossmarket. Контроль — постоянная экспозиция = средней экспозиции ансамбля.\n\n");
+        sb.append("Критерий §3.4 (до прогона): принять ансамбль, если (1) он лучше `sma200` по `ratio` на ")
+                .append("**≥4/6** рынков И (2) не хуже `sma200` по абс. просадке более чем на **3 п.п.** ни на одном.\n\n");
+        sb.append("| Рынок | Окно (eval) | ансамбль CAGR/MaxDD/ratio | sma200 CAGR/MaxDD/ratio | контроль (эксп=avg) CAGR | избыток ансамбля | avg эксп |\n");
+        sb.append("|---|---|---|---|---|---|---|\n");
+
+        int ensBetterRatio = 0, valid = 0;
+        boolean crit2ok = true;
+        for (Mkt mk : mkts) {
+            Ohlc o;
+            try {
+                o = fetchYahoo(mk.symbol());
+                Thread.sleep(400);
+            } catch (Exception e) {
+                sb.append(String.format("| %s | ошибка загрузки (%s) | | | | | |%n", mk.name(), e.getClass().getSimpleName()));
+                continue;
+            }
+            if (o == null || o.close().length < 400) {
+                sb.append(String.format("| %s | мало данных | | | | | |%n", mk.name()));
+                continue;
+            }
+            String[] r = RegimeDetectorV3.statesFromPrice(o.high(), o.low(), o.close());
+            String[] s = sma200.predict(o.high(), o.low(), o.close());
+            String[] c = cusum.predict(o.high(), o.low(), o.close());
+            List<Integer> idxs = new ArrayList<>();
+            for (int i = 0; i < r.length; i++) {
+                if (r[i] != null && s[i] != null && c[i] != null) {
+                    idxs.add(i);
+                }
+            }
+            if (idxs.size() < 200) {
+                sb.append(String.format("| %s | мало данных после прогрева | | | | | |%n", mk.name()));
+                continue;
+            }
+            int m = idxs.size();
+            int[] ci = new int[m];
+            double[] ensTarget = new double[m];
+            String[] sEv = new String[m];
+            double expSum = 0;
+            for (int t = 0; t < m; t++) {
+                int i = idxs.get(t);
+                ci[t] = i;
+                sEv[t] = s[i];
+                int votes = ("BULL".equals(s[i]) ? 1 : 0)
+                        + ("BULL".equals(c[i]) ? 1 : 0)
+                        + (("BULL".equals(r[i]) || "TRANSITION".equals(r[i])) ? 1 : 0);
+                ensTarget[t] = votes >= 2 ? 1.0 : 0.0;
+                expSum += ensTarget[t];
+            }
+            double avgExp = expSum / m;
+            LocalDate a = LocalDate.parse(o.dates()[ci[0]]), b = LocalDate.parse(o.dates()[ci[m - 1]]);
+            double years = (b.toEpochDay() - a.toEpochDay()) / 365.25;
+            Metrics ens = metrics(sim(ensTarget, noImmediate(m), o.close(), ci).curve(), 0, years);
+            Metrics smaM = metrics(sim(stateTargets(sEv), noImmediate(m), o.close(), ci).curve(), 0, years);
+            Metrics bh = buyHold(o.close(), ci, years);
+            Metrics ctrl = constExposure(avgExp, o.close(), ci, years);
+            double ensRatio = ratio(ens, bh), smaRatio = ratio(smaM, bh);
+            boolean ensBetter = ratioScore(ens, bh) < ratioScore(smaM, bh);
+            boolean lose3 = ens.maxdd() < smaM.maxdd() - 0.03;   // ансамбль глубже sma200 более чем на 3 п.п.
+            valid++;
+            if (ensBetter) {
+                ensBetterRatio++;
+            }
+            if (lose3) {
+                crit2ok = false;
+            }
+            sb.append(String.format("| %s | %s … %s | %.1f%% / %.1f%% / %s | %.1f%% / %.1f%% / %s | %.1f%% | %+.1f п.п.%s | %.0f%% |%n",
+                    mk.name(), o.dates()[ci[0]], o.dates()[ci[m - 1]],
+                    ens.cagr() * 100, ens.maxdd() * 100, fmtRatio(ensRatio),
+                    smaM.cagr() * 100, smaM.maxdd() * 100, fmtRatio(smaRatio),
+                    ctrl.cagr() * 100, (ens.cagr() - ctrl.cagr()) * 100, lose3 ? " ⚠просадка" : "", avgExp * 100));
+        }
+
+        boolean crit1 = ensBetterRatio >= 4;
+        boolean pass = crit1 && crit2ok && valid == 6;
+        sb.append(String.format("%n**Критерий §3.4:** (1) ансамбль лучше sma200 по ratio на **%d/6** (нужно ≥4) — %s; ",
+                ensBetterRatio, crit1 ? "✓" : "✗"));
+        sb.append(String.format("(2) нигде не хуже по просадке >3 п.п. — %s.%n%n", crit2ok ? "✓" : "✗"));
+        sb.append(pass
+                ? "**Итог: ансамбль ПРИНЯТ — идёт в прод.**\n"
+                : "**Итог: критерий НЕ выполнен → ансамбль отклонён, в прод идёт `baseline_sma200` без дальнейших обсуждений (§3.4).**\n");
+        sb.append("\nОжидание, записанное до прогона (§3.3): ансамбль не пройдёт — три компоненты читают один ценовой ")
+                .append("ряд и следуют трендовой логике, усреднение снижает дисперсию, но не общее смещение. ")
+                .append("Среднее трёх запаздывающих детекторов остаётся запаздывающим.\n");
+
+        writeFile(outPath, sb.toString());
+        log.info("ensemble: лучше sma200 по ratio на {}/6, crit2={}, ИТОГ {} -> {}",
+                ensBetterRatio, crit2ok, pass ? "ПРИНЯТ" : "отклонён", Path.of(outPath).toAbsolutePath());
+    }
+
+    /** Контроль: постоянная экспозиция exp каждый день (§2.1), остальное — кэш. */
+    private static Metrics constExposure(double exp, double[] close, int[] ci, double years) {
+        int m = ci.length;
+        double[] curve = new double[m];
+        double eq = 1;
+        for (int t = 0; t < m; t++) {
+            if (t > 0) {
+                double br = close[ci[t]] / close[ci[t - 1]] - 1;
+                eq *= 1 + exp * br + (1 - exp) * CASH_DAILY;
+            }
+            curve[t] = eq;
+        }
+        return metrics(curve, 0, years);
+    }
+
+    /** Сортируемый скор ratio: доминирование (обгон B&H по обеим осям) — лучший; не снижает просадку — худший. */
+    private static double ratioScore(Metrics det, Metrics bh) {
+        double dCagr = det.cagr() - bh.cagr(), dMaxdd = det.maxdd() - bh.maxdd();
+        if (dMaxdd <= 0) {
+            return Double.POSITIVE_INFINITY;   // не снижает просадку
+        }
+        return dCagr < 0 ? -dCagr / dMaxdd : -1.0;   // доминирование = −1 (лучше любого положительного ratio)
+    }
+
+    /**
      * Кросс-рыночная проверка v3 (док. 15 §8): тот же детектор (оси D/T, те же пороги)
      * без изменений на ETH/SPY/золоте/нефти/EUR-USD. Критерий — эффект сохраняется по
      * знаку и порядку величины: просадка снижается, доходность частично теряется.
@@ -680,6 +834,9 @@ public class AllocationProxy {
         sb.append("Чтение: если ничья по `ratio` держится, но rules2d стабильно даёт меньшую абсолютную просадку на ")
                 .append("разных классах активов — это довод в пользу композита именно по глубине просадки, а не по эффективности. ")
                 .append("Если же sma200 не хуже и по абсолютной просадке — правило отсечения сложности усиливается.\n\n");
+        sb.append("**Легенда `ratio`:** «—» = кандидат обогнал buy&hold и по доходности, и по просадке (ΔCAGR≥0, ")
+                .append("доминирование) — это лучший возможный исход, а не провал (док. 20 §2.6). Так, sma200 доминирует ")
+                .append("B&H на BTC-2015 и ETH.\n\n");
         sb.append("**Оговорка:** на низкодрейфовых активах (EUR/USD и т.п.) плюсовой CAGR — в основном кэш 8% за время ")
                 .append("вне рынка; значимый сигнал — снижение просадки. Кэш по торговым барам слегка занижает нейтральное ядро.\n");
 

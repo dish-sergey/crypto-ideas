@@ -117,10 +117,12 @@ public class CliRunner implements ApplicationRunner {
                     case "voltarget" ->
                             allocationProxy.voltargetPostmortem(firstOr(args, "out", "reports/voltarget_postmortem.md"));
                     case "bench" -> bench.run(firstOr(args, "out", "reports/bench"));
+                    case "ensemble" ->
+                            allocationProxy.ensembleRun(firstOr(args, "out", "reports/ensemble.md"));
                     default -> throw new IllegalArgumentException(
                             "Неизвестный отчёт: " + target
                                     + " (regime | regime-v3 | regime-compare | crash-econ | crash-maxdd"
-                                    + " | regime-econ | crossmarket | voltarget | bench)");
+                                    + " | regime-econ | crossmarket | voltarget | bench | ensemble)");
                 }
             }
         } catch (Exception e) {

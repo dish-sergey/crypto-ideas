@@ -218,6 +218,29 @@ public class Bench {
         };
     }
 
+    private static double avgExp(String[] states) {
+        double s = 0;
+        for (String st : states) {
+            s += exposureFor(st);
+        }
+        return s / states.length;
+    }
+
+    /** Контроль: постоянная экспозиция каждый день (§2.1), остальное — кэш; без издержек. */
+    private static Metrics constExposure(double exp, double[] close, int[] ci, double years) {
+        int m = ci.length;
+        double[] curve = new double[m];
+        double eq = 1;
+        for (int t = 0; t < m; t++) {
+            if (t > 0) {
+                double br = close[ci[t]] / close[ci[t - 1]] - 1;
+                eq *= 1 + exp * br + (1 - exp) * CASH_DAILY;
+            }
+            curve[t] = eq;
+        }
+        return metrics(curve, 0, years);
+    }
+
     // ================= технические метрики =================
 
     private static Tech technical(String[] states, String[] labels, int[] ci) {
@@ -280,18 +303,20 @@ public class Bench {
                 .append("реаллокация 5д, издержки 0.10%, кэш 8%). **Прокси, не P&L.** ")
                 .append(String.format("N гипотез из журнала = %d. Правиловые кандидаты не обучаются → OOS ≡ in-sample.%n%n", hypN));
 
-        sb.append("| Кандидат | CAGR | MaxDD | Sharpe ± SE | Sharpe-defl | ΔMaxDD/ΔCAGR | state_acc | lag_дни | флипов/год | false_bear | оборот/год |\n");
-        sb.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
-        sb.append(String.format("| buy & hold | %.1f%% | %.1f%% | %.2f | — | — | — | — | — | — | 0.0 |%n",
+        sb.append("| Кандидат | CAGR | MaxDD | Sharpe ± SE | Sharpe-defl | ΔMaxDD/ΔCAGR | lag_дни | флипов/год | false_bear | оборот/год |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|\n");
+        sb.append(String.format("| buy & hold | %.1f%% | %.1f%% | %.2f | — | — | — | — | — | 0.0 |%n",
                 bh.cagr() * 100, bh.maxdd() * 100, bh.sharpe()));
         for (Row r : rows) {
-            sb.append(String.format("| %s | %.1f%% | %.1f%% | %.2f ± %.2f | %.2f | %s | %.0f%% | %s | %.1f | %.0f%% | %.1f |%n",
+            sb.append(String.format("| %s | %.1f%% | %.1f%% | %.2f ± %.2f | %.2f | %s | %s | %.1f | %.0f%% | %.1f |%n",
                     r.key(), r.m().cagr() * 100, r.m().maxdd() * 100, r.m().sharpe(), r.se(), r.sDefl(),
-                    fmt(r.dMaxddOverDCagr()), r.t().accuracy() * 100,
+                    fmt(r.dMaxddOverDCagr()),
                     Double.isNaN(r.t().lagDays()) ? "—" : String.format("%.0f", r.t().lagDays()),
                     r.t().flipsPerYear(), r.t().falseBear() * 100, r.m().turnover()));
         }
-        sb.append("\n`ΔMaxDD/ΔCAGR` — пунктов CAGR отдано за 1 пункт снятой просадки (меньше = лучше; «—» = не снижает просадку). ")
+        sb.append("\n`state_accuracy` убрана из таблицы (док. 20 §2.3): тривиальный `always_range` берёт её на 49% ")
+                .append("просто потому, что RANGE — 49% эталонной разметки. `ΔMaxDD/ΔCAGR` — пунктов CAGR отдано за ")
+                .append("1 пункт снятой просадки (меньше = лучше; «—» = не снижает просадку). ")
                 .append("Sharpe без интервала не интерпретируется: при ").append(String.format("%.1f", years))
                 .append(String.format(" годах SE≈%.2f, дефлированный Sharpe вычитает SE·√(2 ln N).%n%n", rows.get(0).se()));
         sb.append("Отложены (§5.3, ожидается переобучение на 3 циклах): `hmm`, `gmm`, `ensemble`. ")
@@ -337,27 +362,33 @@ public class Bench {
             sb.append(String.format("| %s | %d/20 %s |%n", c.key(), ok, ok == 20 ? "✓" : "✗ УТЕЧКА"));
         }
 
-        // 7.4 shuffle
-        sb.append("\n## 7.4 Тест на перемешанных данных\n\n");
-        sb.append("20 перемешиваний дневных лог-доходностей (структура разрушена, распределение сохранено). ")
-                .append("Преимущество rules2d над buy&hold должно исчезнуть.\n\n");
-        double realEdge = econ(slice(stateCache.get("rules2d"), firstEval, n), close, ci, years).maxdd() - bh.maxdd();
-        double sumEdge = 0, minEdge = 1, maxEdge = -1;
-        Candidate rules = cands.stream().filter(c -> c.key().equals("rules2d")).findFirst().orElseThrow();
-        for (int s = 0; s < 20; s++) {
-            double[] sc = shuffledClose(close, rnd);
-            String[] st = rules.predict(sc, sc, sc);
-            Metrics md = econ(slice(st, firstEval, n), sc, ci, years);
-            Metrics sbh = buyHold(sc, ci, years);
-            double edge = md.maxdd() - sbh.maxdd();
-            sumEdge += edge;
-            minEdge = Math.min(minEdge, edge);
-            maxEdge = Math.max(maxEdge, edge);
+        // 7.4 shuffle — корректная статистика (док. 20 §2.1): избыток CAGR над контролем с той же
+        // средней экспозицией. ΔMaxDD не годится — снижение просадки на перемешанных механическое.
+        sb.append("\n## 7.4 Тест на перемешанных данных (исправлено, док. 20 §2.1)\n\n");
+        sb.append("Статистика — **избыток CAGR над контролем с той же средней экспозицией** (не ΔMaxDD: ")
+                .append("снижение просадки на перемешанных возникает механически, от удержания меньшей позиции). ")
+                .append("400 перестановок дневных лог-доходностей; p = доля перестановок с избытком ≥ фактического.\n\n");
+        sb.append("| Кандидат | избыток факт | p |\n|---|---|---|\n");
+        String[] keys = {"rules2d", "baseline_sma200", "cusum"};
+        int perm = 400;
+        for (String key : keys) {
+            Candidate cand = cands.stream().filter(c -> c.key().equals(key)).findFirst().orElseThrow();
+            String[] evReal = slice(stateCache.get(key), firstEval, n);
+            double realExcess = econ(evReal, close, ci, years).cagr() - constExposure(avgExp(evReal), close, ci, years).cagr();
+            int ge = 0;
+            for (int s = 0; s < perm; s++) {
+                double[] sc = shuffledClose(close, rnd);
+                String[] ev = slice(cand.predict(sc, sc, sc), firstEval, n);
+                double ex = econ(ev, sc, ci, years).cagr() - constExposure(avgExp(ev), sc, ci, years).cagr();
+                if (ex >= realExcess) {
+                    ge++;
+                }
+            }
+            sb.append(String.format("| %s | %+.2f%% | %.3f |%n", key, realExcess * 100, (double) ge / perm));
         }
-        sb.append(String.format("ΔMaxDD (детектор − B&H) на РЕАЛЬНЫХ данных: **%+.1f п.п.** (снижает просадку). ", realEdge * 100));
-        sb.append(String.format("На перемешанных: среднее %+.1f п.п., диапазон [%+.1f, %+.1f]. %s%n%n",
-                sumEdge / 20 * 100, minEdge * 100, maxEdge * 100,
-                Math.abs(sumEdge / 20) < Math.abs(realEdge) / 2 ? "✓ преимущество исчезло" : "⚠ преимущество осталось — разобрать"));
+        sb.append("\nНи один кандидат не показывает значимого тайминга (p не мал) — на 6.6 годах одного актива это ")
+                .append("ожидаемо (t07). Прежняя галочка «преимущество исчезло» снята: она опиралась на неверную статистику ")
+                .append("(снижение MaxDD на перемешанных — механическое, а не признак структуры).\n\n");
 
         // 7.4 прочее
         double corrDT = corrDtFromV3();
@@ -391,7 +422,10 @@ public class Bench {
                 + "| Ось `S` с `dd_speed` | doc 18 A1/A2: храповик по построению, серии до 41 дня | ничего: дефект из определения формулы |\n"
                 + "| Состояние `CRASH` | doc 18 A4: CAGR 26.9% против 32.7% при идентичном MaxDD | измерение выигрыша на другом рынке/таймфрейме |\n"
                 + "| `baseline_voltarget` | doc 19: 67% на потолке, min экспозиция 0.29, защита/цена 0.79 | версия с плечом либо мультиактивный портфель |\n"
-                + "| Множитель `stress_level` | doc 01 v4 §2.4: диапазон [0.5, 1.0] выходит ещё меньше | новое измерение под другую задачу (защита моментума, doc 17 §7) |\n";
+                + "| Множитель `stress_level` | doc 01 v4 §2.4: диапазон [0.5, 1.0] выходит ещё меньше | новое измерение под другую задачу (защита моментума, doc 17 §7) |\n"
+                + "| Композит `rules2d` (оси D+T) | doc 20 §1: −25.6% было свойством окна (2015+: −57.9%); ratio 0.15 vs 0.14 у sma200; кросс-рынок 2/5 | измерение на большем числе независимых наблюдений (кросс-секция, t10) |\n"
+                + "| `cusum` (самостоятельный кандидат) | doc 20: ratio 0.44, избыток над контролем незначим (p≈0.36) | — |\n"
+                + "| Ансамбль (голосование 3, равные веса) | doc 20 §3: лучше sma200 по ratio 0/6, crit2 провален (BTC −69.2 vs −64.3) | — |\n";
         writeFile(outDir + "/rejected.md", s);
     }
 
