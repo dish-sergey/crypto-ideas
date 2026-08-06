@@ -11,6 +11,7 @@ import org.home.data.detector.RegimeDetectorV3;
 import org.home.data.detector.RegimeDetectorV5;
 import org.home.data.detector.RegimeReport;
 import org.home.data.eval.AllocationProxy;
+import org.home.data.eval.S1Backtest;
 import org.home.data.eval.bench.Bench;
 import org.home.data.ws.LiquidationWsCollector;
 import org.slf4j.Logger;
@@ -56,6 +57,7 @@ public class CliRunner implements ApplicationRunner {
     private final RegimeReport report;
     private final AllocationProxy allocationProxy;
     private final Bench bench;
+    private final S1Backtest s1Backtest;
     private final LiquidationWsCollector liquidations;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
@@ -65,7 +67,7 @@ public class CliRunner implements ApplicationRunner {
                      OnchainCollector onchain, OiArchiveImporter oiArchive,
                      RegimeDetector detector, RegimeDetectorV2 detectorV2, RegimeDetectorV3 detectorV3,
                      RegimeDetectorV5 detectorV5,
-                     RegimeReport report, AllocationProxy allocationProxy, Bench bench,
+                     RegimeReport report, AllocationProxy allocationProxy, Bench bench, S1Backtest s1Backtest,
                      LiquidationWsCollector liquidations,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
@@ -83,6 +85,7 @@ public class CliRunner implements ApplicationRunner {
         this.report = report;
         this.allocationProxy = allocationProxy;
         this.bench = bench;
+        this.s1Backtest = s1Backtest;
         this.liquidations = liquidations;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
@@ -131,6 +134,7 @@ public class CliRunner implements ApplicationRunner {
                             allocationProxy.slopeGateB(firstOr(args, "out", "reports/slope_gate_b.md"));
                     case "s3-viability" ->
                             allocationProxy.s3Viability(firstOr(args, "out", "reports/s3_viability.md"));
+                    case "s1" -> s1Backtest.run(firstOr(args, "out", "reports/s1_backtest.md"));
                     default -> throw new IllegalArgumentException(
                             "Неизвестный отчёт: " + target
                                     + " (regime | regime-v3 | regime-v5 | regime-all | regime-compare | crash-econ | crash-maxdd"
