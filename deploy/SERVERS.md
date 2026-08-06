@@ -55,13 +55,16 @@
 
 ### 5. `detector-report.timer` — суточное обновление дашборда
 - **Что:** раз в сутки 08:00 UTC гоняет `~/update-dashboard.sh` на боевой БД (`Persistent=true`).
-  Скрипт делает backfill+report обеих версий детектора:
-  - **v3 (актуальный)** → `--backfill=regime-v3` + `--report=regime-v3 --out=~/dash/index.html` (главный дашборд).
-  - **v1 (наследие)** → `--backfill=regime` + `--report=regime --out=~/dash/regime-v1.html` (для сравнения).
-- **Юниты:** `/etc/systemd/system/detector-report.{service,timer}`, скрипт `~/update-dashboard.sh` (бэкап `.bak`).
+  Скрипт делает backfill трёх версий детектора и рендерит 4 дашборда:
+  - **v5 (ПРОД)** `close>SMA200` → `--backfill=regime-v5` + `--report=regime-v5 --out=~/dash/index.html` (главный).
+  - **v3** (оси D/T) → `--report=regime-v3 --out=~/dash/regime-v3.html`.
+  - **v1** (композит) → `--report=regime --out=~/dash/regime-v1.html`.
+  - **общий** (v1/v3/v5) → `--report=regime-all --out=~/dash/regime-all.html`.
+- **Юниты:** `/etc/systemd/system/detector-report.{service,timer}`, скрипт `~/update-dashboard.sh` (бэкап `.bak-v3`).
 - **Проверить:** `systemctl list-timers detector-report.timer` · `journalctl -u detector-report`
 - **Обновить вручную:** `sudo systemctl start detector-report.service` (или `bash ~/update-dashboard.sh` от ubuntu).
-- **Дашборд:** `http://crypto-micro:8088/` = v3, `.../regime-v1.html` = v1.
+- **Дашборд:** `http://crypto-micro:8088/` = **v5 (прод)**; `.../regime-v3.html`, `.../regime-v1.html`, `.../regime-all.html`.
+- **Откат:** `mv app.jar.bak-v3 app.jar` + `update-dashboard.sh.bak-v3` (jar менялся атомарным mv, без рестарта crypto-data).
 
 ### Tailscale (приватная сеть)
 - Mesh-VPN (WireGuard). Micro = `crypto-micro` (100.64.144.85). Даёт приватный доступ к дашборду без открытия портов и без домена. Бесплатно (personal). Авторизация — по устройствам аккаунта `dish.sergey@`. Проверка: `tailscale status`.
