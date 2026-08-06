@@ -41,6 +41,8 @@ public class RegimeReport {
     private record Reg(String day, String state, Double score, Double c1, Double c2, Double c3, Double c4, Double c5) {}
     private record RegCmp(String day, String v1, String v2, Double d, Double t, Double s, String phase) {}
     private record RegV3(String day, String state, Double d, Double t, String phase, Double stress, Double breadth, Double conf) {}
+    private record RegV5(String day, String state, Double distAtr, String phase, Double breadth, Double conf) {}
+    private record RegAll(String day, String v1, String v3, String v5) {}
 
     public void generate(String outPath) {
         Map<String, Double> price = new HashMap<>();
@@ -130,6 +132,77 @@ public class RegimeReport {
         data.put("points", points);
 
         writeReport("regime-v3-report.template.html", data, outPath, points.size());
+    }
+
+    /**
+     * Отчёт детектора v5 (прод): цена BTC (лог) + полосы {BULL,BEAR}, нижняя панель —
+     * dist_atr = (close−SMA200)/ATR90. Читает regime_daily_v5. CLI: --report=regime-v5.
+     */
+    public void generateV5(String outPath) {
+        Map<String, Double> price = new HashMap<>();
+        for (DayClose d : db.query(
+                "SELECT date(open_time/1000,'unixepoch') d, close FROM candles "
+                        + "WHERE symbol='BTCUSDT' AND interval='1d'",
+                rs -> new DayClose(rs.getString(1), rs.getDouble(2)))) {
+            price.put(d.day(), d.close());
+        }
+        List<RegV5> rows = db.query(
+                "SELECT day, state, dist_atr, cycle_phase, breadth, confidence FROM regime_daily_v5 ORDER BY day",
+                rs -> new RegV5(rs.getString("day"), rs.getString("state"), d(rs, "dist_atr"),
+                        rs.getString("cycle_phase"), d(rs, "breadth"), d(rs, "confidence")));
+        if (rows.isEmpty()) {
+            log.warn("report: regime_daily_v5 пуст — сначала --backfill=regime-v5");
+            return;
+        }
+        List<Object[]> points = new ArrayList<>();
+        for (RegV5 r : rows) {
+            Double p = price.get(r.day());
+            if (p == null) {
+                continue;
+            }
+            points.add(new Object[]{r.day(), p, stateIdx(r.state()), r.distAtr(),
+                    phaseShort(r.phase()), r.breadth(), r.conf()});
+        }
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("from", points.get(0)[0]);
+        data.put("to", points.get(points.size() - 1)[0]);
+        data.put("points", points);
+        writeReport("regime-v5-report.template.html", data, outPath, points.size());
+    }
+
+    /**
+     * Общий отчёт: цена BTC (лог) + три ленты состояний v1 / v3 / v5. Джойн regime_daily,
+     * regime_daily_v3, regime_daily_v5 по дню. CLI: --report=regime-all.
+     */
+    public void generateAll(String outPath) {
+        Map<String, Double> price = new HashMap<>();
+        for (DayClose d : db.query(
+                "SELECT date(open_time/1000,'unixepoch') d, close FROM candles "
+                        + "WHERE symbol='BTCUSDT' AND interval='1d'",
+                rs -> new DayClose(rs.getString(1), rs.getDouble(2)))) {
+            price.put(d.day(), d.close());
+        }
+        List<RegAll> rows = db.query(
+                "SELECT a.day, a.state v1, b.state v3, c.state v5 FROM regime_daily a "
+                        + "JOIN regime_daily_v3 b USING(day) JOIN regime_daily_v5 c USING(day) ORDER BY a.day",
+                rs -> new RegAll(rs.getString("day"), rs.getString("v1"), rs.getString("v3"), rs.getString("v5")));
+        if (rows.isEmpty()) {
+            log.warn("report: нет пересечения regime_daily/v3/v5 — прогони все три backfill");
+            return;
+        }
+        List<Object[]> points = new ArrayList<>();
+        for (RegAll r : rows) {
+            Double p = price.get(r.day());
+            if (p == null) {
+                continue;
+            }
+            points.add(new Object[]{r.day(), p, stateIdx(r.v1()), stateIdx(r.v3()), stateIdx(r.v5())});
+        }
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("from", points.get(0)[0]);
+        data.put("to", points.get(points.size() - 1)[0]);
+        data.put("points", points);
+        writeReport("regime-all.template.html", data, outPath, points.size());
     }
 
     /**

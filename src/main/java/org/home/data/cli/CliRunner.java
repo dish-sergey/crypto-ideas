@@ -108,6 +108,8 @@ public class CliRunner implements ApplicationRunner {
                 switch (target) {
                     case "regime" -> report.generate(firstOr(args, "out", "regime-report.html"));
                     case "regime-v3" -> report.generateV3(firstOr(args, "out", "regime-v3-report.html"));
+                    case "regime-v5" -> report.generateV5(firstOr(args, "out", "regime-v5-report.html"));
+                    case "regime-all" -> report.generateAll(firstOr(args, "out", "regime-all.html"));
                     case "regime-compare" ->
                             report.generateCompare(firstOr(args, "out", "regime-compare.html"));
                     case "crash-econ" ->
@@ -131,7 +133,7 @@ public class CliRunner implements ApplicationRunner {
                             allocationProxy.s3Viability(firstOr(args, "out", "reports/s3_viability.md"));
                     default -> throw new IllegalArgumentException(
                             "Неизвестный отчёт: " + target
-                                    + " (regime | regime-v3 | regime-compare | crash-econ | crash-maxdd"
+                                    + " (regime | regime-v3 | regime-v5 | regime-all | regime-compare | crash-econ | crash-maxdd"
                                     + " | regime-econ | crossmarket | voltarget | bench | ensemble"
                                     + " | slope-gate-a | slope-gate-b | s3-viability)");
                 }
