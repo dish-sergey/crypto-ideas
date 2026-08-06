@@ -218,6 +218,127 @@ public class S1Backtest {
                 rotWins ? "ротация бьёт" : "постоянная лучше", Path.of(outPath).toAbsolutePath());
     }
 
+    /**
+     * Блок E (doc 24 §E / 23 §5.1): описательное исследование leverage_warning вокруг обвалов.
+     * 5 обвалов против 5 спокойных периодов (фикс. зерно), метрики за 30/14/7 дней до точки.
+     * <b>Это описание, а не доказательство</b> — 5 событий статистики не дают. Пороги не
+     * подбираются. Данные-ограничение: funding с 2019-09, OI с 2021 → 2018-01 исключён.
+     * CLI: --report=leverage.
+     */
+    public void leverageStudy(String outPath) {
+        // суточный funding BTC+ETH (средняя ставка за день) + leverage_warning из regime_daily_v5
+        Map<LocalDate, double[]> fund = new TreeMap<>();   // [sum, cnt] по дню (BTC+ETH)
+        db.query("SELECT date(funding_time/1000,'unixepoch') d, rate FROM funding "
+                        + "WHERE exchange='binance' AND symbol IN ('BTCUSDT','ETHUSDT')",
+                rs -> { fund.computeIfAbsent(LocalDate.parse(rs.getString(1)), k -> new double[2]);
+                        double[] a = fund.get(LocalDate.parse(rs.getString(1))); a[0] += rs.getDouble(2); a[1]++; return null; });
+        Map<LocalDate, Integer> lev = new TreeMap<>();
+        db.query("SELECT day, leverage_warning FROM regime_daily_v5",
+                rs -> { lev.put(LocalDate.parse(rs.getString(1)), rs.getInt(2)); return null; });
+
+        LocalDate[] crashes = {LocalDate.parse("2020-03-12"), LocalDate.parse("2021-05-19"),
+                LocalDate.parse("2021-11-10"), LocalDate.parse("2024-08-05")};
+        // спокойные периоды: фикс. зерно, вне ±45 дней любого обвала
+        java.util.Random rnd = new java.util.Random(42);
+        LocalDate lo = LocalDate.parse("2020-06-01"), hi = LocalDate.parse("2026-06-01");
+        long span = hi.toEpochDay() - lo.toEpochDay();
+        List<LocalDate> calm = new ArrayList<>();
+        while (calm.size() < 5) {
+            LocalDate d = lo.plusDays((long) (rnd.nextDouble() * span));
+            boolean near = false;
+            for (LocalDate c : crashes) {
+                if (Math.abs(d.toEpochDay() - c.toEpochDay()) < 45) {
+                    near = true;
+                }
+            }
+            if (!near) {
+                calm.add(d);
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# leverage_warning вокруг обвалов — описательное исследование (doc 24 §E)\n\n");
+        sb.append("**Это ОПИСАНИЕ, а не доказательство.** 5 событий (из них 2018-01 исключён — нет деривативных ")
+                .append("данных до 2019-09) статистики не дают. Вопрос — «отличались ли метрики за 30/14/7 дней до точки», ")
+                .append("а не «предсказывают ли». Пороги не подбирались, выборка не расширялась. funding — средняя BTC+ETH ")
+                .append("(бп/8ч); lev% — доля дней с leverage_warning=1 (OI/MC-компонента доступна с 2021).\n\n");
+        sb.append("| Событие | тип | funding 30д | funding 14д | funding 7д | lev% 30д | lev% 14д |\n|---|---|---|---|---|---|---|\n");
+        double[] crAgg = new double[5];
+        int crN = 0;
+        for (LocalDate c : crashes) {
+            double[] r = window(c, fund, lev);
+            sb.append(String.format("| %s | ОБВАЛ | %s | %s | %s | %s | %s |%n", c,
+                    bp(r[0]), bp(r[1]), bp(r[2]), pct(r[3]), pct(r[4])));
+            for (int k = 0; k < 5; k++) {
+                crAgg[k] += r[k];
+            }
+            crN++;
+        }
+        double[] caAgg = new double[5];
+        for (LocalDate c : calm) {
+            double[] r = window(c, fund, lev);
+            sb.append(String.format("| %s | спокойн | %s | %s | %s | %s | %s |%n", c,
+                    bp(r[0]), bp(r[1]), bp(r[2]), pct(r[3]), pct(r[4])));
+            for (int k = 0; k < 5; k++) {
+                caAgg[k] += r[k];
+            }
+        }
+        sb.append(String.format("| **среднее ОБВАЛ** | | %s | %s | %s | %s | %s |%n",
+                bp(crAgg[0] / crN), bp(crAgg[1] / crN), bp(crAgg[2] / crN), pct(crAgg[3] / crN), pct(crAgg[4] / crN)));
+        sb.append(String.format("| **среднее спокойн** | | %s | %s | %s | %s | %s |%n%n",
+                bp(caAgg[0] / 5), bp(caAgg[1] / 5), bp(caAgg[2] / 5), pct(caAgg[3] / 5), pct(caAgg[4] / 5)));
+        boolean fundHigher = crAgg[1] / crN > caAgg[1] / 5;
+        boolean levHigher = crAgg[3] / crN > caAgg[3] / 5;
+        sb.append(String.format("**Наблюдение (описательно):** перед обвалами funding за 14д %s, чем в спокойные (%s vs %s бп/8ч); ",
+                fundHigher ? "ВЫШЕ" : "не выше", bp(crAgg[1] / crN), bp(caAgg[1] / 5)));
+        sb.append(String.format("доля дней leverage_warning за 30д %s (%s vs %s). ",
+                levHigher ? "ВЫШЕ" : "не выше", pct(crAgg[3] / crN), pct(caAgg[3] / 5)));
+        sb.append("Это согласуется с механикой (набитые плечи = топливо каскадов), но на 4 наблюдениях это лишь описание — ")
+                .append("не сигнал и не доказательство. leverage_warning остаётся диагностическим модификатором, не входом детектора.\n");
+        writeFile(outPath, sb.toString());
+        log.info("leverage-study: funding14 обвал/спок = {}/{} бп -> {}",
+                bp(crAgg[1] / crN), bp(caAgg[1] / 5), Path.of(outPath).toAbsolutePath());
+    }
+
+    /** Метрики за 30/14/7 дней до date: {funding30, funding14, funding7, lev%30, lev%14} (funding в бп/8ч). */
+    private static double[] window(LocalDate date, Map<LocalDate, double[]> fund, Map<LocalDate, Integer> lev) {
+        int[] wins = {30, 14, 7};
+        double[] out = new double[5];
+        for (int w = 0; w < 3; w++) {
+            double sum = 0;
+            int cnt = 0;
+            for (long k = 1; k <= wins[w]; k++) {
+                double[] fv = fund.get(date.minusDays(k));
+                if (fv != null && fv[1] > 0) {
+                    sum += fv[0] / fv[1];
+                    cnt++;
+                }
+            }
+            out[w] = cnt > 0 ? sum / cnt * 1e4 : Double.NaN;   // бп/8ч
+        }
+        int[] levWins = {30, 14};
+        for (int w = 0; w < 2; w++) {
+            int on = 0, cnt = 0;
+            for (long k = 1; k <= levWins[w]; k++) {
+                Integer lv = lev.get(date.minusDays(k));
+                if (lv != null) {
+                    cnt++;
+                    on += lv;
+                }
+            }
+            out[3 + w] = cnt > 0 ? (double) on / cnt : Double.NaN;
+        }
+        return out;
+    }
+
+    private static String bp(double v) {
+        return Double.isNaN(v) ? "н/д" : String.format("%.2f", v);
+    }
+
+    private static String pct(double v) {
+        return Double.isNaN(v) ? "н/д" : String.format("%.0f%%", v * 100);
+    }
+
     private record Metrics(double cagr, double maxdd, double sharpe, double se) {}
 
     private static Metrics metrics(double[] eq, double years) {

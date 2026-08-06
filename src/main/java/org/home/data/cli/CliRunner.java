@@ -135,6 +135,7 @@ public class CliRunner implements ApplicationRunner {
                     case "s3-viability" ->
                             allocationProxy.s3Viability(firstOr(args, "out", "reports/s3_viability.md"));
                     case "s1" -> s1Backtest.run(firstOr(args, "out", "reports/s1_backtest.md"));
+                    case "leverage" -> s1Backtest.leverageStudy(firstOr(args, "out", "reports/leverage_warning_study.md"));
                     default -> throw new IllegalArgumentException(
                             "Неизвестный отчёт: " + target
                                     + " (regime | regime-v3 | regime-v5 | regime-all | regime-compare | crash-econ | crash-maxdd"
