@@ -119,10 +119,15 @@ public class CliRunner implements ApplicationRunner {
                     case "bench" -> bench.run(firstOr(args, "out", "reports/bench"));
                     case "ensemble" ->
                             allocationProxy.ensembleRun(firstOr(args, "out", "reports/ensemble.md"));
+                    case "slope-gate-a" ->
+                            allocationProxy.slopeGateA(firstOr(args, "out", "reports/slope_gate_a.md"));
+                    case "slope-gate-b" ->
+                            allocationProxy.slopeGateB(firstOr(args, "out", "reports/slope_gate_b.md"));
                     default -> throw new IllegalArgumentException(
                             "Неизвестный отчёт: " + target
                                     + " (regime | regime-v3 | regime-compare | crash-econ | crash-maxdd"
-                                    + " | regime-econ | crossmarket | voltarget | bench | ensemble)");
+                                    + " | regime-econ | crossmarket | voltarget | bench | ensemble"
+                                    + " | slope-gate-a | slope-gate-b)");
                 }
             }
         } catch (Exception e) {

@@ -46,6 +46,21 @@ class CandidatesTest {
         assertEquals("RANGE", s[0]);            // до первого срабатывания
     }
 
+    /** Гейт наклона (doc 21 §4): плоская SMA → RANGE; растущая с ценой выше → BULL. */
+    @Test
+    void slopeGateFlatIsRange() {
+        int n = 500;
+        double[] flat = new double[n], up = new double[n];
+        for (int i = 0; i < n; i++) {
+            flat[i] = 100 + Math.sin(i / 3.0);       // плоская средняя, болтанка
+            up[i] = 100 * Math.exp(0.004 * i);       // устойчивый рост
+        }
+        var gate = new Candidates.Sma200SlopeGate();
+        assertEquals("RANGE", gate.predict(flat, flat, flat)[n - 1]);
+        assertEquals("BULL", gate.predict(up, up, up)[n - 1]);
+        assertNull(gate.predict(up, up, up)[228], "до прогрева (SMA200+наклон30) состояния нет");
+    }
+
     /** Каузальность: усечение ряда не меняет прошлых состояний (§7.1). */
     @Test
     void cusumCausal() {

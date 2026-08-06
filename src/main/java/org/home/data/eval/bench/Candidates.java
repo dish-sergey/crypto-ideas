@@ -101,6 +101,76 @@ public final class Candidates {
         }
     }
 
+    /**
+     * baseline_sma200 + гейт наклона (doc 21 §4): к пересечению SMA200 добавлено третье
+     * состояние RANGE, когда средняя плоская. Параметры ЗАФИКСИРОВАНЫ в doc 21 §4.5,
+     * не подбираются: окно наклона N=30, порог 0.5·ATR90.
+     * <pre>
+     *   slope = (SMA200_t − SMA200_{t−30}) / ATR90
+     *   close>SMA200 и slope ≥ +0.5  → BULL
+     *   close<SMA200 и slope ≤ −0.5  → BEAR
+     *   иначе (плоская средняя или несогласие цены и наклона) → RANGE
+     * </pre>
+     */
+    public static final class Sma200SlopeGate implements Candidate {
+        private static final int SMA_N = 200;
+        private static final int ATR_N = 90;
+        private static final int SLOPE_N = 30;
+        private static final double THR = 0.5;
+
+        public String key() {
+            return "sma200_slope_gate";
+        }
+
+        public String[] predict(double[] high, double[] low, double[] close) {
+            int n = close.length;
+            String[] s = new String[n];
+            double[] sma = new double[n], atr = new double[n];
+            java.util.Arrays.fill(sma, Double.NaN);
+            java.util.Arrays.fill(atr, Double.NaN);
+            double sum = 0;
+            for (int i = 0; i < n; i++) {
+                sum += close[i];
+                if (i >= SMA_N) {
+                    sum -= close[i - SMA_N];
+                }
+                if (i >= SMA_N - 1) {
+                    sma[i] = sum / SMA_N;
+                }
+            }
+            double[] tr = new double[n];
+            tr[0] = high[0] - low[0];
+            for (int i = 1; i < n; i++) {
+                double pc = close[i - 1];
+                tr[i] = Math.max(high[i] - low[i], Math.max(Math.abs(high[i] - pc), Math.abs(low[i] - pc)));
+            }
+            double ts = 0;
+            for (int i = 0; i < n; i++) {
+                ts += tr[i];
+                if (i >= ATR_N) {
+                    ts -= tr[i - ATR_N];
+                }
+                if (i >= ATR_N - 1) {
+                    atr[i] = ts / ATR_N;
+                }
+            }
+            for (int i = 0; i < n; i++) {
+                if (i < SMA_N - 1 + SLOPE_N || Double.isNaN(atr[i]) || atr[i] <= 0) {
+                    continue;
+                }
+                double slope = (sma[i] - sma[i - SLOPE_N]) / atr[i];
+                if (close[i] > sma[i] && slope >= THR) {
+                    s[i] = "BULL";
+                } else if (close[i] < sma[i] && slope <= -THR) {
+                    s[i] = "BEAR";
+                } else {
+                    s[i] = "RANGE";
+                }
+            }
+            return s;
+        }
+    }
+
     /** rules2d: оси D/T детектора v3 (doc 01 v4 §2–3), пороги фиксированы, не подбираются. */
     public static final class Rules2d implements Candidate {
         public String key() {

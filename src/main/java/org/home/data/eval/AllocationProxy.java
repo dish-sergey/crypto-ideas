@@ -738,6 +738,222 @@ public class AllocationProxy {
     }
 
     /**
+     * Задача A (doc 21 §4.4/§4.5): улучшает ли гейт наклона SMA200 экономику детектора.
+     * Тот же прокси, что crossmarket, полные окна 6 рынков; гейт (sma200_slope_gate) против
+     * чистого baseline_sma200. Критерий §4.5-A (до прогона): гейт лучше по ΔMaxDD/ΔCAGR на
+     * ≥4/6 рынков И нигде не хуже по абс. просадке >3 п.п. CLI: --report=slope-gate-a.
+     */
+    public void slopeGateA(String outPath) {
+        record Mkt(String name, String symbol) {}
+        List<Mkt> mkts = List.of(new Mkt("BTC", "BTC-USD"), new Mkt("ETH", "ETH-USD"),
+                new Mkt("S&P 500", "^GSPC"), new Mkt("Золото", "GC=F"),
+                new Mkt("Нефть WTI", "CL=F"), new Mkt("EUR/USD", "EURUSD=X"));
+        var gate = new org.home.data.eval.bench.Candidates.Sma200SlopeGate();
+        var sma = new org.home.data.eval.bench.Candidates.Sma200();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Гейт наклона SMA — задача A: экономика детектора (doc 21 §4.5)\n\n");
+        sb.append("Гейт `sma200_slope_gate` (N=30, порог 0.5·ATR90, фикс. в doc 21 §4.5) против чистого ")
+                .append("`baseline_sma200`. Прокси как в crossmarket, полные окна. `ratio`=ΔMaxDD/ΔCAGR к B&H (меньше=лучше; ")
+                .append("«—»=доминирование). **Критерий §4.5-A:** гейт лучше по ratio на **≥4/6** И нигде не хуже по абс. ")
+                .append("просадке >3 п.п.\n\n");
+        sb.append("| Рынок | Окно (eval) | гейт CAGR/MaxDD/ratio | sma200 CAGR/MaxDD/ratio | avg эксп гейт/sma | гейт лучше? |\n");
+        sb.append("|---|---|---|---|---|---|\n");
+
+        int gateBetter = 0, valid = 0;
+        boolean crit2ok = true;
+        for (Mkt mk : mkts) {
+            Ohlc o;
+            try {
+                o = fetchYahoo(mk.symbol());
+                Thread.sleep(400);
+            } catch (Exception e) {
+                sb.append(String.format("| %s | ошибка загрузки (%s) | | | | |%n", mk.name(), e.getClass().getSimpleName()));
+                continue;
+            }
+            if (o == null || o.close().length < 400) {
+                sb.append(String.format("| %s | мало данных | | | | |%n", mk.name()));
+                continue;
+            }
+            String[] g = gate.predict(o.high(), o.low(), o.close());
+            String[] s = sma.predict(o.high(), o.low(), o.close());
+            List<Integer> idxs = new ArrayList<>();
+            for (int i = 0; i < g.length; i++) {
+                if (g[i] != null && s[i] != null) {
+                    idxs.add(i);
+                }
+            }
+            if (idxs.size() < 200) {
+                sb.append(String.format("| %s | мало данных после прогрева | | | | |%n", mk.name()));
+                continue;
+            }
+            int m = idxs.size();
+            int[] ci = new int[m];
+            String[] gEv = new String[m], sEv = new String[m];
+            for (int t = 0; t < m; t++) {
+                ci[t] = idxs.get(t);
+                gEv[t] = g[idxs.get(t)];
+                sEv[t] = s[idxs.get(t)];
+            }
+            LocalDate a = LocalDate.parse(o.dates()[ci[0]]), b = LocalDate.parse(o.dates()[ci[m - 1]]);
+            double years = (b.toEpochDay() - a.toEpochDay()) / 365.25;
+            double[] gTarget = stateTargets(gEv), sTarget = stateTargets(sEv);
+            Metrics gm = metrics(sim(gTarget, noImmediate(m), o.close(), ci).curve(), 0, years);
+            Metrics sm = metrics(sim(sTarget, noImmediate(m), o.close(), ci).curve(), 0, years);
+            Metrics bh = buyHold(o.close(), ci, years);
+            boolean better = ratioScore(gm, bh) < ratioScore(sm, bh);
+            boolean lose3 = gm.maxdd() < sm.maxdd() - 0.03;
+            valid++;
+            if (better) {
+                gateBetter++;
+            }
+            if (lose3) {
+                crit2ok = false;
+            }
+            sb.append(String.format("| %s | %s … %s | %.1f%% / %.1f%% / %s | %.1f%% / %.1f%% / %s | %.0f%% / %.0f%% | %s%s |%n",
+                    mk.name(), o.dates()[ci[0]], o.dates()[ci[m - 1]],
+                    gm.cagr() * 100, gm.maxdd() * 100, fmtRatio(ratio(gm, bh)),
+                    sm.cagr() * 100, sm.maxdd() * 100, fmtRatio(ratio(sm, bh)),
+                    mean(gTarget) * 100, mean(sTarget) * 100, better ? "да" : "нет", lose3 ? " ⚠просадка" : ""));
+        }
+        boolean crit1 = gateBetter >= 4;
+        boolean pass = crit1 && crit2ok && valid == 6;
+        sb.append(String.format("%n**Критерий §4.5-A:** (1) гейт лучше по ratio на **%d/6** (нужно ≥4) — %s; ",
+                gateBetter, crit1 ? "✓" : "✗"));
+        sb.append(String.format("(2) нигде не хуже по просадке >3 п.п. — %s.%n%n", crit2ok ? "✓" : "✗"));
+        sb.append(pass ? "**Задача A: ПРОЙДЕНА** — гейт улучшает экономику детектора.\n"
+                : "**Задача A: НЕ ПРОЙДЕНА** (ожидалось, §4.3: граница выигрыша по издержкам ≈0.5 п.п.).\n");
+        writeFile(outPath, sb.toString());
+        log.info("slope-gate A: гейт лучше по ratio {}/6, crit2={}, ИТОГ {} -> {}",
+                gateBetter, crit2ok, pass ? "ПРОЙДЕНА" : "не пройдена", Path.of(outPath).toAbsolutePath());
+    }
+
+    /**
+     * Задача B (doc 21 §4.4/§4.5): даёт ли гейт наклона валидный RANGE для S3 (mean reversion).
+     * Тест не про метрики детектора: канонический S3 (z-score band, окно 20, вход ±1σ, выход
+     * к средней, издержки 0.10%) прогоняется отдельно на днях, помеченных гейтом как RANGE, и
+     * на днях BEAR. Критерий §4.5-B: S3 в RANGE (1) положителен после издержек И (2) лучше,
+     * чем в BEAR (главный пункт). Рынки — BTC и ETH (S3 крипто-стратегия). CLI: --report=slope-gate-b.
+     */
+    public void slopeGateB(String outPath) {
+        record Mkt(String name, String symbol) {}
+        List<Mkt> mkts = List.of(new Mkt("BTC", "BTC-USD"), new Mkt("ETH", "ETH-USD"));
+        var gate = new org.home.data.eval.bench.Candidates.Sma200SlopeGate();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Гейт наклона SMA — задача B: валиден ли RANGE для S3 (doc 21 §4.5)\n\n");
+        sb.append("**S3 в этом репозитории не реализован** — использую канонический mean reversion как прокси S3: ")
+                .append("z=(close−SMA20)/std20; вход LONG при z<−1, выход при z≥0; вход SHORT при z>+1, выход при z≤0; ")
+                .append("±1 позиция, издержки 0.10% с оборота. **Один и тот же S3** прогоняется на днях гейта RANGE и BEAR. ")
+                .append("Тест сравнительный → устойчив к выбору S3; абсолютный пункт (1) зависит от него.\n\n");
+        sb.append("**Критерий §4.5-B:** S3 в RANGE (1) положителен после издержек И (2) **лучше, чем в BEAR** (главный пункт).\n\n");
+        sb.append("| Рынок | RANGE: дней / S3 сред.дн (бп) / год | BEAR: дней / S3 сред.дн (бп) / год | (1) RANGE>0 | (2) RANGE>BEAR |\n");
+        sb.append("|---|---|---|---|---|\n");
+
+        int passBoth = 0, total = 0;
+        for (Mkt mk : mkts) {
+            Ohlc o;
+            try {
+                o = fetchYahoo(mk.symbol());
+                Thread.sleep(400);
+            } catch (Exception e) {
+                sb.append(String.format("| %s | ошибка загрузки (%s) | | | |%n", mk.name(), e.getClass().getSimpleName()));
+                continue;
+            }
+            if (o == null || o.close().length < 400) {
+                sb.append(String.format("| %s | мало данных | | | |%n", mk.name()));
+                continue;
+            }
+            String[] g = gate.predict(o.high(), o.low(), o.close());
+            int[] s3 = s3Signal(o.close());
+            double years = (LocalDate.parse(o.dates()[o.dates().length - 1]).toEpochDay()
+                    - LocalDate.parse(o.dates()[0]).toEpochDay()) / 365.25;
+            double[] rng = s3Gated(o.close(), g, s3, "RANGE");
+            double[] ber = s3Gated(o.close(), g, s3, "BEAR");
+            boolean c1 = rng[0] > 0;                 // RANGE mean daily net > 0
+            boolean c2 = rng[0] > ber[0];            // RANGE лучше BEAR
+            total++;
+            if (c1 && c2) {
+                passBoth++;
+            }
+            sb.append(String.format("| %s | %.0f / %+.2f / %+.1f%% | %.0f / %+.2f / %+.1f%% | %s | %s |%n",
+                    mk.name(), rng[2], rng[0] * 1e4, rng[1] * 100, ber[2], ber[0] * 1e4, ber[1] * 100,
+                    c1 ? "✓" : "✗", c2 ? "✓" : "✗"));
+        }
+        sb.append(String.format("%n**Критерий §4.5-B (главный — п.2):** оба условия выполнены на **%d/%d** рынков. ", passBoth, total));
+        sb.append(passBoth == total && total > 0
+                ? "**Задача B: ПРОЙДЕНА** — гейт даёт осмысленный RANGE для S3.\n"
+                : "**Задача B: НЕ ПРОЙДЕНА** — RANGE не отделяет пригодные для S3 условия от непригодных.\n");
+        sb.append("\nПояснение к столбцам: «сред.дн» — среднее дневное P&L S3 (в базисных пунктах) по дням соответствующего ")
+                .append("режима, после издержек; «год» — грубая аннуализация (сред.дн×365). Оговорка t07: 6.6 лет одного ")
+                .append("класса активов, значимость невелика — вес на сравнительном пункте (2), а не на абсолютном уровне.\n");
+        writeFile(outPath, sb.toString());
+        log.info("slope-gate B: оба критерия на {}/{} рынков -> {}", passBoth, total, Path.of(outPath).toAbsolutePath());
+    }
+
+    /** Канонический S3 mean reversion: сигнал −1/0/+1 по z-score band (окно 20, вход ±1σ, выход к средней). */
+    private static int[] s3Signal(double[] close) {
+        int n = close.length;
+        int win = 20;
+        int[] sig = new int[n];
+        int pos = 0;
+        for (int i = 0; i < n; i++) {
+            if (i < win) {
+                sig[i] = 0;
+                continue;
+            }
+            double sum = 0, sq = 0;
+            for (int j = i - win + 1; j <= i; j++) {
+                sum += close[j];
+                sq += close[j] * close[j];
+            }
+            double mean = sum / win, std = Math.sqrt(Math.max(sq / win - mean * mean, 0));
+            double z = std <= 0 ? 0 : (close[i] - mean) / std;
+            if (pos == 0) {
+                if (z < -1) {
+                    pos = 1;
+                } else if (z > 1) {
+                    pos = -1;
+                }
+            } else if (pos == 1 && z >= 0) {
+                pos = 0;
+            } else if (pos == -1 && z <= 0) {
+                pos = 0;
+            }
+            sig[i] = pos;
+        }
+        return sig;
+    }
+
+    /** S3, гейтированный к режиму target: {mean daily net, ann net (простая), regimeDays}. */
+    private static double[] s3Gated(double[] close, String[] gate, int[] signal, String target) {
+        int n = close.length;
+        double pos = 0, sumNet = 0;
+        int regimeDays = 0;
+        for (int i = 1; i < n; i++) {
+            double ret = close[i] / close[i - 1] - 1;
+            double pnl = pos * ret;                                  // позиция входит в день i по решению i−1
+            double desired = target.equals(gate[i]) ? signal[i] : 0; // сигнал дня i, гейт дня i (каузально)
+            double cost = COST * Math.abs(desired - pos);
+            pos = desired;
+            if (target.equals(gate[i])) {
+                sumNet += pnl - cost;
+                regimeDays++;
+            }
+        }
+        double meanDaily = regimeDays > 0 ? sumNet / regimeDays : 0;
+        return new double[]{meanDaily, meanDaily * 365, regimeDays};
+    }
+
+    private static double mean(double[] a) {
+        double s = 0;
+        for (double v : a) {
+            s += v;
+        }
+        return s / a.length;
+    }
+
+    /**
      * Кросс-рыночная проверка v3 (док. 15 §8): тот же детектор (оси D/T, те же пороги)
      * без изменений на ETH/SPY/золоте/нефти/EUR-USD. Критерий — эффект сохраняется по
      * знаку и порядку величины: просадка снижается, доходность частично теряется.
