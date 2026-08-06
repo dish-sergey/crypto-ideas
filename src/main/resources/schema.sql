@@ -186,6 +186,28 @@ CREATE TABLE IF NOT EXISTS regime_daily_v3 (
     PRIMARY KEY (day)
 );
 
+-- Детектор режима v5 (док. 01-detektor-rezhima-v5, 22 §A): финал — состояние по
+-- одному правилу close>SMA200 (BULL) иначе BEAR, без гистерезиса и dwell. Оси D/T/S
+-- и состояния RANGE/TRANSITION/CRASH удалены. Модификаторы сохранены, состояние не
+-- меняют. confidence — непроверенная эвристика, для размера капитала НЕ используется.
+-- stress_level — диагностический (флаг stress_level_is_diagnostic).
+CREATE TABLE IF NOT EXISTS regime_daily_v5 (
+    day                       TEXT    NOT NULL,   -- 'YYYY-MM-DD'
+    state                     TEXT,               -- BULL|BEAR
+    confidence                REAL,               -- непроверенная эвристика
+    dist_atr                  REAL,               -- (close − SMA200)/ATR90
+    cycle_phase               TEXT,               -- ACCUMULATION|EARLY|MID|LATE|EUPHORIA
+    macro_flag                INTEGER,            -- −1|0|+1
+    breadth                   REAL,               -- доля топ-100 > SMA200 ∈[0,1]
+    leverage_warning          INTEGER,            -- 0/1
+    stress_level              REAL,               -- диагностический ∈[0,1]
+    stress_level_is_diagnostic INTEGER,           -- всегда 1
+    days_in_state             INTEGER,            -- может быть 1 (гистерезиса нет)
+    sources_failed            INTEGER,
+    available_at              INTEGER NOT NULL,
+    PRIMARY KEY (day)
+);
+
 CREATE INDEX IF NOT EXISTS idx_candles_avail ON candles(available_at);
 CREATE INDEX IF NOT EXISTS idx_liq_symbol_ts ON liquidations(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_news_pub ON news_items(published_ts);

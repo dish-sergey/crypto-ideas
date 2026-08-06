@@ -8,6 +8,7 @@ import org.home.data.collectors.OnchainCollector;
 import org.home.data.detector.RegimeDetector;
 import org.home.data.detector.RegimeDetectorV2;
 import org.home.data.detector.RegimeDetectorV3;
+import org.home.data.detector.RegimeDetectorV5;
 import org.home.data.detector.RegimeReport;
 import org.home.data.eval.AllocationProxy;
 import org.home.data.eval.bench.Bench;
@@ -51,6 +52,7 @@ public class CliRunner implements ApplicationRunner {
     private final RegimeDetector detector;
     private final RegimeDetectorV2 detectorV2;
     private final RegimeDetectorV3 detectorV3;
+    private final RegimeDetectorV5 detectorV5;
     private final RegimeReport report;
     private final AllocationProxy allocationProxy;
     private final Bench bench;
@@ -62,6 +64,7 @@ public class CliRunner implements ApplicationRunner {
                      List<Collector> collectors, OhlcvCollector ohlcv, FundingCollector funding,
                      OnchainCollector onchain, OiArchiveImporter oiArchive,
                      RegimeDetector detector, RegimeDetectorV2 detectorV2, RegimeDetectorV3 detectorV3,
+                     RegimeDetectorV5 detectorV5,
                      RegimeReport report, AllocationProxy allocationProxy, Bench bench,
                      LiquidationWsCollector liquidations,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
@@ -76,6 +79,7 @@ public class CliRunner implements ApplicationRunner {
         this.detector = detector;
         this.detectorV2 = detectorV2;
         this.detectorV3 = detectorV3;
+        this.detectorV5 = detectorV5;
         this.report = report;
         this.allocationProxy = allocationProxy;
         this.bench = bench;
@@ -123,11 +127,13 @@ public class CliRunner implements ApplicationRunner {
                             allocationProxy.slopeGateA(firstOr(args, "out", "reports/slope_gate_a.md"));
                     case "slope-gate-b" ->
                             allocationProxy.slopeGateB(firstOr(args, "out", "reports/slope_gate_b.md"));
+                    case "s3-viability" ->
+                            allocationProxy.s3Viability(firstOr(args, "out", "reports/s3_viability.md"));
                     default -> throw new IllegalArgumentException(
                             "Неизвестный отчёт: " + target
                                     + " (regime | regime-v3 | regime-compare | crash-econ | crash-maxdd"
                                     + " | regime-econ | crossmarket | voltarget | bench | ensemble"
-                                    + " | slope-gate-a | slope-gate-b)");
+                                    + " | slope-gate-a | slope-gate-b | s3-viability)");
                 }
             }
         } catch (Exception e) {
@@ -184,9 +190,10 @@ public class CliRunner implements ApplicationRunner {
             case "regime" -> detector.backfill(firstOr(args, "from", "2020-01-01"));
             case "regime-v2" -> detectorV2.backfill(firstOr(args, "from", "2020-01-01"));
             case "regime-v3" -> detectorV3.backfill(firstOr(args, "from", "2020-01-01"));
+            case "regime-v5" -> detectorV5.backfill(firstOr(args, "from", "2020-01-01"));
             default -> throw new IllegalArgumentException(
                     "Неизвестная цель backfill: " + target
-                            + " (ohlcv | funding-okx | onchain | oi-archive | regime | regime-v2 | regime-v3)");
+                            + " (ohlcv | funding-okx | onchain | oi-archive | regime | regime-v2 | regime-v3 | regime-v5)");
         }
     }
 

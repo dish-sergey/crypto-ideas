@@ -954,6 +954,147 @@ public class AllocationProxy {
     }
 
     /**
+     * Блок C (doc 22): жизнеспособность S3. Тот же канонический mean reversion, что в
+     * slope_gate_b, но БЕЗ гейта — на полной истории BTC и ETH, три уровня издержек
+     * (0.10% / 0% / 0.02%) + распределение P&L по сделкам. Решение по прогону 0%: минус →
+     * S3 удаляется из пула (§C3). CLI: --report=s3-viability.
+     */
+    public void s3Viability(String outPath) {
+        record Mkt(String name, String symbol) {}
+        List<Mkt> mkts = List.of(new Mkt("BTC", "BTC-USD"), new Mkt("ETH", "ETH-USD"));
+        double[] costs = {0.001, 0.0, 0.0002};
+        String[] costLabels = {"0.10%", "0% (эталон идеи)", "0.02% (мейкер)"};
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Жизнеспособность S3 (doc 22 §C)\n\n");
+        sb.append("Канонический S3 (z=(close−SMA20)/std20; LONG при z<−1 выход z≥0; SHORT при z>+1 выход z≤0; ±1) ")
+                .append("**без гейта**, на полной истории. Три уровня издержек. **Решение (§C3): если прогон 0% в минусе — ")
+                .append("идея мертва по существу, S3 удаляется из пула (не приостанавливается).**\n\n");
+        sb.append("| Рынок | Издержки | CAGR | Sharpe | сделок | оборот/год |\n|---|---|---|---|---|---|\n");
+        boolean zeroCostNegAll = true;
+        boolean makerPosAny = false;
+        for (Mkt mk : mkts) {
+            Ohlc o;
+            try {
+                o = fetchYahoo(mk.symbol());
+                Thread.sleep(400);
+            } catch (Exception e) {
+                sb.append(String.format("| %s | ошибка загрузки (%s) | | | | |%n", mk.name(), e.getClass().getSimpleName()));
+                continue;
+            }
+            if (o == null || o.close().length < 400) {
+                sb.append(String.format("| %s | мало данных | | | | |%n", mk.name()));
+                continue;
+            }
+            int[] sig = s3Signal(o.close());
+            double years = (LocalDate.parse(o.dates()[o.dates().length - 1]).toEpochDay()
+                    - LocalDate.parse(o.dates()[0]).toEpochDay()) / 365.25;
+            for (int k = 0; k < costs.length; k++) {
+                double[] r = s3Full(o.close(), sig, costs[k], years);
+                sb.append(String.format("| %s | %s | %+.1f%% | %.2f | %.0f | %.1f |%n",
+                        mk.name(), costLabels[k], r[0] * 100, r[1], r[2], r[3]));
+                if (costs[k] == 0.0 && r[0] >= 0) {
+                    zeroCostNegAll = false;
+                }
+                if (costs[k] == 0.0002 && r[0] > 0) {
+                    makerPosAny = true;
+                }
+            }
+        }
+        // распределение P&L по сделкам (издержки 0.10%, эталон)
+        sb.append("\n## Распределение P&L по сделкам (издержки 0.10%)\n\n");
+        sb.append("| Рынок | сделок | медиана | доля прибыльных | худшие 5% (P05) | лучшая / худшая |\n|---|---|---|---|---|---|\n");
+        for (Mkt mk : mkts) {
+            Ohlc o;
+            try {
+                o = fetchYahoo(mk.symbol());
+                Thread.sleep(400);
+            } catch (Exception e) {
+                continue;
+            }
+            if (o == null || o.close().length < 400) {
+                continue;
+            }
+            int[] sig = s3Signal(o.close());
+            List<Double> tr = s3Trades(o.close(), sig, 0.001);
+            if (tr.isEmpty()) {
+                continue;
+            }
+            double[] a = tr.stream().mapToDouble(Double::doubleValue).sorted().toArray();
+            double median = a[a.length / 2];
+            long win = tr.stream().filter(x -> x > 0).count();
+            double p05 = a[(int) (a.length * 0.05)];
+            sb.append(String.format("| %s | %d | %+.2f%% | %.0f%% | %+.2f%% | %+.1f%% / %+.1f%% |%n",
+                    mk.name(), a.length, median * 100, 100.0 * win / a.length, p05 * 100,
+                    a[a.length - 1] * 100, a[0] * 100));
+        }
+        sb.append("\nЕсли убыток сосредоточен в редких крупных потерях (P05 сильно отрицателен, медиана около нуля) — ")
+                .append("это профиль проданного опциона, и средние вводят в заблуждение (§C2).\n\n");
+
+        sb.append("## Решение (§C3)\n\n");
+        String verdict;
+        if (zeroCostNegAll) {
+            verdict = "Прогон 0% издержек в минусе на всех рынках → **идея мертва по существу. S3 УДАЛЯЕТСЯ из пула** "
+                    + "(не приостанавливается). Дневной fade проигрывает momentum даже без издержек.";
+        } else if (!makerPosAny) {
+            verdict = "0% в плюсе, но 0.02% (мейкер) в минусе → **мертва по исполнению**: переписывать под лимитные "
+                    + "ордера либо закрывать.";
+        } else {
+            verdict = "0% и 0.02% в плюсе → **стратегия жива, нужен гейт** — вопрос возвращается открытым.";
+        }
+        sb.append(verdict).append("\n");
+        writeFile(outPath, sb.toString());
+        log.info("s3-viability: 0%-издержки минус везде={} -> {}", zeroCostNegAll, Path.of(outPath).toAbsolutePath());
+    }
+
+    /** Полный S3 (без гейта), дневная модель издержек: {CAGR, Sharpe, trades, turnover/год}. */
+    private static double[] s3Full(double[] close, int[] signal, double cost, double years) {
+        int n = close.length;
+        double eq = 1, pos = 0, turnover = 0;
+        int trades = 0;
+        double sum = 0, sq = 0;
+        int cnt = 0;
+        for (int i = 1; i < n; i++) {
+            double ret = close[i] / close[i - 1] - 1;
+            double dayPnl = pos * ret;
+            double desired = signal[i];
+            double c = cost * Math.abs(desired - pos);
+            if (pos == 0 && desired != 0) {
+                trades++;
+            }
+            turnover += Math.abs(desired - pos);
+            double net = dayPnl - c;
+            eq *= 1 + net;
+            sum += net;
+            sq += net * net;
+            cnt++;
+            pos = desired;
+        }
+        double cagr = Math.pow(Math.max(eq, 1e-9), 1.0 / years) - 1;
+        double m = sum / cnt, std = Math.sqrt(Math.max(sq / cnt - m * m, 0));
+        double sharpe = std <= 0 ? 0 : m / std * Math.sqrt(365);
+        return new double[]{cagr, sharpe, trades, turnover / years};
+    }
+
+    /** Чистая доходность по каждой сделке S3 (вход 0→±1 до выхода ±1→0), за вычетом издержек входа+выхода. */
+    private static List<Double> s3Trades(double[] close, int[] signal, double cost) {
+        List<Double> out = new ArrayList<>();
+        double pos = 0;
+        int entry = -1;
+        for (int i = 0; i < close.length; i++) {
+            double desired = signal[i];
+            if (pos == 0 && desired != 0) {
+                entry = i;
+            } else if (pos != 0 && desired == 0 && entry >= 0) {
+                out.add(pos * (close[i] / close[entry] - 1) - 2 * cost);
+                entry = -1;
+            }
+            pos = desired;
+        }
+        return out;
+    }
+
+    /**
      * Кросс-рыночная проверка v3 (док. 15 §8): тот же детектор (оси D/T, те же пороги)
      * без изменений на ETH/SPY/золоте/нефти/EUR-USD. Критерий — эффект сохраняется по
      * знаку и порядку величины: просадка снижается, доходность частично теряется.
