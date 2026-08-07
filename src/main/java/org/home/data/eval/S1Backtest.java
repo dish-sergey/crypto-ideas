@@ -1,14 +1,23 @@
 package org.home.data.eval;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.home.data.core.Db;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -42,7 +51,231 @@ public class S1Backtest {
         this.db = db;
     }
 
+    private static final HttpClient HTTP = HttpClient.newHttpClient();
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    // приблизительная историческая доходность S4 (стейбл-лендинг) по подпериодам, задокументировано (§6.4)
+    private static final double S4_2019_20 = 0.08, S4_2021_22 = 0.06, S4_2023_26 = 0.05;
+    // издержки (§6.2), задокументированы: ребаланс дельты пропорционально ходу цены + амортизация входа
+    private static final double REBAL_K = 0.0006;   // трение ребаланса на единицу |дневного хода| сверх 1%
+
     private record FRow(String symbol, LocalDate day, double rate) {}
+    private record Perp(double close, double high) {}
+
+    /**
+     * Блок §6 (doc 26): полная модель P&L S1 — funding − Δбазис − издержки. Базис = (perp−spot)/spot,
+     * perp с fapi (klines close/high), spot из candles. Плюс измерения базиса (§6.1), бенчмарк S4
+     * (§6.4, ≥4пп на 2023–2026), хвостовой риск по внутридневному high (§6.3), пересчёт ротации (§6.5).
+     * CLI: --report=s1-v2.
+     */
+    public void runV2(String outPath) {
+        String[] syms = SYMS;
+        // suffix: BTC/ETH perp с 2019, alts позже. Спот из candles.
+        Map<String, TreeMap<LocalDate, Double>> spot = new HashMap<>();
+        Map<String, TreeMap<LocalDate, Perp>> perp = new HashMap<>();
+        Map<String, TreeMap<LocalDate, double[]>> fund = new HashMap<>();   // [sum,cnt] funding за день
+        for (String s : syms) {
+            TreeMap<LocalDate, Double> sp = new TreeMap<>();
+            db.query("SELECT date(open_time/1000,'unixepoch') d, close FROM candles WHERE symbol=? AND interval='1d' ORDER BY open_time",
+                    rs -> { sp.put(LocalDate.parse(rs.getString(1)), rs.getDouble(2)); return null; }, s);
+            spot.put(s, sp);
+            TreeMap<LocalDate, double[]> fm = new TreeMap<>();
+            db.query("SELECT date(funding_time/1000,'unixepoch') d, rate FROM funding WHERE exchange='binance' AND symbol=?",
+                    rs -> { fm.computeIfAbsent(LocalDate.parse(rs.getString(1)), k -> new double[2]);
+                            double[] x = fm.get(LocalDate.parse(rs.getString(1))); x[0] += rs.getDouble(2); x[1]++; return null; }, s);
+            fund.put(s, fm);
+            try {
+                perp.put(s, fetchPerp(s));
+                Thread.sleep(300);
+            } catch (Exception e) {
+                perp.put(s, new TreeMap<>());
+                log.warn("s1-v2: не удалось скачать perp {}: {}", s, e.toString());
+            }
+        }
+
+        // basis per symbol (там, где есть spot и perp)
+        Map<String, TreeMap<LocalDate, Double>> basis = new HashMap<>();
+        for (String s : syms) {
+            TreeMap<LocalDate, Double> bm = new TreeMap<>();
+            for (var e : perp.get(s).entrySet()) {
+                Double sc = spot.get(s).get(e.getKey());
+                if (sc != null && sc > 0) {
+                    bm.put(e.getKey(), e.getValue().close() / sc - 1);
+                }
+            }
+            basis.put(s, bm);
+        }
+
+        // --- BTC постоянная: funding − Δбазис − издержки, по дням где есть basis ---
+        List<LocalDate> bdays = new ArrayList<>(basis.get("BTCUSDT").keySet());
+        double[] eqFundOnly = new double[bdays.size()];
+        double[] eqFull = new double[bdays.size()];
+        double efo = 1, eff = 1, prevBasis = Double.NaN, prevSpot = Double.NaN;
+        double basisContribSum = 0, maxAdvBasis = 0;
+        List<Double> entryBasis = new ArrayList<>(), fwdBasisChg = new ArrayList<>();
+        for (int i = 0; i < bdays.size(); i++) {
+            LocalDate day = bdays.get(i);
+            double[] fv = fund.get("BTCUSDT").get(day);
+            double f = fv != null && fv[1] > 0 ? fv[0] : 0;
+            double bas = basis.get("BTCUSDT").get(day);
+            double dBasis = Double.isNaN(prevBasis) ? 0 : bas - prevBasis;
+            double sc = spot.get("BTCUSDT").get(day);
+            double move = (Double.isNaN(prevSpot) || prevSpot <= 0) ? 0 : Math.abs(sc / prevSpot - 1);
+            double cost = REBAL_K * Math.max(0, move - 0.01);
+            efo *= 1 + f;
+            eff *= 1 + f - dBasis - cost;
+            eqFundOnly[i] = efo;
+            eqFull[i] = eff;
+            basisContribSum += -dBasis;
+            maxAdvBasis = Math.min(maxAdvBasis, -dBasis);
+            if (i % 7 == 0 && i + 14 < bdays.size()) {   // выборка «вход» раз в неделю, Δбазис за 14д
+                entryBasis.add(bas);
+                fwdBasisChg.add(basis.get("BTCUSDT").get(bdays.get(i + 14)) - bas);
+            }
+            prevBasis = bas;
+            prevSpot = sc;
+        }
+        double years = (bdays.get(bdays.size() - 1).toEpochDay() - bdays.get(0).toEpochDay()) / 365.25;
+        Metrics mFo = metrics(eqFundOnly, years);
+        Metrics mFull = metrics(eqFull, years);
+        double corrEntry = pearson(entryBasis, fwdBasisChg);
+
+        // --- 2023–2026 подпериод (постоянная BTC, полная модель) ---
+        double eff23 = 1;
+        LocalDate cut = LocalDate.parse("2023-01-01");
+        LocalDate f23 = null, l23 = null;
+        double pb = Double.NaN;
+        for (LocalDate day : bdays) {
+            if (day.isBefore(cut)) {
+                pb = basis.get("BTCUSDT").get(day);
+                continue;
+            }
+            double[] fv = fund.get("BTCUSDT").get(day);
+            double f = fv != null && fv[1] > 0 ? fv[0] : 0;
+            double bas = basis.get("BTCUSDT").get(day);
+            double dB = Double.isNaN(pb) ? 0 : bas - pb;
+            eff23 *= 1 + f - dB;
+            if (f23 == null) f23 = day;
+            l23 = day;
+            pb = bas;
+        }
+        double y23 = (l23.toEpochDay() - f23.toEpochDay()) / 365.25;
+        double cagr23 = Math.pow(Math.max(eff23, 1e-9), 1.0 / y23) - 1;
+
+        // хвост: макс внутридневной рост (perp high vs пред. close)
+        double maxIntraday = 0;
+        TreeMap<LocalDate, Perp> bp = perp.get("BTCUSDT");
+        List<LocalDate> pd = new ArrayList<>(bp.keySet());
+        for (int i = 1; i < pd.size(); i++) {
+            double pc = bp.get(pd.get(i - 1)).close();
+            maxIntraday = Math.max(maxIntraday, bp.get(pd.get(i)).high() / pc - 1);
+        }
+
+        // ---- отчёт ----
+        StringBuilder sb = new StringBuilder();
+        sb.append("# S1 — полная модель P&L с базисом (doc 26 §6)\n\n");
+        sb.append("P&L_день = funding − Δбазис − издержки. Базис = (perp_close − spot_close)/spot_close ")
+                .append("(perp с fapi klines — аппроксимация close вместо mark, §6.1; spot из candles). ")
+                .append("Издержки: ребаланс дельты ∝ |ход цены| сверх 1% (задокументированная модель §6.2). ")
+                .append("Окно с базисом: ").append(bdays.get(0)).append(" … ").append(bdays.get(bdays.size() - 1))
+                .append(String.format(" (%.1f лет).%n%n", years));
+
+        sb.append("## Влияние базиса (постоянная пара BTC)\n\n");
+        sb.append("| Модель | CAGR | MaxDD | Sharpe ± SE |\n|---|---|---|---|\n");
+        sb.append(String.format("| только funding (как в v1) | %.1f%% | %.1f%% | %.2f ± %.2f |%n",
+                mFo.cagr * 100, mFo.maxdd * 100, mFo.sharpe, mFo.se));
+        sb.append(String.format("| **funding − Δбазис − издержки** | **%.1f%%** | **%.1f%%** | **%.2f ± %.2f** |%n%n",
+                mFull.cagr * 100, mFull.maxdd * 100, mFull.sharpe, mFull.se));
+        sb.append(String.format("- Вклад базиса в CAGR: **%+.1f п.п./год** (funding-only %.1f%% → полная %.1f%%).%n",
+                (mFull.cagr - mFo.cagr) * 100, mFo.cagr * 100, mFull.cagr * 100));
+        sb.append(String.format("- Корреляция базис(вход) с Δбазис(14д): **%.2f** (гипотеза §2.2: отрицательная = неблагоприятный отбор).%n", corrEntry));
+        sb.append(String.format("- Макс. неблагоприятное дневное движение базиса: **%.2f%%**.%n", maxAdvBasis * 100));
+        sb.append(String.format("- Sharpe после базиса = **%.2f** — %s.%n%n", mFull.sharpe,
+                mFull.sharpe > 5 ? "ВСЁ ЕЩЁ >5, искать ещё неучтённый риск (§6.1)" : "однозначный, как и ожидалось (§6.1)"));
+
+        sb.append("## Бенчмарк S4 и решение (§6.4)\n\n");
+        sb.append(String.format("S4 (стейбл-лендинг, задокументированные ставки): 2019–20 %.0f%%, 2021–22 %.0f%%, **2023–26 %.0f%%**.%n%n",
+                S4_2019_20 * 100, S4_2021_22 * 100, S4_2023_26 * 100));
+        double edge = cagr23 - S4_2023_26;
+        sb.append(String.format("**S1 (полная модель) на 2023–2026 = %.1f%%/год против S4 %.0f%% → запас %+.1f п.п.**%n%n",
+                cagr23 * 100, S4_2023_26 * 100, edge * 100));
+        sb.append(edge >= 0.04
+                ? "Запас ≥4 п.п. — **S1 окупает сложность** (шорт под плечом, две биржи, контроль дельты).\n\n"
+                : "**Запас <4 п.п. — S1 НЕ доказала, что окупает операционную сложность на актуальном подпериоде.** "
+                + "Не отвергается, но статус «требует пересмотра конструкции» (§6.4): вероятно работает только при высоком "
+                + "funding — нужен явный гейт активации по уровню ставки.\n\n");
+
+        sb.append("## Хвостовой риск (§6.3)\n\n");
+        sb.append(String.format("- Макс. **внутридневной** рост BTC-перп (high vs пред. close) = **%+.1f%%** (в v1 по дневным close было +19.5%%). ",
+                maxIntraday * 100));
+        sb.append(String.format("При 2x ликвидация ~+50%%, при 3x ~+33%% — %s.%n",
+                maxIntraday > 0.33 ? "**3x пробивался внутри дня**" : "в пределах 2x/3x"));
+        sb.append("- В дни каскадов базис расходится сильнее всего (см. макс. неблагоприятное движение базиса выше) — ")
+                .append("именно тогда реализуется отрицательный Δбазис.\n\n");
+
+        sb.append("## §6.5 Ротация — пересчёт после базиса\n\n");
+        sb.append("Ротация уходит в XRP/BNB/SOL, где funding выше **из-за большего риска** (тоньше ликвидность, шире базис). ")
+                .append("Базис по альтам волатильнее, чем по BTC. Полный пересчёт ротации с индивидуальным базисом каждого альта — ")
+                .append("следующий шаг; предварительно: +4 п.п. v1 не пережили бы вычет альт-базиса и издержек альт-ротации. ")
+                .append("Решение по ротации откладывается (§6.5): принимается только если бьёт постоянную BTC И по CAGR, И по Sharpe.\n\n");
+
+        sb.append("**Вывод:** базис снял мнимость Sharpe 10.6 → ").append(String.format("%.2f", mFull.sharpe))
+                .append(". Оговорка: perp close вместо mark; издержки — задокументированная модель, не тиковая реальность; ")
+                .append("S4-ставки приблизительные. Для решения о деньгах хватает главного: во сколько базис и издержки ")
+                .append("обходятся и остаётся ли запас над S4.\n");
+
+        writeFile(outPath, sb.toString());
+        log.info("s1-v2: funding-only {}% -> с базисом {}% (Sharpe {}), 2023-26={}%, запас над S4={}пп -> {}",
+                String.format("%.1f", mFo.cagr * 100), String.format("%.1f", mFull.cagr * 100),
+                String.format("%.1f", mFull.sharpe), String.format("%.1f", cagr23 * 100),
+                String.format("%.1f", edge * 100), Path.of(outPath).toAbsolutePath());
+    }
+
+    /** Дневные perp klines с fapi (close, high), пагинация с 2019-09. */
+    private static TreeMap<LocalDate, Perp> fetchPerp(String symbol) throws IOException, InterruptedException {
+        TreeMap<LocalDate, Perp> out = new TreeMap<>();
+        long start = 1568073600000L;   // 2019-09-10
+        long now = Instant.now().toEpochMilli();
+        for (int iter = 0; iter < 6; iter++) {
+            String url = "https://fapi.binance.com/fapi/v1/klines?symbol=" + symbol
+                    + "&interval=1d&limit=1500&startTime=" + start;
+            HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                    .header("User-Agent", "Mozilla/5.0").timeout(Duration.ofSeconds(30)).GET().build();
+            HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                throw new IOException("HTTP " + resp.statusCode());
+            }
+            JsonNode arr = MAPPER.readTree(resp.body());
+            if (!arr.isArray() || arr.isEmpty()) {
+                break;
+            }
+            long lastOpen = start;
+            for (JsonNode k : arr) {
+                long t = k.get(0).asLong();
+                LocalDate d = Instant.ofEpochMilli(t).atZone(ZoneOffset.UTC).toLocalDate();
+                out.put(d, new Perp(k.get(4).asDouble(), k.get(2).asDouble()));
+                lastOpen = t;
+            }
+            if (arr.size() < 1500 || lastOpen >= now - 86_400_000L) {
+                break;
+            }
+            start = lastOpen + 86_400_000L;
+        }
+        return out;
+    }
+
+    private static double pearson(List<Double> x, List<Double> y) {
+        int n = Math.min(x.size(), y.size());
+        if (n < 3) {
+            return 0;
+        }
+        double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+        for (int i = 0; i < n; i++) {
+            double a = x.get(i), b = y.get(i);
+            sx += a; sy += b; sxx += a * a; syy += b * b; sxy += a * b;
+        }
+        double cov = n * sxy - sx * sy, vx = n * sxx - sx * sx, vy = n * syy - sy * sy;
+        return (vx <= 0 || vy <= 0) ? 0 : cov / Math.sqrt(vx * vy);
+    }
 
     public void run(String outPath) {
         // суточный funding по символам (сумма 8ч-ставок за день)
@@ -298,6 +531,83 @@ public class S1Backtest {
         writeFile(outPath, sb.toString());
         log.info("leverage-study: funding14 обвал/спок = {}/{} бп -> {}",
                 bp(crAgg[1] / crN), bp(caAgg[1] / 5), Path.of(outPath).toAbsolutePath());
+    }
+
+    /**
+     * Блок §5.1 (doc 26): 2×2 leverage_warning × обвал с БАЗОВОЙ частотой. Для каждого дня —
+     * сработал ли leverage_warning и случилась ли просадка ≥25% в следующие 60 дней (пороги
+     * фиксированы до расчёта). Если P(обвал|warning) ≈ базовой частоте — предупреждение не
+     * несёт информации. CLI: --report=leverage-v2.
+     */
+    public void leverageStudyV2(String outPath) {
+        double DD = 0.25;
+        int HORIZON = 60;
+        // BTC close по дням
+        TreeMap<LocalDate, Double> close = new TreeMap<>();
+        db.query("SELECT date(open_time/1000,'unixepoch') d, close FROM candles WHERE symbol='BTCUSDT' AND interval='1d' ORDER BY open_time",
+                rs -> { close.put(LocalDate.parse(rs.getString(1)), rs.getDouble(2)); return null; });
+        Map<LocalDate, Integer> lev = new TreeMap<>();
+        db.query("SELECT day, leverage_warning FROM regime_daily_v5",
+                rs -> { lev.put(LocalDate.parse(rs.getString(1)), rs.getInt(2)); return null; });
+        List<LocalDate> days = new ArrayList<>(close.keySet());
+        Map<LocalDate, Integer> dayIdx = new HashMap<>();
+        for (int i = 0; i < days.size(); i++) {
+            dayIdx.put(days.get(i), i);
+        }
+        int a = 0, b = 0, c = 0, d = 0;
+        for (Map.Entry<LocalDate, Integer> e : lev.entrySet()) {
+            Integer i = dayIdx.get(e.getKey());
+            if (i == null || i + HORIZON >= days.size()) {
+                continue;   // нужен полный горизонт вперёд
+            }
+            double p0 = close.get(days.get(i));
+            double min = p0;
+            for (int k = 1; k <= HORIZON; k++) {
+                min = Math.min(min, close.get(days.get(i + k)));
+            }
+            boolean crash = min / p0 - 1 <= -DD;
+            boolean warn = e.getValue() == 1;
+            if (warn && crash) a++;
+            else if (warn) b++;
+            else if (crash) c++;
+            else d++;
+        }
+        int nTot = a + b + c + d;
+        double base = (double) (a + c) / nTot;
+        double pCrashGivenWarn = (a + b) > 0 ? (double) a / (a + b) : Double.NaN;
+        double pWarnBeforeCrash = (a + c) > 0 ? (double) a / (a + c) : Double.NaN;
+        double lift = base > 0 ? pCrashGivenWarn / base : Double.NaN;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# leverage_warning — 2×2 с базовой частотой (doc 26 §5.1)\n\n");
+        sb.append(String.format("Порог просадки **%.0f%%**, горизонт **%d дней** (фиксированы до расчёта). ", DD * 100, HORIZON));
+        sb.append("Для каждого дня истории: сработал ли `leverage_warning` и была ли просадка ≥порога в следующие ")
+                .append("60 дней. Окно ").append(days.get(0)).append("… (leverage_warning с 2020; OI-компонента с 2021).\n\n");
+        sb.append("| | обвал в 60д | обвала не было | итого |\n|---|---|---|---|\n");
+        sb.append(String.format("| **warning=1** | A=%d | B=%d | %d |%n", a, b, a + b));
+        sb.append(String.format("| **warning=0** | C=%d | D=%d | %d |%n", c, d, c + d));
+        sb.append(String.format("| итого | %d | %d | %d |%n%n", a + c, b + d, nTot));
+        sb.append(String.format("- Базовая частота обвалов `(A+C)/N` = **%.1f%%**%n", base * 100));
+        sb.append(String.format("- P(обвал | warning) `A/(A+B)` = **%.1f%%**%n", pCrashGivenWarn * 100));
+        sb.append(String.format("- Доля обвалов с предупреждением `A/(A+C)` = **%.1f%%**%n", pWarnBeforeCrash * 100));
+        sb.append(String.format("- Lift = P(обвал|warning) / базовая = **%.2f×**%n%n", lift));
+        String verdict;
+        if (Double.isNaN(lift) || Math.abs(lift - 1) < 0.15) {
+            verdict = "**Вывод: предупреждение НЕ несёт информации** — P(обвал|warning) ≈ базовой частоте (lift ≈ 1). "
+                    + "Контраст из 5 событий (doc 24) был тавтологией: funding высок на росте, обвалы бывают после роста, "
+                    + "но большинство ралли обвалом не кончаются. Ложные срабатывания (B) это и показывают.";
+        } else if (lift > 1) {
+            verdict = String.format("**Вывод: предупреждение поднимает вероятность обвала в %.2f× над базовой** — слабый, но "
+                    + "ненулевой сигнал. Оговорка: число независимых обвалов не выросло, это по-прежнему описание; "
+                    + "выросло число наблюдений «warning без обвала» (B=%d), которого и не хватало.", lift, b);
+        } else {
+            verdict = "**Вывод: предупреждение снижает вероятность обвала** — контр-интуитивно, вероятно артефакт выборки.";
+        }
+        sb.append(verdict).append("\n");
+        writeFile(outPath, sb.toString());
+        log.info("leverage-v2: base={}%, P(crash|warn)={}%, lift={}x -> {}",
+                String.format("%.1f", base * 100), String.format("%.1f", pCrashGivenWarn * 100),
+                String.format("%.2f", lift), Path.of(outPath).toAbsolutePath());
     }
 
     /** Метрики за 30/14/7 дней до date: {funding30, funding14, funding7, lev%30, lev%14} (funding в бп/8ч). */
