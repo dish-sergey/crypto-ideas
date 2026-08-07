@@ -230,6 +230,151 @@ public class S1Backtest {
                 String.format("%.1f", edge * 100), Path.of(outPath).toAbsolutePath());
     }
 
+    /**
+     * Блок §6 (doc 27): проверка гейта активации S1. Если EMA7(средней 8ч-ставки funding_BTC)
+     * ≥ порога — S1 активна (funding − Δбазис − издержки, плечо ≤2x), иначе капитал в S4
+     * (стейбл-лендинг по историческим ставкам). Порог ЗАФИКСИРОВАН §6.2 = 0.010%/8ч, одна
+     * попытка. Критерий §6.4 (все три): CAGR23-26 − S4 ≥4пп И доля активной ≥30% И издержки
+     * переключений ≤20% прироста. Иначе Вариант Б. CLI: --report=s1-gate.
+     */
+    public void gateTest(String outPath) {
+        double THRESH = 0.0001;        // 0.010% за 8ч (§6.2), не подбирается
+        double SWITCH = 0.001;         // 2 ноги на вход или выход (0.1%)
+        // funding BTC (сумма+cnt за день) + basis BTC
+        TreeMap<LocalDate, double[]> fm = new TreeMap<>();
+        db.query("SELECT date(funding_time/1000,'unixepoch') d, rate FROM funding WHERE exchange='binance' AND symbol='BTCUSDT'",
+                rs -> { fm.computeIfAbsent(LocalDate.parse(rs.getString(1)), k -> new double[2]);
+                        double[] x = fm.get(LocalDate.parse(rs.getString(1))); x[0] += rs.getDouble(2); x[1]++; return null; });
+        TreeMap<LocalDate, Double> spot = new TreeMap<>();
+        db.query("SELECT date(open_time/1000,'unixepoch') d, close FROM candles WHERE symbol='BTCUSDT' AND interval='1d' ORDER BY open_time",
+                rs -> { spot.put(LocalDate.parse(rs.getString(1)), rs.getDouble(2)); return null; });
+        TreeMap<LocalDate, Perp> pp;
+        try {
+            pp = fetchPerp("BTCUSDT");
+        } catch (Exception e) {
+            log.warn("s1-gate: не удалось скачать perp BTC: {}", e.toString());
+            return;
+        }
+        TreeMap<LocalDate, Double> basis = new TreeMap<>();
+        for (var e : pp.entrySet()) {
+            Double sc = spot.get(e.getKey());
+            if (sc != null && sc > 0) {
+                basis.put(e.getKey(), e.getValue().close() / sc - 1);
+            }
+        }
+        // EMA7 средней 8ч-ставки
+        List<LocalDate> days = new ArrayList<>(fm.keySet());
+        TreeMap<LocalDate, Double> ema = new TreeMap<>();
+        double e = Double.NaN, k = 2.0 / (7 + 1);
+        for (LocalDate d : days) {
+            double[] fv = fm.get(d);
+            double avg = fv[1] > 0 ? fv[0] / fv[1] : 0;
+            e = Double.isNaN(e) ? avg : e + k * (avg - e);
+            ema.put(d, e);
+        }
+
+        // прогон на 2023-2026 (окно критерия §6.4), полная модель + гейт
+        LocalDate cut = LocalDate.parse("2023-01-01");
+        double s4Daily = Math.pow(1 + S4_2023_26, 1.0 / 365) - 1;
+        double eqGate = 1, eqS4 = 1;
+        double prevBasis = Double.NaN;
+        boolean active = false;
+        int activeDays = 0, total = 0, switches = 0;
+        double switchCost = 0;
+        LocalDate first = null, last = null;
+        double[] curve = null;
+        List<Double> rets = new ArrayList<>();
+        for (LocalDate d : days) {
+            if (d.isBefore(cut) || !basis.containsKey(d)) {
+                if (basis.containsKey(d)) {
+                    prevBasis = basis.get(d);
+                }
+                continue;
+            }
+            boolean want = ema.get(d) >= THRESH;
+            if (want != active) {
+                switches++;
+                switchCost += SWITCH;
+                eqGate *= 1 - SWITCH;
+            }
+            active = want;
+            double ret;
+            if (active) {
+                double[] fv = fm.get(d);
+                double f = fv[1] > 0 ? fv[0] : 0;
+                double bas = basis.get(d);
+                double dB = Double.isNaN(prevBasis) ? 0 : bas - prevBasis;
+                ret = f - dB;
+                activeDays++;
+            } else {
+                ret = s4Daily;
+            }
+            eqGate *= 1 + ret;
+            eqS4 *= 1 + s4Daily;
+            rets.add(ret);
+            prevBasis = basis.get(d);
+            total++;
+            if (first == null) {
+                first = d;
+            }
+            last = d;
+        }
+        double years = (last.toEpochDay() - first.toEpochDay()) / 365.25;
+        double cagrGate = Math.pow(Math.max(eqGate, 1e-9), 1.0 / years) - 1;
+        double cagrS4 = Math.pow(eqS4, 1.0 / years) - 1;
+        double edge = cagrGate - cagrS4;
+        double activeFrac = (double) activeDays / total;
+        double switchShare = edge > 0 ? switchCost / years / edge : Double.NaN;
+        double mean = rets.stream().mapToDouble(x -> x).average().orElse(0);
+        double var = rets.stream().mapToDouble(x -> (x - mean) * (x - mean)).average().orElse(0);
+        double sharpe = var <= 0 ? 0 : mean / Math.sqrt(var) * Math.sqrt(365);
+
+        boolean c1 = edge >= 0.04, c2 = activeFrac >= 0.30, c3 = !Double.isNaN(switchShare) && switchShare <= 0.20;
+        boolean varА = c1 && c2 && c3;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("# S1 — гейт активации: последняя проверка конструкции (doc 27 §6)\n\n");
+        String hdr = "Гейт: EMA7(средней 8ч-ставки funding_BTC) ≥ **%.3f%%/8ч** → S1 активна (плечо ≤2x, полная модель "
+                + "funding − Δбазис − издержки), иначе капитал в **S4** (%.0f%%/год). Порог фиксирован §6.2, не подбирался. "
+                + "Окно критерия %s … %s (%.1f лет). Перп с fapi (close-аппрокс).%n%n";
+        sb.append(String.format(hdr, THRESH * 100, S4_2023_26 * 100, first, last, years));
+
+        sb.append("| Метрика | Значение | Порог §6.4 | ✓/✗ |\n|---|---|---|---|\n");
+        sb.append(String.format("| CAGR с гейтом (2023-26) | %.1f%% | — | |%n", cagrGate * 100));
+        sb.append(String.format("| S4 (тот же период) | %.1f%% | — | |%n", cagrS4 * 100));
+        sb.append(String.format("| **Запас над S4** | **%+.1f п.п.** | ≥ 4.0 | %s |%n", edge * 100, c1 ? "✓" : "✗"));
+        sb.append(String.format("| **Доля времени активна S1** | **%.0f%%** | ≥ 30%% | %s |%n", activeFrac * 100, c2 ? "✓" : "✗"));
+        sb.append(String.format("| **Издержки переключений / прирост** | **%s** | ≤ 20%% | %s |%n",
+                Double.isNaN(switchShare) ? "н/д (нет прироста)" : String.format("%.0f%%", switchShare * 100), c3 ? "✓" : "✗"));
+        sb.append(String.format("| Переключений/год | %.1f | — | |%n", switches / years));
+        sb.append(String.format("| Sharpe | %.2f | «>5 искать дальше» | %s |%n%n", sharpe, sharpe > 5 ? "⚠>5" : "ок"));
+
+        sb.append("## Вывод (§6.4)\n\n");
+        if (varА) {
+            sb.append("**Все три критерия выполнены → ВАРИАНТ А:** гейт окупает сложность, S1 принимается как ")
+                    .append("оппортунистическая надстройка над S4 (не постоянное ядро). Это изменение архитектуры (00 §3) — принять явно.\n");
+        } else {
+            sb.append("**Критерий НЕ выполнен (");
+            List<String> fails = new ArrayList<>();
+            if (!c1) fails.add(String.format("запас %+.1fпп < 4пп", edge * 100));
+            if (!c2) fails.add(String.format("активна %.0f%% < 30%%", activeFrac * 100));
+            if (!c3) fails.add("издержки переключений > 20% прироста");
+            sb.append(String.join("; ", fails)).append(") → ВАРИАНТ Б (§5, §9):** ");
+            sb.append("гейт активации не спасает. **S1 исключается из постоянной архитектуры, ядром становится S4.** ")
+                    .append("При розничном размере капитала постоянного нейтрального дохода с приемлемым доход/сложность не нашлось; ")
+                    .append("доступны S4 + событийные (S5 разлоки, S7 panic-fade) + направленная премия (S2/S9). ")
+                    .append("Согласуется с ожиданием §6.5 (записано до прогона: гейт не пройдёт — funding>порога в осн. 2019-22).\n");
+        }
+        sb.append("\n_Оговорки: perp close вместо mark (занижает хвост и Δбазис в стрессе, §3.1); все три недоучёта работают ")
+                .append("против S1 — уточнение сделает вывод жёстче, не мягче. Плечо 3x запрещено (§2: внутридневной +36.2% > ликвидации 3x).\n");
+
+        writeFile(outPath, sb.toString());
+        log.info("s1-gate: CAGR={}%, S4={}%, запас={}пп, активна={}%, Вариант {} -> {}",
+                String.format("%.1f", cagrGate * 100), String.format("%.1f", cagrS4 * 100),
+                String.format("%.1f", edge * 100), String.format("%.0f", activeFrac * 100),
+                varА ? "А" : "Б", Path.of(outPath).toAbsolutePath());
+    }
+
     /** Дневные perp klines с fapi (close, high), пагинация с 2019-09. */
     private static TreeMap<LocalDate, Perp> fetchPerp(String symbol) throws IOException, InterruptedException {
         TreeMap<LocalDate, Perp> out = new TreeMap<>();
