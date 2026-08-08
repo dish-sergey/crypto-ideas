@@ -5,3 +5,4 @@ build/
 *.log
 .idea/workspace.xml
 .claude/settings.local.json
+reports/analysis/*.class
