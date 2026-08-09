@@ -33,6 +33,7 @@ public class S12Compensation {
 
     static Map<String,TreeMap<Long,double[]>> fund = new HashMap<>();
     static Map<String,Map<Long,Double>> mark = new HashMap<>(), spot = new HashMap<>(), turn = new HashMap<>();
+    static Map<String,Map<Long,double[]>> markHL = new HashMap<>(); // day -> [high, low]
     static Map<String,Long> firstDay = new HashMap<>();
     static List<String> syms = new ArrayList<>();
     static long d0, dNow;
@@ -58,7 +59,12 @@ public class S12Compensation {
                 }
                 fund.put(s,fm); firstDay.put(s,first);
                 Map<Long,Double> mk=new HashMap<>(), sp=new HashMap<>(), tn=new HashMap<>();
-                candles("https://futures.kraken.com/api/charts/v1/mark/"+s+"/1d?from="+fromSec, mk);
+                Map<Long,double[]> mhl=new HashMap<>();
+                JsonNode mj=get("https://futures.kraken.com/api/charts/v1/mark/"+s+"/1d?from="+fromSec);
+                for (JsonNode c: mj.get("candles")){ long d=c.get("time").asLong()/DAY;
+                    mk.put(d, Double.parseDouble(c.get("close").asText()));
+                    mhl.put(d, new double[]{Double.parseDouble(c.get("high").asText()), Double.parseDouble(c.get("low").asText())}); }
+                markHL.put(s, mhl);
                 candles("https://futures.kraken.com/api/charts/v1/spot/"+s+"/1d?from="+fromSec, sp);
                 JsonNode tj=get("https://futures.kraken.com/api/charts/v1/trade/"+s+"/1d?from="+fromSec);
                 for (JsonNode c: tj.get("candles")){ double cl=Double.parseDouble(c.get("close").asText()); tn.put(c.get("time").asLong()/DAY, Double.parseDouble(c.get("volume").asText())*cl); }
@@ -73,14 +79,17 @@ public class S12Compensation {
         run(10_000,    "универсум >=$10k (микро $1k)");
     }
 
-    static double winsor(double x){ return Math.max(-0.5, Math.min(0.5, x)); } // 2x-liquidation bound
+    static final double LIQ = 0.50; // adverse move that wipes 2x margin (=-100% leg capital)
 
     static void run(double minTurn, String label) {
-        List<Double> FSs=new ArrayList<>(), PSs=new ArrayList<>(), NETs=new ArrayList<>();
-        List<Double> PSw=new ArrayList<>(), NETw=new ArrayList<>(); // winsorized price returns
-        double worstPrice=0; String worstName="";
+        List<Double> FSs=new ArrayList<>(), PSs=new ArrayList<>();
+        List<Double> NETclose=new ArrayList<>(), NETliq=new ArrayList<>();
+        int shortLiq=0, longLiq=0, legWeeks=0;
+        // §2.1 diagnostic: single (name,week) contributions to weekly PS
+        double worstWeekPS=0; String worstWeekLabel=""; List<Double> weeklyPS=new ArrayList<>();
         for (long t=d0+L; t+H<=dNow; t+=STEP) {
-            List<double[]> rows=new ArrayList<>(); // [signal, fundRet, priceRet]
+            // row: [signal, fundRet, priceRetClose, shortAdverse, longAdverse, nameIdx]
+            List<double[]> rows=new ArrayList<>(); List<String> names=new ArrayList<>();
             for (String s : syms) {
                 TreeMap<Long,double[]> fm=fund.get(s); if(fm==null) continue;
                 if (firstDay.getOrDefault(s,Long.MAX_VALUE) > t-60) continue;
@@ -95,35 +104,55 @@ public class S12Compensation {
                 List<Double> tv=new ArrayList<>();
                 for(long d=t-30; d<t; d++){ Double v=turn.get(s).get(d); if(v!=null&&v>0) tv.add(v); }
                 if(tv.size()<15 || median(tv)<minTurn) continue;
-                double pr=(mh-mt)/mt;
-                if(Math.abs(pr)>Math.abs(worstPrice)){ worstPrice=pr; worstName=s; }
-                rows.add(new double[]{sSum/sN, rSum, pr});
+                // intra-week extremes of mark over [t, t+H)
+                double maxHi=mt, minLo=mt; Map<Long,double[]> hl=markHL.get(s);
+                for(long d=t; d<t+H; d++){ double[] x=hl==null?null:hl.get(d); if(x!=null){ maxHi=Math.max(maxHi,x[0]); minLo=Math.min(minLo,x[1]); } }
+                double shortAdv=(maxHi-mt)/mt, longAdv=(mt-minLo)/mt;
+                rows.add(new double[]{sSum/sN, rSum, (mh-mt)/mt, shortAdv, longAdv}); names.add(s);
             }
             if(rows.size()<8) continue;
-            rows.sort((x,y)->Double.compare(y[0],x[0]));
+            // sort indices by signal desc
+            Integer[] ord=new Integer[rows.size()]; for(int i=0;i<ord.length;i++) ord[i]=i;
+            Arrays.sort(ord,(x,y)->Double.compare(rows.get(y)[0],rows.get(x)[0]));
             int k=Math.max(1,(int)Math.ceil(rows.size()/10.0));
-            double fTop=0,fBot=0,pTop=0,pBot=0,pTopW=0,pBotW=0;
-            for(int i=0;i<k;i++){ fTop+=rows.get(i)[1]; pTop+=rows.get(i)[2]; pTopW+=winsor(rows.get(i)[2]); }
-            for(int i=0;i<k;i++){ int j=rows.size()-1-i; fBot+=rows.get(j)[1]; pBot+=rows.get(j)[2]; pBotW+=winsor(rows.get(j)[2]); }
-            double FS=fTop/k-fBot/k, PS=pTop/k-pBot/k, PSwk=pTopW/k-pBotW/k;
-            FSs.add(FS); PSs.add(PS); NETs.add(FS-PS);
-            PSw.add(PSwk); NETw.add(FS-PSwk);
+            double fTop=0,fBot=0,pTop=0,pBot=0;               // close-based
+            double sPxLiq=0, lPxLiq=0;                         // liquidation-based price outcome
+            for(int i=0;i<k;i++){
+                double[] r=rows.get(ord[i]);                  // TOP decile -> SHORT
+                fTop+=r[1]; pTop+=r[2];
+                boolean liq = r[3]>=LIQ;                       // intra-week high hit +50%
+                sPxLiq += liq ? -LIQ : -r[2];                 // liq: lose 100% margin = -50% notional; else short price P&L
+                if(liq) shortLiq++;
+                double contrib = r[2]/k;                       // this name's contribution to weekly PS (top side, +)
+                if(Math.abs(contrib*ANN)>Math.abs(worstWeekPS)){ worstWeekPS=contrib*ANN; worstWeekLabel=names.get(ord[i])+" @wk"+((t-d0)/7)+" priceRet="+String.format("%.0f%%",r[2]*100); }
+                legWeeks++;
+            }
+            for(int i=0;i<k;i++){
+                double[] r=rows.get(ord[rows.size()-1-i]);    // BOTTOM decile -> LONG
+                fBot+=r[1]; pBot+=r[2];
+                boolean liq = r[4]>=LIQ;                       // intra-week low hit -50%
+                lPxLiq += liq ? -LIQ : r[2];
+                if(liq) longLiq++;
+            }
+            double FS=fTop/k-fBot/k, PS=pTop/k-pBot/k;
+            FSs.add(FS); PSs.add(PS);
+            NETclose.add(FS-PS);
+            NETliq.add(FS + sPxLiq/k + lPxLiq/k);              // FS + liquidation-aware price P&L (short+long legs)
+            weeklyPS.add(PS*ANN);
         }
-        double fsA=mean(FSs)*ANN, psA=mean(PSs)*ANN, netA=mean(NETs)*ANN;
-        double psWA=mean(PSw)*ANN, netWA=mean(NETw)*ANN;
-        Collections.sort(NETs);
-        System.out.printf("%n%s  (ребалансов N=%d)%n", label, NETs.size());
-        System.out.printf("  FS funding-спред верх-низ         = %+7.1f%%/год%n", fsA*100);
-        System.out.printf("  PS ценовой спред (raw)            = %+7.1f%%/год   PS/FS=%.0f%%%n", psA*100, fsA!=0?100*psA/fsA:0);
-        System.out.printf("  PS ценовой спред (winsor ±50%%)    = %+7.1f%%/год   <-- робастная оценка%n", psWA*100);
-        System.out.printf("  NET raw = FS-PS                   = %+7.1f%%/год   %%нед NET>0=%.0f%%%n", netA*100, 100.0*fracPos(NETs));
-        System.out.printf("  NET winsor                        = %+7.1f%%/год%n", netWA*100);
-        System.out.printf("  недельный NET: min=%+.1f%% max=%+.1f%% std=%.1f%% (в нед.единицах)%n",
-            NETs.get(0)*100, NETs.get(NETs.size()-1)*100, std(NETs)*100);
-        System.out.printf("  крупнейший ценовой ход в универсуме: %s %+.0f%% за неделю (источник хвоста)%n", worstName, worstPrice*100);
-        System.out.printf("  критерий §3.3 (NET winsor >=20пп): %s%n", netWA*100>=20 ? "ПРОЙДЕН" : "НЕ ПРОЙДЕН");
+        double fsA=mean(FSs)*ANN, psA=mean(PSs)*ANN, netCA=mean(NETclose)*ANN, netLA=mean(NETliq)*ANN;
+        double liqPerYr=(shortLiq+longLiq)*(52.0/NETliq.size());
+        Collections.sort(weeklyPS);
+        System.out.printf("%n%s  (ребалансов N=%d)%n", label, NETliq.size());
+        System.out.printf("  FS funding-спред                  = %+7.1f%%/год%n", fsA*100);
+        System.out.printf("  PS ценовой спред (close)          = %+7.1f%%/год%n", psA*100);
+        System.out.printf("  §2.1 недельный PS: медиана=%+.0f%% макс|нед|-вклад: %s%n", median(weeklyPS), worstWeekLabel);
+        System.out.printf("  NET (close, БЕЗ ликвидаций)       = %+7.1f%%/год%n", netCA*100);
+        System.out.printf("  NET (модель ликвидации §2.3)      = %+7.1f%%/год   <-- честная оценка%n", netLA*100);
+        System.out.printf("  ликвидаций ног: шорт=%d, лонг=%d -> ~%.1f/год (%.1f%% нога-недель)%n",
+            shortLiq, longLiq, liqPerYr, 100.0*(shortLiq+longLiq)/(2*legWeeks));
+        System.out.printf("  критерий §3.3 (NET_liq >=20пп): %s%n", netLA*100>=20 ? "ПРОЙДЕН" : "НЕ ПРОЙДЕН");
     }
-    static double std(List<Double> v){ if(v.size()<2)return 0; double m=mean(v),s=0; for(double x:v)s+=(x-m)*(x-m); return Math.sqrt(s/(v.size()-1)); }
 
     static double fracPos(List<Double> v){ int c=0; for(double x:v) if(x>0)c++; return (double)c/v.size(); }
     static double mean(List<Double> v){ double s=0; for(double x:v)s+=x; return s/v.size(); }
