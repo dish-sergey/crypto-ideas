@@ -77,6 +77,7 @@ public class S12IcAutocorr {
     static void runIC(double minTurn, String label) {
         List<Double> ic = new ArrayList<>();
         List<Integer> nInstr = new ArrayList<>();
+        List<Double> decileSpread = new ArrayList<>(); // top-decile ret - bottom-decile ret (7d)
         for (long t=d0+L; t+H<=dNow; t+=STEP) {
             List<double[]> rows=new ArrayList<>();
             for (String s : syms) {
@@ -98,6 +99,13 @@ public class S12IcAutocorr {
             }
             if(rows.size()<8) continue;
             ic.add(spearman(rows)); nInstr.add(rows.size());
+            // decile return spread: mean ret top-decile signal - mean ret bottom-decile signal
+            rows.sort((x,y)->Double.compare(y[0],x[0]));
+            int k=Math.max(1,(int)Math.ceil(rows.size()/10.0));
+            double topR=0, botR=0;
+            for(int i=0;i<k;i++) topR+=rows.get(i)[1];
+            for(int i=0;i<k;i++) botR+=rows.get(rows.size()-1-i)[1];
+            decileSpread.add(topR/k - botR/k);
         }
         int n=ic.size();
         double m=mean(ic), sd=std(ic), ir=sd==0?Double.NaN:m/sd;
@@ -108,6 +116,9 @@ public class S12IcAutocorr {
         System.out.printf("  инстр/нед median=%d (min %d,max %d); ребалансов N=%d%n", med(nInstr), Collections.min(nInstr), Collections.max(nInstr), n);
         System.out.printf("  IC_mean=%+.4f  IC_std=%.4f  IC_IR=%+.3f  %%>0=%.0f%%%n", m, sd, ir, 100.0*frac(ic));
         System.out.printf("  rho1(IC_t)=%.3f  N_eff=%.1f  t_raw=%.2f  t_eff=%.2f%n", rho1, nEff, tRaw, tEff);
+        double dsMean=mean(decileSpread), dsAnn=dsMean*(365.0/7.0);
+        System.out.printf("  ВАЛОВЫЙ спред доходности дециль(верх-низ) = %.3f%%/нед -> %.1f%%/год (это премия ДО издержек, §1.2)%n",
+            dsMean*100, dsAnn*100);
     }
 
     static double autocorr1(List<Double> v){
