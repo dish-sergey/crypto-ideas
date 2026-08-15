@@ -233,14 +233,15 @@ class S5OrchestratorTest {
         assertEquals(1, c.orch.openPositions());
     }
 
-    @Test void unapprovedExpiresAfterEntryDay() throws Exception {
+    @Test void unapprovedLingersUntilUnlockThenExpires() throws Exception {
         Ctx c = ctx(CHEAP);
         long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
-        c.feed.events.add(ev("APT", today + 7));                 // entryDay = today+2
+        c.feed.events.add(ev("APT", today + 7));                 // entryDay = today+2, разлок today+7
         c.orch.discover(today);
-        assertEquals(1, c.orch.pendingApprovals());
-        c.orch.executeApproved(today + 3);                       // день входа прошёл без подтверждения
-        assertEquals(0, c.orch.pendingApprovals(), "не подтвердили вовремя → снято");
+        c.orch.executeApproved(today + 3);                       // день входа прошёл, но разлок нет
+        assertEquals(1, c.orch.pendingApprovals(), "до разлока ещё можно подтвердить — не снимаем");
+        c.orch.executeApproved(today + 7);                       // наступил разлок без подтверждения
+        assertEquals(0, c.orch.pendingApprovals(), "разлок наступил → снято");
         assertEquals(0, c.orch.openPositions());
         assertTrue(c.notifier.pushes().stream().anyMatch(a -> a.title().equals("Вход пропущен")));
     }

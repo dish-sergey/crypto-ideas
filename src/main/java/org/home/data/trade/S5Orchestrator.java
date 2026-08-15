@@ -125,11 +125,11 @@ public class S5Orchestrator {
                     it.remove();
                     opened++;
                 }
-            } else if (gated && today > entryDay) {              // не подтвердили к дню входа — пропуск
+            } else if (gated && today >= e.unlockDay()) {        // разлок наступил без подтверждения — снять
                 reminders.clear(id);
                 dismissed.add(id);
                 notifier.push(Alert.info("Вход пропущен",
-                        e.krakenSymbol() + " — не подтверждён к дню входа, событие снято"));
+                        e.krakenSymbol() + " — не подтверждён до разлока, событие снято"));
                 it.remove();
             }
         }
