@@ -132,4 +132,20 @@ public class StopEngine {
     }
 
     public int openCount() { return managed.size(); }
+
+    public java.util.Set<String> openSymbols() { return java.util.Set.copyOf(managed.keySet()); }
+
+    /**
+     * Восстановление состояния из биржи при перезапуске: усыновить открытые шорты, которых нет в памяти
+     * (источник истины — {@link ExchangeAdapter#positions()}, не память). runningMax = max(entry, текущая цена).
+     */
+    public void adopt(java.util.Collection<Position> positions) {
+        for (Position p : positions) {
+            if (p.side() != Side.SHORT || managed.containsKey(p.symbol())) continue;
+            Managed m = new Managed(p.entryPx(), p.qty());
+            try { m.runningMax = Math.max(m.runningMax, ex.mark(p.symbol())); }
+            catch (ExchangeDisconnectedException ignore) { /* останется entryPx */ }
+            managed.put(p.symbol(), m);
+        }
+    }
 }

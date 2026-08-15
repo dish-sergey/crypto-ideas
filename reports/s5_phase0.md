@@ -108,3 +108,22 @@ API-ключи Kraken Futures — действие постановщика); ф
 **Осталось только с ключами/оркестрацией:** `KrakenFuturesExchange` (прод-адаптер, API-ключи Kraken Futures)
 + склейка (планировщик: ежедневно фид→Approval Gate→openShort; poll стопа; ежедневный ScheduleTracker;
 monitor.record на закрытии) с восстановлением из `positions()`. Вся логика, тестируемая без ключей, закрыта.
+
+## Каркас оркестратора построен (2026-08-15)
+
+`S5Orchestrator` (против `ExchangeAdapter` — тестируется на моке без ключей) склеивает всё:
+- `discover(today)` — события с днём входа сегодня (unlock−5) → фильтр дорогого шорта (`FundingSource`,
+  текущая ставка как прокси 5д) → лимит экспозиции (≤81%) → подача в Approval Gate;
+- `executeApproved()` — открыть шорт по подтверждённым (сайзинг 4.5% капитала), зафиксировать дату;
+- `maintain(today)` — плановый выход в день разлока; перенос/отмена расписания → закрытие немедленно;
+- `pollStops()` — опрос стопов; закрытия пишутся в `DegradationMonitor` (наблюдение);
+- `recover()` — усыновление позиций с биржи при перезапуске (источник истины `positions()`).
+Абстракции `EventFeed`/`FundingSource`/`S5Config`.
+
+**Тесты: 33/33 зелёные, полный `./gradlew test` проходит** (StopEngine 12 + UnlockFeed 4 + Degradation 6 +
+Schedule 5 + Orchestrator 6). Полный цикл на моке: обнаружение→Gate→открытие→плановый выход; отмена
+расписания→закрытие; лимит экспозиции→18 позиций; стоп→монитор; recover→усыновление+стоп по восстановленной.
+
+**Осталось ТОЛЬКО с ключами:** `KrakenFuturesExchange implements ExchangeAdapter` (аутентификация/nonce/
+подпись, реальные ордера) + `KrakenFundingSource implements FundingSource` (текущая ставка из тикера) +
+планировщик (ежедневно discover→maintain, часто pollStops). Вся бизнес-логика закрыта на синтетике.

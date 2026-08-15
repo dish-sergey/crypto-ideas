@@ -14,7 +14,7 @@ import java.util.TreeMap;
  * доступности на Kraken. Логика парсинга — как в бэктесте (`S5Unlocks`): circulating = сумма
  * documentedData на дату; событие — metadata.events с unlockType=cliff и noOfTokens[0].
  */
-public class UnlockFeed {
+public class UnlockFeed implements EventFeed {
 
     public static final double MIN_PCT = 0.03;
 
@@ -27,7 +27,7 @@ public class UnlockFeed {
     }
 
     /** Все клифф-разлоки ≥3% на Kraken-инструментах с датой > todayEpochDay (будущие). */
-    public List<UnlockEvent> upcoming(long todayEpochDay) throws Exception {
+    @Override public List<UnlockEvent> upcoming(long todayEpochDay) throws Exception {
         List<UnlockEvent> out = new ArrayList<>();
         for (String slug : src.protocols()) {
             try { collect(src.emissions(slug), todayEpochDay, out); }
@@ -38,7 +38,7 @@ public class UnlockFeed {
     }
 
     /** События, для которых сегодня день входа: unlockDay == today + entryLead. */
-    public List<UnlockEvent> dueForEntry(long todayEpochDay, int entryLead) throws Exception {
+    @Override public List<UnlockEvent> dueForEntry(long todayEpochDay, int entryLead) throws Exception {
         List<UnlockEvent> out = new ArrayList<>();
         for (UnlockEvent e : upcoming(todayEpochDay)) if (e.unlockDay() == todayEpochDay + entryLead) out.add(e);
         return out;

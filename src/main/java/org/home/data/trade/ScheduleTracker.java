@@ -37,6 +37,9 @@ public class ScheduleTracker {
         return changed;
     }
 
+    /** Зафиксированная при входе дата разлока, или null если не отслеживается. */
+    public Long expectedDay(String symbol) { return entryUnlockDay.get(symbol); }
+
     public List<Revision> revisions() { return List.copyOf(revisions); }
     public int tracked() { return entryUnlockDay.size(); }
 }
