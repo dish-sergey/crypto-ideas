@@ -66,6 +66,21 @@
 - **Дашборд:** `http://crypto-micro:8088/` = **v5 (прод)**; `.../regime-v3.html`, `.../regime-v1.html`, `.../regime-all.html`.
 - **Откат:** `mv app.jar.bak-v3 app.jar` + `update-dashboard.sh.bak-v3` (jar менялся атомарным mv, без рестарта crypto-data).
 
+### 6. `s5-dryrun` — S5 paper (dry-run) + Telegram-бот
+- **Что:** `~/jre25/bin/java -Xms32m -Xmx192m -jar ~/s5/app.jar --s5-dry-run` — оркестратор S5 против живого
+  фида разлоков (DefiLlama) + реальные марк-цены Kraken Futures, исполнение на MockExchange (деньги
+  виртуальные). Telegram: пуши, эскалация напоминаний (24/12/3/1ч), кнопки Подтвердить/Отклонить, `/status`,
+  `/positions`. Отдельная от `crypto-data` копия jar (`~/s5/app.jar`, `WorkingDirectory=~/s5`).
+- **Юнит:** `/etc/systemd/system/s5-dryrun.service` (enabled). Restart=on-failure.
+- **Секрет:** `~/s5/telegram/s5_bot.txt` (600, gitignored) — username/access_token/chat_id бота
+  `@k7pQ2m_note_bot`. Либо env `S5_TELEGRAM_TOKEN`/`S5_TELEGRAM_CHAT`. В git НЕ коммитим.
+- **Проверить:** `systemctl status s5-dryrun` · `journalctl -u s5-dryrun -f` (старт ~2–3 мин: CoinGecko
+  coins/list + скан ~370 протоколов DefiLlama, потом «слушатель запущен»).
+- **Обновить jar:** `./gradlew bootJar` локально → `scp build/libs/crypto-ideas-1.0-SNAPSHOT.jar
+  ubuntu@89.168.115.160:~/s5/app.jar` → `sudo systemctl restart s5-dryrun`.
+- **NB:** тяжёлый скан фида — раз в день; ежеминутно только марки Kraken + напоминания + стопы (мок).
+  Только ОДИН потребитель Telegram getUpdates — не запускать второй getUpdates параллельно (409 conflict).
+
 ### Tailscale (приватная сеть)
 - Mesh-VPN (WireGuard). Micro = `crypto-micro` (100.64.144.85). Даёт приватный доступ к дашборду без открытия портов и без домена. Бесплатно (personal). Авторизация — по устройствам аккаунта `dish.sergey@`. Проверка: `tailscale status`.
 
