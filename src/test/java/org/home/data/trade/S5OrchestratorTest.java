@@ -93,6 +93,23 @@ class S5OrchestratorTest {
         assertEquals(18, c.orch.openPositions(), "18×4.5% = 81% ровно лимит; 19-я блокируется");
     }
 
+    @Test void acceleratedUnlockCaughtWithinWindow() throws Exception {
+        // doc 59 §4: событие с датой разлока через 5 дней должно ловиться; и УСКОРЕННОЕ (через 2 дня),
+        // впрыгнувшее в окно, тоже — не только ровно unlock−5.
+        Ctx c = ctx(CHEAP);
+        long today = 20000;
+        c.ex.tick("PF_APTUSD", 10.0); c.ex.tick("PF_ARBUSD", 5.0);
+        c.feed.events.add(ev("APT", today + 5));   // обычный вход (ровно 5 дней)
+        c.feed.events.add(ev("ARB", today + 2));   // ускоренный: в окне, но не 5 дней
+        List<UnlockEvent> submitted = c.orch.discover(today);
+        assertEquals(2, submitted.size(), "ловятся оба: и +5, и ускоренный +2");
+        // событие за пределами окна (через 8 дней) не ловится
+        c.feed.events.add(ev("SOL", today + 8));
+        c.ex.tick("PF_SOLUSD", 100.0);
+        // повторный discover в тот же день: APT/ARB уже pending → дедуп, SOL вне окна
+        assertTrue(c.orch.discover(today).isEmpty(), "дубликаты дедуплятся, SOL вне окна");
+    }
+
     @Test void scheduleChangeClosesImmediately() throws Exception {
         Ctx c = ctx(CHEAP);
         long today = 20000;

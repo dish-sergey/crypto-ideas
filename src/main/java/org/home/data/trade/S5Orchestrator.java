@@ -47,7 +47,8 @@ public class S5Orchestrator {
      */
     public List<UnlockEvent> discover(long today) throws Exception {
         List<UnlockEvent> submitted = new java.util.ArrayList<>();
-        for (UnlockEvent e : feed.dueForEntry(today, cfg.entryLead())) {
+        // окно (today, today+lead]: обычный вход за 5 дней + ускоренные разлоки (doc 59 §4)
+        for (UnlockEvent e : feed.enterableWithin(today, cfg.entryLead())) {
             String id = eventId(e);
             if (engine.openSymbols().contains(e.krakenSymbol()) || pending.containsKey(id)) continue;
             if (funding.estimate5dFunding(e.base()) < cfg.expensiveFundingThreshold()) continue; // дорогой шорт
@@ -71,7 +72,7 @@ public class S5Orchestrator {
             if (px <= 0) continue;
             double qty = ex.balance() * cfg.positionFraction() / px;
             if (engine.openShort(id, gate, e.krakenSymbol(), qty)) {
-                tracker.onEntry(e.krakenSymbol(), e.unlockDay());
+                tracker.onEntry(e.krakenSymbol(), e.unlockDay(), e.category());
                 it.remove();
                 opened++;
             }

@@ -15,15 +15,20 @@ import java.util.Map;
 public class ScheduleTracker {
 
     private final Map<String, Long> entryUnlockDay = new LinkedHashMap<>();
+    private final Map<String, String> entryCategory = new LinkedHashMap<>();
     private final List<Revision> revisions = new ArrayList<>();
 
-    public record Revision(String symbol, long expectedDay, Long newDay, long daysToDateWhenSeen) {}
+    /** category — категория получателя (investors/team/ecosystem/staking) для разбивки пересмотров (doc 59 §6). */
+    public record Revision(String symbol, String category, long expectedDay, Long newDay, long daysToDateWhenSeen) {}
 
-    /** Зафиксировать дату разлока на момент входа. */
-    public void onEntry(String symbol, long unlockDay) { entryUnlockDay.put(symbol, unlockDay); }
+    /** Зафиксировать дату разлока и категорию на момент входа. */
+    public void onEntry(String symbol, long unlockDay, String category) {
+        entryUnlockDay.put(symbol, unlockDay);
+        entryCategory.put(symbol, category);
+    }
 
     /** Позиция закрыта — снять с отслеживания. */
-    public void onExit(String symbol) { entryUnlockDay.remove(symbol); }
+    public void onExit(String symbol) { entryUnlockDay.remove(symbol); entryCategory.remove(symbol); }
 
     /**
      * Сверить текущую дату разлока с зафиксированной при входе. currentUnlockDay=null → разлок исчез
@@ -33,7 +38,8 @@ public class ScheduleTracker {
         Long expected = entryUnlockDay.get(symbol);
         if (expected == null) return false;                  // не отслеживаем
         boolean changed = currentUnlockDay == null || !currentUnlockDay.equals(expected);
-        if (changed) revisions.add(new Revision(symbol, expected, currentUnlockDay, expected - todayEpochDay));
+        if (changed) revisions.add(new Revision(symbol, entryCategory.getOrDefault(symbol, "unknown"),
+                expected, currentUnlockDay, expected - todayEpochDay));
         return changed;
     }
 
@@ -42,4 +48,11 @@ public class ScheduleTracker {
 
     public List<Revision> revisions() { return List.copyOf(revisions); }
     public int tracked() { return entryUnlockDay.size(); }
+
+    /** Число пересмотров по категории получателя (doc 59 §6: у инсайдеров ожидается больше). */
+    public Map<String, Integer> revisionsByCategory() {
+        Map<String, Integer> m = new LinkedHashMap<>();
+        for (Revision r : revisions) m.merge(r.category(), 1, Integer::sum);
+        return m;
+    }
 }
