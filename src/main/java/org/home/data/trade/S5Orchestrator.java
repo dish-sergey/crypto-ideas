@@ -24,16 +24,26 @@ public class S5Orchestrator {
     private final DegradationMonitor monitor;
     private final TradeJournal journal;
     private final S5Config cfg;
+    private final Notifier notifier;
 
     /** eventId -> событие, поданное в Approval Gate и ждущее подтверждения. */
     private final Map<String, UnlockEvent> pending = new LinkedHashMap<>();
     private int journalCursor = 0;
+    private boolean pauseNotified = false;
 
+    /** Без канала уведомлений (уведомления не шлём). */
     public S5Orchestrator(ExchangeAdapter ex, EventFeed feed, FundingSource funding, ApprovalGate gate,
                           StopEngine engine, ScheduleTracker tracker, DegradationMonitor monitor,
                           TradeJournal journal, S5Config cfg) {
+        this(ex, feed, funding, gate, engine, tracker, monitor, journal, cfg, Notifier.NONE);
+    }
+
+    public S5Orchestrator(ExchangeAdapter ex, EventFeed feed, FundingSource funding, ApprovalGate gate,
+                          StopEngine engine, ScheduleTracker tracker, DegradationMonitor monitor,
+                          TradeJournal journal, S5Config cfg, Notifier notifier) {
         this.ex = ex; this.feed = feed; this.funding = funding; this.gate = gate; this.engine = engine;
         this.tracker = tracker; this.monitor = monitor; this.journal = journal; this.cfg = cfg;
+        this.notifier = notifier;
     }
 
     /** Перезапуск: усыновить открытые позиции с биржи (источник истины), не из памяти. */
@@ -56,6 +66,10 @@ public class S5Orchestrator {
             gate.submit(id);
             pending.put(id, e);
             submitted.add(e);
+            notifier.push(Alert.approval("Нужно подтверждение",
+                    e.krakenSymbol() + ": разлок " + e.category() + " "
+                            + String.format(java.util.Locale.ROOT, "%.1f%%", e.pctCirculating() * 100)
+                            + " circ — вход по протоколу сегодня", id));
         }
         return submitted;
     }
@@ -73,6 +87,8 @@ public class S5Orchestrator {
             double qty = ex.balance() * cfg.positionFraction() / px;
             if (engine.openShort(id, gate, e.krakenSymbol(), qty)) {
                 tracker.onEntry(e.krakenSymbol(), e.unlockDay(), e.category());
+                notifier.push(Alert.info("Открыт шорт",
+                        e.krakenSymbol() + " qty=" + num(qty) + " @ " + num(px)));
                 it.remove();
                 opened++;
             }
@@ -103,19 +119,66 @@ public class S5Orchestrator {
     /** Частый опрос стопов (внутридневной). */
     public void pollStops() { engine.poll(); flushClosedToMonitor(); }
 
-    /** Записать премию каждой закрытой ноги в монитор деградации (наблюдение). */
+    /** Записать премию каждой закрытой ноги в монитор + пуш о закрытии; пуш при уходе монитора в паузу. */
     private void flushClosedToMonitor() {
         List<TradeJournal.Entry> es = journal.entries();
-        for (int i = journalCursor; i < es.size(); i++) monitor.record(es.get(i).pnlPct());
+        for (int i = journalCursor; i < es.size(); i++) {
+            TradeJournal.Entry e = es.get(i);
+            monitor.record(e.pnlPct());
+            notifier.push(alertFor(e));
+        }
         journalCursor = es.size();
+        if (monitor.pauseSignalled() && !pauseNotified) {
+            pauseNotified = true;
+            notifier.push(Alert.warn("Монитор деградации: ПАУЗА",
+                    "Премия ушла в минус (rolling-40<0 или два подряд rolling-20<0). Новые входы остановить, механизм пересмотреть."));
+        } else if (!monitor.pauseSignalled()) {
+            pauseNotified = false;
+        }
+    }
+
+    /** Уведомление по закрытой ноге — по категории журнала. */
+    private static Alert alertFor(TradeJournal.Entry e) {
+        String pnl = pct(e.pnlPct());
+        return switch (e.category()) {
+            case PLANNED_EXIT     -> Alert.info("Плановый выход", e.symbol() + " " + pnl);
+            case STOP             -> Alert.warn("Стоп сработал", e.symbol() + " " + pnl);
+            case STOP_GAP         -> Alert.warn("Стоп с гэпом", e.symbol() + " " + pnl + " (проскальзывание за порог)");
+            case UNLOCK_CANCELLED -> Alert.warn("Разлок перенесён/отменён", e.symbol() + " закрыто " + pnl);
+            case RECONNECT_CLOSE  -> Alert.warn("Докрыто после реконнекта", e.symbol() + " " + pnl);
+            case ALREADY_CLOSED   -> Alert.info("Позиция уже закрыта вне системы", e.symbol());
+            case CLOSE_FAILED     -> Alert.critical("ЗАКРЫТИЕ НЕ УДАЛОСЬ", e.symbol() + " — требуется ручное вмешательство");
+        };
     }
 
     private boolean wouldBreachExposure() {
         return (engine.openSymbols().size() + 1) * cfg.positionFraction() > cfg.maxExposure();
     }
 
+    private static String pct(double frac) { return String.format(java.util.Locale.ROOT, "%+.1f%%", frac * 100); }
+    private static String num(double v)    { return String.format(java.util.Locale.ROOT, "%.4f", v); }
+
     // --- наблюдаемое состояние ---
     public boolean pauseSignalled() { return monitor.pauseSignalled(); }
     public int openPositions() { return engine.openCount(); }
     public int pendingApprovals() { return pending.size(); }
+
+    /** Снимок для запроса «/status» с телефона. */
+    public StatusSnapshot status() {
+        return new StatusSnapshot(engine.openCount(), pending.size(), monitor.pauseSignalled(), journalCursor);
+    }
+
+    /** Открытые позиции (для «/positions» с телефона) — источник истины биржа. */
+    public List<Position> positions() throws Exception { return ex.positions(); }
+
+    // --- ручное подтверждение с телефона (кнопки Telegram) ---
+
+    /** Кнопка «Подтвердить»: одобрить кандидата. true — если он ждал подтверждения. */
+    public boolean approve(String eventId) { return gate.approve(eventId); }
+
+    /** Кнопка «Отклонить»: снять кандидата — не откроем и в следующем discover не переотправим. */
+    public boolean reject(String eventId) {
+        gate.reject(eventId);
+        return pending.remove(eventId) != null;
+    }
 }

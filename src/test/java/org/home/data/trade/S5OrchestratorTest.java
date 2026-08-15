@@ -27,7 +27,7 @@ class S5OrchestratorTest {
 
     private record Ctx(MockExchange ex, FakeFeed feed, ApprovalGate gate, StopEngine engine,
                        ScheduleTracker tracker, DegradationMonitor monitor, TradeJournal journal,
-                       S5Orchestrator orch) {}
+                       MockNotifier notifier, S5Orchestrator orch) {}
 
     private static Ctx ctx(FundingSource funding) {
         MockExchange ex = new MockExchange(1000);
@@ -37,8 +37,9 @@ class S5OrchestratorTest {
         StopEngine engine = new StopEngine(ex, j, 0.30, 3);
         ScheduleTracker tracker = new ScheduleTracker();
         DegradationMonitor monitor = new DegradationMonitor();
-        S5Orchestrator orch = new S5Orchestrator(ex, feed, funding, gate, engine, tracker, monitor, j, S5Config.protocol());
-        return new Ctx(ex, feed, gate, engine, tracker, monitor, j, orch);
+        MockNotifier notifier = new MockNotifier();
+        S5Orchestrator orch = new S5Orchestrator(ex, feed, funding, gate, engine, tracker, monitor, j, S5Config.protocol(), notifier);
+        return new Ctx(ex, feed, gate, engine, tracker, monitor, j, notifier, orch);
     }
 
     private static final FundingSource CHEAP = base -> 0.0;   // funding 0 → дешёвый шорт
@@ -157,5 +158,68 @@ class S5OrchestratorTest {
         assertEquals(1, c.journal.count(TradeJournal.Category.STOP));
         assertEquals(1, c.monitor.count());
         assertEquals(-0.30, c.monitor.rolling(1) == null ? 0 : c.journal.entries().get(0).pnlPct(), 1e-9);
+    }
+
+    // --- уведомления на телефон (Telegram-канал через Notifier) ---
+
+    @Test void discoverPushesApprovalNeeded() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
+        c.feed.events.add(ev("APT", today + 5));
+        c.orch.discover(today);
+        assertEquals(1, c.notifier.count(), "кандидат → один пуш «нужно подтверждение»");
+        assertEquals(Alert.Level.INFO, c.notifier.last().level());
+        assertTrue(c.notifier.last().title().contains("подтверждение"));
+        assertTrue(c.notifier.last().body().contains("PF_APTUSD"));
+    }
+
+    @Test void openAndPlannedExitPushed() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
+        c.feed.events.add(ev("APT", today + 5));
+        c.orch.discover(today);                                  // +1 approval
+        c.gate.approve("PF_APTUSD@" + (today + 5));
+        c.orch.executeApproved();                               // +1 opened
+        assertEquals("Открыт шорт", c.notifier.last().title());
+        c.ex.tick("PF_APTUSD", 9.5);
+        c.orch.maintain(today + 5);                             // +1 planned exit
+        assertEquals("Плановый выход", c.notifier.last().title());
+        assertEquals(3, c.notifier.count());
+    }
+
+    @Test void stopPushesWarn() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
+        c.feed.events.add(ev("APT", today + 5));
+        c.orch.discover(today); c.gate.approve("PF_APTUSD@" + (today + 5)); c.orch.executeApproved();
+        c.ex.tick("PF_APTUSD", 13.0);                          // +30% → стоп
+        c.orch.pollStops();
+        assertEquals(1, c.notifier.count(Alert.Level.WARN), "стоп → один WARN");
+        assertEquals("Стоп сработал", c.notifier.last().title());
+    }
+
+    @Test void closeFailedPushesCritical() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
+        c.feed.events.add(ev("APT", today + 5));
+        c.orch.discover(today); c.gate.approve("PF_APTUSD@" + (today + 5)); c.orch.executeApproved();
+        c.ex.tick("PF_APTUSD", 13.0);                          // стоп
+        c.ex.rejectNextCloses(4);                              // бюджет ретраев (maxRetries+1) исчерпан → CLOSE_FAILED
+        c.orch.pollStops();
+        assertEquals(1, c.notifier.count(Alert.Level.CRITICAL), "провал закрытия → CRITICAL");
+        assertTrue(c.notifier.last().title().contains("НЕ УДАЛОСЬ"));
+    }
+
+    @Test void statusSnapshotReflectsState() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
+        c.feed.events.add(ev("APT", today + 5));
+        c.orch.discover(today);
+        assertEquals(1, c.orch.status().pendingApprovals());
+        assertEquals(0, c.orch.status().openPositions());
+        c.gate.approve("PF_APTUSD@" + (today + 5)); c.orch.executeApproved();
+        assertEquals(0, c.orch.status().pendingApprovals());
+        assertEquals(1, c.orch.status().openPositions());
+        assertFalse(c.orch.status().paused());
     }
 }

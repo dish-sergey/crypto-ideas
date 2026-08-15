@@ -21,6 +21,9 @@ public class ApprovalGate {
         return false;
     }
 
+    /** Отклонить событие (кнопка «Отклонить»). true — если оно было в ожидании. */
+    public boolean reject(String eventId) { return pending.remove(eventId); }
+
     public boolean isApproved(String eventId) { return approved.contains(eventId); }
     public Set<String> pending() { return Set.copyOf(pending); }
 }
