@@ -84,13 +84,15 @@ public class S5DryRun {
         while (true) {
             try {
                 long today = LocalDate.now(ZoneOffset.UTC).toEpochDay();
+                long nowSec = System.currentTimeMillis() / 1000;
                 krakenMarks().forEach(c.ex::tick);                 // свежие марки (1 HTTP)
                 if (today != lastScanDay) {                        // тяжёлый скан фида — раз в день
-                    c.orch.discover(today);                        // новые кандидаты → пуши с кнопками
+                    c.orch.discover(today);                        // новые кандидаты → первый пуш с кнопками
                     c.orch.maintain(today);                        // плановый выход / перенос
                     lastScanDay = today;
                 }
-                c.orch.executeApproved();                          // подтверждённые → открыть (mock)
+                c.orch.pollReminders(nowSec);                      // эскалация напоминаний 24/12/3/1ч
+                c.orch.executeApproved(today);                     // подтверждённые → открыть в день входа
                 c.orch.pollStops();                                // стопы по свежим маркам
             } catch (Exception e) {
                 log.warn("dry-run цикл: {}", e.toString());

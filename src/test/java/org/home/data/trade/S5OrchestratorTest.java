@@ -221,6 +221,46 @@ class S5OrchestratorTest {
         assertEquals(0, c.orch.pendingApprovals());
     }
 
+    @Test void approvedEarlyOpensOnlyOnEntryDay() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
+        c.feed.events.add(ev("APT", today + 7));                 // entryDay = today+2
+        c.orch.discover(today);                                  // всплыл заранее (approvalLead)
+        c.gate.approve("PF_APTUSD@" + (today + 7));
+        assertEquals(0, c.orch.executeApproved(today), "подтверждено рано → не открываем до дня входа");
+        assertEquals(0, c.orch.openPositions());
+        assertEquals(1, c.orch.executeApproved(today + 2), "в день входа → открыто");
+        assertEquals(1, c.orch.openPositions());
+    }
+
+    @Test void unapprovedExpiresAfterEntryDay() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
+        c.feed.events.add(ev("APT", today + 7));                 // entryDay = today+2
+        c.orch.discover(today);
+        assertEquals(1, c.orch.pendingApprovals());
+        c.orch.executeApproved(today + 3);                       // день входа прошёл без подтверждения
+        assertEquals(0, c.orch.pendingApprovals(), "не подтвердили вовремя → снято");
+        assertEquals(0, c.orch.openPositions());
+        assertTrue(c.notifier.pushes().stream().anyMatch(a -> a.title().equals("Вход пропущен")));
+    }
+
+    @Test void remindersEscalateUntilApproved() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
+        c.feed.events.add(ev("APT", today + 7));                 // entryDay = today+2
+        c.orch.discover(today);                                  // первый пуш (approval)
+        long entryInstant = (today + 2) * 86400L;
+        c.orch.pollReminders(entryInstant - 10 * 3600);          // 10ч до входа → порог 12ч
+        assertTrue(c.notifier.last().title().contains("Напоминание"));
+        assertTrue(c.notifier.last().title().contains("12"));
+        // подтвердили — напоминания прекращаются
+        c.gate.approve("PF_APTUSD@" + (today + 7));
+        int before = c.notifier.count();
+        c.orch.pollReminders(entryInstant - 2 * 3600);           // 2ч — но уже подтверждено
+        assertEquals(before, c.notifier.count(), "после подтверждения не напоминаем");
+    }
+
     @Test void statusSnapshotReflectsState() throws Exception {
         Ctx c = ctx(CHEAP);
         long today = 20000; c.ex.tick("PF_APTUSD", 10.0);

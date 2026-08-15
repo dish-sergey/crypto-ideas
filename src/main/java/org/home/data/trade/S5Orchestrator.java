@@ -30,6 +30,7 @@ public class S5Orchestrator {
     private final Map<String, UnlockEvent> pending = new LinkedHashMap<>();
     /** Отклонённые оператором eventId — чтобы дневной цикл не переотправлял их снова. */
     private final java.util.Set<String> dismissed = new java.util.HashSet<>();
+    private final ApprovalReminders reminders = new ApprovalReminders();
     private int journalCursor = 0;
     private boolean pauseNotified = false;
 
@@ -59,8 +60,9 @@ public class S5Orchestrator {
      */
     public List<UnlockEvent> discover(long today) throws Exception {
         List<UnlockEvent> submitted = new java.util.ArrayList<>();
-        // окно (today, today+lead]: обычный вход за 5 дней + ускоренные разлоки (doc 59 §4)
-        for (UnlockEvent e : feed.enterableWithin(today, cfg.entryLead())) {
+        // окно чуть шире дня входа (approvalLeadDays) — кандидат всплывает заранее, чтобы успела эскалация
+        // напоминаний; сам вход всё равно на unlockDay−entryLead. Плюс ускоренные разлоки (doc 59 §4).
+        for (UnlockEvent e : feed.enterableWithin(today, cfg.entryLead() + cfg.approvalLeadDays())) {
             String id = eventId(e);
             if (engine.openSymbols().contains(e.krakenSymbol()) || pending.containsKey(id) || dismissed.contains(id)) continue;
             if (funding.estimate5dFunding(e.base()) < cfg.expensiveFundingThreshold()) continue; // дорогой шорт
@@ -68,31 +70,67 @@ public class S5Orchestrator {
             gate.submit(id);
             pending.put(id, e);
             submitted.add(e);
+            long daysToEntry = (e.unlockDay() - cfg.entryLead()) - today;
+            String when = daysToEntry <= 0 ? "сегодня" : ("через " + daysToEntry + " дн");
             notifier.push(Alert.approval("Нужно подтверждение",
                     e.krakenSymbol() + ": разлок " + e.category() + " "
                             + String.format(java.util.Locale.ROOT, "%.1f%%", e.pctCirculating() * 100)
-                            + " circ — вход по протоколу сегодня", id));
+                            + " circ — вход " + when, id));
         }
         return submitted;
     }
 
-    /** Исполнение подтверждённых событий: открыть шорт, зафиксировать дату разлока. */
-    public int executeApproved() throws Exception {
+    /**
+     * Эскалация напоминаний по неподтверждённым кандидатам (вызывать часто, {@code nowSec} — сейчас).
+     * Момент входа = день (unlockDay−entryLead), 00:00 UTC. Подтверждённые — молчим.
+     */
+    public void pollReminders(long nowSec) {
+        for (var en : pending.entrySet()) {
+            String id = en.getKey(); UnlockEvent e = en.getValue();
+            if (gate.isApproved(id)) { reminders.clear(id); continue; }
+            long entryInstant = (e.unlockDay() - cfg.entryLead()) * 86400L;
+            Integer h = reminders.due(id, entryInstant, nowSec);
+            if (h != null) notifier.push(Alert.approval("Напоминание: подтвердить (≈" + h + "ч до входа)",
+                    e.krakenSymbol() + ": разлок " + e.category() + " "
+                            + String.format(java.util.Locale.ROOT, "%.1f%%", e.pctCirculating() * 100) + " circ", id));
+        }
+    }
+
+    /** Немедленное исполнение подтверждённых (ручной/тестовый путь): без гейта по дню входа. */
+    public int executeApproved() throws Exception { return exec(0, false); }
+
+    /**
+     * Исполнение с гейтом по дню входа (демон): подтверждённое открывается только в день входа
+     * (unlockDay−entryLead) или позже; неподтверждённое после дня входа — снимается как пропущенное.
+     */
+    public int executeApproved(long today) throws Exception { return exec(today, true); }
+
+    private int exec(long today, boolean gated) throws Exception {
         int opened = 0;
         for (var it = pending.entrySet().iterator(); it.hasNext(); ) {
             var en = it.next();
             String id = en.getKey(); UnlockEvent e = en.getValue();
-            if (!gate.isApproved(id)) continue;
-            if (wouldBreachExposure()) continue;
-            double px = ex.mark(e.krakenSymbol());
-            if (px <= 0) continue;
-            double qty = ex.balance() * cfg.positionFraction() / px;
-            if (engine.openShort(id, gate, e.krakenSymbol(), qty)) {
-                tracker.onEntry(e.krakenSymbol(), e.unlockDay(), e.category());
-                notifier.push(Alert.info("Открыт шорт",
-                        e.krakenSymbol() + " qty=" + num(qty) + " @ " + num(px)));
+            long entryDay = e.unlockDay() - cfg.entryLead();
+            if (gate.isApproved(id)) {
+                if (gated && today < entryDay) continue;        // подтверждено рано — ждём дня входа
+                if (wouldBreachExposure()) continue;
+                double px = ex.mark(e.krakenSymbol());
+                if (px <= 0) continue;
+                double qty = ex.balance() * cfg.positionFraction() / px;
+                if (engine.openShort(id, gate, e.krakenSymbol(), qty)) {
+                    tracker.onEntry(e.krakenSymbol(), e.unlockDay(), e.category());
+                    reminders.clear(id);
+                    notifier.push(Alert.info("Открыт шорт",
+                            e.krakenSymbol() + " qty=" + num(qty) + " @ " + num(px)));
+                    it.remove();
+                    opened++;
+                }
+            } else if (gated && today > entryDay) {              // не подтвердили к дню входа — пропуск
+                reminders.clear(id);
+                dismissed.add(id);
+                notifier.push(Alert.info("Вход пропущен",
+                        e.krakenSymbol() + " — не подтверждён к дню входа, событие снято"));
                 it.remove();
-                opened++;
             }
         }
         return opened;
@@ -182,6 +220,7 @@ public class S5Orchestrator {
     public boolean reject(String eventId) {
         gate.reject(eventId);
         dismissed.add(eventId);
+        reminders.clear(eventId);
         return pending.remove(eventId) != null;
     }
 }
