@@ -20,7 +20,12 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun --args='--backfill=funding-okx'
 ./gradlew bootRun --args='--backfill=onchain --from=2015-07-01'
 ./gradlew bootRun --args='--backfill=oi-archive --symbols=BTCUSDT,ETHUSDT --from=2021-01-01'  # ретро-OI из bulk-архива
+./gradlew bootRun --args='--s5-dry-run=once'                    # S5: дайджест ближайших разлоков в Telegram и выход
+./gradlew bootRun --args='--s5-dry-run'                         # S5: интерактивный dry-run (живой фид + марки Kraken + мок-исполнение)
 ```
+
+S5 dry-run читает токен/chat_id из `telegram/s5_bot.txt` (gitignored) либо env
+`S5_TELEGRAM_TOKEN`/`S5_TELEGRAM_CHAT`. Деньги виртуальные (MockExchange), данные и Telegram — реальные.
 
 База: `data/crypto.db` (WAL). Схема: `src/main/resources/schema.sql`.
 

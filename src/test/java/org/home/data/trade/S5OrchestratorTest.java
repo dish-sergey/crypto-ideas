@@ -210,6 +210,17 @@ class S5OrchestratorTest {
         assertTrue(c.notifier.last().title().contains("НЕ УДАЛОСЬ"));
     }
 
+    @Test void rejectedEventNotRediscovered() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
+        c.feed.events.add(ev("APT", today + 5));
+        c.orch.discover(today);
+        assertTrue(c.orch.reject("PF_APTUSD@" + (today + 5)));
+        assertEquals(0, c.orch.pendingApprovals());
+        assertTrue(c.orch.discover(today).isEmpty(), "отклонённое не переоткрывается в дневном цикле");
+        assertEquals(0, c.orch.pendingApprovals());
+    }
+
     @Test void statusSnapshotReflectsState() throws Exception {
         Ctx c = ctx(CHEAP);
         long today = 20000; c.ex.tick("PF_APTUSD", 10.0);

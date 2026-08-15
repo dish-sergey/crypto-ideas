@@ -106,6 +106,11 @@ public class CliRunner implements ApplicationRunner {
             if (args.containsOption("backfill")) {
                 runBackfill(first(args, "backfill"), args);
             }
+            if (args.containsOption("s5-dry-run")) {
+                var dry = new org.home.data.trade.S5DryRun("telegram/s5_bot.txt");
+                if ("once".equals(firstOr(args, "s5-dry-run", "live"))) dry.digestOnce();
+                else dry.runDaemon();                       // блокирует: интерактивный демон
+            }
             if (args.containsOption("report")) {
                 String target = first(args, "report");
                 switch (target) {

@@ -28,6 +28,8 @@ public class S5Orchestrator {
 
     /** eventId -> событие, поданное в Approval Gate и ждущее подтверждения. */
     private final Map<String, UnlockEvent> pending = new LinkedHashMap<>();
+    /** Отклонённые оператором eventId — чтобы дневной цикл не переотправлял их снова. */
+    private final java.util.Set<String> dismissed = new java.util.HashSet<>();
     private int journalCursor = 0;
     private boolean pauseNotified = false;
 
@@ -60,7 +62,7 @@ public class S5Orchestrator {
         // окно (today, today+lead]: обычный вход за 5 дней + ускоренные разлоки (doc 59 §4)
         for (UnlockEvent e : feed.enterableWithin(today, cfg.entryLead())) {
             String id = eventId(e);
-            if (engine.openSymbols().contains(e.krakenSymbol()) || pending.containsKey(id)) continue;
+            if (engine.openSymbols().contains(e.krakenSymbol()) || pending.containsKey(id) || dismissed.contains(id)) continue;
             if (funding.estimate5dFunding(e.base()) < cfg.expensiveFundingThreshold()) continue; // дорогой шорт
             if (wouldBreachExposure()) continue;
             gate.submit(id);
@@ -179,6 +181,7 @@ public class S5Orchestrator {
     /** Кнопка «Отклонить»: снять кандидата — не откроем и в следующем discover не переотправим. */
     public boolean reject(String eventId) {
         gate.reject(eventId);
+        dismissed.add(eventId);
         return pending.remove(eventId) != null;
     }
 }
