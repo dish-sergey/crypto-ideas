@@ -6,3 +6,9 @@ build/
 .idea/workspace.xml
 .claude/settings.local.json
 reports/analysis/*.class
+
+# Секреты — никогда в git (токены Telegram, ключи Kraken и т.п.)
+/telegram/
+*.secret
+*.token
+.env
