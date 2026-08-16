@@ -15,7 +15,7 @@ public class CliMode {
     public CliMode(ApplicationArguments args) {
         this.scheduleMode = !args.containsOption("collect") && !args.containsOption("backfill")
                 && !args.containsOption("report") && !args.containsOption("s5-dry-run")
-                && !args.containsOption("s5-kraken-check");
+                && !args.containsOption("s5-kraken-check") && !args.containsOption("s5-demo");
     }
 
     public boolean isScheduleMode() {
