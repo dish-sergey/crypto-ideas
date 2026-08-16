@@ -114,9 +114,12 @@ public class KrakenFuturesExchange implements ExchangeAdapter {
     public double balance() throws ExchangeDisconnectedException {
         try {
             JsonNode flex = M.readTree(api.get("/api/v3/accounts", true)).path("accounts").path("flex");
-            double v = flex.path("portfolioValue").asDouble(flex.path("availableMargin").asDouble(0));
-            if (v <= 0) log.warn("Kraken balance: flex.portfolioValue не найден/0 — проверить структуру accounts");
-            return v;
+            JsonNode pv = flex.path("portfolioValue");
+            if (pv.isMissingNode()) {   // 0 — валидно (пустой счёт); тревога только если поля НЕТ
+                log.warn("Kraken balance: accounts.flex.portfolioValue отсутствует — проверить структуру accounts");
+                return flex.path("availableMargin").asDouble(0);
+            }
+            return pv.asDouble(0);
         } catch (Exception e) {
             throw new ExchangeDisconnectedException("Kraken accounts: " + e);
         }
