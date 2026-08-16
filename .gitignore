@@ -9,6 +9,7 @@ reports/analysis/*.class
 
 # Секреты — никогда в git (токены Telegram, ключи Kraken и т.п.)
 /telegram/
+/kraken/
 *.secret
 *.token
 .env
