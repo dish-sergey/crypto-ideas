@@ -73,9 +73,7 @@ public class S5Orchestrator {
             long daysToEntry = (e.unlockDay() - cfg.entryLead()) - today;
             String when = daysToEntry <= 0 ? "сегодня" : ("через " + daysToEntry + " дн");
             notifier.push(Alert.approval("Нужно подтверждение",
-                    e.krakenSymbol() + ": разлок " + e.category() + " "
-                            + String.format(java.util.Locale.ROOT, "%.1f%%", e.pctCirculating() * 100)
-                            + " circ — вход " + when, id));
+                    e.krakenSymbol() + ": " + e.pctLabel() + " circ — вход " + when, id));
         }
         return submitted;
     }
@@ -91,8 +89,7 @@ public class S5Orchestrator {
             long entryInstant = (e.unlockDay() - cfg.entryLead()) * 86400L;
             Integer h = reminders.due(id, entryInstant, nowSec);
             if (h != null) notifier.push(Alert.approval("Напоминание: подтвердить (≈" + h + "ч до входа)",
-                    e.krakenSymbol() + ": разлок " + e.category() + " "
-                            + String.format(java.util.Locale.ROOT, "%.1f%%", e.pctCirculating() * 100) + " circ", id));
+                    e.krakenSymbol() + ": " + e.pctLabel() + " circ", id));
         }
     }
 

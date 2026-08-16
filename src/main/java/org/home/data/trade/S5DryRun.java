@@ -16,7 +16,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -110,8 +109,7 @@ public class S5DryRun {
             if (shown++ >= 12) break;
             sb.append("\n").append(e.krakenSymbol())
               .append("  через ").append(e.unlockDay() - today).append("д  ")
-              .append(String.format(Locale.ROOT, "%.1f%%", e.pctCirculating() * 100))
-              .append("  ").append(e.category());
+              .append(e.pctLabel());
         }
         if (up.isEmpty()) sb.append("\n(пусто — нет предстоящих ≥3%)");
         int lead = S5Config.protocol().entryLead();

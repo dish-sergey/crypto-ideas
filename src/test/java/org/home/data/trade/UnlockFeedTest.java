@@ -87,6 +87,8 @@ class UnlockFeedTest {
         assertEquals(1, up.size(), "два транша одного дня → одно событие");
         assertEquals(0.36, up.get(0).pctCirculating(), 1e-9, "проценты суммируются");
         assertEquals("team", up.get(0).category(), "категория крупнейшего транша");
+        assertEquals("team 32.0 + eco 4.0", up.get(0).breakdown(), "разбивка по траншам, крупнейший первым");
+        assertTrue(up.get(0).pctLabel().startsWith("36.0% (team 32.0 + eco 4.0"), up.get(0).pctLabel());
     }
 
     @Test void oneBadProtocolDoesNotBreakFeed() throws Exception {

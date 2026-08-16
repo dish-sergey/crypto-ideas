@@ -44,22 +44,35 @@ public class UnlockFeed implements EventFeed {
      * оставило бы % лишь одного транша и занизило бы масштаб (напр. XPL 3.2%+32.5%+32.5% ≈ 68%, а не 3.2%).
      */
     static List<UnlockEvent> merge(List<UnlockEvent> raw) {
-        java.util.LinkedHashMap<String, UnlockEvent> byKey = new java.util.LinkedHashMap<>();
-        Map<String, Double> topTranche = new java.util.HashMap<>();
-        for (UnlockEvent e : raw) {
-            String key = e.krakenSymbol() + "@" + e.unlockDay();
-            UnlockEvent cur = byKey.get(key);
-            if (cur == null) {
-                byKey.put(key, e);
-                topTranche.put(key, e.pctCirculating());
-            } else {
-                double sum = Math.min(1.0, cur.pctCirculating() + e.pctCirculating());
-                String cat = e.pctCirculating() > topTranche.get(key) ? e.category() : cur.category();
-                topTranche.put(key, Math.max(topTranche.get(key), e.pctCirculating()));
-                byKey.put(key, new UnlockEvent(cur.base(), cur.krakenSymbol(), cur.unlockDay(), sum, cat));
+        java.util.LinkedHashMap<String, List<UnlockEvent>> groups = new java.util.LinkedHashMap<>();
+        for (UnlockEvent e : raw)
+            groups.computeIfAbsent(e.krakenSymbol() + "@" + e.unlockDay(), k -> new ArrayList<>()).add(e);
+        List<UnlockEvent> out = new ArrayList<>();
+        for (List<UnlockEvent> g : groups.values()) {
+            if (g.size() == 1) { out.add(g.get(0)); continue; }
+            g.sort((a, b) -> Double.compare(b.pctCirculating(), a.pctCirculating()));   // крупнейший транш первым
+            double sum = 0;
+            StringBuilder bd = new StringBuilder();
+            for (UnlockEvent e : g) {
+                sum += e.pctCirculating();
+                if (bd.length() > 0) bd.append(" + ");
+                bd.append(shortCat(e.category())).append(' ')
+                  .append(String.format(java.util.Locale.ROOT, "%.1f", e.pctCirculating() * 100));
             }
+            UnlockEvent top = g.get(0);
+            out.add(new UnlockEvent(top.base(), top.krakenSymbol(), top.unlockDay(),
+                    Math.min(1.0, sum), top.category(), bd.toString()));
         }
-        return new ArrayList<>(byKey.values());
+        return out;
+    }
+
+    private static String shortCat(String category) {
+        return switch (category) {
+            case "investors" -> "inv";
+            case "ecosystem" -> "eco";
+            case "staking" -> "stk";
+            default -> category;   // team
+        };
     }
 
     /** События, для которых сегодня день входа: unlockDay == today + entryLead. */
