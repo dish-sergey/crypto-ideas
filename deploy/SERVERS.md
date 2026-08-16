@@ -34,7 +34,14 @@
 - **Юнит:** `/etc/systemd/system/litestream.service`
 - **Конфиг:** `/etc/litestream.yml` (ссылается на env-переменные).
 - **Секреты B2:** `/etc/litestream.env` (права `600 root`, читает systemd как root). Копия ключей у тебя в `D:\servers\backblaze\key.txt`. В git НЕ коммитим.
-- **B2:** бакет `ideas-backup-dish7`, регион `eu-central-003`, endpoint `s3.eu-central-003.backblazeb2.com`.
+- **B2:** бакет `ideas-backup-dish7` (id `1003dc43b957910c9ffd0915`), регион `eu-central-003`, endpoint `s3.eu-central-003.backblazeb2.com`.
+- **⚠️ Скрытые версии (ловушка Litestream+B2):** Litestream по retention постоянно удаляет WAL-сегменты,
+  а B2 по умолчанию хранит удалённые версии вечно → бакет пухнет (2026-08-17: живых данных 602 МБ / 22к
+  объектов, а B2 показывал **8 ГБ** — ~7.4 ГБ скрытых версий, близко к free-лимиту 10 ГБ). **Фикс поставлен:**
+  B2 lifecycle rule `daysFromHidingToDeleting=1` (скрытые версии удаляются через сутки) — задано через
+  `b2_update_bucket` (ключ из `key.txt` имеет `writeBucketLifecycleRules`). Разовая очистка накопленного —
+  `rclone cleanup :b2:ideas-backup-dish7` (b2-backend, креды `RCLONE_B2_ACCOUNT`/`RCLONE_B2_KEY` из `key.txt`,
+  файл в CRLF — стрипнуть `\r`). Проверить размеры: `rclone size :b2:<bucket>` (живые) vs `--b2-versions` (все).
 - **Проверить:** `systemctl status litestream` · `journalctl -u litestream -f`
 - **Список снапшотов:** `sudo bash -c 'set -a; . /etc/litestream.env; litestream snapshots -config /etc/litestream.yml ~/crypto-data/data/crypto.db'`
 - **Восстановить БД:** `sudo bash -c 'set -a; . /etc/litestream.env; litestream restore -config /etc/litestream.yml -o /tmp/restored.db ~/crypto-data/data/crypto.db'`
