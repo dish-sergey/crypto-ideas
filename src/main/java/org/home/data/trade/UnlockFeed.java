@@ -28,13 +28,38 @@ public class UnlockFeed implements EventFeed {
 
     /** Все клифф-разлоки ≥3% на Kraken-инструментах с датой > todayEpochDay (будущие). */
     @Override public List<UnlockEvent> upcoming(long todayEpochDay) throws Exception {
-        List<UnlockEvent> out = new ArrayList<>();
+        List<UnlockEvent> raw = new ArrayList<>();
         for (String slug : src.protocols()) {
-            try { collect(src.emissions(slug), todayEpochDay, out); }
+            try { collect(src.emissions(slug), todayEpochDay, raw); }
             catch (Exception ignore) { /* один протокол не валит фид */ }
         }
+        List<UnlockEvent> out = merge(raw);
         out.sort((a, b) -> Long.compare(a.unlockDay(), b.unlockDay()));
         return out;
+    }
+
+    /**
+     * Слить транши одного разлока (совпадают символ и день) в одно событие: проценты СУММИРУЕМ (истинный
+     * размер клиффа за день), категория — у крупнейшего транша. Иначе схлопывание по ключу символ@день
+     * оставило бы % лишь одного транша и занизило бы масштаб (напр. XPL 3.2%+32.5%+32.5% ≈ 68%, а не 3.2%).
+     */
+    static List<UnlockEvent> merge(List<UnlockEvent> raw) {
+        java.util.LinkedHashMap<String, UnlockEvent> byKey = new java.util.LinkedHashMap<>();
+        Map<String, Double> topTranche = new java.util.HashMap<>();
+        for (UnlockEvent e : raw) {
+            String key = e.krakenSymbol() + "@" + e.unlockDay();
+            UnlockEvent cur = byKey.get(key);
+            if (cur == null) {
+                byKey.put(key, e);
+                topTranche.put(key, e.pctCirculating());
+            } else {
+                double sum = Math.min(1.0, cur.pctCirculating() + e.pctCirculating());
+                String cat = e.pctCirculating() > topTranche.get(key) ? e.category() : cur.category();
+                topTranche.put(key, Math.max(topTranche.get(key), e.pctCirculating()));
+                byKey.put(key, new UnlockEvent(cur.base(), cur.krakenSymbol(), cur.unlockDay(), sum, cat));
+            }
+        }
+        return new ArrayList<>(byKey.values());
     }
 
     /** События, для которых сегодня день входа: unlockDay == today + entryLead. */

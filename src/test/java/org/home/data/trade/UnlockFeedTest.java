@@ -74,6 +74,21 @@ class UnlockFeedTest {
         assertEquals("APT", due.get(0).base(), "вход сегодня только для разлока через 5 дней");
     }
 
+    @Test void mergesSameDayTranchesIntoOne() throws Exception {
+        long today = 20000, unlockDay = today + 5, ts = unlockDay * 86400;
+        // два клиффа в один день: 40/1000=4% ecosystem + 320/1000=32% team → одно событие 36%, категория team
+        String twoTranche = """
+            {"metadata":{"token":"coingecko:aptos","events":[
+               {"unlockType":"cliff","timestamp":%d,"noOfTokens":[40],"category":"","description":"cliff from Ecosystem on X"},
+               {"unlockType":"cliff","timestamp":%d,"noOfTokens":[320],"category":"","description":"cliff from Team on X"}
+            ]},"documentedData":{"data":[{"label":"All","data":[{"timestamp":%d,"unlocked":1000}]}]}}
+            """.formatted(ts, ts, ts);
+        List<UnlockEvent> up = feed(fake(Map.of("aptos", twoTranche))).upcoming(today);
+        assertEquals(1, up.size(), "два транша одного дня → одно событие");
+        assertEquals(0.36, up.get(0).pctCirculating(), 1e-9, "проценты суммируются");
+        assertEquals("team", up.get(0).category(), "категория крупнейшего транша");
+    }
+
     @Test void oneBadProtocolDoesNotBreakFeed() throws Exception {
         long today = 20000;
         var src = fake(Map.of(
