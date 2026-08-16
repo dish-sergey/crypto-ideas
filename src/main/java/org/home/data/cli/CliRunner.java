@@ -111,6 +111,9 @@ public class CliRunner implements ApplicationRunner {
                 if ("once".equals(firstOr(args, "s5-dry-run", "live"))) dry.digestOnce();
                 else dry.runDaemon();                       // блокирует: интерактивный демон
             }
+            if (args.containsOption("s5-kraken-check")) {
+                org.home.data.trade.S5KrakenCheck.run("kraken/keys.txt");   // read-only, без ордеров
+            }
             if (args.containsOption("report")) {
                 String target = first(args, "report");
                 switch (target) {
