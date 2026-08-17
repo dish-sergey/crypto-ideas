@@ -23,11 +23,14 @@ public class KrakenFuturesExchange implements ExchangeAdapter {
     private static final Logger log = LoggerFactory.getLogger(KrakenFuturesExchange.class);
     private static final ObjectMapper M = new ObjectMapper();
     private static final long MARK_TTL_MS = 2000;
+    private static final long INSTR_TTL_MS = 3_600_000;   // спецификации меняются редко — час
 
     private final KrakenApi api;
 
     private Map<String, Double> markCache = Map.of();
     private long markCacheAt = 0;
+    private Map<String, Double> minSizeCache = Map.of();
+    private long minSizeCacheAt = 0;
 
     public KrakenFuturesExchange(KrakenApi api) { this.api = api; }
 
@@ -122,6 +125,25 @@ public class KrakenFuturesExchange implements ExchangeAdapter {
             return pv.asDouble(0);
         } catch (Exception e) {
             throw new ExchangeDisconnectedException("Kraken accounts: " + e);
+        }
+    }
+
+    @Override
+    public double minOrderSize(String symbol) throws ExchangeDisconnectedException {
+        try {
+            long now = System.currentTimeMillis();
+            if (now - minSizeCacheAt > INSTR_TTL_MS) {
+                Map<String, Double> m = new HashMap<>();
+                for (JsonNode i : M.readTree(api.get("/api/v3/instruments", false)).path("instruments")) {
+                    if (!i.path("tradeable").asBoolean(false)) continue;
+                    int cvtp = i.path("contractValueTradePrecision").asInt(0);   // мин.лот = 10^(−cvtp) базовой валюты
+                    m.put(i.path("symbol").asText("").toUpperCase(), Math.pow(10, -cvtp));
+                }
+                minSizeCache = m; minSizeCacheAt = now;
+            }
+            return minSizeCache.getOrDefault(symbol.toUpperCase(), 0.0);
+        } catch (Exception e) {
+            throw new ExchangeDisconnectedException("Kraken instruments: " + e);
         }
     }
 

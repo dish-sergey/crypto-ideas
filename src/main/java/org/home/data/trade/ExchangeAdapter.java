@@ -30,4 +30,11 @@ public interface ExchangeAdapter {
 
     /** Баланс счёта (для лимитов сайзинга). */
     double balance() throws ExchangeDisconnectedException;
+
+    /**
+     * Минимальный размер ордера в базовой валюте (он же шаг лота). 0 — ограничения нет/неизвестно.
+     * У Kraken PF-перпов = 10^(−contractValueTradePrecision). Нужно, чтобы микро-позиция не отклонялась
+     * биржей и чтобы показать оператору, сколько должно быть на счёте для валидного входа.
+     */
+    default double minOrderSize(String symbol) throws ExchangeDisconnectedException { return 0.0; }
 }

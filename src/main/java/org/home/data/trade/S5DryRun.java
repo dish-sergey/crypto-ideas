@@ -53,6 +53,7 @@ public class S5DryRun {
 
         MockExchange ex = new MockExchange(1000);
         marks.forEach(ex::tick);                                    // сид цен реальными марками Kraken
+        krakenMinSizes().forEach(ex::setMinSize);                   // сид реальных мин. лотов Kraken
         ApprovalGate gate = new ApprovalGate();
         TradeJournal j = new TradeJournal();
         StopEngine engine = new StopEngine(ex, j, S5Config.protocol().stopFrac(), 3);
@@ -147,6 +148,17 @@ public class S5DryRun {
             if (mk > 0) marks.put(sym, mk);
         }
         return marks;
+    }
+
+    /** Мин. лоты перпов Kraken: PF_<BASE>USD -> 10^(−contractValueTradePrecision). */
+    private Map<String, Double> krakenMinSizes() throws Exception {
+        Map<String, Double> min = new LinkedHashMap<>();
+        for (JsonNode i : getJson("https://futures.kraken.com/derivatives/api/v3/instruments").path("instruments")) {
+            String sym = i.path("symbol").asText("").toUpperCase();
+            if (!sym.startsWith("PF_") || !sym.endsWith("USD") || !i.path("tradeable").asBoolean(false)) continue;
+            min.put(sym, Math.pow(10, -i.path("contractValueTradePrecision").asInt(0)));
+        }
+        return min;
     }
 
     /** Из символов PF_<BASE>USD — базы-тикеры (XBT->BTC), как ждёт UnlockFeed. */

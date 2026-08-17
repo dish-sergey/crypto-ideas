@@ -30,6 +30,8 @@ public class S5Orchestrator {
     private final Map<String, UnlockEvent> pending = new LinkedHashMap<>();
     /** Отклонённые оператором eventId — чтобы дневной цикл не переотправлял их снова. */
     private final java.util.Set<String> dismissed = new java.util.HashSet<>();
+    /** eventId, по которым уже слали «недостаточно средств» — не спамить каждый цикл. */
+    private final java.util.Set<String> underfundedNotified = new java.util.HashSet<>();
     private final ApprovalReminders reminders = new ApprovalReminders();
     private int journalCursor = 0;
     private boolean pauseNotified = false;
@@ -73,9 +75,38 @@ public class S5Orchestrator {
             long daysToEntry = (e.unlockDay() - cfg.entryLead()) - today;
             String when = daysToEntry <= 0 ? "сегодня" : ("через " + daysToEntry + " дн");
             notifier.push(Alert.approval("Нужно подтверждение",
-                    e.krakenSymbol() + ": " + e.pctLabel() + " circ — вход " + when, id));
+                    e.krakenSymbol() + ": " + e.pctLabel() + " circ — вход " + when + sizingLine(e), id));
         }
         return submitted;
+    }
+
+    /** Расчёт размера позиции и минимума ордера — источник истины для сообщений и проверки средств. */
+    private record Sizing(double px, double bal, double minSize, double qty,
+                          double notional, double minNotional, double minBalance, boolean ok) {}
+
+    private Sizing sizing(UnlockEvent e) throws Exception {
+        double px = ex.mark(e.krakenSymbol());
+        double bal = ex.balance();
+        double minSize = ex.minOrderSize(e.krakenSymbol());
+        double raw = px > 0 ? bal * cfg.positionFraction() / px : 0;
+        double qty = minSize > 0 ? Math.floor(raw / minSize) * minSize : raw;   // округлить вниз к шагу лота
+        double minNotional = minSize * px;
+        double minBalance = cfg.positionFraction() > 0 ? minNotional / cfg.positionFraction() : 0;
+        boolean ok = px > 0 && qty > 0 && (minSize <= 0 || qty >= minSize);
+        return new Sizing(px, bal, minSize, qty, qty * px, minNotional, minBalance, ok);
+    }
+
+    /** Строка для сообщения оператору: размер позиции, мин. ордер и сколько нужно на счёте. */
+    private String sizingLine(UnlockEvent e) throws Exception {
+        Sizing s = sizing(e);
+        if (s.px() <= 0) return "";
+        String line = "\nразмер 4.5%: " + num(s.qty()) + " (~$" + usd(s.notional()) + ")";
+        if (s.minSize() > 0)
+            line += "\nмин. ордер: " + num(s.minSize()) + " (~$" + usd(s.minNotional())
+                    + "), нужно ≥ $" + usd(s.minBalance()) + " на счёте";
+        line += s.ok() ? "\nбаланс $" + usd(s.bal()) + " — хватает ✓"
+                       : "\n⚠️ баланс $" + usd(s.bal()) + " — НЕ хватает для входа";
+        return line;
     }
 
     /**
@@ -111,14 +142,22 @@ public class S5Orchestrator {
             if (gate.isApproved(id)) {
                 if (gated && today < entryDay) continue;        // подтверждено рано — ждём дня входа
                 if (wouldBreachExposure()) continue;
-                double px = ex.mark(e.krakenSymbol());
-                if (px <= 0) continue;
-                double qty = ex.balance() * cfg.positionFraction() / px;
-                if (engine.openShort(id, gate, e.krakenSymbol(), qty)) {
+                Sizing s = sizing(e);
+                if (s.px() <= 0) continue;
+                if (!s.ok()) {                                  // средств не хватает на мин. ордер
+                    if (underfundedNotified.add(id))            // уведомить один раз, не спамить каждый цикл
+                        notifier.push(Alert.warn("Недостаточно средств для входа",
+                                e.krakenSymbol() + ": на счёте $" + usd(s.bal())
+                                        + ", нужно ≥ $" + usd(s.minBalance()) + " (мин. ордер " + num(s.minSize())
+                                        + "). Вход отложен — пополни счёт."));
+                    continue;                                   // оставляем pending: при пополнении откроется
+                }
+                if (engine.openShort(id, gate, e.krakenSymbol(), s.qty())) {
                     tracker.onEntry(e.krakenSymbol(), e.unlockDay(), e.category());
                     reminders.clear(id);
+                    underfundedNotified.remove(id);
                     notifier.push(Alert.info("Открыт шорт",
-                            e.krakenSymbol() + " qty=" + num(qty) + " @ " + num(px)));
+                            e.krakenSymbol() + " qty=" + num(s.qty()) + " (~$" + usd(s.notional()) + ") @ " + num(s.px())));
                     it.remove();
                     opened++;
                 }
@@ -194,6 +233,7 @@ public class S5Orchestrator {
 
     private static String pct(double frac) { return String.format(java.util.Locale.ROOT, "%+.1f%%", frac * 100); }
     private static String num(double v)    { return String.format(java.util.Locale.ROOT, "%.4f", v); }
+    private static String usd(double v)    { return String.format(java.util.Locale.ROOT, "%.2f", v); }
 
     // --- наблюдаемое состояние ---
     public boolean pauseSignalled() { return monitor.pauseSignalled(); }
@@ -218,6 +258,7 @@ public class S5Orchestrator {
         gate.reject(eventId);
         dismissed.add(eventId);
         reminders.clear(eventId);
+        underfundedNotified.remove(eventId);
         return pending.remove(eventId) != null;
     }
 }

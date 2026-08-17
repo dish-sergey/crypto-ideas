@@ -86,6 +86,22 @@ class KrakenFuturesExchangeTest {
         assertEquals(63004.5, r.fillPx(), 1e-9, "нет событий исполнения → марка");
     }
 
+    private static final String INSTRUMENTS =
+            "{\"result\":\"success\",\"instruments\":["
+            + "{\"symbol\":\"PF_XBTUSD\",\"tradeable\":true,\"contractValueTradePrecision\":4},"
+            + "{\"symbol\":\"PF_KAITOUSD\",\"tradeable\":true,\"contractValueTradePrecision\":0},"
+            + "{\"symbol\":\"PF_DEADUSD\",\"tradeable\":false,\"contractValueTradePrecision\":0}]}";
+
+    @Test void minOrderSizeFromInstruments() throws Exception {
+        FakeKrakenApi api = new FakeKrakenApi();
+        api.getResponses.put("/api/v3/instruments", INSTRUMENTS);
+        KrakenFuturesExchange ex = new KrakenFuturesExchange(api);
+        assertEquals(0.0001, ex.minOrderSize("PF_XBTUSD"), 1e-12, "cvtp=4 → 10^-4");
+        assertEquals(1.0, ex.minOrderSize("pf_kaitousd"), 1e-12, "cvtp=0 → 1 (регистр не важен)");
+        assertEquals(0.0, ex.minOrderSize("PF_DEADUSD"), 1e-12, "не tradeable → 0");
+        assertEquals(0.0, ex.minOrderSize("PF_UNKNOWNUSD"), 1e-12, "нет в списке → 0");
+    }
+
     @Test void networkFailureBecomesDisconnect() {
         FakeKrakenApi api = new FakeKrakenApi();
         api.failure = new RuntimeException("connection reset");

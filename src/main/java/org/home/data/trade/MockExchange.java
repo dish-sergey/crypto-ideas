@@ -13,6 +13,7 @@ import java.util.Map;
 public class MockExchange implements ExchangeAdapter {
 
     private final Map<String, Double> marks = new LinkedHashMap<>();
+    private final Map<String, Double> minSizes = new LinkedHashMap<>();
     private final Map<String, Position> pos = new LinkedHashMap<>();
     private double balance;
 
@@ -25,6 +26,7 @@ public class MockExchange implements ExchangeAdapter {
 
     // ---- управление сценарием (только в тестах/фазе 0) ----
     public void tick(String symbol, double price) { marks.put(symbol, price); }
+    public void setMinSize(String symbol, double size) { minSizes.put(symbol, size); }
     public void disconnect() { disconnected = true; }
     public void reconnect() { disconnected = false; }
     public void rejectNextCloses(int n) { rejectCloses = n; }
@@ -63,4 +65,8 @@ public class MockExchange implements ExchangeAdapter {
     }
 
     @Override public double balance() throws ExchangeDisconnectedException { checkConn(); return balance; }
+
+    @Override public double minOrderSize(String symbol) throws ExchangeDisconnectedException {
+        checkConn(); return minSizes.getOrDefault(symbol, 0.0);
+    }
 }

@@ -210,6 +210,47 @@ class S5OrchestratorTest {
         assertTrue(c.notifier.last().title().contains("НЕ УДАЛОСЬ"));
     }
 
+    @Test void insufficientFundsBlocksEntryAndNotifiesOnce() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000;
+        c.ex.tick("PF_APTUSD", 10.0);
+        c.ex.setMinSize("PF_APTUSD", 10.0);                     // мин.лот 10 → мин. ордер $100; 4.5% от $1000 = $45 < $100
+        c.feed.events.add(ev("APT", today + 5));
+        c.orch.discover(today);
+        c.gate.approve("PF_APTUSD@" + (today + 5));
+        assertEquals(0, c.orch.executeApproved(), "мало средств → не открыто");
+        assertEquals(0, c.orch.openPositions());
+        assertEquals(1, c.notifier.count(Alert.Level.WARN));
+        assertTrue(c.notifier.last().title().contains("Недостаточно"));
+        c.orch.executeApproved();
+        assertEquals(1, c.notifier.count(Alert.Level.WARN), "повторно не спамит");
+    }
+
+    @Test void orderQuantityRoundedDownToStep() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000;
+        c.ex.tick("PF_APTUSD", 10.0);
+        c.ex.setMinSize("PF_APTUSD", 1.0);                     // шаг 1: 4.5% от $1000 / $10 = 4.5 → 4
+        c.feed.events.add(ev("APT", today + 5));
+        c.orch.discover(today);
+        c.gate.approve("PF_APTUSD@" + (today + 5));
+        c.orch.executeApproved();
+        assertEquals(4.0, c.ex.positions().get(0).qty(), 1e-9, "округление вниз к шагу лота");
+    }
+
+    @Test void approvalMessageShowsMinOrderAndRequiredBalance() throws Exception {
+        Ctx c = ctx(CHEAP);
+        long today = 20000;
+        c.ex.tick("PF_APTUSD", 10.0);
+        c.ex.setMinSize("PF_APTUSD", 1.0);
+        c.feed.events.add(ev("APT", today + 5));
+        c.orch.discover(today);
+        String body = c.notifier.last().body();
+        assertTrue(body.contains("мин. ордер"), body);
+        assertTrue(body.contains("нужно ≥ $"), body);
+        assertTrue(body.contains("размер 4.5%"), body);
+    }
+
     @Test void rejectedEventNotRediscovered() throws Exception {
         Ctx c = ctx(CHEAP);
         long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
