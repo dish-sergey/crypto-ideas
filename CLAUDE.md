@@ -22,10 +22,17 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun --args='--backfill=oi-archive --symbols=BTCUSDT,ETHUSDT --from=2021-01-01'  # ретро-OI из bulk-архива
 ./gradlew bootRun --args='--s5-dry-run=once'                    # S5: дайджест ближайших разлоков в Telegram и выход
 ./gradlew bootRun --args='--s5-dry-run'                         # S5: интерактивный dry-run (живой фид + марки Kraken + мок-исполнение)
+./gradlew bootRun --args='--s5-kraken-check'                    # S5: read-only проверка ключа Kraken (без ордеров)
+./gradlew bootRun --args='--s5-demo'                            # S5: показ жизненного цикла сделки в Telegram (без ордеров)
+./gradlew bootRun --args='--s5-live'                            # S5: LIVE — РЕАЛЬНЫЕ ордера на Kraken Futures
 ```
 
 S5 dry-run читает токен/chat_id из `telegram/s5_bot.txt` (gitignored) либо env
 `S5_TELEGRAM_TOKEN`/`S5_TELEGRAM_CHAT`. Деньги виртуальные (MockExchange), данные и Telegram — реальные.
+`--s5-live` дополнительно читает ключи Kraken из `kraken/keys.txt` (gitignored) либо env
+`S5_KRAKEN_KEY`/`S5_KRAKEN_SECRET`; исполнение настоящее, но ордер только после ручного подтверждения
+(Approval Gate) + стоп −30%. **Live и dry-run с одним ботом одновременно НЕ запускать** (один потребитель
+Telegram getUpdates, иначе 409). На micro — сервис `s5-live` (см. deploy/SERVERS.md).
 
 База: `data/crypto.db` (WAL). Схема: `src/main/resources/schema.sql`.
 

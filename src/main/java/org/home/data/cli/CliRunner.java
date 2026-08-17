@@ -117,6 +117,9 @@ public class CliRunner implements ApplicationRunner {
             if (args.containsOption("s5-demo")) {
                 org.home.data.trade.S5Demo.run("telegram/s5_bot.txt");      // показ цикла в Telegram, без ордеров
             }
+            if (args.containsOption("s5-live")) {
+                new org.home.data.trade.S5Live("telegram/s5_bot.txt", "kraken/keys.txt").run();  // РЕАЛЬНЫЕ ордера
+            }
             if (args.containsOption("report")) {
                 String target = first(args, "report");
                 switch (target) {
