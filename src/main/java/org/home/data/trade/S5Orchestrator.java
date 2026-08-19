@@ -35,6 +35,8 @@ public class S5Orchestrator {
     private final ApprovalReminders reminders = new ApprovalReminders();
     private int journalCursor = 0;
     private boolean pauseNotified = false;
+    /** Последний снимок ближайших разлоков (для команды /unlocks); обновляется в discover. */
+    private volatile List<UnlockEvent> upcomingSnapshot = List.of();
 
     /** Без канала уведомлений (уведомления не шлём). */
     public S5Orchestrator(ExchangeAdapter ex, EventFeed feed, FundingSource funding, ApprovalGate gate,
@@ -62,9 +64,13 @@ public class S5Orchestrator {
      */
     public List<UnlockEvent> discover(long today) throws Exception {
         List<UnlockEvent> submitted = new java.util.ArrayList<>();
+        List<UnlockEvent> up = feed.upcoming(today);
+        upcomingSnapshot = up;                              // снимок для команды /unlocks
         // окно чуть шире дня входа (approvalLeadDays) — кандидат всплывает заранее, чтобы успела эскалация
         // напоминаний; сам вход всё равно на unlockDay−entryLead. Плюс ускоренные разлоки (doc 59 §4).
-        for (UnlockEvent e : feed.enterableWithin(today, cfg.entryLead() + cfg.approvalLeadDays())) {
+        long horizon = today + cfg.entryLead() + cfg.approvalLeadDays();
+        for (UnlockEvent e : up) {
+            if (e.unlockDay() > horizon) continue;          // вне окна входа
             String id = eventId(e);
             if (engine.openSymbols().contains(e.krakenSymbol()) || pending.containsKey(id) || dismissed.contains(id)) continue;
             if (funding.estimate5dFunding(e.base()) < cfg.expensiveFundingThreshold()) continue; // дорогой шорт
@@ -243,6 +249,25 @@ public class S5Orchestrator {
     /** Снимок для запроса «/status» с телефона. */
     public StatusSnapshot status() {
         return new StatusSnapshot(engine.openCount(), pending.size(), monitor.pauseSignalled(), journalCursor);
+    }
+
+    /** Текст ближайших разлоков для команды /unlocks (из снимка последнего скана). */
+    public String upcomingText(long today) {
+        List<UnlockEvent> up = upcomingSnapshot;
+        if (up.isEmpty()) return "Ближайшие разлоки: список ещё не собран (скан раз в день). Загляни позже.";
+        StringBuilder sb = new StringBuilder("Ближайшие клифф-разлоки ≥3% на Kraken:");
+        int n = 0;
+        for (UnlockEvent e : up) {
+            if (n++ >= 15) break;
+            sb.append("\n").append(e.krakenSymbol()).append("  через ")
+              .append(e.unlockDay() - today).append("д  ").append(e.pctLabel());
+        }
+        int lead = cfg.entryLead();
+        long horizon = today + lead + cfg.approvalLeadDays();
+        long inWindow = up.stream().filter(e -> e.unlockDay() <= horizon).count();
+        sb.append("\n\nвсего впереди: ").append(up.size())
+          .append(", в окне входа: ").append(inWindow);
+        return sb.toString();
     }
 
     /** Открытые позиции (для «/positions» с телефона) — источник истины биржа. */

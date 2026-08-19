@@ -36,12 +36,15 @@ public class TelegramNotifier implements Notifier {
         }
     }
 
-    /** Сборка тела sendMessage: текст с эмодзи-меткой уровня, тихий режим для INFO, кнопки при наличии. */
+    /**
+     * Сборка тела sendMessage: обычный текст (БЕЗ parse_mode) — тикеры вида PF_KAITOUSD содержат '_',
+     * который Markdown ловит как курсив и роняет всё сообщение (HTTP 400 can't parse entities). Плоский
+     * текст надёжен для любых символов. Эмодзи-метка уровня, тихий режим для INFO, кнопки при наличии.
+     */
     ObjectNode payload(Alert alert) {
         ObjectNode body = M.createObjectNode();
         body.put("chat_id", chatId);
-        body.put("text", mark(alert.level()) + " *" + alert.title() + "*\n" + alert.body());
-        body.put("parse_mode", "Markdown");
+        body.put("text", mark(alert.level()) + " " + alert.title() + "\n" + alert.body());
         if (alert.level() == Alert.Level.INFO) body.put("disable_notification", true);
         if (!alert.actions().isEmpty()) {
             ArrayNode row = M.createArrayNode();

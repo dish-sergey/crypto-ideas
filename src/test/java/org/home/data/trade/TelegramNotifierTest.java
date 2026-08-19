@@ -26,6 +26,14 @@ class TelegramNotifierTest {
         assertTrue(p.get("text").asText().contains("⚠️"));
     }
 
+    @Test void plainTextNoMarkdownForUnderscoreSymbols() {
+        // тикеры вида PF_KAITOUSD содержат '_' — с parse_mode=Markdown Telegram роняет сообщение (400).
+        ObjectNode p = new TelegramNotifier(new FakeTelegramTransport(), 42L)
+                .payload(Alert.info("Открыт шорт", "PF_KAITOUSD qty=133 @ 0.3384"));
+        assertFalse(p.has("parse_mode"), "без parse_mode — плоский текст");
+        assertTrue(p.get("text").asText().contains("PF_KAITOUSD"), "подчёркивание в тикере сохранено как есть");
+    }
+
     @Test void approvalCarriesButtons() {
         ObjectNode p = new TelegramNotifier(new FakeTelegramTransport(), 42L)
                 .payload(Alert.approval("Нужно подтверждение", "APT", "PF_APTUSD@20005"));

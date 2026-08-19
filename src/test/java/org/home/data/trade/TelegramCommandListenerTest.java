@@ -70,6 +70,13 @@ class TelegramCommandListenerTest {
         assertTrue(r.tx.last().body().contains("S5"), "ответ на /status — снимок состояния");
     }
 
+    @Test void unlocksCommandListsUpcoming() throws Exception {
+        Rig r = rig();                                            // rig() уже вызвал discover → снимок собран
+        r.lis.handleUpdates(messageJson(6, "/unlocks", CHAT));
+        assertEquals("sendMessage", r.tx.last().method());
+        assertTrue(r.tx.last().body().contains("PF_APTUSD"), "в ответе — ближайший разлок");
+    }
+
     @Test void foreignChatIgnored() throws Exception {
         Rig r = rig();
         r.lis.handleUpdates(messageJson(4, "/status", 999L));     // чужой чат

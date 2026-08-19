@@ -43,7 +43,7 @@ public class TelegramCommandListener {
                     handleUpdates(transport.call("getUpdates", M.writeValueAsString(req)));
                 } catch (Exception e) {
                     log.warn("Telegram getUpdates: {}", e.toString());
-                    sleep(3000);
+                    sleep(5000);                           // транзиентные 429/502/timeout — подождать и повторить
                 }
             }
         }, "s5-telegram-listener");
@@ -74,7 +74,8 @@ public class TelegramCommandListener {
         switch (text.split("\\s+")[0]) {
             case "/status" -> send(orch.status().render());
             case "/positions" -> send(renderPositions());
-            case "/help", "/start" -> send("Команды: /status — состояние, /positions — открытые позиции");
+            case "/unlocks", "/next" -> send(orch.upcomingText(java.time.LocalDate.now(java.time.ZoneOffset.UTC).toEpochDay()));
+            case "/help", "/start" -> send("Команды: /status — состояние, /positions — открытые позиции, /unlocks — ближайшие разлоки");
             default -> { /* не команда — молчим */ }
         }
     }
