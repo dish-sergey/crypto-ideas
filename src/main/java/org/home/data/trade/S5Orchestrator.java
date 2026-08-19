@@ -79,9 +79,12 @@ public class S5Orchestrator {
             pending.put(id, e);
             submitted.add(e);
             long daysToEntry = (e.unlockDay() - cfg.entryLead()) - today;
+            long daysToUnlock = e.unlockDay() - today;
             String when = daysToEntry <= 0 ? "сегодня" : ("через " + daysToEntry + " дн");
             notifier.push(Alert.approval("Нужно подтверждение",
-                    e.krakenSymbol() + ": " + e.pctLabel() + " circ — вход " + when + sizingLine(e), id));
+                    e.krakenSymbol() + ": " + e.pctLabel() + " circ\n"
+                            + "шорт входим " + when + " (00:00 UTC), разлок через " + daysToUnlock + " дн"
+                            + sizingLine(e), id));
         }
         return submitted;
     }
@@ -125,8 +128,11 @@ public class S5Orchestrator {
             if (gate.isApproved(id)) { reminders.clear(id); continue; }
             long entryInstant = (e.unlockDay() - cfg.entryLead()) * 86400L;
             Integer h = reminders.due(id, entryInstant, nowSec);
-            if (h != null) notifier.push(Alert.approval("Напоминание: подтвердить (≈" + h + "ч до входа)",
-                    e.krakenSymbol() + ": " + e.pctLabel() + " circ", id));
+            if (h != null) {
+                long hrs = Math.max(0, (entryInstant - nowSec) / 3600);   // реальные часы до входа
+                notifier.push(Alert.approval("Напоминание: подтвердить (вход через ~" + hrs + "ч)",
+                        e.krakenSymbol() + ": " + e.pctLabel() + " circ, шорт входим в ~" + hrs + "ч (00:00 UTC)", id));
+            }
         }
     }
 

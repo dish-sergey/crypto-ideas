@@ -293,9 +293,9 @@ class S5OrchestratorTest {
         c.feed.events.add(ev("APT", today + 7));                 // entryDay = today+2
         c.orch.discover(today);                                  // первый пуш (approval)
         long entryInstant = (today + 2) * 86400L;
-        c.orch.pollReminders(entryInstant - 10 * 3600);          // 10ч до входа → порог 12ч
+        c.orch.pollReminders(entryInstant - 10 * 3600);          // 10ч до входа → порог 12ч, реально ~10ч
         assertTrue(c.notifier.last().title().contains("Напоминание"));
-        assertTrue(c.notifier.last().title().contains("12"));
+        assertTrue(c.notifier.last().title().contains("10"), c.notifier.last().title());
         // подтвердили — напоминания прекращаются
         c.gate.approve("PF_APTUSD@" + (today + 7));
         int before = c.notifier.count();
