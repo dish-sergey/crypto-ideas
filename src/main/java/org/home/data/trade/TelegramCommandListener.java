@@ -86,16 +86,22 @@ public class TelegramCommandListener {
         String cbId = cb.path("id").asText("");
         if (fromChat != chatId) { answerCallback(cbId, "не разрешено"); return; }
 
-        String reply;
         if (data.startsWith("approve:")) {
-            reply = orch.approve(data.substring("approve:".length())) ? "✅ подтверждено" : "уже неактуально";
+            try {
+                S5Orchestrator.ApproveOutcome out = orch.approve(data.substring("approve:".length()));
+                answerCallback(cbId, out.approved() ? "✅ принято" : "❌ не принято");
+                send(out.message());
+            } catch (Exception e) {                    // биржа недоступна при проверке средств
+                answerCallback(cbId, "ошибка");
+                send("⚠️ Не удалось проверить баланс — попробуй подтвердить ещё раз через минуту.");
+            }
         } else if (data.startsWith("reject:")) {
-            reply = orch.reject(data.substring("reject:".length())) ? "✖️ отклонено" : "уже неактуально";
+            boolean ok = orch.reject(data.substring("reject:".length()));
+            answerCallback(cbId, ok ? "✖️ отклонено" : "уже неактуально");
+            send((ok ? "✖️ Отклонено" : "уже неактуально") + ": " + data.substring("reject:".length()));
         } else {
-            reply = "неизвестная кнопка";
+            answerCallback(cbId, "неизвестная кнопка");
         }
-        answerCallback(cbId, reply);
-        send(reply + ": " + data);
     }
 
     private String renderPositions() throws Exception {

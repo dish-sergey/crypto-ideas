@@ -275,8 +275,27 @@ public class S5Orchestrator {
 
     // --- ручное подтверждение с телефона (кнопки Telegram) ---
 
-    /** Кнопка «Подтвердить»: одобрить кандидата. true — если он ждал подтверждения. */
-    public boolean approve(String eventId) { return gate.approve(eventId); }
+    /** Результат нажатия «Подтвердить»: принято ли + текст-ответ оператору. */
+    public record ApproveOutcome(boolean approved, String message) {}
+
+    /**
+     * Кнопка «Подтвердить»: одобряем ТОЛЬКО если на счёте хватает на мин. ордер (иначе подтверждение
+     * бессмысленно — вход всё равно отклонится). При нехватке возвращаем понятный отказ, событие
+     * остаётся в ожидании — можно подтвердить снова после пополнения.
+     */
+    public ApproveOutcome approve(String eventId) throws Exception {
+        UnlockEvent e = pending.get(eventId);
+        if (e == null) return new ApproveOutcome(false, "уже неактуально");
+        Sizing s = sizing(e);
+        if (s.px() <= 0) return new ApproveOutcome(false, "нет цены по " + e.krakenSymbol() + ", попробуй позже");
+        if (!s.ok()) return new ApproveOutcome(false,
+                "❌ Не подтверждено: на счёте $" + usd(s.bal()) + ", для " + e.krakenSymbol()
+                        + " нужно ≥ $" + usd(s.minBalance()) + " (мин. ордер " + num(s.minSize())
+                        + "). Пополни счёт и подтверди снова.");
+        gate.approve(eventId);
+        return new ApproveOutcome(true, "✅ Подтверждено: " + e.krakenSymbol()
+                + ", вход " + num(s.qty()) + " (~$" + usd(s.notional()) + ") в день −5.");
+    }
 
     /** Кнопка «Отклонить»: снять кандидата — не откроем и в следующем discover не переотправим. */
     public boolean reject(String eventId) {

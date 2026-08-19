@@ -23,7 +23,7 @@ class TelegramCommandListenerTest {
         };
     }
 
-    private record Rig(ApprovalGate gate, S5Orchestrator orch, FakeTelegramTransport tx, TelegramCommandListener lis) {}
+    private record Rig(MockExchange ex, ApprovalGate gate, S5Orchestrator orch, FakeTelegramTransport tx, TelegramCommandListener lis) {}
 
     private static Rig rig() throws Exception {
         MockExchange ex = new MockExchange(1000);
@@ -34,7 +34,7 @@ class TelegramCommandListenerTest {
                 new StopEngine(ex, j, 0.30, 3), new ScheduleTracker(), new DegradationMonitor(), j, S5Config.protocol());
         orch.discover(TODAY);                                     // кандидат в pending
         FakeTelegramTransport tx = new FakeTelegramTransport();
-        return new Rig(gate, orch, tx, new TelegramCommandListener(tx, CHAT, orch));
+        return new Rig(ex, gate, orch, tx, new TelegramCommandListener(tx, CHAT, orch));
     }
 
     private static String callbackJson(long updId, String data, long chat) {
@@ -53,6 +53,15 @@ class TelegramCommandListenerTest {
         assertTrue(r.gate.isApproved(EID), "кнопка Подтвердить → gate одобрил");
         assertEquals(1, r.tx.countOf("answerCallbackQuery"), "кнопке ответили");
         assertTrue(r.tx.countOf("sendMessage") >= 1, "прислали подтверждение в чат");
+    }
+
+    @Test void approveBlockedWhenInsufficientFunds() throws Exception {
+        Rig r = rig();
+        r.ex.setMinSize("PF_APTUSD", 10.0);                       // мин.лот 10 → нужно $100 при $10 цене; баланс $1000 даёт $45 позицию < мин
+        r.lis.handleUpdates(callbackJson(10, "approve:" + EID, CHAT));
+        assertFalse(r.gate.isApproved(EID), "подтверждение отклонено — средств не хватает");
+        assertEquals(1, r.orch.status().pendingApprovals(), "событие остаётся в ожидании");
+        assertTrue(r.tx.lastOf("sendMessage").body().contains("Не подтверждено"), r.tx.lastOf("sendMessage").body());
     }
 
     @Test void rejectButtonDropsCandidate() throws Exception {
