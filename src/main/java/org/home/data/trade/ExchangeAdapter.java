@@ -37,4 +37,7 @@ public interface ExchangeAdapter {
      * биржей и чтобы показать оператору, сколько должно быть на счёте для валидного входа.
      */
     default double minOrderSize(String symbol) throws ExchangeDisconnectedException { return 0.0; }
+
+    /** Человекочитаемая разбивка баланса для команды /balance (по умолчанию — просто число). */
+    default String balanceBreakdown() throws ExchangeDisconnectedException { return "$" + balance(); }
 }

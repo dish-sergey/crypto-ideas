@@ -74,8 +74,9 @@ public class TelegramCommandListener {
         switch (text.split("\\s+")[0]) {
             case "/status" -> send(orch.status().render());
             case "/positions" -> send(renderPositions());
+            case "/balance" -> send(orch.balanceBreakdown());
             case "/unlocks", "/next" -> send(orch.upcomingText(java.time.LocalDate.now(java.time.ZoneOffset.UTC).toEpochDay()));
-            case "/help", "/start" -> send("Команды: /status — состояние, /positions — открытые позиции, /unlocks — ближайшие разлоки");
+            case "/help", "/start" -> send("Команды: /status — состояние, /balance — баланс счёта, /positions — позиции, /unlocks — ближайшие разлоки");
             default -> { /* не команда — молчим */ }
         }
     }

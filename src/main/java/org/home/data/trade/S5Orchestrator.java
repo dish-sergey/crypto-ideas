@@ -279,6 +279,9 @@ public class S5Orchestrator {
     /** Открытые позиции (для «/positions» с телефона) — источник истины биржа. */
     public List<Position> positions() throws Exception { return ex.positions(); }
 
+    /** Разбивка баланса (для «/balance») — куда легли деньги (flex vs cash). */
+    public String balanceBreakdown() throws Exception { return ex.balanceBreakdown(); }
+
     // --- ручное подтверждение с телефона (кнопки Telegram) ---
 
     /** Результат нажатия «Подтвердить»: принято ли + текст-ответ оператору. */

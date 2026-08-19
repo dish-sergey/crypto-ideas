@@ -128,6 +128,48 @@ public class KrakenFuturesExchange implements ExchangeAdapter {
         }
     }
 
+    /** Полная разбивка счёта: flex (маржа фьючерсов) + cash (не идёт в маржу) — диагностика «куда легли деньги». */
+    @Override
+    public String balanceBreakdown() throws ExchangeDisconnectedException {
+        try {
+            JsonNode acc = M.readTree(api.get("/api/v3/accounts", true)).path("accounts");
+            JsonNode flex = acc.path("flex");
+            StringBuilder sb = new StringBuilder("Kraken Futures — счёт:\n");
+            sb.append("flex (multi-collateral, ИДЁТ в маржу):\n")
+              .append("  portfolioValue: $").append(fmtUsd(flex.path("portfolioValue").asDouble(0))).append("\n")
+              .append("  collateralValue: $").append(fmtUsd(flex.path("collateralValue").asDouble(0))).append("\n")
+              .append("  availableMargin: $").append(fmtUsd(flex.path("availableMargin").asDouble(0))).append("\n");
+            JsonNode curr = flex.path("currencies");
+            if (curr.isObject() && curr.size() > 0) {
+                sb.append("  залог:");
+                for (var it = curr.fields(); it.hasNext(); ) {
+                    var en = it.next();
+                    JsonNode c = en.getValue();
+                    double q = c.path("quantity").asDouble(c.path("balance").asDouble(0));
+                    sb.append(" ").append(en.getKey().toUpperCase()).append("=").append(q);
+                }
+                sb.append("\n");
+            }
+            // cash-кошелёк: ненулевые валюты
+            StringBuilder cash = new StringBuilder();
+            for (var it = acc.path("cash").path("balances").fields(); it.hasNext(); ) {
+                var en = it.next();
+                double v = en.getValue().asDouble(0);
+                if (v != 0) cash.append(" ").append(en.getKey().toUpperCase()).append("=").append(v);
+            }
+            if (cash.length() > 0)
+                sb.append("cash-кошелёк (НЕ идёт в маржу фьючерсов!):").append(cash).append("\n")
+                  .append("→ переведи в multi-collateral (flex) кошелёк, иначе для торговли недоступно.\n");
+            else if (flex.path("portfolioValue").asDouble(0) <= 0)
+                sb.append("(пусто — пополни flex/multi-collateral кошелёк фьючерсов)\n");
+            return sb.toString();
+        } catch (Exception e) {
+            throw new ExchangeDisconnectedException("Kraken accounts: " + e);
+        }
+    }
+
+    private static String fmtUsd(double v) { return String.format(java.util.Locale.ROOT, "%.2f", v); }
+
     @Override
     public double minOrderSize(String symbol) throws ExchangeDisconnectedException {
         try {
