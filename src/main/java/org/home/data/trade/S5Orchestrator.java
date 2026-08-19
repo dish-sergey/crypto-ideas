@@ -109,7 +109,7 @@ public class S5Orchestrator {
     private String sizingLine(UnlockEvent e) throws Exception {
         Sizing s = sizing(e);
         if (s.px() <= 0) return "";
-        String line = "\nразмер 4.5%: " + num(s.qty()) + " (~$" + usd(s.notional()) + ")";
+        String line = "\nразмер ~4.5% (ориентир, пересчёт на входе): " + num(s.qty()) + " (~$" + usd(s.notional()) + ")";
         if (s.minSize() > 0)
             line += "\nмин. ордер: " + num(s.minSize()) + " (~$" + usd(s.minNotional())
                     + "), нужно ≥ $" + usd(s.minBalance()) + " на счёте";
@@ -250,11 +250,23 @@ public class S5Orchestrator {
     // --- наблюдаемое состояние ---
     public boolean pauseSignalled() { return monitor.pauseSignalled(); }
     public int openPositions() { return engine.openCount(); }
-    public int pendingApprovals() { return pending.size(); }
+    /** Кандидаты, реально ждущие подтверждения оператора (в pending и НЕ одобрены). */
+    public int pendingApprovals() {
+        int n = 0;
+        for (String id : pending.keySet()) if (!gate.isApproved(id)) n++;
+        return n;
+    }
+    /** Одобренные, но ещё не открытые — ждут наступления дня входа (−5). */
+    public int approvedAwaitingEntry() {
+        int n = 0;
+        for (String id : pending.keySet()) if (gate.isApproved(id)) n++;
+        return n;
+    }
 
     /** Снимок для запроса «/status» с телефона. */
     public StatusSnapshot status() {
-        return new StatusSnapshot(engine.openCount(), pending.size(), monitor.pauseSignalled(), journalCursor);
+        return new StatusSnapshot(engine.openCount(), pendingApprovals(), approvedAwaitingEntry(),
+                monitor.pauseSignalled(), journalCursor);
     }
 
     /** Текст ближайших разлоков для команды /unlocks (из снимка последнего скана). */
@@ -303,7 +315,8 @@ public class S5Orchestrator {
                         + "). Пополни счёт и подтверди снова.");
         gate.approve(eventId);
         return new ApproveOutcome(true, "✅ Подтверждено: " + e.krakenSymbol()
-                + ", вход " + num(s.qty()) + " (~$" + usd(s.notional()) + ") в день −5.");
+                + ". В день −5 откроем шорт ~4.5% капитала (сейчас ориентир ≈" + num(s.qty()) + " / $" + usd(s.notional())
+                + "; точный размер пересчитается по цене и балансу на момент входа).");
     }
 
     /** Кнопка «Отклонить»: снять кандидата — не откроем и в следующем discover не переотправим. */

@@ -248,7 +248,7 @@ class S5OrchestratorTest {
         String body = c.notifier.last().body();
         assertTrue(body.contains("мин. ордер"), body);
         assertTrue(body.contains("нужно ≥ $"), body);
-        assertTrue(body.contains("размер 4.5%"), body);
+        assertTrue(body.contains("размер ~4.5%"), body);
     }
 
     @Test void rejectedEventNotRediscovered() throws Exception {
