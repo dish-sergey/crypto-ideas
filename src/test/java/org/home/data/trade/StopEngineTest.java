@@ -33,6 +33,51 @@ class StopEngineTest {
         assertEquals(1, e.openCount());
     }
 
+    // ---- биржевой стоп-ордер (страховка) ----
+    @Test void exchangeStopPlacedOnOpenAtStopLevel() throws Exception {
+        MockExchange ex = new MockExchange(1000); ex.tick("PF_APTUSD", 10.0);
+        TradeJournal j = new TradeJournal(); StopEngine e = engine(ex, j);
+        assertTrue(e.openShort("ev1", approved("ev1"), "PF_APTUSD", 4.5));
+        assertEquals(13.0, ex.stopPrice("PF_APTUSD"), 1e-9, "биржевой стоп на уровне вход×1.30");
+        assertEquals(13.0, e.stopLevel("PF_APTUSD"), 1e-9);
+    }
+
+    @Test void exchangeStopCancelledOnPlannedExit() throws Exception {
+        MockExchange ex = new MockExchange(1000); ex.tick("PF_APTUSD", 10.0);
+        TradeJournal j = new TradeJournal(); StopEngine e = engine(ex, j);
+        e.openShort("ev1", approved("ev1"), "PF_APTUSD", 4.5);
+        assertNotNull(ex.stopPrice("PF_APTUSD"));
+        e.closePlanned("PF_APTUSD");
+        assertNull(ex.stopPrice("PF_APTUSD"), "плановый выход снимает биржевой стоп");
+    }
+
+    @Test void exchangeStopCancelledOnStop() throws Exception {
+        MockExchange ex = new MockExchange(1000); ex.tick("PF_APTUSD", 10.0);
+        TradeJournal j = new TradeJournal(); StopEngine e = engine(ex, j);
+        e.openShort("ev1", approved("ev1"), "PF_APTUSD", 4.5);
+        ex.tick("PF_APTUSD", 13.0); e.poll();                 // софт-стоп сработал → закрыл
+        assertNull(ex.stopPrice("PF_APTUSD"), "после закрытия биржевой стоп снят");
+    }
+
+    @Test void exchangeStopReplacedOnAdopt() throws Exception {
+        // как после рестарта: позиция на бирже, в памяти пусто → adopt ставит свежий биржевой стоп
+        MockExchange ex = new MockExchange(1000); ex.tick("PF_APTUSD", 10.0);
+        ex.openShort("PF_APTUSD", 4.5);
+        TradeJournal j = new TradeJournal(); StopEngine e = engine(ex, j);
+        e.adopt(ex.positions());
+        assertEquals(13.0, ex.stopPrice("PF_APTUSD"), 1e-9, "adopt восстановил биржевой стоп");
+    }
+
+    @Test void openSucceedsEvenIfExchangeStopRejected() throws Exception {
+        MockExchange ex = new MockExchange(1000); ex.tick("PF_APTUSD", 10.0);
+        ex.rejectStops(true);                                 // биржа отклоняет стоп
+        TradeJournal j = new TradeJournal(); StopEngine e = engine(ex, j);
+        assertTrue(e.openShort("ev1", approved("ev1"), "PF_APTUSD", 4.5), "открытие не падает из-за стопа");
+        assertNull(ex.stopPrice("PF_APTUSD"), "стоп не поставлен, но софт-стоп работает");
+        ex.tick("PF_APTUSD", 13.0); e.poll();
+        assertEquals(1, j.count(TradeJournal.Category.STOP), "софт-стоп сработал как основной");
+    }
+
     // ---- ≥20 корректных срабатываний стопа (§5) ----
     @Test void stopTriggersTwentyTimes() throws Exception {
         MockExchange ex = new MockExchange(100000); TradeJournal j = new TradeJournal(); StopEngine e = engine(ex, j);

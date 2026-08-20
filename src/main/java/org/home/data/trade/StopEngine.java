@@ -39,7 +39,30 @@ public class StopEngine {
         OrderResult r = ex.openShort(symbol, qty);
         if (!r.isFilled()) return false;
         managed.put(symbol, new Managed(r.fillPx(), qty));
+        placeExchangeStop(symbol, qty, r.fillPx());          // биржевая страховка на случай простоя бота
         return true;
+    }
+
+    /** Цена входа управляемой позиции (для показа/уровня стопа), 0 — если не управляется. */
+    public double entryPrice(String symbol) {
+        Managed m = managed.get(symbol);
+        return m == null ? 0 : m.entryPx;
+    }
+
+    /** Уровень стопа (цена) по символу = вход × (1 + stopFrac). */
+    public double stopLevel(String symbol) {
+        Managed m = managed.get(symbol);
+        return m == null ? 0 : m.entryPx * (1 + stopFrac);
+    }
+
+    private void placeExchangeStop(String symbol, double qty, double entryPx) {
+        try { ex.placeStopBuy(symbol, qty, entryPx * (1 + stopFrac)); }
+        catch (Exception e) { /* best-effort: софт-стоп остаётся основным */ }
+    }
+
+    private void cancelExchangeStop(String symbol) {
+        try { ex.cancelStops(symbol); }
+        catch (Exception e) { /* best-effort */ }
     }
 
     /** Один опрос цен: обновить внутридневной максимум и сработать стопом при пробое порога. */
@@ -91,6 +114,7 @@ public class StopEngine {
                 journal.record(symbol, TradeJournal.Category.ALREADY_CLOSED, m.entryPx, m.entryPx,
                         "позиция закрыта вне системы");
                 managed.remove(symbol);
+                cancelExchangeStop(symbol);              // позиции нет — снять висящий биржевой стоп
                 return;
             }
         } catch (ExchangeDisconnectedException e) { return; } // разрыв — попробуем на reconnect()
@@ -108,6 +132,7 @@ public class StopEngine {
                         : "закрыто";
                 journal.record(symbol, cat, m.entryPx, exit, note);
                 managed.remove(symbol);
+                cancelExchangeStop(symbol);              // закрыли — снять биржевой стоп-дубликат
                 return;
             }
             // отклонено: возможно, позиция исчезла между проверкой и ордером
@@ -116,6 +141,7 @@ public class StopEngine {
                     journal.record(symbol, TradeJournal.Category.ALREADY_CLOSED, m.entryPx, m.entryPx,
                             "позиция исчезла при закрытии");
                     managed.remove(symbol);
+                    cancelExchangeStop(symbol);
                     return;
                 }
             } catch (ExchangeDisconnectedException e) { return; }
@@ -146,6 +172,9 @@ public class StopEngine {
             try { m.runningMax = Math.max(m.runningMax, ex.mark(p.symbol())); }
             catch (ExchangeDisconnectedException ignore) { /* останется entryPx */ }
             managed.put(p.symbol(), m);
+            // после рестарта: снять возможный старый биржевой стоп и поставить свежий по цене входа с биржи
+            cancelExchangeStop(p.symbol());
+            placeExchangeStop(p.symbol(), p.qty(), p.entryPx());
         }
     }
 }

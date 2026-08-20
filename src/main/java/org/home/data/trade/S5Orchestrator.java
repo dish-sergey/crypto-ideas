@@ -181,7 +181,8 @@ public class S5Orchestrator {
                     reminders.clear(id);
                     underfundedNotified.remove(id);
                     notifier.push(Alert.info("Открыт шорт",
-                            e.krakenSymbol() + " qty=" + num(s.qty()) + " (~$" + usd(s.notional()) + ") @ " + num(s.px())));
+                            e.krakenSymbol() + " qty=" + num(s.qty()) + " (~$" + usd(s.notional()) + ") @ " + num(s.px())
+                                    + "\nстоп −30% @ " + num(engine.stopLevel(e.krakenSymbol())) + " (софт + биржевой)"));
                     it.remove();
                     opened++;
                 }

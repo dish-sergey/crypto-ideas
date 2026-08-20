@@ -30,6 +30,7 @@ public class KrakenFuturesExchange implements ExchangeAdapter {
     private Map<String, Double> markCache = Map.of();
     private long markCacheAt = 0;
     private Map<String, Double> minSizeCache = Map.of();
+    private Map<String, Double> tickSizeCache = Map.of();
     private long minSizeCacheAt = 0;
 
     public KrakenFuturesExchange(KrakenApi api) { this.api = api; }
@@ -196,21 +197,68 @@ public class KrakenFuturesExchange implements ExchangeAdapter {
 
     @Override
     public double minOrderSize(String symbol) throws ExchangeDisconnectedException {
+        refreshInstruments();
+        return minSizeCache.getOrDefault(symbol.toUpperCase(), 0.0);
+    }
+
+    private void refreshInstruments() throws ExchangeDisconnectedException {
         try {
             long now = System.currentTimeMillis();
-            if (now - minSizeCacheAt > INSTR_TTL_MS) {
-                Map<String, Double> m = new HashMap<>();
-                for (JsonNode i : M.readTree(api.get("/api/v3/instruments", false)).path("instruments")) {
-                    if (!i.path("tradeable").asBoolean(false)) continue;
-                    int cvtp = i.path("contractValueTradePrecision").asInt(0);   // мин.лот = 10^(−cvtp) базовой валюты
-                    m.put(i.path("symbol").asText("").toUpperCase(), Math.pow(10, -cvtp));
-                }
-                minSizeCache = m; minSizeCacheAt = now;
+            if (now - minSizeCacheAt <= INSTR_TTL_MS && !minSizeCache.isEmpty()) return;
+            Map<String, Double> mins = new HashMap<>(), ticks = new HashMap<>();
+            for (JsonNode i : M.readTree(api.get("/api/v3/instruments", false)).path("instruments")) {
+                if (!i.path("tradeable").asBoolean(false)) continue;
+                String sym = i.path("symbol").asText("").toUpperCase();
+                mins.put(sym, Math.pow(10, -i.path("contractValueTradePrecision").asInt(0)));  // мин.лот
+                double tick = i.path("tickSize").asDouble(0);
+                if (tick > 0) ticks.put(sym, tick);
             }
-            return minSizeCache.getOrDefault(symbol.toUpperCase(), 0.0);
+            minSizeCache = mins; tickSizeCache = ticks; minSizeCacheAt = now;
         } catch (Exception e) {
             throw new ExchangeDisconnectedException("Kraken instruments: " + e);
         }
+    }
+
+    /**
+     * Биржевой стоп-ордер: reduceOnly buy-stop (закрытие шорта), триггер stopPrice по МАРКЕ, без limitPrice →
+     * рыночное исполнение. Best-effort: любую ошибку логируем и возвращаем "" (софт-стоп — основной).
+     */
+    @Override
+    public String placeStopBuy(String symbol, double qty, double stopPrice) throws ExchangeDisconnectedException {
+        try {
+            double px = roundToTick(symbol, stopPrice);
+            String body = "orderType=stp&symbol=" + symbol + "&side=buy&size=" + trimNum(qty)
+                    + "&stopPrice=" + trimNum(px) + "&triggerSignal=mark&reduceOnly=true";
+            String resp = api.post("/api/v3/sendorder", body);
+            JsonNode root = M.readTree(resp);
+            String status = root.path("sendStatus").path("status").asText("");
+            if (!"success".equals(root.path("result").asText()) || status.contains("Reject") || status.equals("invalidOrder")) {
+                log.warn("Kraken биржевой стоп не поставлен ({} @ {}): {}", symbol, px, truncate(resp));
+                return "";
+            }
+            log.info("Kraken биржевой стоп поставлен: {} buy-stop {} @ {}", symbol, trimNum(qty), trimNum(px));
+            return root.path("sendStatus").path("order_id").asText("");
+        } catch (Exception e) {
+            log.warn("Kraken биржевой стоп ошибка ({}): {}", symbol, e.toString());
+            return "";                                    // best-effort — не роняем открытие
+        }
+    }
+
+    @Override
+    public void cancelStops(String symbol) throws ExchangeDisconnectedException {
+        try {
+            api.post("/api/v3/cancelallorders", "symbol=" + symbol);
+        } catch (Exception e) {
+            log.warn("Kraken cancelallorders ({}) ошибка: {}", symbol, e.toString());
+        }
+    }
+
+    /** Округлить цену к tickSize инструмента (для buy-stop — вверх, чтобы триггер не оказался ниже допустимого). */
+    private double roundToTick(String symbol, double price) throws ExchangeDisconnectedException {
+        refreshInstruments();
+        double tick = tickSizeCache.getOrDefault(symbol.toUpperCase(), 0.0);
+        if (tick <= 0) return price;
+        return Math.ceil(price / tick) * tick;
     }
 
     /** size без хвостовых нулей (Kraken принимает десятичную строку). */

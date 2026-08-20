@@ -102,6 +102,36 @@ class KrakenFuturesExchangeTest {
         assertEquals(0.0, ex.minOrderSize("PF_UNKNOWNUSD"), 1e-12, "нет в списке → 0");
     }
 
+    @Test void placeStopBuyFormatsReduceOnlyStopMarket() throws Exception {
+        FakeKrakenApi api = new FakeKrakenApi();
+        api.getResponses.put("/api/v3/instruments", INSTRUMENTS);              // PF_XBTUSD tradeable, для tick нет → без округления
+        api.postResponses.put("/api/v3/sendorder",
+                "{\"result\":\"success\",\"sendStatus\":{\"order_id\":\"s1\",\"status\":\"placed\"}}");
+        String id = new KrakenFuturesExchange(api).placeStopBuy("PF_XBTUSD", 0.001, 80000.0);
+        assertEquals("s1", id);
+        String body = api.lastPostBody;
+        assertTrue(body.contains("orderType=stp"), body);
+        assertTrue(body.contains("side=buy"), body);
+        assertTrue(body.contains("reduceOnly=true"), body);
+        assertTrue(body.contains("triggerSignal=mark"), body);
+        assertTrue(body.contains("stopPrice=80000"), body);
+        assertFalse(body.contains("limitPrice"), "без limitPrice → рыночное исполнение по триггеру");
+    }
+
+    @Test void placeStopBuyBestEffortOnReject() throws Exception {
+        FakeKrakenApi api = new FakeKrakenApi();
+        api.getResponses.put("/api/v3/instruments", INSTRUMENTS);
+        api.postResponses.put("/api/v3/sendorder", "{\"result\":\"error\",\"error\":\"marketSuspended\"}");
+        // ошибка → пустой id, без исключения (best-effort)
+        assertEquals("", new KrakenFuturesExchange(api).placeStopBuy("PF_XBTUSD", 0.001, 80000.0));
+    }
+
+    @Test void cancelStopsCallsCancelAll() throws Exception {
+        FakeKrakenApi api = new FakeKrakenApi();
+        new KrakenFuturesExchange(api).cancelStops("PF_XBTUSD");
+        assertTrue(api.posts.stream().anyMatch(p -> p.startsWith("/api/v3/cancelallorders") && p.contains("symbol=PF_XBTUSD")));
+    }
+
     @Test void networkFailureBecomesDisconnect() {
         FakeKrakenApi api = new FakeKrakenApi();
         api.failure = new RuntimeException("connection reset");

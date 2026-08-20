@@ -69,4 +69,23 @@ public class MockExchange implements ExchangeAdapter {
     @Override public double minOrderSize(String symbol) throws ExchangeDisconnectedException {
         checkConn(); return minSizes.getOrDefault(symbol, 0.0);
     }
+
+    // --- биржевые стопы (для тестов) ---
+    private final Map<String, Double> stops = new LinkedHashMap<>();
+    private boolean rejectStops = false;
+
+    public void rejectStops(boolean v) { rejectStops = v; }
+    /** Текущий биржевой стоп по символу, или null. */
+    public Double stopPrice(String symbol) { return stops.get(symbol); }
+
+    @Override public String placeStopBuy(String symbol, double qty, double stopPrice) throws ExchangeDisconnectedException {
+        checkConn();
+        if (rejectStops) return "";                 // имитация неудачи размещения (best-effort)
+        stops.put(symbol, stopPrice);
+        return "mock-stop-" + symbol;
+    }
+
+    @Override public void cancelStops(String symbol) throws ExchangeDisconnectedException {
+        checkConn(); stops.remove(symbol);
+    }
 }

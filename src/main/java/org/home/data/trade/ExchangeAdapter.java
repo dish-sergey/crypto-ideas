@@ -40,4 +40,14 @@ public interface ExchangeAdapter {
 
     /** Человекочитаемая разбивка баланса для команды /balance (по умолчанию — просто число). */
     default String balanceBreakdown() throws ExchangeDisconnectedException { return "$" + balance(); }
+
+    /**
+     * Биржевой стоп-ордер (страховка на случай простоя бота): reduceOnly buy-stop на закрытие шорта с
+     * триггером stopPrice по марке, рыночным исполнением. Best-effort — при неудаче не бросает (софт-стоп
+     * остаётся основным). Возвращает orderId (или пусто). По умолчанию no-op.
+     */
+    default String placeStopBuy(String symbol, double qty, double stopPrice) throws ExchangeDisconnectedException { return ""; }
+
+    /** Снять все открытые ордера по символу (наши биржевые стопы). По умолчанию no-op. */
+    default void cancelStops(String symbol) throws ExchangeDisconnectedException { }
 }
