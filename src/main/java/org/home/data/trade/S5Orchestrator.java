@@ -53,8 +53,20 @@ public class S5Orchestrator {
         this.notifier = notifier;
     }
 
-    /** Перезапуск: усыновить открытые позиции с биржи (источник истины), не из памяти. */
-    public void recover() throws Exception { engine.adopt(ex.positions()); }
+    /**
+     * Перезапуск: усыновить открытые позиции с биржи (источник истины) И восстановить их расписание выхода
+     * из фида — иначе после рестарта плановый выход в день разлока потеряется (в памяти его больше нет).
+     * Скан фида делаем только если есть что восстанавливать (обычно позиций нет — тогда мгновенно).
+     */
+    public void recover(long today) throws Exception {
+        engine.adopt(ex.positions());
+        var open = engine.openSymbols();
+        if (open.isEmpty()) return;
+        for (UnlockEvent e : feed.upcoming(today)) {
+            if (open.contains(e.krakenSymbol()) && tracker.expectedDay(e.krakenSymbol()) == null)
+                tracker.onEntry(e.krakenSymbol(), e.unlockDay(), e.category());
+        }
+    }
 
     private static String eventId(UnlockEvent e) { return e.krakenSymbol() + "@" + e.unlockDay(); }
 

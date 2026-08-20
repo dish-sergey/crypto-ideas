@@ -132,6 +132,7 @@ class S5OrchestratorTest {
 
     @Test void recoverAdoptsPositionsFromExchange() throws Exception {
         // на бирже уже есть шорт (как после перезапуска процесса)
+        long today = 20000;
         MockExchange ex = new MockExchange(1000);
         ex.tick("PF_APTUSD", 10.0);
         ex.openShort("PF_APTUSD", 4.5);
@@ -140,12 +141,32 @@ class S5OrchestratorTest {
         var orch = new S5Orchestrator(ex, new FakeFeed(), CHEAP, new ApprovalGate(), engine,
                 new ScheduleTracker(), new DegradationMonitor(), j, S5Config.protocol());
         assertEquals(0, orch.openPositions(), "в памяти пусто");
-        orch.recover();
+        orch.recover(today);
         assertEquals(1, orch.openPositions(), "усыновлено с биржи");
         // и стоп теперь работает по восстановленной позиции
         ex.tick("PF_APTUSD", 13.0);
         orch.pollStops();
         assertEquals(1, j.count(TradeJournal.Category.STOP));
+    }
+
+    @Test void recoverRestoresExitScheduleFromFeed() throws Exception {
+        // после рестарта расписание выхода в памяти потеряно — восстанавливаем из фида
+        long today = 20000;
+        MockExchange ex = new MockExchange(1000);
+        ex.tick("PF_APTUSD", 10.0);
+        ex.openShort("PF_APTUSD", 4.5);
+        FakeFeed feed = new FakeFeed();
+        feed.events.add(ev("APT", today + 3));                 // фид знает дату разлока
+        TradeJournal j = new TradeJournal();
+        ScheduleTracker tracker = new ScheduleTracker();
+        var orch = new S5Orchestrator(ex, feed, CHEAP, new ApprovalGate(),
+                new StopEngine(ex, j, 0.30, 3), tracker, new DegradationMonitor(), j, S5Config.protocol());
+        orch.recover(today);
+        assertEquals(today + 3, (long) tracker.expectedDay("PF_APTUSD"), "расписание выхода восстановлено");
+        ex.tick("PF_APTUSD", 9.5);
+        orch.maintain(today + 3);                              // день разлока → плановый выход
+        assertEquals(1, j.count(TradeJournal.Category.PLANNED_EXIT), "плановый выход работает после recover");
+        assertEquals(0, orch.openPositions());
     }
 
     @Test void stopPollFeedsMonitor() throws Exception {

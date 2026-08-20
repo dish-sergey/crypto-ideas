@@ -69,9 +69,9 @@ public class S5Live {
     /** Боевой демон: усыновить позиции, объявить LIVE, слушатель + минутный цикл. Блокирует поток. */
     public void run() throws Exception {
         Ctx c = build();
-        c.orch.recover();                                          // источник истины — позиции с биржи
-        double bal = safeBalance(c);
         long today = LocalDate.now(ZoneOffset.UTC).toEpochDay();
+        c.orch.recover(today);                                     // усыновить позиции + восстановить расписание выхода
+        double bal = safeBalance(c);
         c.notifier.push(Alert.warn("🔴 S5 LIVE запущен — РЕАЛЬНЫЕ ДЕНЬГИ",
                 "Kraken Futures, исполнение настоящее. Ордер только после ручного подтверждения (кнопки).\n"
                         + "баланс: $" + String.format(Locale.ROOT, "%.2f", bal)

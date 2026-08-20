@@ -72,6 +72,7 @@ public class KrakenFuturesExchange implements ExchangeAdapter {
         } catch (Exception e) {
             throw new ExchangeDisconnectedException("Kraken sendorder: " + e);  // неизвестный исход → как разрыв
         }
+        log.info("Kraken sendorder resp: {}", truncate(resp));   // диагностика формата orderEvents/fill
         try {
             JsonNode root = M.readTree(resp);
             if (!"success".equals(root.path("result").asText()))
@@ -82,13 +83,18 @@ public class KrakenFuturesExchange implements ExchangeAdapter {
                 return OrderResult.rejected("status=" + status);
             double sumQty = 0, notional = 0;
             for (JsonNode ev : ss.path("orderEvents")) {
-                if (!ev.path("type").asText("").toUpperCase().contains("EXECUTION")) continue;
-                double px = ev.path("price").asDouble(ev.path("executionPrice").asDouble(0));
-                double amt = ev.path("amount").asDouble(0);
-                sumQty += amt; notional += amt * px;
+                // цена/объём исполнения могут лежать прямо в событии или в orderPriorExecution (формат Kraken)
+                double px = firstPositive(ev.path("price"), ev.path("executionPrice"),
+                        ev.path("orderPriorExecution").path("limitPrice"), ev.path("orderPriorExecution").path("price"));
+                double amt = firstPositive(ev.path("amount"), ev.path("executionSize"),
+                        ev.path("orderPriorExecution").path("quantity"), ev.path("orderPriorExecution").path("filled"));
+                if (px > 0 && amt > 0) { sumQty += amt; notional += amt * px; }
             }
-            double fillPx = sumQty > 0 ? notional / sumQty : mark(symbol);   // нет событий исполнения → марка
             String id = ss.path("order_id").asText(ss.path("orderId").asText(""));
+            double fillPx;
+            if (sumQty > 0) fillPx = notional / sumQty;
+            else if (!reduceOnly) fillPx = firstPositive(positionEntryPrice(symbol), mark(symbol));  // открытие: цена из позиции
+            else fillPx = mark(symbol);                                                              // закрытие: марка
             return OrderResult.filled(id, fillPx, sumQty > 0 ? sumQty : qty);
         } catch (ExchangeDisconnectedException e) {
             throw e;
@@ -96,6 +102,24 @@ public class KrakenFuturesExchange implements ExchangeAdapter {
             return OrderResult.rejected("parse: " + e);
         }
     }
+
+    /** Цена входа позиции по символу с биржи (источник истины); 0 — если позиции нет. */
+    private double positionEntryPrice(String symbol) {
+        try {
+            for (Position p : positions()) if (p.symbol().equalsIgnoreCase(symbol)) return p.entryPx();
+        } catch (Exception ignore) { /* нет позиции/сеть — вернём 0, вызывающий возьмёт марку */ }
+        return 0;
+    }
+
+    private static double firstPositive(JsonNode... nodes) {
+        for (JsonNode n : nodes) { double v = n.asDouble(0); if (v > 0) return v; }
+        return 0;
+    }
+    private static double firstPositive(double... vals) {
+        for (double v : vals) if (v > 0) return v;
+        return 0;
+    }
+    private static String truncate(String s) { return s == null ? "" : s.substring(0, Math.min(s.length(), 600)); }
 
     @Override
     public List<Position> positions() throws ExchangeDisconnectedException {
