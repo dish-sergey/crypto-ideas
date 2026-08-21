@@ -3,7 +3,9 @@ package org.home.data.core;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Primary;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Component;
 
@@ -21,15 +23,26 @@ import java.util.List;
 /**
  * SQLite-хранилище. Один writer-connection (SQLite всё равно однописательный),
  * WAL-режим, все записи через синхронизированные upsert/batch.
+ *
+ * Основной бин — слой данных (crypto.db, schema.sql). Стенд Revolut X держит
+ * свою базу отдельным наследником ({@link org.home.data.revx.RevxDb}), поэтому
+ * путь и schema-ресурс параметризованы.
  */
 @Component
+@Primary
 public class Db {
 
     private static final Logger log = LoggerFactory.getLogger(Db.class);
 
     private final Connection conn;
 
+    // @Autowired обязателен: у класса два конструктора, иначе Spring ищет default
+    @Autowired
     public Db(@Value("${data.db-path}") String dbPath) {
+        this(dbPath, "schema.sql");
+    }
+
+    protected Db(String dbPath, String schemaResource) {
         try {
             Path path = Path.of(dbPath);
             if (path.getParent() != null) {
@@ -41,24 +54,37 @@ public class Db {
                 st.execute("PRAGMA busy_timeout=5000");
                 st.execute("PRAGMA synchronous=NORMAL");
             }
-            initSchema();
+            initSchema(schemaResource);
             log.info("SQLite открыт: {}", path.toAbsolutePath());
         } catch (SQLException | IOException e) {
             throw new IllegalStateException("Не удалось открыть SQLite: " + dbPath, e);
         }
     }
 
-    private void initSchema() throws SQLException, IOException {
-        String schema = new String(new ClassPathResource("schema.sql").getInputStream().readAllBytes(),
+    private void initSchema(String schemaResource) throws SQLException, IOException {
+        String schema = new String(new ClassPathResource(schemaResource).getInputStream().readAllBytes(),
                 StandardCharsets.UTF_8);
         try (Statement st = conn.createStatement()) {
-            for (String sql : schema.split(";")) {
+            // Комментарии срезаются ДО разбиения: ';' внутри комментария иначе
+            // порождает фрагмент без единого оператора, а sqlite-jdbc отвечает
+            // на такой невнятным «The prepared statement has been finalized».
+            for (String sql : stripLineComments(schema).split(";")) {
                 String trimmed = sql.trim();
                 if (!trimmed.isEmpty()) {
                     st.execute(trimmed);
                 }
             }
         }
+    }
+
+    /** Убирает построчные '--' комментарии. Строковых литералов с '--' в схемах нет. */
+    private static String stripLineComments(String schema) {
+        StringBuilder sb = new StringBuilder(schema.length());
+        for (String line : schema.split("\n")) {
+            int comment = line.indexOf("--");
+            sb.append(comment < 0 ? line : line.substring(0, comment)).append('\n');
+        }
+        return sb.toString();
     }
 
     /** Одиночный upsert. SQL обязан быть INSERT OR REPLACE / ON CONFLICT. */

@@ -7,9 +7,12 @@ build/
 .claude/settings.local.json
 reports/analysis/*.class
 
-# Секреты — никогда в git (токены Telegram, ключи Kraken и т.п.)
+# Секреты — никогда в git (токены Telegram, ключи Kraken, ключ Revolut X и т.п.)
 /telegram/
 /kraken/
+/keys/
+*.pem
 *.secret
 *.token
 .env
+

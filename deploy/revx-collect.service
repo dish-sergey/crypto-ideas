@@ -1,0 +1,24 @@
+[Unit]
+# Сбор данных стенда Revolut X (ТЗ — docs/63-...). Данные книги невосполнимы
+# задним числом, поэтому сервис enabled и переживает ребут.
+Description=Revolut X market-making stand: order book + trades collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx
+# Куча маленькая: коллектор упирается в лимит площадки (~1 req/s), а не в CPU/RAM
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx160m -jar /home/ubuntu/revx/app.jar --revx-collect
+Restart=always
+RestartSec=15
+# SIGTERM демон обрабатывает сам (shutdown hook): дописывает healthcheck и закрывает БД
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=revx-collect
+
+[Install]
+WantedBy=multi-user.target

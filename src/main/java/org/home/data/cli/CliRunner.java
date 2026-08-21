@@ -13,9 +13,11 @@ import org.home.data.detector.RegimeReport;
 import org.home.data.eval.AllocationProxy;
 import org.home.data.eval.S1Backtest;
 import org.home.data.eval.bench.Bench;
+import org.home.data.revx.RevxCommands;
 import org.home.data.ws.LiquidationWsCollector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
@@ -37,6 +39,11 @@ import java.util.List;
  *   ./gradlew bootRun --args='--backfill=ohlcv --symbols=BTCUSDT --interval=1m --from=2023-01-01'
  *   ./gradlew bootRun --args='--backfill=funding-okx'
  *   ./gradlew bootRun --args='--backfill=onchain --from=2015-07-01'
+ *   ./gradlew bootRun --args='--revx-pairs'                       — стенд Revolut X: каталог пар и вселенная
+ *   ./gradlew bootRun --args='--revx-probe-limits --max-rps=16'   — стенд: эмпирический потолок запросов
+ *   ./gradlew bootRun --args='--revx-collect=once'                — стенд: разовый обход книг и сделок
+ *   ./gradlew bootRun --args='--revx-collect'                     — стенд: непрерывный сбор (демон)
+ *   ./gradlew bootRun --args='--revx-basis --hours=6'             — стенд: курс USDC/USD и пригодность пар
  */
 @Component
 public class CliRunner implements ApplicationRunner {
@@ -59,6 +66,8 @@ public class CliRunner implements ApplicationRunner {
     private final Bench bench;
     private final S1Backtest s1Backtest;
     private final LiquidationWsCollector liquidations;
+    /** Стенд Revolut X — через провайдер: в режиме планировщика его бины не создаются. */
+    private final ObjectProvider<RevxCommands> revx;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
 
@@ -69,6 +78,7 @@ public class CliRunner implements ApplicationRunner {
                      RegimeDetectorV5 detectorV5,
                      RegimeReport report, AllocationProxy allocationProxy, Bench bench, S1Backtest s1Backtest,
                      LiquidationWsCollector liquidations,
+                     ObjectProvider<RevxCommands> revx,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
         this.context = context;
@@ -87,6 +97,7 @@ public class CliRunner implements ApplicationRunner {
         this.bench = bench;
         this.s1Backtest = s1Backtest;
         this.liquidations = liquidations;
+        this.revx = revx;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
     }
@@ -119,6 +130,30 @@ public class CliRunner implements ApplicationRunner {
             }
             if (args.containsOption("s5-live")) {
                 new org.home.data.trade.S5Live("telegram/s5_bot.txt", "kraken/keys.txt").run();  // РЕАЛЬНЫЕ ордера
+            }
+            if (args.containsOption("revx-pairs")) {
+                revx.getObject().pairs();
+            }
+            if (args.containsOption("revx-collect")) {
+                // без значения — демон (блокирует), =once — разовый обход и выход
+                revx.getObject().collect("once".equals(firstOr(args, "revx-collect", "daemon")));
+            }
+            if (args.containsOption("revx-basis")) {
+                revx.getObject().basis(
+                        Integer.parseInt(firstOr(args, "hours", "24")),
+                        Long.parseLong(firstOr(args, "bucket-seconds", "5")) * 1000L,
+                        firstOr(args, "out", "reports/revx_basis.md"));
+            }
+            if (args.containsOption("revx-sim")) {
+                revx.getObject().simulate(
+                        firstOr(args, "symbol", "ETH/USDC"),
+                        Integer.parseInt(firstOr(args, "hours", "24")),
+                        firstOr(args, "out", "reports/revx_sim.md"));
+            }
+            if (args.containsOption("revx-probe-limits")) {
+                revx.getObject().probeLimits(new org.home.data.revx.RateLimitProbe.Ladder(
+                        doubleOrNull(args, "start-rps"), doubleOrNull(args, "step-rps"),
+                        doubleOrNull(args, "max-rps"), intOrNull(args, "dwell")));
             }
             if (args.containsOption("report")) {
                 String target = first(args, "report");
@@ -231,6 +266,16 @@ public class CliRunner implements ApplicationRunner {
             throw new IllegalArgumentException("--" + name + " требует значение");
         }
         return values.get(0);
+    }
+
+    private static Double doubleOrNull(ApplicationArguments args, String name) {
+        String v = firstOr(args, name, null);
+        return v == null ? null : Double.valueOf(v);
+    }
+
+    private static Integer intOrNull(ApplicationArguments args, String name) {
+        String v = firstOr(args, name, null);
+        return v == null ? null : Integer.valueOf(v);
     }
 
     private static String firstOr(ApplicationArguments args, String name, String fallback) {

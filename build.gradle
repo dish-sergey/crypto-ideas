@@ -26,10 +26,36 @@ dependencies {
 
     implementation 'org.xerial:sqlite-jdbc:3.46.0.0'
 
+
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
 test {
     useJUnitPlatform()
+}
+
+/*
+ * Git-хэш в ресурсы: ТЗ стенда (docs/63) требует записывать в каждый прогон
+ * симулятора хэш кода, иначе через неделю не ответить, чем получено число.
+ * Суффикс -dirty обязателен: прогон незакоммиченным кодом невоспроизводим.
+ */
+def gitDescribe = { ->
+    try {
+        def hash = providers.exec {
+            commandLine 'git', 'rev-parse', '--short=12', 'HEAD'
+        }.standardOutput.asText.get().trim()
+        def dirty = !providers.exec {
+            commandLine 'git', 'status', '--porcelain'
+        }.standardOutput.asText.get().trim().isEmpty()
+        return dirty ? "${hash}-dirty" : hash
+    } catch (Exception ignored) {
+        return 'unknown'
+    }
+}
+
+processResources {
+    filesMatching('revx-build.properties') {
+        expand(gitHash: gitDescribe(), buildTime: java.time.Instant.now().toString())
+    }
 }

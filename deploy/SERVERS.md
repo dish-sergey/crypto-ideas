@@ -94,8 +94,50 @@
 - **NB:** тяжёлый скан фида — раз в день; ежеминутно — напоминания + реальные стопы. С пустым счётом
   входы отклоняются по нехватке средств (сейф). Пополнить — перевод в Futures(flex)-кошелёк на pro.kraken.com.
 
+### 7. `revx-backup` (cron на micro) — ночная копия базы стенда с ARM
+- **Что:** `15 3 * * * /home/ubuntu/revx-backup.sh >> ~/revx-backup.log` — снимок
+  `revx.db` через `sqlite3 .backup` **на ARM**, gzip, забор на micro в `~/revx-backups/`,
+  ротация 7 копий. Скрипт в репо: `deploy/revx-backup.sh`.
+- **Почему с micro, а не с ARM:** ключ есть только в направлении micro → ARM (`~/.ssh/armkey`).
+- **Почему не Litestream:** он реплицирует `crypto.db` в B2 с free-лимитом 10 ГБ; поток
+  стенда туда подмешивать нельзя. `revx.db` в Litestream **не добавлять**.
+- **Проверить:** `ls -la ~/revx-backups/` · `tail ~/revx-backup.log`. Первая копия
+  19.08.2026 — 664 КБ (gzip).
+
 ### Tailscale (приватная сеть)
 - Mesh-VPN (WireGuard). Micro = `crypto-micro` (100.64.144.85). Даёт приватный доступ к дашборду без открытия портов и без домена. Бесплатно (personal). Авторизация — по устройствам аккаунта `dish.sergey@`. Проверка: `tailscale status`.
+
+---
+
+## Сервисы на bot-arm (ARM, 130.61.31.216)
+
+### 1. `revx-collect` — сбор данных стенда Revolut X
+- **Что:** `~/jre25/bin/java -Xms32m -Xmx160m -jar ~/revx/app.jar --revx-collect` —
+  ярусный сбор книг и лент сделок по 23 USDC-парам (ТЗ — `docs/63-...`, план —
+  `plans/2026-08-19-revx-mm-stand.md`). Ордера не отправляет, ключей не хранит.
+- **Юнит:** `/etc/systemd/system/revx-collect.service` (enabled, Restart=always).
+  Исходник в репо: `deploy/revx-collect.service`.
+- **Рантайм:** Liberica **JRE 25 aarch64** в `~/jre25` (ставился с github bell-sw, 25.0.4+9).
+- **БД:** `~/revx/data/revx.db` (SQLite WAL), `WorkingDirectory=~/revx`. Рост ~1 МБ/час.
+- **Почему на ARM, а не на micro:** на micro свободно ~260 МБ при трёх JVM, на ARM — 5.2 ГБ.
+  Регион тот же (Frankfurt), площадка оттуда отвечает за ~110 мс.
+- **Проверить:** `systemctl status revx-collect` · `journalctl -u revx-collect -f` ·
+  `cat ~/revx/data/revx-health.txt` (время последней записи + доля 429).
+- **Обновить jar:** `./gradlew bootJar` → `scp build/libs/crypto-ideas-1.0-SNAPSHOT.jar
+  ubuntu@130.61.31.216:~/revx/app.jar` → `sudo systemctl restart revx-collect`.
+- **Ключ API (только чтение):** `~/revx/keys/private.pem` (600, Ed25519) +
+  `~/revx/keys/api_key.txt` (600, 64 символа) + `public.pem` — он зарегистрирован
+  в веб-приложении Revolut X, там же прописан IP-whitelist на `130.61.31.216`.
+  В git не попадают. С ключом лимиты 100 req/с и 1000/мин, сбор идёт по всем
+  23 парам раз в 5 с; без ключа сервис не падает, а переходит на публичные
+  эндпоинты с 0.8 req/s и ярусным расписанием.
+- **⚠️ Публичный лимит ~1 req/s на IP** и запрет запросов встык (см. CLAUDE.md).
+  Второй сборщик с того же адреса запускать нельзя — начнутся 429.
+- **NB:** в `~/revx/data/` лежит пустой `crypto.db` — его создаёт основной бин `Db`
+  при любом запуске приложения; коллекторы слоя данных в режиме `--revx-collect`
+  не работают (расписание выключено через `CliMode`). 10 МБ мусора там появились
+  19.08.2026 от случайно запущенного вручную экземпляра без аргументов — можно
+  удалить при следующем рестарте сервиса.
 
 ---
 
@@ -108,7 +150,8 @@
 ## Секреты — где лежат (никогда в git)
 - `/etc/litestream.env` (micro) — ключи B2. Копия: `D:\servers\backblaze\key.txt` (локально).
 - OCI — через **instance principal**, ключей на диске нет.
-- SSH к micro — `D:\servers\oracle\ssh-key-2026-07-22.key` (локально).
+- SSH к micro — `D:\servers\oracle\instance-20260722-1110\ssh-key-2026-07-22.key` (локально).
+- SSH к bot-arm — `D:\servers\oracle\arm1\private.key` (локально) и `~/.ssh/armkey` на micro.
 
 ---
 
