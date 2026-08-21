@@ -33,6 +33,7 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun --args='--theory=kelly --out=reports/theory'   # ТЗ 66: размер позиции S5 (Kelly с усадкой)
 ./gradlew bootRun --args='--theory=ou --out=reports/theory'      # ТЗ 67: калибровка и допуск OU (предтест блока B)
 ./gradlew bootRun --args='--theory=band --out=reports/theory'    # ТЗ 68: полоса бездействия и граница разорения
+./gradlew bootRun --args='--theory=verify --out=reports/theory'  # ТЗ 72: доверификация базиса без прореживания + сверка констант S5
 ```
 
 Дашборд режима: `--report=regime-dash` рендерит `index.html` (меню с карточками версий:

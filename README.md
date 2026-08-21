@@ -89,6 +89,7 @@
 ./gradlew bootRun --args='--theory=kelly --out=reports/theory'  # ТЗ 66: размер позиции S5
 ./gradlew bootRun --args='--theory=ou --out=reports/theory'     # ТЗ 67: допуск OU (предтест блока B)
 ./gradlew bootRun --args='--theory=band --out=reports/theory'   # ТЗ 68: полоса и разорение
+./gradlew bootRun --args='--theory=verify --out=reports/theory' # ТЗ 72: доверификация + сверка констант S5
 ```
 
 **Выбор стека** (ТЗ §2 требует зафиксировать одной строкой): Java 25 + Gradle —
