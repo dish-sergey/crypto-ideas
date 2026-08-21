@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Детектор режима — дашборд</title>
+<style>
+  :root{ --bg:#fff; --panel:#f8fafc; --ink:#0f172a; --muted:#64748b; --grid:#e2e8f0;
+    --bull:#22c55e; --range:#eab308; --bear:#ef4444; --trans:#94a3b8; --crash:#9333ea; }
+  @media (prefers-color-scheme: dark){ :root{ --bg:#0b1120; --panel:#0f172a; --ink:#e2e8f0; --muted:#94a3b8; --grid:#1e293b; } }
+  :root[data-theme="light"]{ --bg:#fff; --panel:#f8fafc; --ink:#0f172a; --muted:#64748b; --grid:#e2e8f0; }
+  :root[data-theme="dark"]{ --bg:#0b1120; --panel:#0f172a; --ink:#e2e8f0; --muted:#94a3b8; --grid:#1e293b; }
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:1100px;margin:0 auto;padding:24px 20px 40px}
+  header{display:flex;flex-wrap:wrap;align-items:baseline;gap:12px;margin-bottom:18px}
+  h1{font-size:22px;margin:0} .sub{color:var(--muted);font-size:13px} .px{margin-left:auto;font-size:13px;color:var(--muted)}
+  .px b{color:var(--ink);font-size:16px;font-variant-numeric:tabular-nums}
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--grid);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+  .card h2{font-size:16px;margin:0;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .card h2 a{color:inherit;text-decoration:none} .card h2 a:hover{text-decoration:underline}
+  .tag{font-size:11px;font-weight:700;letter-spacing:.04em;background:var(--ink);color:var(--bg);border-radius:4px;padding:1px 6px}
+  .desc{color:var(--muted);font-size:13px;margin:0}
+  .state{display:flex;align-items:baseline;gap:8px;font-size:13px;color:var(--muted);flex-wrap:wrap}
+  .st-badge{display:inline-block;padding:1px 8px;border-radius:4px;color:#fff;font-weight:700}
+  .spark{display:flex;height:12px;border-radius:3px;overflow:hidden;border:1px solid var(--grid)}
+  .spark i{display:block;height:100%}
+  .sparklab{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:-6px}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:auto;padding-top:4px}
+  .chips a{font-size:12px;color:var(--muted);text-decoration:none;border:1px solid var(--grid);border-radius:7px;padding:3px 9px;background:var(--bg)}
+  .chips a:hover{color:var(--ink);border-color:var(--muted)}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin:18px 0 0;font-size:12px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:6px} .sw{width:12px;height:12px;border-radius:3px;display:inline-block}
+  .foot{color:var(--muted);font-size:12px;margin-top:14px;border-top:1px solid var(--grid);padding-top:10px}
+  code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Детектор режима рынка — дашборд</h1>
+    <span class="sub" id="gen"></span>
+    <span class="px" id="px"></span>
+  </header>
+  <div class="cards" id="cards"></div>
+  <div class="legend" id="legend"></div>
+  <div class="foot">
+    Данные вшиты в каждый график целиком — период («1М», «3М», «1Г», «Всё», произвольные даты,
+    ◀/▶ или стрелки на клавиатуре) переключается на клиенте, без перегенерации.
+    Выбранное окно попадает в адрес страницы (<code>#w=1m</code>, <code>#w=2024-01-01..2024-06-30</code>) —
+    ссылку можно сохранить. Пересборка дашборда: <code>--report=regime-dash --out=~/dash</code>.
+  </div>
+</div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(function(){
+  const D=JSON.parse(document.getElementById('data').textContent);
+  const STATES=["BULL","RANGE","BEAR","TRANSITION","CRASH"];
+  const css=k=>getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+  const stColor=i=>[css('--bull'),css('--range'),css('--bear'),css('--trans'),css('--crash')][i];
+  const RANGES=[["1М","1m"],["3М","3m"],["6М","6m"],["1Г","1y"],["Всё","all"]];
+  const HASH={"1m":"30","3m":"91","6m":"182","1y":"365","all":"all"};
+
+  document.getElementById('gen').textContent="обновлено "+D.generated;
+  if(D.price){
+    const c=D.price.chg30;
+    document.getElementById('px').innerHTML="BTC <b>$"+Math.round(D.price.close).toLocaleString('en-US')+"</b> "
+      +(c==null?"":"<span style='color:"+(c>=0?css('--bull'):css('--bear'))+"'>"+(c>=0?"+":"")+(c*100).toFixed(1)+"% за 30д</span>")
+      +" · "+D.price.day;
+  }
+  document.getElementById('legend').innerHTML=STATES.map((s,i)=>
+    "<span><i class='sw' style='background:"+stColor(i)+"'></i>"+s+"</span>").join("")
+    +"<span style='margin-left:auto'>полоса на карточке — состояние за последний год</span>";
+
+  function spark(arr){
+    let html="",i0=0;
+    for(let i=1;i<=arr.length;i++){
+      if(i===arr.length||arr[i]!==arr[i0]){
+        html+="<i style='flex:"+(i-i0)+";background:"+stColor(arr[i0])+"'></i>";
+        i0=i;
+      }
+    }
+    return "<div class='spark'>"+html+"</div>";
+  }
+  function plural(n){const m=n%100,k=n%10;return (m>=11&&m<=14)?"дней":k===1?"день":(k>=2&&k<=4)?"дня":"дней";}
+
+  document.getElementById('cards').innerHTML=D.cards.map(c=>{
+    let h="<div class='card'><h2><a href='"+c.file+"'>"+c.title+"</a>"+(c.tag?"<span class='tag'>"+c.tag+"</span>":"")+"</h2>";
+    if(c.state){
+      h+="<div class='state'><span class='st-badge' style='background:"+stColor(c.stIdx)+"'>"+c.state+"</span>"
+        +"<span>"+(c.sinceCapped?"≥":"")+c.sinceDays+" "+plural(c.sinceDays)+" (с "+c.since+")</span>"
+        +"<span style='margin-left:auto'>"+c.n+" дней в базе, с "+c.from+"</span></div>";
+      h+=spark(c.spark)+"<div class='sparklab'><span>"+c.spark.length+" дней назад</span><span>"+c.day+"</span></div>";
+    }
+    h+="<p class='desc'>"+c.desc+"</p>";
+    h+="<div class='chips'>"+RANGES.map(r=>"<a href='"+c.file+"#w="+HASH[r[1]]+"'>"+r[0]+"</a>").join("")+"</div>";
+    return h+"</div>";
+  }).join("");
+})();
+</script>
+</body>
+</html>

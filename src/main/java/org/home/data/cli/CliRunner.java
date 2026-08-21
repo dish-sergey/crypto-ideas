@@ -164,6 +164,8 @@ public class CliRunner implements ApplicationRunner {
                     case "regime-all" -> report.generateAll(firstOr(args, "out", "regime-all.html"));
                     case "regime-compare" ->
                             report.generateCompare(firstOr(args, "out", "regime-compare.html"));
+                    case "regime-index" -> report.generateIndex(firstOr(args, "out", "reports/index.html"));
+                    case "regime-dash" -> report.generateDash(firstOr(args, "out", "reports"));
                     case "crash-econ" ->
                             allocationProxy.run(firstOr(args, "out", "reports/crash_econ.md"));
                     case "crash-maxdd" ->
@@ -190,7 +192,8 @@ public class CliRunner implements ApplicationRunner {
                     case "leverage-v2" -> s1Backtest.leverageStudyV2(firstOr(args, "out", "reports/leverage_warning_study_v2.md"));
                     default -> throw new IllegalArgumentException(
                             "Неизвестный отчёт: " + target
-                                    + " (regime | regime-v3 | regime-v5 | regime-all | regime-compare | crash-econ | crash-maxdd"
+                                    + " (regime | regime-v3 | regime-v5 | regime-all | regime-compare | regime-index"
+                                    + " | regime-dash | crash-econ | crash-maxdd"
                                     + " | regime-econ | crossmarket | voltarget | bench | ensemble"
                                     + " | slope-gate-a | slope-gate-b | s3-viability)");
                 }

@@ -2,6 +2,7 @@
 build/
 /data/
 /reports/*.html
+/reports/dash/
 *.log
 .idea/workspace.xml
 .claude/settings.local.json

@@ -52,6 +52,7 @@
     <span class="sub" id="range"></span>
     <span class="now" id="nowbox"></span>
   </header>
+  <div id="toolbar"></div>
   <div class="legend" id="legend"></div>
   <div class="card"><canvas id="c"></canvas></div>
   <div class="foot" id="foot"></div>
@@ -59,16 +60,17 @@
 <div id="tip"></div>
 
 <script id="data" type="application/json">__DATA__</script>
+<script>__WINDOW_JS__</script>
 <script>
 (function(){
   const RAW = JSON.parse(document.getElementById('data').textContent);
-  const P = RAW.points;   // [d, price, v1Idx, v2Idx, D, T, S, phase]
+  const ALL = RAW.points; // [d, price, v1Idx, v2Idx, D, T, S, phase]
+  let P = ALL;            // текущее окно (см. RegimeWindow)
   const STATES = ["BULL","RANGE","BEAR","TRANSITION","CRASH"];
   const css = k => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
   const stColor = i => [css('--bull'),css('--range'),css('--bear'),css('--trans'),css('--crash')][i];
 
-  document.getElementById('range').textContent = RAW.from + " — " + RAW.to + " · " + P.length + " дней";
-  const last = P[P.length-1];
+  const last = ALL[ALL.length-1];
   document.getElementById('nowbox').innerHTML =
     "сейчас: v1 <b><span class='st-badge' style='background:"+stColor(last[2])+"'>"+STATES[last[2]]+"</span></b> "+
     "· v2 <b><span class='st-badge' style='background:"+stColor(last[3])+"'>"+STATES[last[3]]+"</span></b>";
@@ -87,10 +89,12 @@
   let W=0, H=0, dpr=1;
   const PAD={l:58,r:12,t:10,b:22}, GAP=14, RIB=16, AX_H=130;
 
-  const prices = P.map(p=>p[1]);
-  const pMin=Math.min(...prices), pMax=Math.max(...prices);
   const lg = v => Math.log10(v);
-  let priceTop, priceBot, ribTop, ribBot, axTop, axBot, plotW;
+  let pMin=1, pMax=2, priceTop, priceBot, ribTop, ribBot, axTop, axBot, plotW;
+  function rescale(){
+    pMin=Math.min(...P.map(p=>p[1])); pMax=Math.max(...P.map(p=>p[1]));
+    if(pMax<=pMin) pMax=pMin*1.01;
+  }
 
   function layout(){
     dpr = window.devicePixelRatio||1;
@@ -151,11 +155,10 @@
       const y=yA(v);ctx.strokeStyle=c;ctx.globalAlpha=(v===0)?0.9:0.5;ctx.beginPath();ctx.moveTo(PAD.l,y);ctx.lineTo(W-PAD.r,y);ctx.stroke();ctx.globalAlpha=1;
       if(lab){ctx.fillStyle=muted;ctx.textAlign="right";ctx.fillText(lab,PAD.l-6,y);}});
 
-    // оси X — годы
-    let py=-1;
-    for(let i=0;i<P.length;i++){const y=+P[i][0].slice(0,4);if(y!==py){py=y;
+    // ось X — годы/месяцы/дни по ширине окна
+    RegimeWindow.ticks(P).forEach(([i,lab])=>{
       const xx=x(i);ctx.strokeStyle=grid;ctx.beginPath();ctx.moveTo(xx,priceTop);ctx.lineTo(xx,axBot);ctx.stroke();
-      ctx.fillStyle=muted;ctx.textAlign="center";ctx.textBaseline="top";ctx.fillText(y,xx,axBot+4);ctx.textBaseline="middle";}}
+      ctx.fillStyle=muted;ctx.textAlign="center";ctx.textBaseline="top";ctx.fillText(lab,xx,axBot+4);ctx.textBaseline="middle";});
 
     // цена
     ctx.strokeStyle=css('--price'); ctx.lineWidth=1.6; ctx.beginPath();
@@ -167,8 +170,7 @@
     line(css('--sline'), p=>p[6], yA);
   }
 
-  function priceTicks(lo,hi){const out=[];for(let e=Math.floor(lg(lo));e<=Math.ceil(lg(hi));e++){
-    [1,2,5].forEach(m=>{const v=m*Math.pow(10,e);if(v>=lo*0.9&&v<=hi*1.1)out.push(v);});}return out;}
+  function priceTicks(lo,hi){return RegimeWindow.priceTicks(lo,hi);}  // декады, на узком окне — линейная сетка
   function fmtP(v){return v>=1000?(v/1000)+"k":""+v;}
 
   function onMove(ev){
@@ -202,7 +204,7 @@
   cv.addEventListener('mouseleave',()=>{tip.style.opacity=0;draw();});
   cv.addEventListener('touchmove',e=>{if(e.touches[0])onMove(e.touches[0]);},{passive:true});
   new ResizeObserver(draw).observe(cv);
-  draw();
+  RegimeWindow.init({all:ALL, apply(win){ P=win; rescale(); draw(); }});
 })();
 </script>
 </body>

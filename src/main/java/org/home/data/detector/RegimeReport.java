@@ -77,19 +77,7 @@ public class RegimeReport {
         data.put("to", points.get(points.size() - 1)[0]);
         data.put("points", points);
 
-        try {
-            String tpl = new String(new ClassPathResource("regime-report.template.html")
-                    .getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            String html = tpl.replace("__DATA__", mapper.writeValueAsString(data));
-            Path out = Path.of(outPath);
-            if (out.getParent() != null) {
-                Files.createDirectories(out.getParent());
-            }
-            Files.writeString(out, html);
-            log.info("report: {} точек -> {}", points.size(), out.toAbsolutePath());
-        } catch (IOException e) {
-            throw new IllegalStateException("не удалось записать отчёт: " + outPath, e);
-        }
+        writeReport("regime-report.template.html", data, outPath, points.size());
     }
 
     /**
@@ -247,11 +235,127 @@ public class RegimeReport {
         writeReport("regime-compare.template.html", data, outPath, points.size());
     }
 
+    /**
+     * Главная страница дашборда: меню со всеми графиками режима, текущее состояние
+     * каждой версии детектора и лента состояний за последний год. Ссылки ведут на
+     * соседние файлы (regime-v5.html и т.д.) с якорем окна (#w=1m/3m/1y/all).
+     * CLI: --report=regime-index [--out=path].
+     */
+    public void generateIndex(String outPath) {
+        List<Map<String, Object>> cards = new ArrayList<>();
+        addCard(cards, "regime_daily_v5", "regime-v5.html", "v5 — SMA200", "ПРОД",
+                "close &gt; SMA200 → BULL, иначе BEAR. Ноль параметров, без гистерезиса. Нижняя панель — dist_atr.");
+        addCard(cards, "regime_daily_v3", "regime-v3.html", "v3 — оси D/T", null,
+                "Направление D и трендовость T с порогами (T=0.40, |D|=0.20), dwell 15 дней. Без CRASH.");
+        addCard(cards, "regime_daily", "regime-v1.html", "v1 — композит C1–C5", null,
+                "Скалярный score из пяти компонент + гистерезис FSM (вход ±0.30, выход ±0.10).");
+        if (hasRows("regime_daily") && hasRows("regime_daily_v3") && hasRows("regime_daily_v5")) {
+            cards.add(plainCard("regime-all.html", "Все версии — v1 / v3 / v5", null,
+                    "Цена и три ленты состояний рядом: где версии расходятся."));
+        }
+        if (hasRows("regime_daily") && hasRows("regime_daily_v2")) {
+            cards.add(plainCard("regime-compare.html", "Сравнение v1 vs v2", null,
+                    "Фон — состояние v2, лента снизу — v1, нижняя панель — оси D/T/S."));
+        }
+        if (cards.isEmpty()) {
+            log.warn("report: нет ни одной заполненной таблицы regime_daily* — сначала прогони --backfill=regime-v5");
+            return;
+        }
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("generated", java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC)
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm 'UTC'")));
+        data.put("cards", cards);
+        List<DayClose> tail = db.query(
+                "SELECT date(open_time/1000,'unixepoch') d, close FROM candles "
+                        + "WHERE symbol='BTCUSDT' AND interval='1d' ORDER BY open_time DESC LIMIT 31",
+                rs -> new DayClose(rs.getString(1), rs.getDouble(2)));
+        if (!tail.isEmpty()) {
+            Map<String, Object> p = new LinkedHashMap<>();
+            p.put("day", tail.get(0).day());
+            p.put("close", tail.get(0).close());
+            p.put("chg30", tail.size() > 30 ? tail.get(0).close() / tail.get(30).close() - 1 : null);
+            data.put("price", p);
+        }
+        writeReport("regime-index.template.html", data, outPath, cards.size());
+    }
+
+    /**
+     * Собирает весь дашборд в один каталог под каноническими именами:
+     * index.html (меню) + regime-v5/v3/v1/all/compare.html. Пустые таблицы пропускаются.
+     * CLI: --report=regime-dash [--out=каталог].
+     */
+    public void generateDash(String outDir) {
+        Path dir = Path.of(outDir);
+        generateV5(dir.resolve("regime-v5.html").toString());
+        generateV3(dir.resolve("regime-v3.html").toString());
+        generate(dir.resolve("regime-v1.html").toString());
+        generateAll(dir.resolve("regime-all.html").toString());
+        generateCompare(dir.resolve("regime-compare.html").toString());
+        generateIndex(dir.resolve("index.html").toString());
+        log.info("dash: готово -> {}", dir.toAbsolutePath());
+    }
+
+    private static final int SPARK_DAYS = 365;
+
+    private void addCard(List<Map<String, Object>> cards, String table, String file,
+                         String title, String tag, String desc) {
+        if (!hasRows(table)) {
+            return;
+        }
+        Map<String, Object> c = plainCard(file, title, tag, desc);
+        List<String[]> tail = db.query(
+                "SELECT day, state FROM " + table + " ORDER BY day DESC LIMIT " + SPARK_DAYS,
+                rs -> new String[]{rs.getString(1), rs.getString(2)});
+        java.util.Collections.reverse(tail);
+        String state = tail.get(tail.size() - 1)[1];
+        int since = 1;
+        for (int i = tail.size() - 2; i >= 0; i--) {
+            if (!java.util.Objects.equals(tail.get(i)[1], state)) {
+                break;
+            }
+            since++;
+        }
+        c.put("state", state);
+        c.put("stIdx", stateIdx(state));
+        c.put("day", tail.get(tail.size() - 1)[0]);
+        c.put("since", tail.get(Math.max(0, tail.size() - since))[0]);
+        c.put("sinceDays", since);
+        c.put("sinceCapped", since >= tail.size());
+        c.put("from", db.queryStrings("SELECT min(day) FROM " + table).stream().findFirst().orElse(null));
+        c.put("n", db.queryLong("SELECT count(*) FROM " + table));
+        List<Integer> spark = new ArrayList<>(tail.size());
+        for (String[] r : tail) {
+            spark.add(stateIdx(r[1]));
+        }
+        c.put("spark", spark);
+        cards.add(c);
+    }
+
+    private static Map<String, Object> plainCard(String file, String title, String tag, String desc) {
+        Map<String, Object> c = new LinkedHashMap<>();
+        c.put("file", file);
+        c.put("title", title);
+        c.put("tag", tag);
+        c.put("desc", desc);
+        return c;
+    }
+
+    private boolean hasRows(String table) {
+        Long t = db.queryLong("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?", table);
+        if (t == null || t == 0) {
+            return false;
+        }
+        Long n = db.queryLong("SELECT count(*) FROM " + table);
+        return n != null && n > 0;
+    }
+
     private void writeReport(String template, Map<String, Object> data, String outPath, int nPoints) {
         try {
             String tpl = new String(new ClassPathResource(template)
                     .getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            String html = tpl.replace("__DATA__", mapper.writeValueAsString(data));
+            String html = tpl.replace("__DATA__", mapper.writeValueAsString(data))
+                    .replace("__WINDOW_JS__", windowJs());
             Path out = Path.of(outPath);
             if (out.getParent() != null) {
                 Files.createDirectories(out.getParent());
@@ -262,6 +366,21 @@ public class RegimeReport {
             throw new IllegalStateException("не удалось записать отчёт: " + outPath, e);
         }
     }
+
+    /** Общий JS выбора окна времени (regime-window.js), встраивается в каждый отчёт. */
+    private String windowJs() {
+        if (windowJs == null) {
+            try {
+                windowJs = new String(new ClassPathResource("regime-window.js")
+                        .getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                throw new IllegalStateException("не найден regime-window.js", e);
+            }
+        }
+        return windowJs;
+    }
+
+    private String windowJs;
 
     private static String phaseShort(String phase) {
         return switch (phase == null ? "" : phase) {

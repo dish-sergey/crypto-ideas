@@ -25,7 +25,17 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun --args='--s5-kraken-check'                    # S5: read-only проверка ключа Kraken (без ордеров)
 ./gradlew bootRun --args='--s5-demo'                            # S5: показ жизненного цикла сделки в Telegram (без ордеров)
 ./gradlew bootRun --args='--s5-live'                            # S5: LIVE — РЕАЛЬНЫЕ ордера на Kraken Futures
+./gradlew bootRun --args='--report=regime-dash --out=reports/dash'  # весь HTML-дашборд режима: index.html (меню) + 5 графиков
 ```
+
+Дашборд режима: `--report=regime-dash` рендерит `index.html` (меню с карточками версий:
+текущее состояние, сколько дней в нём, лента за год) плюс `regime-v5.html` (прод), `regime-v3.html`,
+`regime-v1.html`, `regime-all.html`, `regime-compare.html`. Отдельные графики по-прежнему доступны
+как `--report=regime-v5|regime-v3|regime|regime-all|regime-compare [--out=...]`, меню — `--report=regime-index`.
+**Период выбирается на клиенте**: данные вшиты в страницу целиком, кнопки 1М/3М/6М/YTD/1Г/2Г/Всё,
+поля дат, ◀/▶ (и стрелки клавиатуры) режут окно без перегенерации; окно пишется в hash
+(`regime-v5.html#w=30`, `#w=2024-01-01..2024-06-30`) — ссылкой можно делиться. Общий код окна —
+`src/main/resources/regime-window.js`, он инлайнится в каждый отчёт вместо `__WINDOW_JS__`.
 
 S5 dry-run читает токен/chat_id из `telegram/s5_bot.txt` (gitignored) либо env
 `S5_TELEGRAM_TOKEN`/`S5_TELEGRAM_CHAT`. Деньги виртуальные (MockExchange), данные и Telegram — реальные.
