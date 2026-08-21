@@ -1,0 +1,102 @@
+﻿Kraken PF_*USD: 274 | OKX USDT-SWAP live: 423 | intersection: 166
+  processed 30/166
+  processed 60/166
+  processed 90/166
+  processed 120/166
+  processed 150/166
+
+===== CROSS-VENUE FUNDING SPREAD (Kraken vs OKX) =====
+instruments with overlap (>=20 common days): 164
+|spread| distribution: p50=20.3%  p75=63.5%  p90=100.0%
+
+-- joint spread x turnover (|spread|>20%, any turnover) --
+base           spread    narrowTurn$/d    sign%  nDays
+RAY           -210.0%            9,805       51     97
+AGLD          -194.0%            3,206       77     97
+LAYER         -152.7%            2,050       63     82
+SOON          +152.1%            1,672       62     84
+BRETT         -132.5%           23,911       64     84
+ZBT           -122.4%            8,618       65     84
+BICO          -121.8%           14,959       77     97
+IOTA          +119.3%           16,151       59     97
+MOVE          -118.7%            9,609       79     82
+ZRX           -117.3%            2,414       85     84
+ATH           -114.0%            3,448       74     84
+CRO           +113.6%            4,526       77     97
+GMX           -112.7%            2,709       77     97
+ONE           -111.2%            1,276       76     97
+ICX           -109.6%            1,211       82     84
+BAND          -109.1%            3,227       82     97
+GPS           -100.0%           11,182       74     84
+AIXBT          -93.4%           15,796       79     84
+BB             +92.1%            4,389       41     69
+ZIL            -89.1%            1,495       90     84
+BOME           -89.0%           32,025       71     84
+YGG            -88.8%            4,402       85     84
+BAT            -88.2%            4,369       90     97
+SPK            -85.7%            3,568       69     84
+ONT            -83.5%            4,004       58     84
+BLUR           -82.7%            8,902       84     80
+SSV            -80.7%            1,835       85     97
+ZETA           -78.9%            3,363       83     84
+ARKM           -78.0%            4,198       78     97
+IOST           -77.6%            1,057       91     97
+QTUM           -74.9%            2,024       86     84
+UMA            -73.0%              445       87     84
+MEW            -71.2%           51,150       82     84
+BERA           +69.6%           10,163       52     84
+1INCH          -68.0%            2,918       75     97
+NOT            -67.5%            5,391       82     84
+LPT            -67.4%           25,053       81     84
+KSM            -66.8%           14,406       96     84
+OPN            -65.6%           14,038       67     84
+INIT           -65.5%            2,726       71     84
+KAITO          -65.0%           69,372       67     84
+AR             -63.5%           21,650       80     97
+GRT            -62.1%           19,741       90     97
+CFX            -61.2%            7,976       86     97
+PNUT           -60.6%           25,347       71     84
+ZK             +57.0%           18,823       55     84
+POPCAT         -56.6%          108,122       93     84
+ANIME          -56.0%            1,498       77     84
+ENJ            -53.8%            6,338       80     84
+NEO            -53.8%            9,321       65     97
+2Z             -52.1%              857       74     84
+FLOKI          -50.5%           16,901       78     97
+RIVER          +49.6%           70,041       77     84
+BIGTIME        -42.7%            2,063       75     84
+HMSTR          -41.8%           28,849       71     84
+LQTY           -41.4%            3,894       62     97
+GMT            +40.9%           20,440       67     84
+METIS          -40.6%            1,223       81     84
+TURBO          -40.5%           41,751       81     84
+SNX            -38.4%           48,699       88     97
+SYRUP          -38.3%            5,453       71     84
+RSR            +37.9%            8,237       35     97
+MINA           -37.3%            8,239       76     84
+MON            +36.5%           19,988       45     84
+ETHFI          -29.9%           92,642       57     84
+AEVO           +26.4%            2,598       44     84
+NIGHT          -24.1%           46,751       67     84
+GRASS          +24.0%          213,750       70     84
+MANA           -23.9%           64,611       74     97
+ENS            -23.8%           48,515       75     97
+STX            -23.8%           28,644       67     97
+IMX            -23.6%            4,515       65     84
+NMR            -22.8%           14,935       55     84
+SPX            +22.6%          163,883       54     84
+XTZ            -22.1%          118,802       91     97
+SUSHI          -21.8%          113,232       84     97
+ZRO            +21.7%          144,050       63     84
+CELO           -21.4%            1,666       84     97
+COMP           -21.3%           48,496       88     97
+TRB            +21.1%            4,342       31     84
+YFI            -20.9%            9,631       73     97
+TRUMP          -20.3%          693,121       77     84
+
+===== CRITERION �6.3 =====
+(1) instruments |spread|>20% AND narrow turnover>$2M : 0  (need >=5) -> FAIL
+(2) of those, sign stable >=70% days                 : 0/0
+(3) cost <=1/4 spread: full-cycle ~0.6% (4 taker legs+spreads) vs 20% spread = 3% of spread -> PASS for captured spread; binding constraint is capacity (1)
+
+VERDICT: criterion NOT MET - direction closes, -> rejected.md

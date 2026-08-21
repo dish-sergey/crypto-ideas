@@ -1,0 +1,39 @@
+﻿Kraken tradeable PF_*USD: 274
+  fetched 50/274
+  fetched 100/274
+  fetched 150/274
+  fetched 200/274
+  fetched 250/274
+
+===== STEP 1: TURNOVER RECONCILIATION (�6) =====
+top-signal-decile median daily turnover (30d method) = $3,236
+cross_venue_funding.md ?ses identical method (charts trade vol x close).
+=> discrepancy with $1k-108k is INSTRUMENT SELECTION (high funding LEVEL vs high cross-venue SPREAD), not methodology.
+
+===== STEP 2: TRADEABLE UNIVERSE (�7) =====
+instruments with median 30d turnover >= $1M: median-over-weeks 25  (min 16, max 39)
+instruments >= $2M: median-over-weeks 16  (min 12, max 30)   <-- STOP if <30
+instruments >= $5M: median-over-weeks 9  (min 7, max 18)
+
+full-universe turnover distribution (last 30d, n=274):
+  p10=$1,066  p25=$3,135  p50=$11,863  p75=$163,514  p90=$693,702
+  instruments below $500k: 235 / 274 (86%)
+  instruments >= $2M at reference: 13
+
+monthly dynamics (avg instruments >= $2M):
+  2025-09 : 27
+  2025-10 : 25
+  2025-11 : 29
+  2025-12 : 22
+  2026-01 : 16
+  2026-02 : 19
+  2026-03 : 16
+  2026-04 : 13
+  2026-05 : 13
+  2026-06 : 16
+  2026-07 : 15
+  2026-08 : 13
+
+NB: IC on the >=$2M universe already computed = 0.489 (s12_ic_kraken.md, MIN_TURN=$2M) -> >0.15 OK; binding stop is count>=30.
+
+STOP-CONDITION �7: instruments>=$2M typical=16 -> TRIGGERED (<30): ?????-????. ???????????? Kraken ??? ???????? -> ????????? ?? ??? 4 + forward

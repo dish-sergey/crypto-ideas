@@ -7,12 +7,19 @@
 
 | Роль | Инстанс | Спека | Регион | IP | Доступ |
 |---|---|---|---|---|---|
-| **micro** (сбор + ловушка) | `instance-2026...` | Oracle Always Free AMD (E2.1.Micro), 1 CPU / 1 ГБ (+2 ГБ swap), 41 ГБ, Ubuntu 20.04 | eu-frankfurt-1 | `89.168.115.160` | `ssh -i D:\servers\oracle\ssh-key-2026-07-22.key ubuntu@89.168.115.160` |
-| **arm** (мощный, компьют) | `bot-arm` — ещё **не пойман** | Oracle Always Free ARM A1.Flex, 2 CPU / 12 ГБ (fallback 1/6) | eu-frankfurt-1 | — | будет: `ssh -i ~/.ssh/armkey ubuntu@<IP>` **с micro** |
+| **micro** (сбор + ловушка) | `instance-2026...` | Oracle Always Free AMD (E2.1.Micro), 1 CPU / 1 ГБ (+2 ГБ swap), 41 ГБ, Ubuntu 20.04 | eu-frankfurt-1 | `89.168.115.160` | `ssh -i D:\servers\oracle\instance-20260722-1110\ssh-key-2026-07-22.key ubuntu@89.168.115.160` |
+| **arm1** (компьют) | `bot-arm` — **пойман 19.08.2026 09:42 UTC** | Oracle Always Free ARM A1.Flex, **1 CPU / 6 ГБ**, Ubuntu 22.04 | eu-frankfurt-1 | `130.61.31.216` | `ssh -i ~/.ssh/armkey ubuntu@130.61.31.216` **с micro** (копия ключа: `D:\servers\oracle\arm1\private.key`) |
+| **arm2** (второй 1/6) | `bot-arm-2` — **ловим** | Oracle Always Free ARM A1.Flex, 1 CPU / 6 ГБ | eu-frankfurt-1 | — | будет: `ssh -i ~/.ssh/armkey ubuntu@<IP>` **с micro** (тот же ключ) |
 
 > Ключевая причина, почему сбор на micro: из Frankfurt (ЕС) доступны `fapi.binance.com`
 > и `api.bybit.com`, заблокированные с локальной машины/US-песочницы. Значит отсюда
 > берутся Binance funding/OI/ликвидации. micro — хорошее постоянное место для сбора.
+
+> ⚠️ **Локальная копия ключа ARM** (`D:\servers\oracle\arm1\private.key`) приехала из
+> консоли Oracle **без завершающего перевода строки** — openssh на это отвечает
+> `error in libcrypto: unsupported` / `invalid format`, что выглядит как «битый ключ».
+> Лечится дописыванием `\n` в конец файла (сделано 19.08.2026). Права на файл —
+> только чтение для владельца, иначе ssh его игнорирует.
 
 ---
 
@@ -46,32 +53,46 @@
 - **Список снапшотов:** `sudo bash -c 'set -a; . /etc/litestream.env; litestream snapshots -config /etc/litestream.yml ~/crypto-data/data/crypto.db'`
 - **Восстановить БД:** `sudo bash -c 'set -a; . /etc/litestream.env; litestream restore -config /etc/litestream.yml -o /tmp/restored.db ~/crypto-data/data/crypto.db'`
 
-### 3. `arm-catch` — ловушка мощного ARM
-- **Что:** `~/arm_catch.sh` в цикле пытается запустить бесплатный A1.Flex (сначала 2/12, потом 1/6, по 3 зонам Frankfurt) через OCI instance principal. Поймает — `exit 0`, сервис встаёт сам (без дублей).
+### 3. `arm-catch` — ловушка ARM
+- **Что:** `~/arm_catch.sh` в цикле пытается запустить бесплатный A1.Flex по 3 зонам Frankfurt через OCI instance principal. Поймает — `exit 0`, сервис встаёт сам.
+- **Исходник в git:** `deploy/arm_catch.sh` (на micro лежит копия; старая версия — `~/arm_catch.sh.bak-v1`).
+- **v2 (19.08.2026, после первой поимки):** предохранитель считает **бюджет** Always Free, а не «есть ли хоть один A1»: суммирует OCPU/RAM живых A1 и сравнивает с потолком. Поэтому после пойманного 1/6 ловушка едет дальше. Имя нового инстанса — `bot-arm-<N+1>` (дублей имён нет). Ответ `LimitExceeded/QuotaExceeded` → выход (не долбимся).
+- **Настройки (env, можно задать в юните):** `SHAPES` (по умолчанию `1:6`; формат `"2:12 1:6"` — по приоритету), `FREE_OCPUS`/`FREE_MEM` (по умолчанию **2/12** — консервативно, т.к. Oracle документирует 4/24, но тенанту может быть выдано меньше), `PAUSE` (30 с), `NAME`.
 - **Юнит:** `/etc/systemd/system/arm-catch.service`
 - **OCI CLI:** `~/bin/oci` → симлинк на venv **Python 3.11** (`~/lib/oci-py311`, ставился через `uv`; PATH в юните через `Environment=PATH=...`).
 - **Ключ для пойманного ARM:** `~/.ssh/armkey` (+ `.pub`) — прописывается в новый инстанс.
 - **Проверить:** `systemctl is-active arm-catch` · `journalctl -u arm-catch -f` (строки «занято (круг N)»)
-- **Поймал?:** `cat ~/arm-catch-SUCCESS.log 2>/dev/null && echo ПОЙМАНО || echo "ещё ловим"`
+- **Поймал?:** `cat ~/arm-catch-SUCCESS.log 2>/dev/null && echo ПОЙМАНО || echo "ещё ловим"` (лог накопительный — по строке на поимку; `systemctl is-active` = `inactive` после успеха)
+- **Запустить на следующую поимку:** обновить `~/arm_catch.sh` из `deploy/arm_catch.sh` (при изменениях) → `sudo systemctl start arm-catch`. Если в остаток бюджета ничего не влезает, скрипт сам напишет «бюджет Always Free исчерпан» и выйдет.
 - **Настройка политики (Oracle-консоль):** dynamic-group `arm-catcher-dg` + policy `arm-catcher-policy`; при Identity Domains имя группы с префиксом домена: `dynamic-group 'Default'/'arm-catcher-dg'`.
 
 ### 4. `dash` — HTML-дашборд детектора (только tailnet)
-- **Что:** `python3 -m http.server 8088 --directory ~/dash --bind <tailscale-ip>` — раздаёт `~/dash/index.html` (визуализация режима). Привязан к tailnet-IP → публично **недоступен**, только устройства твоего Tailscale.
+- **Что:** `python3 -m http.server 8088 --directory ~/dash --bind <tailscale-ip>` — раздаёт `~/dash/` (визуализация режима; `index.html` — меню со всеми графиками). Привязан к tailnet-IP → публично **недоступен**, только устройства твоего Tailscale.
 - **Юнит:** `/etc/systemd/system/dash.service`
 - **Доступ:** `http://100.64.144.85:8088/` или `http://crypto-micro:8088/` (MagicDNS) с любого устройства в tailnet.
 
 ### 5. `detector-report.timer` — суточное обновление дашборда
 - **Что:** раз в сутки 08:00 UTC гоняет `~/update-dashboard.sh` на боевой БД (`Persistent=true`).
-  Скрипт делает backfill трёх версий детектора и рендерит 4 дашборда:
-  - **v5 (ПРОД)** `close>SMA200` → `--backfill=regime-v5` + `--report=regime-v5 --out=~/dash/index.html` (главный).
-  - **v3** (оси D/T) → `--report=regime-v3 --out=~/dash/regime-v3.html`.
-  - **v1** (композит) → `--report=regime --out=~/dash/regime-v1.html`.
-  - **общий** (v1/v3/v5) → `--report=regime-all --out=~/dash/regime-all.html`.
+  Скрипт делает backfill трёх версий детектора и рендерит дашборд **одной командой**:
+  - `--backfill=regime-v5` (+ `regime-v3`, `regime`) → затем `--report=regime-dash --out=~/dash`.
+  - Это кладёт в `~/dash`: `index.html` (**меню** — карточки версий с текущим состоянием и лентой
+    за год), `regime-v5.html` (**ПРОД**, `close>SMA200`), `regime-v3.html` (оси D/T),
+    `regime-v1.html` (композит), `regime-all.html` (три ленты). `regime-compare.html` (v1 vs v2)
+    на micro **не рендерится**: таблица `regime_daily_v2` там пустая — карточка просто не появляется
+    в меню (штатное поведение, не ошибка).
+  - Период на каждом графике переключается **на клиенте** (1М/3М/6М/YTD/1Г/2Г/Всё, произвольные
+    даты, ◀/▶ или стрелки), окно попадает в hash — `regime-v5.html#w=30`, `#w=2024-01-01..2024-06-30`.
+  - **Миграция сделана 20.08.2026:** `index.html` теперь меню, а не v5 (сам v5 — `regime-v5.html`);
+    четыре вызова `--report=...` в `~/update-dashboard.sh` заменены одним `--report=regime-dash`.
+    Бэкапы: `~/update-dashboard.sh.bak-dash`, `~/crypto-data/app.jar.bak-dash` (jar подменён
+    атомарным `mv`, без рестарта `crypto-data`).
 - **Юниты:** `/etc/systemd/system/detector-report.{service,timer}`, скрипт `~/update-dashboard.sh` (бэкап `.bak-v3`).
 - **Проверить:** `systemctl list-timers detector-report.timer` · `journalctl -u detector-report`
 - **Обновить вручную:** `sudo systemctl start detector-report.service` (или `bash ~/update-dashboard.sh` от ubuntu).
-- **Дашборд:** `http://crypto-micro:8088/` = **v5 (прод)**; `.../regime-v3.html`, `.../regime-v1.html`, `.../regime-all.html`.
-- **Откат:** `mv app.jar.bak-v3 app.jar` + `update-dashboard.sh.bak-v3` (jar менялся атомарным mv, без рестарта crypto-data).
+- **Дашборд:** `http://crypto-micro:8088/` = **меню**; с него ссылки на v5 (прод), v3, v1, общий, сравнение
+  (и быстрые периоды 1М/3М/6М/1Г прямо с карточки).
+- **Откат:** `mv app.jar.bak-dash app.jar` + `cp update-dashboard.sh.bak-dash update-dashboard.sh`
+  (более старые бэкапы: `app.jar.bak-v3`, `update-dashboard.sh.bak-v3`). Jar менялся атомарным mv, без рестарта crypto-data.
 
 ### 6. `s5-live` — S5 LIVE (реальные ордера Kraken Futures) + Telegram-бот
 - **Что:** `~/jre25/bin/java -Xms32m -Xmx192m -jar ~/s5/app.jar --s5-live` — оркестратор S5 против живого

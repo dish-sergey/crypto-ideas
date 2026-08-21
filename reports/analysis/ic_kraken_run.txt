@@ -1,0 +1,20 @@
+﻿Kraken tradeable PF_*USD: 274
+  fetched 40/274
+  fetched 80/274
+  fetched 120/274
+  fetched 160/274
+  fetched 200/274
+  fetched 240/274
+
+===== S12 IC KRAKEN (1yr) =====
+params: L=7d signal, h=7d horizon, 7d rebal; return=SUM(funding)+(basis_t-basis_t+h)
+liquidity filter: median 30d turnover >= $2M, age>=60d, full funding window
+rebalances with >=8 instruments: 43
+IC all (total return)        IC_mean=+0.4891  IC_std=0.2468  IC_IR=+1.982  (n=43, %>0=98%)
+IC vs funding-only           IC_mean=+0.5460  IC_std=0.2487  IC_IR=+2.195  (n=43, %>0=100%)
+IC vs basis-change           IC_mean=+0.0209  IC_std=0.2827  IC_IR=+0.074  (n=43, %>0=44%)
+IC tercile LOW turnover      IC_mean=+0.5316  IC_std=0.3950  IC_IR=+1.346  (n=30, %>0=90%)
+IC tercile MID turnover      IC_mean=+0.4847  IC_std=0.3881  IC_IR=+1.249  (n=35, %>0=83%)
+IC tercile HIGH turnover     IC_mean=+0.3764  IC_std=0.4345  IC_IR=+0.866  (n=41, %>0=76%)
+top-signal-decile median daily turnover = $4,817,933
+  -> 1% of turnover position size = $48,179

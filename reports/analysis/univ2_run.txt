@@ -1,0 +1,19 @@
+﻿Kraken tradeable PF_*USD: 274
+  fetched 50/274
+  fetched 100/274
+  fetched 150/274
+  fetched 200/274
+  fetched 250/274
+
+===== STEP 1: UNIVERSE BY CAPITAL LEVEL (�7) =====
+required_turnover = capital*10 (2x lev, 20 positions, 1% rule)
+capital      threshold      N>=thr (median/min/max ?? ???????)
+$1000        $10000         133 / 101 / 154
+   monthly: 25-09=145 25-10=144 25-11=135 25-12=132 26-01=125 26-02=117 26-03=104 26-04=109 26-05=128 26-06=135 26-07=151 26-08=148 
+$10000       $100000        75 / 56 / 88
+$50000       $500000        35 / 27 / 53
+$200000      $2000000       16 / 12 / 30
+   monthly: 25-09=27 25-10=25 25-11=29 25-12=22 26-01=16 26-02=19 26-03=16 26-04=13 26-05=13 26-06=16 26-07=15 26-08=13 
+
+===== MIN ORDER ($100 leg) =====
+instruments where $100 leg clears min contract size: 274/274
