@@ -17,3 +17,5 @@ reports/analysis/*.class
 *.token
 .env
 
+# parquet счётных стендов (ТЗ 65–68) — бинарные ряды прогонов, в git не нужны
+reports/theory/*.parquet

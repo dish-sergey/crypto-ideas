@@ -26,6 +26,11 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun --args='--s5-demo'                            # S5: показ жизненного цикла сделки в Telegram (без ордеров)
 ./gradlew bootRun --args='--s5-live'                            # S5: LIVE — РЕАЛЬНЫЕ ордера на Kraken Futures
 ./gradlew bootRun --args='--report=regime-dash --out=reports/dash'  # весь HTML-дашборд режима: index.html (меню) + 5 графиков
+./gradlew bootRun --args='--theory=s5-import'                    # ТЗ 65/66: датасет событий S5 в data/theory.db (разово, сеть)
+./gradlew bootRun --args='--theory=alloc --out=reports/theory'   # ТЗ 65: стенд аллокации поверх пула S1–S12
+./gradlew bootRun --args='--theory=kelly --out=reports/theory'   # ТЗ 66: размер позиции S5 (Kelly с усадкой)
+./gradlew bootRun --args='--theory=ou --out=reports/theory'      # ТЗ 67: калибровка и допуск OU (предтест блока B)
+./gradlew bootRun --args='--theory=band --out=reports/theory'    # ТЗ 68: полоса бездействия и граница разорения
 ```
 
 Дашборд режима: `--report=regime-dash` рендерит `index.html` (меню с карточками версий:

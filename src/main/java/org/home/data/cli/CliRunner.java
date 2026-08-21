@@ -68,6 +68,8 @@ public class CliRunner implements ApplicationRunner {
     private final LiquidationWsCollector liquidations;
     /** Стенд Revolut X — через провайдер: в режиме планировщика его бины не создаются. */
     private final ObjectProvider<RevxCommands> revx;
+    /** Счётные стенды теории оптимальности (ТЗ 65–68) — тоже через провайдер, data/theory.db лениво. */
+    private final ObjectProvider<org.home.data.theory.TheoryCommands> theory;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
 
@@ -79,6 +81,7 @@ public class CliRunner implements ApplicationRunner {
                      RegimeReport report, AllocationProxy allocationProxy, Bench bench, S1Backtest s1Backtest,
                      LiquidationWsCollector liquidations,
                      ObjectProvider<RevxCommands> revx,
+                     ObjectProvider<org.home.data.theory.TheoryCommands> theory,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
         this.context = context;
@@ -98,6 +101,7 @@ public class CliRunner implements ApplicationRunner {
         this.s1Backtest = s1Backtest;
         this.liquidations = liquidations;
         this.revx = revx;
+        this.theory = theory;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
     }
@@ -154,6 +158,9 @@ public class CliRunner implements ApplicationRunner {
                 revx.getObject().probeLimits(new org.home.data.revx.RateLimitProbe.Ladder(
                         doubleOrNull(args, "start-rps"), doubleOrNull(args, "step-rps"),
                         doubleOrNull(args, "max-rps"), intOrNull(args, "dwell")));
+            }
+            if (args.containsOption("theory")) {
+                theory.getObject().run(first(args, "theory"), firstOr(args, "out", "reports/theory"));
             }
             if (args.containsOption("report")) {
                 String target = first(args, "report");

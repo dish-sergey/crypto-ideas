@@ -19,7 +19,8 @@ public class CliMode {
                 && !args.containsOption("s5-live")
                 && !args.containsOption("revx-pairs") && !args.containsOption("revx-probe-limits")
                 && !args.containsOption("revx-collect") && !args.containsOption("revx-basis")
-                && !args.containsOption("revx-sim");
+                && !args.containsOption("revx-sim")
+                && !args.containsOption("theory");
     }
 
     public boolean isScheduleMode() {
