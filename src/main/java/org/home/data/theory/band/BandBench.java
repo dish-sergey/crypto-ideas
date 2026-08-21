@@ -44,6 +44,12 @@ public class BandBench {
     /** Версия алгоритма стенда. */
     public static final String ALGO_VERSION = "band-1.0";
 
+    // Параметры контрольного прогона: печатаются в отчёте, чтобы таблица контроля
+    // воспроизводилась читателем без чтения кода.
+    private static final double CONTROL_PI_STAR = 0.4;
+    private static final double CONTROL_GAMMA = 1;
+    private static final double CONTROL_SIGMA = 0.6;
+
     private final BandConfig cfg;
     private final RunLog runLog;
     private final Db db;
@@ -65,10 +71,13 @@ public class BandBench {
         // ---- этап 3 §9: positive control — без него к сетке не переходим ----
         List<double[]> controls = new ArrayList<>();
         for (double epsilon : new double[]{0.00001, 0.0001, 0.001}) {
-            BandMath.Band asymptotic = BandMath.bandAsymptotic(0.4, 1, 0.6, epsilon);
-            BandMath.Band derived = BandMath.bandAsymptoticDerived(0.4, 1, 0.6, epsilon);
-            BandMath.Band numeric = BandMath.bandNumeric(0.4 * 1 * 0.36, 0.6, 1, epsilon,
-                    cfg.gridPoints(), cfg.bandSteps());
+            BandMath.Band asymptotic = BandMath.bandAsymptotic(CONTROL_PI_STAR, CONTROL_GAMMA,
+                    CONTROL_SIGMA, epsilon);
+            BandMath.Band derived = BandMath.bandAsymptoticDerived(CONTROL_PI_STAR, CONTROL_GAMMA,
+                    CONTROL_SIGMA, epsilon);
+            BandMath.Band numeric = BandMath.bandNumeric(
+                    CONTROL_PI_STAR * CONTROL_GAMMA * CONTROL_SIGMA * CONTROL_SIGMA,
+                    CONTROL_SIGMA, CONTROL_GAMMA, epsilon, cfg.gridPoints(), cfg.bandSteps());
             controls.add(new double[]{epsilon, asymptotic.width(), numeric.width(),
                     numeric.width() / asymptotic.width(), derived.width(),
                     numeric.width() / derived.width()});
@@ -323,6 +332,13 @@ public class BandBench {
         // --- Контроли (идут первыми) ---
         sb.append("## Контроли (§6.1 — от них зависит действительность остального)\n\n");
         sb.append("**1. Сходимость при ε → 0** (§4.4): численная и асимптотическая ширины обязаны сойтись.\n\n");
+        // Параметры и конвенция столбцов — в шапке: без них таблица не воспроизводится
+        // читателем, и «ширина» легко читается как полуширина.
+        sb.append(String.format(Locale.ROOT,
+                "Контроль считается при **π\\* = %.1f, γ = %.0f, σ = %.0f%%**; ε — доля с оборота. "
+                        + "Во всех столбцах — **полная ширина 2Δ**, не полуширина. σ в асимптотику не "
+                        + "входит: она уже зашита в π\\* = μ/(γσ²).%n%n",
+                CONTROL_PI_STAR, CONTROL_GAMMA, CONTROL_SIGMA * 100));
         sb.append("| ε | ширина по формуле ТЗ (3/4γ) | ширина по выведенной константе (3/2γ) | "
                 + "численная ширина | численная / ТЗ | численная / выведенная |\n");
         sb.append("|---|---|---|---|---|---|\n");
