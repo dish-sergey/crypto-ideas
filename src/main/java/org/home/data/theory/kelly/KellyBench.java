@@ -206,6 +206,32 @@ public class KellyBench {
                 pairGroups, tripleGroups));
         sb.append('\n');
 
+        // --- вселенная событий: фильтр — это определение стратегии, а не параметр ---
+        sb.append("## Вселенная событий: какой фильтр применён (П2 док. 71)\n\n");
+        sb.append("Фильтр S5 — **определение стратегии, а не настройка**: ослабив его, получаем другую "
+                + "стратегию с другой μ. Поэтому каждое условие док. 02 v2 перечислено явно, с ответом "
+                + "«применено или нет».\n\n");
+        sb.append("| Условие S5 (док. 02 v2) | В этом прогоне | Комментарий |\n|---|---|---|\n");
+        sb.append(String.format(Locale.ROOT,
+                "| Разлок ≥ 3%% циркулирующего supply | **%s** | порог прогона `theory.kelly.min-pct`; "
+                        + "в датасете хранятся события от 2%%, но в выборку они не попадают |%n",
+                pct(cfg.minPct())));
+        sb.append("| Получатели — инвесторы/команда | **НЕТ** | в кэше DefiLlama тип получателя не "
+                + "размечен надёжно; это расширение вселенной относительно спецификации, и оно "
+                + "работает против стратегии, а не за неё |\n");
+        sb.append(String.format(Locale.ROOT,
+                "| Есть ликвидный перп | **да** | событие берётся, только если есть минутная история "
+                        + "перпа Binance на входе и выходе |%n"));
+        sb.append(String.format(Locale.ROOT,
+                "| Отмена при ожидаемом funding > 1.5%% | **да, %s** | причинно: ожидание берётся по "
+                        + "5 дням ДО входа, а не по периоду удержания; отменено %d событий |%n",
+                pct(cfg.maxFundingCost()), withStop.skippedFunding()));
+        sb.append(String.format(Locale.ROOT,
+                "| Стоп против позиции | **%s** (док. 02 v2 называет 8%%) | расхождение разрешается "
+                        + "сеткой ниже, а не выбором удобного значения |%n", pct(cfg.stop())));
+        sb.append(String.format(Locale.ROOT,
+                "| Вход за 5 дней, выход в день разлока | **да, %d дней** | |%n%n", cfg.lead()));
+
         // --- §3.2 усечения ---
         sb.append("## Усечения распределения (§3.2)\n\n");
         sb.append(String.format(Locale.ROOT,
@@ -254,6 +280,50 @@ public class KellyBench {
                 + "стандартной форме неприменим — решение по хвостовым метрикам (§6.3).\n\n"
                 : "Профиля проданного опциона не видно: убыток не сосредоточен в редких крупных потерях "
                 + "сильнее, чем прибыль — в редких крупных выигрышах.\n\n");
+
+        // --- П3: разрез по режиму и остаточный контроль «событие или бета» ---
+        double[] inBull = withStop.outcomes().stream().filter(S5Outcomes.Outcome::bullRegime)
+                .mapToDouble(S5Outcomes.Outcome::outcome).toArray();
+        double[] inBear = withStop.outcomes().stream().filter(o -> !o.bullRegime())
+                .mapToDouble(S5Outcomes.Outcome::outcome).toArray();
+        double[] btcMoves = withStop.outcomes().stream()
+                .mapToDouble(S5Outcomes.Outcome::btcMove).toArray();
+        double beta = KellySizing.beta(btcMoves, x);
+        double[] residual = new double[x.length];
+        for (int i = 0; i < x.length; i++) {
+            residual[i] = x[i] - beta * btcMoves[i];
+        }
+        double residualKelly = KellySizing.kellyNumeric(residual);
+        double[] residualBoot = KellySizing.bootstrapKelly(residual, cfg.bootstrap(), cfg.seed());
+        double residualP5 = KellySizing.quantile(residualBoot, 0.05);
+
+        sb.append("## Событие или бета: разрез по режиму и остаточный контроль (§3.1, П3 док. 71)\n\n");
+        sb.append("Шорт-стратегия, у которой эффект растёт во второй половине выборки, обязана быть "
+                + "проверена на бету: тот же профиль даёт медвежий рынок. Правило 15 корпуса требует "
+                + "остаточную версию сигнала как контрольную группу.\n\n");
+        sb.append("| Разрез | Событий | Среднее исхода | σ | t-статистика |\n|---|---|---|---|---|\n");
+        sb.append(String.format(Locale.ROOT, "| Режим BULL по SMA200 на входе | %d | %+.2f%% | %.2f%% | %.2f |%n",
+                inBull.length, KellySizing.mean(inBull) * 100,
+                Math.sqrt(KellySizing.variance(inBull)) * 100, tStat(inBull)));
+        sb.append(String.format(Locale.ROOT, "| Режим BEAR | %d | %+.2f%% | %.2f%% | %.2f |%n",
+                inBear.length, KellySizing.mean(inBear) * 100,
+                Math.sqrt(KellySizing.variance(inBear)) * 100, tStat(inBear)));
+        sb.append(String.format(Locale.ROOT, "| Все события | %d | %+.2f%% | %.2f%% | %.2f |%n%n",
+                x.length, mean * 100, sd * 100, tStat(x)));
+        sb.append(String.format(Locale.ROOT,
+                "**Остаточный контроль.** Регрессия исхода события на ход BTC за то же окно даёт "
+                        + "β = **%.2f** (для шорта отрицательная β означает, что доход приходит от падения "
+                        + "рынка, а не от события). Остаток `исход − β·ход BTC`: среднее **%+.2f%%** против "
+                        + "%+.2f%% у сырого исхода, численный Kelly на остатке **%.1f%%**, 5-й процентиль "
+                        + "бутстрапа остатка **%.1f%%**.%n%n",
+                beta, KellySizing.mean(residual) * 100, mean * 100,
+                residualKelly * 100, residualP5 * 100));
+        sb.append(residualP5 > 0
+                ? "**Эффект переживает вычитание беты**: на остатке нижняя граница остаётся выше нуля, "
+                + "то есть событие даёт что-то сверх движения рынка.\n\n"
+                : "**Эффект НЕ переживает вычитание беты**: на остатке нижняя граница уходит к нулю или "
+                + "ниже — то есть измеренная премия неотличима от короткой экспозиции к рынку. Это тот "
+                + "же исход, который закрыл S2/S9, и он важнее любого вывода о размере.\n\n");
 
         // --- §4 оценки размера ---
         sb.append("## Оценки размера (§4)\n\n");
@@ -372,18 +442,33 @@ public class KellyBench {
         sb.append("## Чувствительность к стопу (§3.2)\n\n");
         sb.append("Док. 02 v2 называет стоп +8%, измеренная модель док. 52 и live — 30%. ")
                 .append("Расхождение разрешается сеткой, а не выбором удобного значения.\n\n");
-        sb.append("| Стоп | Сработал | Среднее исхода | σ | Точечный Kelly | 5-й проц. бутстрапа |\n");
-        sb.append("|---|---|---|---|---|---|\n");
+        sb.append("| Стоп | Сработал | Среднее исхода | σ | Точечный Kelly | 5-й проц. бутстрапа | "
+                + "потолок из лимита просадки |\n");
+        sb.append("|---|---|---|---|---|---|---|\n");
         for (double stop : cfg.stopGrid()) {
             S5Outcomes.Dataset d = outcomes.build(cfg, stop);
             double[] v = d.values();
             double[] b = KellySizing.bootstrapKelly(v, Math.max(cfg.bootstrap() / 10, 100), cfg.seed());
-            sb.append(String.format(Locale.ROOT, "| %.0f%% | %d | %+.2f%% | %.2f%% | %.1f%% | %.1f%% |%n",
+            double cap = KellySizing.drawdownCap(cfg.portfolioDdLimit(), observedMaxConcurrent,
+                    stop + cfg.slippage());
+            sb.append(String.format(Locale.ROOT,
+                    "| %.0f%% | %d | %+.2f%% | %.2f%% | %.1f%% | %.1f%% | %.1f%% |%n",
                     stop * 100, d.outcomes().stream().filter(S5Outcomes.Outcome::stopHit).count(),
                     KellySizing.mean(v) * 100, Math.sqrt(KellySizing.variance(v)) * 100,
-                    KellySizing.kellyNumeric(v) * 100, KellySizing.quantile(b, 0.05) * 100));
+                    KellySizing.kellyNumeric(v) * 100, KellySizing.quantile(b, 0.05) * 100, cap * 100));
         }
-        sb.append('\n');
+        sb.append(String.format(Locale.ROOT,
+                "%n**Потолок из лимита просадки зависит от стопа линейно** и потому не является "
+                        + "самостоятельным результатом: при стопе %s он равен %.1f%%, при стопе 8%% из "
+                        + "док. 02 v2 — %.1f%%. Во втором случае ограничение перестаёт связывать вблизи "
+                        + "текущего лимита %s, и «сколько ставить» снова упирается в оценку эффекта, а не "
+                        + "в арифметику портфеля (П2 док. 71).%n%n",
+                pct(cfg.stop()),
+                KellySizing.drawdownCap(cfg.portfolioDdLimit(), observedMaxConcurrent,
+                        cfg.stop() + cfg.slippage()) * 100,
+                KellySizing.drawdownCap(cfg.portfolioDdLimit(), observedMaxConcurrent,
+                        0.08 + cfg.slippage()) * 100,
+                pct(cfg.currentLimit())));
 
         // --- вердикт ---
         double shrunk1 = shrinkGrid.getOrDefault(1.0, KellySizing.shrunkKelly(x, 1));
@@ -503,6 +588,15 @@ public class KellyBench {
                 + "значимого расхождения нет", ratio);
     }
 
+    /** t-статистика среднего: μ̂/SE(μ̂). */
+    private static double tStat(double[] v) {
+        if (v.length < 2) {
+            return Double.NaN;
+        }
+        double se = Math.sqrt(KellySizing.variance(v) / v.length);
+        return se > 0 ? KellySizing.mean(v) / se : Double.NaN;
+    }
+
     private static double min(double[] v) {
         double m = Double.POSITIVE_INFINITY;
         for (double x : v) {
@@ -515,7 +609,15 @@ public class KellyBench {
         return Math.round(f * 10000) / 10000.0;
     }
 
+    /**
+     * Проценты без потери значащих цифр: с {@code %.0f} порог funding 1.5%
+     * печатался как «2%», и читатель отчёта справедливо решил, что фильтр другой
+     * (П2 док. 71). Дробная часть показывается, когда она есть.
+     */
     private static String pct(double v) {
-        return String.format(Locale.ROOT, "%.0f%%", v * 100);
+        double percent = v * 100;
+        return Math.abs(percent - Math.round(percent)) < 1e-9
+                ? String.format(Locale.ROOT, "%.0f%%", percent)
+                : String.format(Locale.ROOT, "%.1f%%", percent);
     }
 }

@@ -83,6 +83,33 @@ public final class BandMath {
      * режим малых издержек, и применимость формулы проверяется численно
      * ({@link #bandNumeric}), а не предполагается.
      */
+    /**
+     * Асимптотика, <b>выведенная для целевой функции этого модуля</b> (П5 док. 71).
+     *
+     * <p>Вывод занимает пять строк и снимает вопрос о множителе. Для узкой полосы
+     * полушириной Δ вокруг π* стационарная плотность доли риска почти равномерна,
+     * поэтому потеря темпа роста от отклонения равна
+     * {@code (γσ²/2)·E[(π−π*)²] = (γσ²/6)·Δ²}. Интенсивность местного времени на
+     * каждой из двух границ равна {@code s²/(4Δ)} при {@code s = σπ*(1−π*)},
+     * значит издержки равны {@code ε·s²/(2Δ)}. Минимум суммы:
+     * <pre>(γσ²/3)·Δ = ε·s²/(2Δ²)  ⇒  Δ³ = (3/(2γ))·π*²(1−π*)²·ε</pre>
+     *
+     * <p>Отсюда константа {@code 3/(2γ)}, а не {@code 3/(4γ)} из формулировки ТЗ:
+     * они отличаются ровно в {@code 2^{1/3} ≈ 1.26} раза — то самое «стабильное
+     * отношение», которое первый прогон списал на «систематический коэффициент
+     * реализации». Численное решение совпадает <b>с этой</b> константой, что и
+     * проверяется positive control-ом.
+     */
+    public static Band bandAsymptoticDerived(double piStar, double gamma, double sigma, double epsilon) {
+        double halfWidth = Math.cbrt(3.0 / (2 * gamma) * piStar * piStar
+                * (1 - piStar) * (1 - piStar) * epsilon);
+        return new Band(piStar - halfWidth, piStar + halfWidth, 2 * halfWidth,
+                Math.pow(epsilon, 2.0 / 3.0));
+    }
+
+    /** Отношение констант ТЗ и вывода: {@code (3/2)/(3/4)} под кубическим корнем. */
+    public static final double TZ_CONSTANT_RATIO = Math.cbrt(2);
+
     public static Band bandAsymptotic(double piStar, double gamma, double sigma, double epsilon) {
         double halfWidth = Math.cbrt(3.0 / (4 * gamma) * piStar * piStar
                 * (1 - piStar) * (1 - piStar) * epsilon);

@@ -64,3 +64,27 @@ CREATE TABLE IF NOT EXISTS s5_symbol_map (
     base          TEXT    NOT NULL,
     imported_ms   INTEGER NOT NULL
 );
+
+-- Минутные свечи ПЕРПА Binance (fapi) для базиса спот–перп ОДНОЙ площадки
+-- (ТЗ 67 §2, П1 док. 71): спот берётся из crypto.db (тот же Binance, интервал 1m),
+-- совпадение по close_time точное — рассинхронизация ног равна нулю по построению,
+-- в отличие от кросс-площадочного ряда на пятиминутных снимках тикера Kraken.
+CREATE TABLE IF NOT EXISTS perp_1m (
+    symbol      TEXT    NOT NULL,
+    close_time  INTEGER NOT NULL,          -- = close_time спотовой свечи того же интервала
+    close       REAL    NOT NULL,
+    imported_ms INTEGER NOT NULL,
+    PRIMARY KEY (symbol, close_time)
+);
+
+-- Минутные свечи СПОТА Binance по стресс-дням (см. perp_1m): в crypto.db минутный
+-- спот есть только за последнюю неделю, а вопрос П1 док. 71 — про всплески
+-- волатильности, где базис и должен расходиться. Обе ноги тянутся одним
+-- импортёром, поэтому сетка у них общая.
+CREATE TABLE IF NOT EXISTS spot_1m (
+    symbol      TEXT    NOT NULL,
+    close_time  INTEGER NOT NULL,
+    close       REAL    NOT NULL,
+    imported_ms INTEGER NOT NULL,
+    PRIMARY KEY (symbol, close_time)
+);

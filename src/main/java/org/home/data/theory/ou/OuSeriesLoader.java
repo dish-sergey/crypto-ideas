@@ -29,11 +29,14 @@ public class OuSeriesLoader {
     private static final Logger log = LoggerFactory.getLogger(OuSeriesLoader.class);
 
     private final Db db;
+    private final org.home.data.theory.TheoryDb theoryDb;
     private final ObjectProvider<RevxDb> revxDb;
     private final OuConfig cfg;
 
-    public OuSeriesLoader(Db db, ObjectProvider<RevxDb> revxDb, OuConfig cfg) {
+    public OuSeriesLoader(Db db, org.home.data.theory.TheoryDb theoryDb,
+                          ObjectProvider<RevxDb> revxDb, OuConfig cfg) {
         this.db = db;
+        this.theoryDb = theoryDb;
         this.revxDb = revxDb;
         this.cfg = cfg;
     }
@@ -90,7 +93,7 @@ public class OuSeriesLoader {
         }
         return new OuSeries("NEG_BTC", "лог-цена BTC, дневные свечи Binance", times, values, inEpisode,
                 "|log P − среднее| > 0.5σ", "дни", 0,
-                "контроль: цена не обязана возвращаться ни к какому уровню (док. 22, S3 закрыта)");
+                "контроль: цена не обязана возвращаться ни к какому уровню (док. 22, S3 закрыта)", false);
     }
 
     // ------------------------------------------------------------- кандидаты
@@ -136,7 +139,7 @@ public class OuSeriesLoader {
                 times, values, inEpisode,
                 "|дифференциал| > " + cfg.fundDiffThreshold() + " (round-trip издержки)", "дни", 0,
                 "механизм привязки — межплощадочный арбитраж; ставки площадок невзаимозаменяемы "
-                        + "(док. 09 §4.7), поэтому сравнивается именно дифференциал, а не уровни");
+                        + "(док. 09 §4.7), поэтому сравнивается именно дифференциал, а не уровни", false);
     }
 
     /**
@@ -205,15 +208,100 @@ public class OuSeriesLoader {
                         "коинтеграционный спред log(BTC) − %.3f·log(ETH), дневные свечи", beta),
                 times, spread, inEpisode,
                 "|z| > " + cfg.pairZThreshold() + " (окно " + w + ")", "дни", 0,
-                "МЕХАНИЧЕСКОЙ ПРИВЯЗКИ НЕТ — только статистическая гипотеза; β оценена in-sample");
+                "МЕХАНИЧЕСКОЙ ПРИВЯЗКИ НЕТ — только статистическая гипотеза; β оценена in-sample", false);
     }
 
     /**
-     * {@code BASIS} — базис спот–перп. <b>Отклонение от ТЗ §3</b>: синхронных
-     * снимков одной площадки у проекта нет, поэтому берётся марк-цена перпа
-     * Kraken против спота Binance. Это кросс-площадочная величина, в которую
-     * подмешан спред между площадками; рассинхронизация снимков считается и
-     * ограничивается порогом, доля отброшенных — в отчёте.
+     * {@code BASIS} — базис спот–перп <b>одной площадки</b> на минутной сетке
+     * (П1 док. 71). Спот — свеча Binance из {@code crypto.db}, перп — свеча fapi
+     * из {@code perp_1m}; совпадение по {@code close_time} точное, поэтому
+     * рассинхронизация ног равна нулю по построению.
+     *
+     * <p>Это исправление первого прогона, где базис мерился кросс-площадочно и на
+     * пятиминутной сетке: отклонения базиса живут минуты, и на такой сетке они
+     * усредняются независимо от того, есть эффект или нет.
+     */
+    /**
+     * Непрерывный минутный базис с даты {@code theory.ou.basis-from} — ряд, на
+     * котором тесты стационарности применимы, а частота эпизодов календарно
+     * честна.
+     */
+    public OuSeries basisSameVenue(String symbol) {
+        return basisSameVenue(symbol, "BASIS", basisFromMs(), Long.MAX_VALUE, false);
+    }
+
+    /**
+     * Стресс-выборка того же базиса: 26 самых волатильных дней до начала
+     * непрерывного окна. Ряд <b>сшит</b>, поэтому годится для статистик эпизодов
+     * (глубина, длительность, доля возвратов) и не годится для тестов
+     * стационарности — это и помечено флагом.
+     */
+    public OuSeries basisStress(String symbol) {
+        return basisSameVenue(symbol, "BASIS_STRESS", 0, basisFromMs(), true);
+    }
+
+    private long basisFromMs() {
+        return java.time.LocalDate.parse(cfg.basisFrom()).atStartOfDay(java.time.ZoneOffset.UTC)
+                .toInstant().toEpochMilli();
+    }
+
+    private OuSeries basisSameVenue(String symbol, String id, long fromMs, long toMs, boolean stitched) {
+        TreeMap<Long, Double> spot = new TreeMap<>();
+        db.query("SELECT close_time, close FROM candles WHERE symbol=? AND interval='1m' "
+                        + "AND close_time >= ? AND close_time < ? ORDER BY open_time",
+                rs -> {
+                    spot.put(rs.getLong(1), rs.getDouble(2));
+                    return null;
+                }, symbol, fromMs, toMs);
+        theoryDb.query("SELECT close_time, close FROM spot_1m WHERE symbol=? AND close_time >= ? "
+                + "AND close_time < ? ORDER BY close_time", rs -> {
+            spot.put(rs.getLong(1), rs.getDouble(2));
+            return null;
+        }, symbol, fromMs, toMs);
+        TreeMap<Long, Double> perp = new TreeMap<>();
+        theoryDb.query("SELECT close_time, close FROM perp_1m WHERE symbol=? ORDER BY close_time", rs -> {
+            perp.put(rs.getLong(1), rs.getDouble(2));
+            return null;
+        }, symbol);
+
+        List<double[]> rows = new ArrayList<>();
+        int missing = 0;
+        for (Map.Entry<Long, Double> e : spot.entrySet()) {
+            Double p = perp.get(e.getKey());
+            if (p == null || e.getValue() <= 0) {
+                missing++;                     // минута без пары: считаем и отчитываем
+                continue;
+            }
+            rows.add(new double[]{e.getKey() / 60_000.0, p / e.getValue() - 1});
+        }
+        double[] times = rows.stream().mapToDouble(r -> r[0]).toArray();
+        double[] values = rows.stream().mapToDouble(r -> r[1]).toArray();
+        boolean[] inEpisode = new boolean[values.length];
+        for (int i = 0; i < values.length; i++) {
+            inEpisode[i] = Math.abs(values[i]) > cfg.basisThreshold();
+        }
+        double droppedShare = spot.isEmpty() ? 1 : (double) missing / spot.size();
+        Jlog.info(log, "ou.basis.same-venue", Map.of("id", id, "symbol", symbol,
+                "points", values.length, "missing", missing, "dropped_share", droppedShare));
+        String window = stitched
+                ? "сшитая стресс-выборка: самые волатильные дни до " + cfg.basisFrom()
+                + " (там док. 61 §2.3 помещает отклонения выше порога)"
+                : "непрерывное окно с " + cfg.basisFrom();
+        return new OuSeries(id,
+                "базис спот–перп ОДНОЙ площадки: перп Binance " + symbol + " против спота Binance "
+                        + symbol + ", минутные свечи; " + window,
+                times, values, inEpisode,
+                "|базис| > " + cfg.basisThreshold() + " (порог входа, док. 61 §2.3)", "минуты",
+                droppedShare,
+                "рассинхронизация ног НУЛЕВАЯ по построению: обе ноги — свечи с одним close_time; "
+                        + "доля минут без пары отчитана отдельно", stitched);
+    }
+
+    /**
+     * {@code BASIS_XVENUE} — тот же базис, но <b>кросс-площадочный</b> и на
+     * пятиминутной сетке снимков тикера Kraken. Оставлен как диагностика: он
+     * показывает, сколько «эффекта» съедают разрешение и разные площадки по
+     * сравнению с {@link #basisSameVenue}.
      */
     public OuSeries basis(String krakenSymbol, String spotSymbol) {
         TreeMap<Long, Double> perp = new TreeMap<>();
@@ -253,13 +341,14 @@ public class OuSeriesLoader {
         double droppedShare = perp.isEmpty() ? 1 : (double) dropped / perp.size();
         Jlog.info(log, "ou.basis", Map.of("points", values.length, "dropped", dropped,
                 "dropped_share", droppedShare));
-        return new OuSeries("BASIS",
-                "базис: марк-цена перпа Kraken " + krakenSymbol + " против спота Binance " + spotSymbol,
+        return new OuSeries("BASIS_XVENUE",
+                "базис КРОСС-ПЛОЩАДОЧНЫЙ (диагностика разрешения): марк-цена перпа Kraken "
+                        + krakenSymbol + " против спота Binance " + spotSymbol + ", снимки раз в 5 минут",
                 times, values, inEpisode,
                 "|базис| > " + cfg.basisThreshold() + " (порог входа, док. 61 §2.3)", "часы", droppedShare,
                 "ОТКЛОНЕНИЕ ОТ ТЗ §3: синхронных снимков одной площадки нет, величина кросс-площадочная — "
                         + "в неё подмешан спред между площадками; допуск рассинхронизации "
-                        + cfg.basisSkewToleranceMs() + " мс вместо 250 мс");
+                        + cfg.basisSkewToleranceMs() + " мс вместо 250 мс", false);
     }
 
     /**
@@ -307,7 +396,7 @@ public class OuSeriesLoader {
                 times, values, inEpisode,
                 "курс ниже " + cfg.depegThreshold() + " дольше " + cfg.depegMinHours() + " ч (док. 60 §7, Z5)",
                 "часы", droppedShare,
-                "механизм привязки — погашение по номиналу; данные накапливаются стендом Revolut X");
+                "механизм привязки — погашение по номиналу; данные накапливаются стендом Revolut X", false);
     }
 
     // ------------------------------------------------------------------ утилиты
@@ -325,7 +414,7 @@ public class OuSeriesLoader {
         }
         return new OuSeries(id, description, times, x, inEpisode,
                 "|x − среднее| > " + thresholdSd + "σ стационарного распределения", "дни", 0,
-                "контроль: параметры известны заранее");
+                "контроль: параметры известны заранее", false);
     }
 
     private static Map.Entry<Long, Double> nearest(TreeMap<Long, Double> map, long key) {

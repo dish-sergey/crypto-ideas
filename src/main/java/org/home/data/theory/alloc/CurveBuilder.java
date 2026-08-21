@@ -251,7 +251,7 @@ public class CurveBuilder {
                 "дельта-нейтральный funding-carry на перпах Binance (" + symbols.size()
                         + " символа с историей funding); выбор символа по EMA7(funding) вчерашнего дня, "
                         + "гейт доступности EMA7 ≥ " + cfg.s1GatePer8h() + " за 8ч (док. 00 v3 §3.1), "
-                        + "издержки переключения " + cfg.s1SwitchCost() + " и трение ребаланса дельты");
+                        + "издержки переключения " + cfg.s1SwitchCost() + " и трение ребаланса дельты", false);
     }
 
     /**
@@ -330,7 +330,7 @@ public class CurveBuilder {
                 "кросс-секционный моментум: лонг топ-" + cfg.s2s9Top() + " по доходности за "
                         + lookback + " дней, ротация раз в " + cfg.s2s9Hold() + " дней, равные веса, издержки "
                         + cfg.cost() + " с оборота. ВСЕЛЕННАЯ СЕГОДНЯШНЯЯ (PIT-капитализаций нет) → survivorship, "
-                        + "кривая завышена");
+                        + "кривая завышена", true);
     }
 
     /**
@@ -366,7 +366,7 @@ public class CurveBuilder {
         return new Curve("S3", CurveKind.IN_SAMPLE, ret, avail, turnover,
                 "канонический mean reversion (z=(close−SMA" + cfg.s3Window() + ")/std, вход ±"
                         + cfg.s3Entry() + "σ, выход к средней), BTC и ETH равными долями, издержки "
-                        + cfg.cost() + " с оборота; закрыта измерением (док. 22), в пуле по правилу §8");
+                        + cfg.cost() + " с оборота; закрыта измерением (док. 22), в пуле по правилу §8", false);
     }
 
     /** Одна нога S3: NaN, когда позиции нет (капитал не задействован). */
@@ -435,7 +435,7 @@ public class CurveBuilder {
         }
         return new Curve("S4", CurveKind.IN_SAMPLE, ret, avail, turnover,
                 "стейблкоин-доходность как ряд достижимых ставок по подпериодам (док. 24 §6.4): "
-                        + cfg.s4YieldsRaw() + " — допущение, не измерение; контрагентский риск в кривой не отражён");
+                        + cfg.s4YieldsRaw() + " — допущение, не измерение; контрагентский риск в кривой не отражён", false);
     }
 
     /**
@@ -577,7 +577,7 @@ public class CurveBuilder {
                         + cfg.s5Slippage() + " только при стопе. Сверка с моделью док. 52: средняя "
                         + "доходность позиции здесь " + String.format(java.util.Locale.ROOT, "%+.2f%%", perTrade * 100)
                         + " против +2.49% там (там 550 сделок, фильтр funding подглядывал в период удержания, "
-                        + "проскальзывание вычиталось только при стопе, окно календаря шире)");
+                        + "проскальзывание вычиталось только при стопе, окно календаря шире)", false);
     }
 
     /**
@@ -633,7 +633,7 @@ public class CurveBuilder {
                 "лестница накопления BTC: гейт BEAR + cycle_phase=ACCUMULATION (regime_daily_v5), "
                         + cfg.s6Steps() + " ступеней с шагом " + (cfg.s6StepDrop() * 100)
                         + "% вниз от цены активации, выход при BULL; доходность на задействованный капитал = "
-                        + "дневная доходность BTC (это бета, а не альфа)");
+                        + "дневная доходность BTC (это бета, а не альфа)", false);
     }
 
     /**
@@ -660,7 +660,7 @@ public class CurveBuilder {
                 "fade panic в ДНЕВНОМ приближении: после дня с падением ≤ "
                         + (cfg.s7CrashThreshold() * 100) + "% — лонг BTC на следующий день, издержки "
                         + (2 * cfg.cost()) + " на сделку. Внутридневного контура нет (док. 29) → это прокси; "
-                        + "механизм закрыт измерением (док. 49)");
+                        + "механизм закрыт измерением (док. 49)", false);
     }
 
     // --------------------------------------------------------------- бенчмарки
@@ -676,7 +676,7 @@ public class CurveBuilder {
                 avail[t] = true;
             }
         }
-        return new Curve(id, CurveKind.IN_SAMPLE, ret, avail, new double[n], note);
+        return new Curve(id, CurveKind.IN_SAMPLE, ret, avail, new double[n], note, false);
     }
 
     /** SMA200 — главный бенчмарк: именно его не превзошёл детектор (док. 20). */
@@ -709,7 +709,7 @@ public class CurveBuilder {
             prevIn = in;
         }
         return new Curve("SMA200", CurveKind.IN_SAMPLE, ret, avail, turnover,
-                "BTC при close > SMA200, иначе кэш по ставке DFF; издержки " + cfg.cost() + " на переключение");
+                "BTC при close > SMA200, иначе кэш по ставке DFF; издержки " + cfg.cost() + " на переключение", false);
     }
 
     private Curve cashCurve(double[] cash) {
@@ -717,7 +717,7 @@ public class CurveBuilder {
         boolean[] avail = new boolean[n];
         Arrays.fill(avail, true);
         return new Curve("CASH", CurveKind.LIVE, cash.clone(), avail, new double[n],
-                "ставка кэша по датам: FRED DFF, доступность день+1 (не константа 8% — док. 01 v5 §6.4)");
+                "ставка кэша по датам: FRED DFF, доступность день+1 (не константа 8% — док. 01 v5 §6.4)", false);
     }
 
     private static double[] nanArray(int n) {

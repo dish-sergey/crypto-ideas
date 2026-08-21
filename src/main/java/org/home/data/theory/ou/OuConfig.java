@@ -34,6 +34,7 @@ public class OuConfig {
     private final double pairZThreshold;
     private final int pairWindow;
     private final String from;
+    private final String basisFrom;
 
     @SuppressWarnings("checkstyle:ParameterNumber")
     public OuConfig(
@@ -54,7 +55,8 @@ public class OuConfig {
             @Value("${theory.ou.funddiff-threshold}") double fundDiffThreshold,
             @Value("${theory.ou.pair-z-threshold}") double pairZThreshold,
             @Value("${theory.ou.pair-window}") int pairWindow,
-            @Value("${theory.ou.from}") String from) {
+            @Value("${theory.ou.from}") String from,
+            @Value("${theory.ou.basis-from}") String basisFrom) {
         this.level = level;
         this.lags = lags;
         this.bootstrap = bootstrap;
@@ -73,6 +75,7 @@ public class OuConfig {
         this.pairZThreshold = pairZThreshold;
         this.pairWindow = pairWindow;
         this.from = from;
+        this.basisFrom = basisFrom;
     }
 
     /** Конфиг целиком — в запись прогона. */
@@ -96,6 +99,7 @@ public class OuConfig {
         m.put("pair_z_threshold", pairZThreshold);
         m.put("pair_window", pairWindow);
         m.put("from", from);
+        m.put("basis_from", basisFrom);
         return m;
     }
 
@@ -169,5 +173,10 @@ public class OuConfig {
 
     public String from() {
         return from;
+    }
+
+    /** Начало НЕПРЕРЫВНОГО минутного окна базиса; до него лежит стресс-выборка. */
+    public String basisFrom() {
+        return basisFrom;
     }
 }

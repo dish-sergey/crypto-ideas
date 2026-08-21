@@ -37,6 +37,7 @@ public class BandConfig {
     private final double ladderStepDrop;
     private final int ladderSteps;
     private final int ladderHorizonDays;
+    private final List<Integer> ladderHorizonGrid;
     private final double inventoryImbalance;
     private final int inventoryCeiling;
     private final int inventorySteps;
@@ -65,6 +66,7 @@ public class BandConfig {
             @Value("${theory.band.ladder-step-drop}") double ladderStepDrop,
             @Value("${theory.band.ladder-steps}") int ladderSteps,
             @Value("${theory.band.ladder-horizon-days}") int ladderHorizonDays,
+            @Value("${theory.band.ladder-horizon-grid}") String ladderHorizonGrid,
             @Value("${theory.band.inventory-imbalance}") double inventoryImbalance,
             @Value("${theory.band.inventory-ceiling}") int inventoryCeiling,
             @Value("${theory.band.inventory-steps}") int inventorySteps,
@@ -90,6 +92,7 @@ public class BandConfig {
         this.ladderStepDrop = ladderStepDrop;
         this.ladderSteps = ladderSteps;
         this.ladderHorizonDays = ladderHorizonDays;
+        this.ladderHorizonGrid = parseDoubles(ladderHorizonGrid).stream().map(Double::intValue).toList();
         this.inventoryImbalance = inventoryImbalance;
         this.inventoryCeiling = inventoryCeiling;
         this.inventorySteps = inventorySteps;
@@ -127,6 +130,7 @@ public class BandConfig {
         m.put("ladder_step_drop", ladderStepDrop);
         m.put("ladder_steps", ladderSteps);
         m.put("ladder_horizon_days", ladderHorizonDays);
+        m.put("ladder_horizon_grid", ladderHorizonGrid);
         m.put("inventory_imbalance", inventoryImbalance);
         m.put("inventory_ceiling", inventoryCeiling);
         m.put("inventory_steps", inventorySteps);
@@ -213,6 +217,11 @@ public class BandConfig {
 
     public int ladderHorizonDays() {
         return ladderHorizonDays;
+    }
+
+    /** Горизонты лестницы для прогона чувствительности (П6 док. 71). */
+    public List<Integer> ladderHorizonGrid() {
+        return ladderHorizonGrid;
     }
 
     public double inventoryImbalance() {

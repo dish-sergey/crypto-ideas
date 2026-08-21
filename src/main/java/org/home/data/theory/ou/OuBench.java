@@ -67,6 +67,8 @@ public class OuBench {
         boolean controlsOk = controlsPass(controls);
 
         List<Row> candidates = new ArrayList<>();
+        candidates.add(analyse(loader.basisSameVenue("BTCUSDT")));
+        candidates.add(analyse(loader.basisStress("BTCUSDT")));
         candidates.add(analyse(loader.basis("PF_XBTUSD", "BTCUSDT")));
         OuSeries depeg = loader.depeg("ETH");
         if (depeg != null) {
@@ -107,6 +109,15 @@ public class OuBench {
     }
 
     private Row analyse(OuSeries series) {
+        long startedMs = System.currentTimeMillis();
+        Row row = analyseInner(series);
+        Jlog.info(log, "ou.analysed", Map.of("id", series.id(), "points", series.length(),
+                "ms", System.currentTimeMillis() - startedMs,
+                "verdict", row.admission().verdict().name()));
+        return row;
+    }
+
+    private Row analyseInner(OuSeries series) {
         double[] dt = series.steps();
         double[] x = series.values();
         if (x.length < 30) {
@@ -121,14 +132,18 @@ public class OuBench {
         OuCalibration.Fit mle = OuCalibration.mle(dt, x);
         double medianDt = OuCalibration.median(dt);
         double kappaAnalytic = OuCalibration.analyticBiasCorrectedKappa(ols.phi(), x.length, medianDt);
-        OuCalibration.Bootstrap bootstrap = OuCalibration.bootstrap(ols, dt, cfg.bootstrap(), cfg.seed());
+        // Число реплик бутстрапа обратно пропорционально длине ряда: на минутном
+        // ряде в полмиллиона точек 2000 реплик считаются десятки минут, а интервал
+        // и так узкий — точность оценки границы упирается не в число реплик.
+        int replicas = Math.min(cfg.bootstrap(),
+                Math.max(200, (int) (cfg.bootstrap() * 20000L / Math.max(x.length, 1))));
+        OuCalibration.Bootstrap bootstrap = OuCalibration.bootstrap(ols, dt, replicas, cfg.seed());
         double kappaBootstrap = bootstrap.correctedKappa();
         double halfLife95 = OuCalibration.Bootstrap.quantile(bootstrap.halfLives(), 0.95);
 
         OuCalibration.Fit corrected = OuCalibration.Fit.of(kappaBootstrap, ols.theta(), ols.sigma(),
                 medianDt, x.length);
-        double horizon = "часы".equals(series.timeUnit())
-                ? cfg.holdingHorizonDays() * 24 : cfg.holdingHorizonDays();
+        double horizon = horizonIn(series.timeUnit());
         OuAdmission.Result admission = OuAdmission.evaluate(series, corrected, halfLife95,
                 cfg.kappaWindow(), cfg.level(), cfg.lags(), cfg.kappaCvThreshold(),
                 cfg.minEpisodes(), cfg.breakToSigma(), horizon);
@@ -136,6 +151,15 @@ public class OuBench {
         return new Row(series, ols, mle, kappaAnalytic, kappaBootstrap, bootstrap.bias(),
                 ols.halfLife(), Math.log(2) / Math.max(kappaAnalytic, 1e-12),
                 Math.log(2) / Math.max(kappaBootstrap, 1e-12), halfLife95, admission);
+    }
+
+    /** Окно применимости в единицах времени ряда: дни, часы или минуты. */
+    private double horizonIn(String timeUnit) {
+        return switch (timeUnit) {
+            case "часы" -> cfg.holdingHorizonDays() * 24;
+            case "минуты" -> cfg.holdingHorizonDays() * 24 * 60;
+            default -> cfg.holdingHorizonDays();
+        };
     }
 
     /**
@@ -358,13 +382,20 @@ public class OuBench {
         }
     }
 
+    /**
+     * Шапка по каждому ряду. Разрешение и доля отброшенных снимков —
+     * <b>обязательные</b> поля (ТЗ 67 §3): без них «эпизодов нет» неотличимо от
+     * «мерили не тем инструментом и не с тем разрешением».
+     */
     private static String verdictTable(List<Row> rows) {
-        StringBuilder sb = new StringBuilder("| Величина | точек | шаг | вердикт |\n|---|---|---|---|\n");
+        StringBuilder sb = new StringBuilder("| Величина | точек | шаг ряда | отброшено по "
+                + "рассинхронизации | вердикт |\n|---|---|---|---|---|\n");
         for (Row r : rows) {
             double[] steps = r.series().length() > 1 ? r.series().steps() : new double[]{1};
-            sb.append(String.format(Locale.ROOT, "| %s | %d | %.3f %s | **%s** |%n",
+            sb.append(String.format(Locale.ROOT, "| %s | %d | %.3f %s | %.2f%% | **%s** |%n",
                     r.series().id(), r.series().length(), OuCalibration.median(steps),
-                    r.series().timeUnit(), verdictName(r.admission().verdict())));
+                    r.series().timeUnit(), r.series().droppedShare() * 100,
+                    verdictName(r.admission().verdict())));
         }
         return sb.toString();
     }

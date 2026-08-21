@@ -248,7 +248,66 @@ public class SimRunner {
                     .append(" | ").append(round(stats.median(), 6))
                     .append(" | ").append(stats.fills()).append(" |\n");
         }
-        sb.append("\nОтрицательный markout(60 с) означает смерть стратегии независимо от эквити.\n\n");
+        // ТЗ §5.5 в исходной формулировке закрывал направление на ЛЮБОМ отрицательном
+        // markout — включая −0.010 при захваченном крае +0.156. Экономически значим
+        // край на сделку целиком: half_spread + markout (ТЗ §4.5), и он же тут считается.
+        Markout.Stats atFill = Markout.compute(baseResult.fills(), baseResult.fairSeries(), 0);
+        Markout.Stats at60 = Markout.compute(baseResult.fills(), baseResult.fairSeries(), 60_000);
+        Markout.Stats at300 = Markout.compute(baseResult.fills(), baseResult.fairSeries(), 300_000);
+        double edge60 = atFill.mean() + at60.mean();
+        sb.append("\n### Край на сделку, а не знак markout (правка ТЗ §5.5 по док. 71 §3.1)\n\n");
+        sb.append("| Величина | Значение |\n|---|---|\n");
+        sb.append("| Захваченный край на исполнение, `markout(0)` | ").append(round(atFill.mean(), 4))
+                .append(" |\n");
+        sb.append("| `markout(60 с)` | ").append(round(at60.mean(), 4)).append(" |\n");
+        sb.append("| **Край на сделку через 60 с** | **").append(round(edge60, 4)).append("** |\n");
+        sb.append("| Неблагоприятный отбор как доля края, 60 с | ")
+                .append(atFill.mean() > 0 ? round(-at60.mean() / atFill.mean() * 100, 1) + "%" : "—")
+                .append(" |\n");
+        sb.append("| То же, 300 с | ")
+                .append(atFill.mean() > 0 ? round(-at300.mean() / atFill.mean() * 100, 1) + "%" : "—")
+                .append(" |\n\n");
+        if (atFill.fills() == 0 || Double.isNaN(edge60)) {
+            sb.append("Исполнений в выборке нет — край на сделку не считается.\n\n");
+        } else {
+            sb.append(edge60 > 0
+                    ? "**Край на сделку положителен**: поток не токсичен в том смысле, который "
+                    + "закрывает направление. Отдельный отрицательный `markout(60 с)` при этом — не "
+                    + "приговор, а стоимость немедленности, которую край покрывает.\n\n"
+                    : "**Край на сделку не положителен** — вот это и закрывает направление: то, что "
+                    + "захватывается на исполнении, уходит на неблагоприятный отбор в течение "
+                    + "минуты.\n\n");
+        }
+
+        // Захват спреда «на исполнение» несопоставим между прогонами при частичных
+        // исполнениях: то же ТЗ §5.3 требует приводить метрику к обороту (док. 71 §3.3).
+        sb.append("### Распределение исполненного объёма (правка ТЗ §5.3 по док. 71 §3.3)\n\n");
+        double[] quantities = baseResult.fills().stream().mapToDouble(Fill::qty).sorted().toArray();
+        double turnover = baseResult.fills().stream().mapToDouble(Fill::notional).sum();
+        if (quantities.length == 0) {
+            sb.append("Исполнений нет — распределение не считается.\n\n");
+        } else {
+            double totalQty = java.util.Arrays.stream(quantities).sum();
+            double median = quantities[quantities.length / 2];
+            double p90 = quantities[(int) (0.9 * (quantities.length - 1))];
+            sb.append("| Показатель | Значение |\n|---|---|\n");
+            sb.append("| Исполнений | ").append(quantities.length).append(" |\n");
+            sb.append("| Объём: сумма / медиана / 90-й процентиль | ").append(round(totalQty, 4))
+                    .append(" / ").append(round(median, 6)).append(" / ").append(round(p90, 6))
+                    .append(" |\n");
+            sb.append("| Средний объём на исполнение | ").append(round(totalQty / quantities.length, 6))
+                    .append(" |\n");
+            sb.append("| Оборот (нотионал) | ").append(round(turnover, 2)).append(" |\n");
+            sb.append("| **Захват спреда на единицу оборота** | **")
+                    .append(turnover > 0 ? round(baseResult.pnl().spreadCapture() / turnover * 10_000, 2)
+                            + " б.п." : "—")
+                    .append("** |\n");
+            sb.append("| Захват спреда на исполнение | ")
+                    .append(round(baseResult.pnl().spreadCapture() / quantities.length, 4)).append(" |\n\n");
+            sb.append("Метрика «на оборот» — основная: при частичных исполнениях «на исполнение» "
+                    + "несопоставима между прогонами, потому что зависит от того, как поток "
+                    + "раздробил заявку.\n\n");
+        }
 
         sb.append("## Реализуемость (ТЗ §5.4 п.6)\n\n");
         double requotesPerDay = baseResult.requotesPerDay(data.spanMs());

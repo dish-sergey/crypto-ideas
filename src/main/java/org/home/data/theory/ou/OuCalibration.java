@@ -47,10 +47,63 @@ public final class OuCalibration {
         if (n < 10) {
             return Fit.of(0, mean(x), 0, median(dt), n);
         }
-        double kappa = goldenSection(k -> -sse(k, dt, x), 1e-6, 50.0);
-        double theta = thetaGiven(kappa, dt, x);
-        double sigma = sigmaGiven(kappa, theta, dt, x);
+        if (isRegular(dt)) {
+            return olsRegular(dt[0], x);
+        }
+        // У реальных рядов различных шагов единицы (минута плюс несколько разрывов),
+        // поэтому exp(−κΔt) считается по РАЗЛИЧНЫМ шагам, а не по каждой точке:
+        // на сшитой стресс-выборке это разница между секундами и минутами прогона.
+        Steps steps = Steps.of(dt);
+        double kappa = goldenSection(k -> -sse(k, steps, x), 1e-6, 50.0);
+        double theta = thetaGiven(kappa, steps, x);
+        double sigma = sigmaGiven(kappa, theta, steps, x);
         return Fit.of(kappa, theta, sigma, median(dt), n);
+    }
+
+    private static boolean isRegular(double[] dt) {
+        double first = dt[0];
+        double tolerance = Math.max(Math.abs(first) * 1e-9, 1e-12);
+        for (double d : dt) {
+            if (Math.abs(d - first) > tolerance) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Замкнутая форма для регулярного шага: та же задача наименьших квадратов,
+     * что решает золотое сечение, но за один проход вместо сотни. Нужна не ради
+     * красоты: на минутном ряде базиса (десятки тысяч точек) бутстрап из 2000
+     * реплик с итерационным поиском не считается за разумное время.
+     */
+    private static Fit olsRegular(double step, double[] x) {
+        int n = x.length - 1;
+        double meanLag = 0;
+        double meanNext = 0;
+        for (int i = 0; i < n; i++) {
+            meanLag += x[i] / n;
+            meanNext += x[i + 1] / n;
+        }
+        double cov = 0;
+        double var = 0;
+        for (int i = 0; i < n; i++) {
+            double d = x[i] - meanLag;
+            cov += d * (x[i + 1] - meanNext);
+            var += d * d;
+        }
+        double phi = var > 0 ? cov / var : 0;
+        phi = Math.max(Math.min(phi, 1 - 1e-12), 1e-12);
+        double kappa = -Math.log(phi) / step;
+        double theta = (meanNext - phi * meanLag) / (1 - phi);
+        double residual = 0;
+        for (int i = 0; i < n; i++) {
+            double r = x[i + 1] - phi * x[i] - theta * (1 - phi);
+            residual += r * r;
+        }
+        double factor = (1 - phi * phi) / (2 * kappa);
+        double sigma = factor > 0 ? Math.sqrt(residual / n / factor) : 0;
+        return Fit.of(kappa, theta, sigma, step, n);
     }
 
     /**
@@ -181,22 +234,53 @@ public final class OuCalibration {
 
     // ------------------------------------------------------------------ детали
 
-    private static double sse(double kappa, double[] dt, double[] x) {
-        double theta = thetaGiven(kappa, dt, x);
+    /**
+     * Сетка шагов: различные значения Δt и индекс шага для каждой пары наблюдений.
+     * Позволяет считать exp(−κΔt) по различным шагам (их единицы), а не по каждой
+     * точке ряда (их десятки тысяч).
+     */
+    private record Steps(double[] distinct, int[] index, int n) {
+
+        static Steps of(double[] dt) {
+            java.util.LinkedHashMap<Double, Integer> seen = new java.util.LinkedHashMap<>();
+            int[] index = new int[dt.length];
+            for (int i = 0; i < dt.length; i++) {
+                index[i] = seen.computeIfAbsent(dt[i], k -> seen.size());
+            }
+            double[] distinct = new double[seen.size()];
+            for (java.util.Map.Entry<Double, Integer> e : seen.entrySet()) {
+                distinct[e.getValue()] = e.getKey();
+            }
+            return new Steps(distinct, index, dt.length);
+        }
+
+        double[] decay(double kappa) {
+            double[] a = new double[distinct.length];
+            for (int j = 0; j < a.length; j++) {
+                a[j] = Math.exp(-kappa * distinct[j]);
+            }
+            return a;
+        }
+    }
+
+    private static double sse(double kappa, Steps steps, double[] x) {
+        double theta = thetaGiven(kappa, steps, x);
+        double[] decay = steps.decay(kappa);
         double sse = 0;
-        for (int i = 0; i < dt.length; i++) {
-            double a = Math.exp(-kappa * dt[i]);
+        for (int i = 0; i < steps.n(); i++) {
+            double a = decay[steps.index()[i]];
             double r = x[i + 1] - a * x[i] - theta * (1 - a);
             sse += r * r;
         }
         return sse;
     }
 
-    private static double thetaGiven(double kappa, double[] dt, double[] x) {
+    private static double thetaGiven(double kappa, Steps steps, double[] x) {
+        double[] decay = steps.decay(kappa);
         double num = 0;
         double den = 0;
-        for (int i = 0; i < dt.length; i++) {
-            double a = Math.exp(-kappa * dt[i]);
+        for (int i = 0; i < steps.n(); i++) {
+            double a = decay[steps.index()[i]];
             double c = 1 - a;
             num += (x[i + 1] - a * x[i]) * c;
             den += c * c;
@@ -204,11 +288,12 @@ public final class OuCalibration {
         return den > 0 ? num / den : mean(x);
     }
 
-    private static double sigmaGiven(double kappa, double theta, double[] dt, double[] x) {
+    private static double sigmaGiven(double kappa, double theta, Steps steps, double[] x) {
+        double[] decay = steps.decay(kappa);
         double sum = 0;
         int n = 0;
-        for (int i = 0; i < dt.length; i++) {
-            double a = Math.exp(-kappa * dt[i]);
+        for (int i = 0; i < steps.n(); i++) {
+            double a = decay[steps.index()[i]];
             double r = x[i + 1] - a * x[i] - theta * (1 - a);
             double factor = (1 - a * a) / (2 * kappa);
             if (factor > 0) {
@@ -252,7 +337,9 @@ public final class OuCalibration {
         for (int i = 0; i <= n; i++) {
             values[i] = f.applyAsDouble(simplex[i]);
         }
-        for (int iter = 0; iter < 3000; iter++) {
+        // 3000 шагов симплекс тратил на ряды в сотни тысяч точек десятки минут, а
+        // сходится он на два порядка раньше; выход по стабилизации ниже всё равно есть.
+        for (int iter = 0; iter < 400; iter++) {
             Integer[] order = new Integer[n + 1];
             for (int i = 0; i <= n; i++) {
                 order[i] = i;

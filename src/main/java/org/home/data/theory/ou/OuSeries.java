@@ -16,10 +16,14 @@ import java.util.List;
  * @param timeUnit      единица времени («дни», «часы») для полупериода
  * @param droppedShare  доля наблюдений, отброшенных по рассинхронизации (для BASIS, §3)
  * @param note          ограничения ряда, переносимые в отчёт
+ * @param stitched      ряд СШИТ из несмежных окон (стресс-выборка): статистики
+ *                      эпизодов на нём законны, а тесты стационарности и
+ *                      структурного сдвига — нет, разрывы между окнами дадут
+ *                      ложный «сдвиг уровня» и ложную нестабильность κ
  */
 public record OuSeries(String id, String description, double[] times, double[] values,
                        boolean[] inEpisode, String episodeRule, String timeUnit,
-                       double droppedShare, String note) {
+                       double droppedShare, String note, boolean stitched) {
 
     public int length() {
         return values.length;

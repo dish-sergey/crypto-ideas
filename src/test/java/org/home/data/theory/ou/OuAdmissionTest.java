@@ -29,7 +29,7 @@ class OuAdmissionTest {
             inEpisode[i] = Math.abs(values[i] - mean) > thresholdSd * sd;
         }
         return new OuSeries(id, "синтетика", times, values, inEpisode,
-                "|x − среднее| > " + thresholdSd + "σ", unit, 0, "тест");
+                "|x − среднее| > " + thresholdSd + "σ", unit, 0, "тест", false);
     }
 
     private static OuAdmission.Result evaluate(OuSeries s, double horizon) {
@@ -116,7 +116,7 @@ class OuAdmissionTest {
             times[i] = i;
         }
         OuSeries s = new OuSeries("NO_EPISODES", "синтетика", times, x, never,
-                "порог недостижим", "дни", 0, "тест");
+                "порог недостижим", "дни", 0, "тест", false);
         assertEquals(OuAdmission.Verdict.INSUFFICIENT_DATA, evaluate(s, 30).verdict());
     }
 
@@ -148,7 +148,7 @@ class OuAdmissionTest {
         }
         boolean[] inEpisode = new boolean[values.length];
         inEpisode[1] = true;
-        OuSeries s = new OuSeries("EP", "синтетика", times, values, inEpisode, "x > 1.5", "дни", 0, "тест");
+        OuSeries s = new OuSeries("EP", "синтетика", times, values, inEpisode, "x > 1.5", "дни", 0, "тест", false);
         List<OuSeries.Episode> eps = s.episodes(0);
         assertEquals(1, eps.size());
         assertEquals(1, eps.getFirst().from());

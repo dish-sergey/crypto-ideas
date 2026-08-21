@@ -27,6 +27,8 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun --args='--s5-live'                            # S5: LIVE — РЕАЛЬНЫЕ ордера на Kraken Futures
 ./gradlew bootRun --args='--report=regime-dash --out=reports/dash'  # весь HTML-дашборд режима: index.html (меню) + 5 графиков
 ./gradlew bootRun --args='--theory=s5-import'                    # ТЗ 65/66: датасет событий S5 в data/theory.db (разово, сеть)
+./gradlew bootRun --args='--theory=basis-history'                  # ТЗ 67: непрерывная минутная история спот+перп для базиса (сеть)
+./gradlew bootRun --args='--theory=basis-stress'                   # ТЗ 67: то же по самым волатильным дням (стресс-выборка)
 ./gradlew bootRun --args='--theory=alloc --out=reports/theory'   # ТЗ 65: стенд аллокации поверх пула S1–S12
 ./gradlew bootRun --args='--theory=kelly --out=reports/theory'   # ТЗ 66: размер позиции S5 (Kelly с усадкой)
 ./gradlew bootRun --args='--theory=ou --out=reports/theory'      # ТЗ 67: калибровка и допуск OU (предтест блока B)

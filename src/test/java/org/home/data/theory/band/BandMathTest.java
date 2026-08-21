@@ -78,6 +78,23 @@ class BandMathTest {
     }
 
     @Test
+    @DisplayName("выведенная константа 3/(2γ) совпадает с численным оптимумом, а константа ТЗ отличается на 2^{1/3}")
+    void derivedConstantMatchesNumericOptimum() {
+        double sigma = 0.6;
+        double piStar = 0.4;
+        double mu = piStar * sigma * sigma;
+        for (double epsilon : new double[]{0.00001, 0.0001, 0.001}) {
+            double numeric = BandMath.bandNumeric(mu, sigma, 1, epsilon, 200, 20).width();
+            double derived = BandMath.bandAsymptoticDerived(piStar, 1, sigma, epsilon).width();
+            double tz = BandMath.bandAsymptotic(piStar, 1, sigma, epsilon).width();
+            assertEquals(1.0, numeric / derived, 0.1,
+                    "численный оптимум обязан совпасть с выведенной константой при ε=" + epsilon);
+            assertEquals(BandMath.TZ_CONSTANT_RATIO, derived / tz, 1e-9,
+                    "константы ТЗ и вывода отличаются ровно на 2^{1/3}");
+        }
+    }
+
+    @Test
     @DisplayName("сходимость по сетке: удвоение числа узлов почти не меняет оптимальную ширину")
     void convergesWithGridResolution() {
         double sigma = 0.6;

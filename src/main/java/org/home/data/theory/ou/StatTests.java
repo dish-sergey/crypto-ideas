@@ -161,28 +161,25 @@ public final class StatTests {
         if (hi - lo < 10) {
             return new TestResult(Double.NaN, SUP_WALD_5, false, "мало наблюдений");
         }
+        // Префиксные суммы: перебор точки разрыва становится линейным. Наивная
+        // версия квадратична и на минутном ряде в полмиллиона точек не считается.
+        double[] prefix = new double[n + 1];
+        double[] prefixSquares = new double[n + 1];
+        for (int i = 0; i < n; i++) {
+            prefix[i + 1] = prefix[i] + x[i];
+            prefixSquares[i + 1] = prefixSquares[i] + x[i] * x[i];
+        }
+        double mean = prefix[n] / n;
+        double total = prefixSquares[n] - n * mean * mean;
         double best = 0;
         int bestIndex = -1;
-        double total = 0;
-        double mean = OuCalibration.mean(x);
-        for (double v : x) {
-            total += (v - mean) * (v - mean);
-        }
         for (int b = lo; b < hi; b++) {
-            double m1 = 0;
-            double m2 = 0;
-            for (int i = 0; i < b; i++) {
-                m1 += x[i];
-            }
-            m1 /= b;
-            for (int i = b; i < n; i++) {
-                m2 += x[i];
-            }
-            m2 /= (n - b);
-            double rss = 0;
-            for (int i = 0; i < n; i++) {
-                double d = x[i] - (i < b ? m1 : m2);
-                rss += d * d;
+            double m1 = prefix[b] / b;
+            double m2 = (prefix[n] - prefix[b]) / (n - b);
+            double rss = prefixSquares[b] - b * m1 * m1
+                    + (prefixSquares[n] - prefixSquares[b]) - (n - b) * m2 * m2;
+            if (rss <= 0) {
+                continue;
             }
             double f = (total - rss) / (rss / (n - 2));
             if (f > best) {

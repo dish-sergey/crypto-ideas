@@ -66,12 +66,17 @@ public class BandBench {
         List<double[]> controls = new ArrayList<>();
         for (double epsilon : new double[]{0.00001, 0.0001, 0.001}) {
             BandMath.Band asymptotic = BandMath.bandAsymptotic(0.4, 1, 0.6, epsilon);
+            BandMath.Band derived = BandMath.bandAsymptoticDerived(0.4, 1, 0.6, epsilon);
             BandMath.Band numeric = BandMath.bandNumeric(0.4 * 1 * 0.36, 0.6, 1, epsilon,
                     cfg.gridPoints(), cfg.bandSteps());
             controls.add(new double[]{epsilon, asymptotic.width(), numeric.width(),
-                    numeric.width() / asymptotic.width()});
+                    numeric.width() / asymptotic.width(), derived.width(),
+                    numeric.width() / derived.width()});
         }
-        boolean convergenceOk = controls.getFirst()[3] > 0.5 && controls.getFirst()[3] < 2.0;
+        // Positive control сверяется с ВЫВЕДЕННОЙ константой 3/(2γ): именно её даёт
+        // минимум целевой функции этого модуля. Расхождение с константой ТЗ 3/(4γ)
+        // ровно 2^{1/3} и объяснено, а не списано на «коэффициент реализации» (П5 док. 71).
+        boolean convergenceOk = controls.stream().allMatch(c -> c[5] > 0.9 && c[5] < 1.1);
 
         // Контроль вырождения — ПАРНОЕ сравнение двух политик на одних и тех же
         // шоках: «прыжок к границе» против «прыжка внутрь». При cFixed = 0 первая
@@ -147,6 +152,13 @@ public class BandBench {
         double[] btcReturns = dailyReturns("BTCUSDT");
         double[] ladder = RuinMath.ladderDistribution(btcReturns, cfg.ladderStepDrop(), cfg.ladderSteps(),
                 cfg.ladderHorizonDays(), cfg.blockSize(), cfg.mcPaths(), cfg.seed());
+        // П6 док. 71: горизонт лестницы — ось чувствительности, а не свойство стратегии
+        List<double[]> ladderHorizons = new ArrayList<>();
+        for (int horizon : cfg.ladderHorizonGrid()) {
+            double[] d = RuinMath.ladderDistribution(btcReturns, cfg.ladderStepDrop(), cfg.ladderSteps(),
+                    horizon, cfg.blockSize(), cfg.mcPaths(), cfg.seed());
+            ladderHorizons.add(new double[]{horizon, d[cfg.ladderSteps()], medianSteps(d)});
+        }
         List<double[]> blockSensitivity = new ArrayList<>();
         for (int block : cfg.blockGrid()) {
             RuinMath.RuinResult r = RuinMath.monteCarloDrawdown(btcReturns, cfg.ruinHorizonDays(),
@@ -186,7 +198,8 @@ public class BandBench {
         double[] controlGrowth = {offsetsByDt[0], offsetsByDt[1], offsetsByDt[2], offsetFixed, fixedShare};
         writeReport(out.resolve("band_ruin.md"), runId, controls, convergenceOk, degenerate,
                 impulseDegenerates, controlGrowth, analytic, iidCheck, ruinCheckOk, grid, impulse, ladder,
-                blockSensitivity, inventory, s5Ruin, accountRuin, btcReturns.length, s5Outcomes.length);
+                ladderHorizons, blockSensitivity, inventory, s5Ruin, accountRuin,
+                btcReturns.length, s5Outcomes.length);
         Jlog.info(log, "band.done", Map.of("run_id", runId, "grid", grid.size(),
                 "convergence_ok", convergenceOk, "out", out.resolve("band_ruin.md").toString()));
     }
@@ -295,6 +308,7 @@ public class BandBench {
                              double[] controlGrowth,
                              double analyticRuin, RuinMath.RuinResult iidCheck, boolean ruinCheckOk,
                              List<GridRow> grid, List<double[]> impulse, double[] ladder,
+                             List<double[]> ladderHorizons,
                              List<double[]> blockSensitivity, double[] inventory,
                              RuinMath.RuinResult s5Ruin, RuinMath.RuinResult accountRuin,
                              int btcDays, int s5Events) {
@@ -309,15 +323,27 @@ public class BandBench {
         // --- Контроли (идут первыми) ---
         sb.append("## Контроли (§6.1 — от них зависит действительность остального)\n\n");
         sb.append("**1. Сходимость при ε → 0** (§4.4): численная и асимптотическая ширины обязаны сойтись.\n\n");
-        sb.append("| ε | асимптотическая ширина | численная ширина | отношение |\n|---|---|---|---|\n");
+        sb.append("| ε | ширина по формуле ТЗ (3/4γ) | ширина по выведенной константе (3/2γ) | "
+                + "численная ширина | численная / ТЗ | численная / выведенная |\n");
+        sb.append("|---|---|---|---|---|---|\n");
         for (double[] c : controls) {
-            sb.append(String.format(Locale.ROOT, "| %.5f%% | %.4f | %.4f | %.2f |%n",
-                    c[0] * 100, c[1], c[2], c[3]));
+            sb.append(String.format(Locale.ROOT, "| %.5f%% | %.4f | %.4f | %.4f | %.3f | %.3f |%n",
+                    c[0] * 100, c[1], c[4], c[2], c[3], c[5]));
         }
-        sb.append('\n').append(convergenceOk
-                ? "Сходимость есть — численное решение согласовано с формулой в её собственной области.\n\n"
-                : "**СХОДИМОСТИ НЕТ — это дефект численного решения, а не результат; прогон "
-                + "недействителен (§6.3).**\n\n");
+        sb.append(String.format(Locale.ROOT,
+                "%n**Множитель объяснён (П5 док. 71).** Отношение к формуле ТЗ стабильно и равно "
+                        + "**2^{1/3} = %.4f**: минимум целевой функции этого модуля даёт константу "
+                        + "`3/(2γ)`, а ТЗ §4.1 называет `3/(4γ)`. Вывод занимает пять строк и приведён в "
+                        + "javadoc `BandMath.bandAsymptoticDerived`: потеря темпа роста от отклонения на "
+                        + "полуширину Δ равна (γσ²/6)Δ², издержки — ε·s²/(2Δ) при s = σπ*(1−π*), и "
+                        + "минимум суммы даёт Δ³ = (3/(2γ))π*²(1−π*)²ε. Это не «систематический "
+                        + "коэффициент реализации», а разные конвенции константы.%n%n",
+                BandMath.TZ_CONSTANT_RATIO));
+        sb.append(convergenceOk
+                ? "Сходимость с выведенной константой есть (отношение в пределах ±10% на всей "
+                + "лестнице ε) — численное решение согласовано с собственной асимптотикой.\n\n"
+                : "**СХОДИМОСТИ НЕТ даже с выведенной константой — это дефект численного решения, "
+                + "а не результат; прогон недействителен (§6.3).**\n\n");
         sb.append(String.format(Locale.ROOT,
                 "**2. Вырождение импульсного решения при c_fixed = 0** (§4.5). В непрерывном времени "
                         + "цель обязана совпасть с границей, поэтому проверяется предел по шагу: "
@@ -396,6 +422,16 @@ public class BandBench {
                 "%nВероятность пройти **всю** лестницу: **%.1f%%**. Бюджет 15%% капитала распределён по "
                         + "%d ступеням, то есть при полном проходе он израсходован целиком, а цена ушла "
                         + "ещё ниже последней ступени.%n%n", ladder[cfg.ladderSteps()] * 100, cfg.ladderSteps()));
+        // П6 док. 71: горизонта у S6 в спецификации нет («позиция на следующий цикл»),
+        // поэтому одно число без горизонта не обосновано — горизонт становится осью.
+        sb.append("**Горизонт — ось чувствительности, а не свойство стратегии.** В док. 02 v2 срока у "
+                + "S6 нет, поэтому вероятность приводится по сетке горизонтов:\n\n");
+        sb.append("| Горизонт, дней | P(пройдена вся лестница) | медиана пройденных ступеней |\n");
+        sb.append("|---|---|---|\n");
+        for (double[] r : ladderHorizons) {
+            sb.append(String.format(Locale.ROOT, "| %.0f | %.1f%% | %.0f |%n", r[0], r[1] * 100, r[2]));
+        }
+        sb.append('\n');
 
         sb.append("### Потолок инвентаря MM (модель потока, не измерение)\n\n");
         sb.append(String.format(Locale.ROOT,
@@ -454,7 +490,8 @@ public class BandBench {
                 atProject.asymptoticWidth(), atProject.numericWidth(), atProject.ratio(),
                 atProject.growthLoss(),
                 Math.abs(atProject.growthLoss()) < 0.001
-                        ? "потеря пренебрежима, формулой пользоваться можно."
+                        ? "потеря пренебрежима, формулой пользоваться можно — но с константой "
+                        + "`3/(2γ)`, а не `3/(4γ)`: см. контроль 1, отношение 2^{1/3} объяснено выводом."
                         : "**потеря значима, пользоваться нужно численной таблицей.**"));
         sb.append(String.format(Locale.ROOT,
                 "2. **Насколько выведенная полоса отличается от «ребалансировать при отклонении на 5%%»:** "

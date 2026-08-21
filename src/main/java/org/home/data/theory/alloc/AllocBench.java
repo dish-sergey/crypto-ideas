@@ -281,12 +281,17 @@ public class AllocBench {
             AllocEngine.Result ew = engine.run(new Allocators.EqualWeight("EW", Allocators.Normalization.ALL));
             double[] mix = engine.bestFixedMix(cfg.bestFixedIterations(), cfg.bestFixedStep());
             AllocEngine.Result best = engine.run(new Allocators.Fixed("BEST_FIXED", mix, true));
+            // DETECTOR тоже раздаёт капитал по ЭТОМУ ЖЕ пулу: без leave-one-out по нему
+            // сравнение «матрица не хуже аллокатора» есть сравнение двух артефактов (П4 док. 71)
+            AllocEngine.Result detector = engine.run(new Allocators.Detector());
             Metrics mh = Metrics.of(hedge.ret(), hedge.equity(), reduced.cash(), reduced.days(), trials);
             Metrics me = Metrics.of(ew.ret(), ew.equity(), reduced.cash(), reduced.days(), trials);
             Metrics mb = Metrics.of(best.ret(), best.equity(), reduced.cash(), reduced.days(), trials);
+            Metrics md = Metrics.of(detector.ret(), detector.equity(), reduced.cash(), reduced.days(), trials);
             out.add(new Object[]{"loo.hedge", "без " + c.id(), 0.0, mh.cagr(), mh.sharpe(), mh.maxDrawdown()});
             out.add(new Object[]{"loo.ew", "без " + c.id(), 0.0, me.cagr(), me.sharpe(), me.maxDrawdown()});
             out.add(new Object[]{"loo.best_fixed", "без " + c.id(), 0.0, mb.cagr(), mb.sharpe(), mb.maxDrawdown()});
+            out.add(new Object[]{"loo.detector", "без " + c.id(), 0.0, md.cagr(), md.sharpe(), md.maxDrawdown()});
         }
         return out;
     }
@@ -350,13 +355,29 @@ public class AllocBench {
 
         // --- Данные ---
         sb.append("## Данные (§6.1)\n\n");
-        sb.append("| Стратегия | Источник кривой | Доля дней доступности | Средн. дн. доходность (задейств.) |\n");
-        sb.append("|---|---|---|---|\n");
+        sb.append("| Стратегия | Источник кривой | Вселенная | Доля дней доступности | "
+                + "Средн. дн. доходность (задейств.) |\n");
+        sb.append("|---|---|---|---|---|\n");
         for (Curve c : set.pool()) {
-            sb.append(String.format(Locale.ROOT, "| %s | %s | %.0f%% | %.3f%% |%n",
-                    c.id(), c.kind(), c.availabilityShare() * 100, meanDeployed(c) * 100));
+            sb.append(String.format(Locale.ROOT, "| %s | %s | %s | %.0f%% | %.3f%% |%n",
+                    c.id(), c.kind(),
+                    c.survivorship() ? "**сегодняшняя (survivorship)**" : "не зависит от состава",
+                    c.availabilityShare() * 100, meanDeployed(c) * 100));
         }
-        sb.append('\n');
+        // распределение curve_kind — обязательное поле §6.1
+        Map<CurveKind, Long> kinds = new LinkedHashMap<>();
+        for (Curve c : set.pool()) {
+            kinds.merge(c.kind(), 1L, Long::sum);
+        }
+        long survivorshipCurves = set.pool().stream().filter(Curve::survivorship).count();
+        sb.append(String.format(Locale.ROOT,
+                "%nРаспределение `curve_kind`: %s. Кривых с сегодняшней вселенной: **%d** — это "
+                        + "отдельная ось честности рядом с `curve_kind`: такая кривая завышена "
+                        + "независимо от того, walk-forward она или in-sample.%n%n",
+                kinds.entrySet().stream()
+                        .map(e -> e.getKey() + " — " + e.getValue())
+                        .reduce((a, b) -> a + ", " + b).orElse("нет кривых"),
+                survivorshipCurves));
         for (Curve c : set.pool()) {
             sb.append("- **").append(c.id()).append("** — ").append(c.note()).append('\n');
         }
@@ -468,7 +489,9 @@ public class AllocBench {
                 .append(String.format(Locale.ROOT, " (%.2f при границе %.2f).%n%n",
                         hedge.regretVsSingle(), bound));
         sb.append("7. **Leave-one-out:** см. строки `loo.*` таблицы выше. ")
-                .append(looVerdict(loo, hedge.metrics().cagr())).append("\n\n");
+                .append(looVerdict(loo, hedge.metrics().cagr())).append(' ')
+                .append(detectorLooVerdict(loo, detector.metrics().cagr(), sma.metrics().cagr()))
+                .append("\n\n");
         sb.append("8. **Сосредоточен ли вклад в одном годе:** ").append(yearConcentration(set, hedge))
                 .append("\n\n");
 
@@ -585,6 +608,30 @@ public class AllocBench {
             }
         }
         return "на всей сетке издержек (0…0.5%) HEDGE сохраняет знак преимущества над EW";
+    }
+
+    /**
+     * Тот же leave-one-out, но для матрицы детектора: она распределяет капитал по
+     * ТОМУ ЖЕ пулу с той же кривой S2S9. Без этой строки сравнение «матрица не
+     * хуже аллокатора» есть сравнение двух артефактов одной кривой (П4 док. 71).
+     */
+    private static String detectorLooVerdict(List<Object[]> loo, double baseCagr, double smaCagr) {
+        String worst = "—";
+        double worstCagr = Double.POSITIVE_INFINITY;
+        for (Object[] g : loo) {
+            if ("loo.detector".equals(g[0]) && (Double) g[3] < worstCagr) {
+                worstCagr = (Double) g[3];
+                worst = String.valueOf(g[1]);
+            }
+        }
+        return String.format(Locale.ROOT,
+                "**DETECTOR на том же тесте:** сильнее всего падает при удалении «%s» — CAGR %.1f%% "
+                        + "против %.1f%% на полном пуле, при SMA200 %.1f%%. %s",
+                worst, worstCagr * 100, baseCagr * 100, smaCagr * 100,
+                worstCagr < smaCagr
+                        ? "**То есть преимущество матрицы над SMA200 держится на той же одной кривой** — "
+                        + "сравнивались два артефакта, а не две конструкции."
+                        : "Матрица переживает удаление любой одной кривой, оставаясь выше SMA200.");
     }
 
     private static String looVerdict(List<Object[]> loo, double baseCagr) {

@@ -12,7 +12,23 @@ import java.util.List;
  */
 public final class OuAdmission {
 
+    /** Потолок числа точек для тестов стационарности и разрыва: см. thin(). */
+    private static final int MAX_TEST_POINTS = 20_000;
+
     private OuAdmission() {
+    }
+
+    /** Равномерное прореживание до {@code max} точек; короткий ряд возвращается как есть. */
+    private static double[] thin(double[] x, int max) {
+        if (x.length <= max) {
+            return x;
+        }
+        int step = (int) Math.ceil((double) x.length / max);
+        double[] out = new double[x.length / step];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = x[i * step];
+        }
+        return out;
     }
 
     /** Сводный исход. Три вида провала ведут к разным действиям (§5.6). */
@@ -56,25 +72,37 @@ public final class OuAdmission {
         double[] x = series.values();
 
         // --- T1: стационарность на полной выборке и на подпериодах ---
+        // Очень длинные ряды (минутный базис — сотни тысяч точек) прореживаются:
+        // KPSS с полосой по Andrews на персистентном ряде стоит O(полоса·n), а
+        // полоса сама растёт с n — прогон уходит в десятки минут. Прореживание
+        // законно: стационарность инвариантна к шагу, а лишние точки внутри одной
+        // минуты всё равно описывают микроструктурный шум, а не уровень.
+        double[] tested = thin(x, MAX_TEST_POINTS);
+        String thinNote = tested.length < x.length
+                ? String.format(java.util.Locale.ROOT, " (тесты на прореженном ряде: %d из %d точек)",
+                        tested.length, x.length)
+                : "";
         // lags <= 0 — автоматический выбор полосы по правилу Шверта (см. StatTests.autoLags)
-        int effectiveLags = lags > 0 ? lags : StatTests.autoLags(x.length);
-        StatTests.TestResult adf = StatTests.adf(x, effectiveLags, level);
+        int effectiveLags = lags > 0 ? lags : StatTests.autoLags(tested.length);
+        StatTests.TestResult adf = StatTests.adf(tested, effectiveLags, level);
         // у KPSS своя полоса: она обязана учитывать персистентность ряда (Andrews)
-        StatTests.TestResult kpss = StatTests.kpss(x, StatTests.andrewsBandwidth(x), level);
+        StatTests.TestResult kpss = StatTests.kpss(tested, StatTests.andrewsBandwidth(tested), level);
         boolean t1Full = adf.rejected() && !kpss.rejected();
         boolean t1Sub = true;
         StringBuilder subDetail = new StringBuilder();
         int parts = 4;
-        int chunk = x.length / parts;
+        int chunk = tested.length / parts;
         // Подпериод короче десяти полупериодов не даёт ADF никакой мощности: на нём
         // «не отвергли» означает «не увидели», а не «не стационарен» (§0 п.3).
         // В этом случае проверка по подпериодам не применяется, и это пишется в отчёт.
-        double halfLifeInSteps = fit.halfLife() / Math.max(medianStep(series), 1e-12);
+        // полупериод переводится в шаги ПРОРЕЖЕННОГО ряда — иначе сравниваются разные единицы
+        double thinFactor = (double) x.length / tested.length;
+        double halfLifeInSteps = fit.halfLife() / Math.max(medianStep(series) * thinFactor, 1e-12);
         boolean subPeriodsApplicable = chunk >= 10 * halfLifeInSteps;
         if (chunk >= 60 && subPeriodsApplicable) {
             for (int p = 0; p < parts; p++) {
-                double[] slice = java.util.Arrays.copyOfRange(x, p * chunk,
-                        p == parts - 1 ? x.length : (p + 1) * chunk);
+                double[] slice = java.util.Arrays.copyOfRange(tested, p * chunk,
+                        p == parts - 1 ? tested.length : (p + 1) * chunk);
                 int sliceLags = lags > 0 ? lags : StatTests.autoLags(slice.length);
                 StatTests.TestResult a = StatTests.adf(slice, sliceLags, level);
                 // KPSS на подпериодах — на уровне 1%: четыре проверки подряд на 5%
@@ -90,6 +118,15 @@ public final class OuAdmission {
                             "не применимы: подпериод %d наблюдений короче 10 полупериодов (%.0f)",
                             chunk, 10 * halfLifeInSteps));
         }
+        // Сшитый ряд (стресс-выборка из несмежных окон) не является временным рядом:
+        // разрывы между окнами дают ложное отвержение стационарности и ложный сдвиг
+        // уровня. Статистики эпизодов на нём законны — они считаются внутри окон.
+        if (series.stitched()) {
+            t1Full = true;
+            t1Sub = true;
+            subDetail.setLength(0);
+            subDetail.append("НЕ ПРИМЕНИМЫ: ряд сшит из несмежных окон");
+        }
         checks.add(new Check("T1 стационарность",
                 t1Full && t1Sub,
                 String.format(java.util.Locale.ROOT,
@@ -98,7 +135,7 @@ public final class OuAdmission {
                         adf.rejected() ? "отвергает единичный корень" : "НЕ отвергает",
                         kpss.statistic(), kpss.criticalValue(),
                         kpss.rejected() ? "ОТВЕРГАЕТ стационарность" : "не отвергает",
-                        subDetail)));
+                        subDetail + thinNote)));
 
         // --- T2: полупериод против окна применимости ---
         // ОТКЛОНЕНИЕ ОТ ТЗ §5.2, обоснованное измерением: буквальный критерий
@@ -126,11 +163,14 @@ public final class OuAdmission {
         // OU закрывался бы как «не OU» — поймано контролем POS_SYN_SLOW).
         double halfLifeSteps = fit.halfLife() / Math.max(medianStep(series), 1e-12);
         boolean t3Applicable = kappaWindow >= 2 * halfLifeSteps;
+        // шаги считаются ОДИН раз: на минутном ряде пересборка внутри цикла окон
+        // превращала линейную работу в квадратичную
+        double[] allSteps = series.steps();
         List<Double> kappas = new ArrayList<>();
         for (int start = 0; start + kappaWindow < x.length; start += Math.max(kappaWindow / 2, 1)) {
             double[] slice = java.util.Arrays.copyOfRange(x, start, start + kappaWindow);
-            double[] dt = java.util.Arrays.copyOfRange(series.steps(), start,
-                    Math.min(start + kappaWindow - 1, series.steps().length));
+            double[] dt = java.util.Arrays.copyOfRange(allSteps, start,
+                    Math.min(start + kappaWindow - 1, allSteps.length));
             if (dt.length >= 10) {
                 kappas.add(OuCalibration.ols(dt, slice).kappa());
             }
@@ -147,10 +187,11 @@ public final class OuAdmission {
             }
             cv = m > 0 ? Math.sqrt(var / (k.length - 1)) / m : Double.NaN;
         }
-        boolean t3 = !t3Applicable
+        boolean t3 = !t3Applicable || series.stitched()
                 || (kappas.size() >= 3 && signStable && !Double.isNaN(cv) && cv < kappaCvThreshold);
         checks.add(new Check("T3 устойчивость κ",
-                t3, t3Applicable
+                t3, series.stitched() ? "НЕ ПРИМЕНИМ: ряд сшит из несмежных окон"
+                : t3Applicable
                 ? String.format(java.util.Locale.ROOT, "окон %d, CV(κ)=%.2f (порог %.2f), знак %s",
                         kappas.size(), cv, kappaCvThreshold, signStable ? "стабилен" : "МЕНЯЕТСЯ")
                 : String.format(java.util.Locale.ROOT, "НЕ ПРИМЕНИМ: окно %d наблюдений короче двух "
@@ -158,12 +199,13 @@ public final class OuAdmission {
                         kappaWindow, 2 * halfLifeSteps)));
 
         // --- T4: стабильность уровня θ ---
-        StatTests.TestResult breakTest = StatTests.supWaldMeanBreak(x);
-        double sd = Math.sqrt(variance(x));
-        double shift = breakShift(x);
-        boolean t4 = !breakTest.rejected() || shift < breakToSigma * sd;
+        StatTests.TestResult breakTest = StatTests.supWaldMeanBreak(tested);
+        double sd = Math.sqrt(variance(tested));
+        double shift = breakShift(tested);
+        boolean t4 = series.stitched() || !breakTest.rejected() || shift < breakToSigma * sd;
         checks.add(new Check("T4 стабильность θ",
-                t4, String.format(java.util.Locale.ROOT,
+                t4, series.stitched() ? "НЕ ПРИМЕНИМ: ряд сшит из несмежных окон — разрывы между "
+                + "окнами неотличимы от сдвига уровня" : String.format(java.util.Locale.ROOT,
                 "sup-Wald=%.1f (крит. %.1f, %s), сдвиг среднего %.4f при σ=%.4f",
                 breakTest.statistic(), breakTest.criticalValue(),
                 breakTest.rejected() ? "РАЗРЫВ ОБНАРУЖЕН" : "разрыв не обнаружен", shift, sd)));
@@ -206,28 +248,24 @@ public final class OuAdmission {
         int n = x.length;
         int lo = (int) (0.15 * n);
         int hi = (int) (0.85 * n);
+        // те же префиксные суммы, что в StatTests.supWaldMeanBreak: линейно вместо квадрата
+        double[] prefix = new double[n + 1];
+        double[] prefixSquares = new double[n + 1];
+        for (int i = 0; i < n; i++) {
+            prefix[i + 1] = prefix[i] + x[i];
+            prefixSquares[i + 1] = prefixSquares[i] + x[i] * x[i];
+        }
         double best = 0;
         double bestShift = 0;
-        double mean = OuCalibration.mean(x);
-        double total = 0;
-        for (double v : x) {
-            total += (v - mean) * (v - mean);
-        }
+        double mean = prefix[n] / n;
+        double total = prefixSquares[n] - n * mean * mean;
         for (int b = lo; b < hi; b++) {
-            double m1 = 0;
-            double m2 = 0;
-            for (int i = 0; i < b; i++) {
-                m1 += x[i];
-            }
-            m1 /= Math.max(b, 1);
-            for (int i = b; i < n; i++) {
-                m2 += x[i];
-            }
-            m2 /= Math.max(n - b, 1);
-            double rss = 0;
-            for (int i = 0; i < n; i++) {
-                double d = x[i] - (i < b ? m1 : m2);
-                rss += d * d;
+            double m1 = prefix[b] / Math.max(b, 1);
+            double m2 = (prefix[n] - prefix[b]) / Math.max(n - b, 1);
+            double rss = prefixSquares[b] - b * m1 * m1
+                    + (prefixSquares[n] - prefixSquares[b]) - (n - b) * m2 * m2;
+            if (rss <= 0) {
+                continue;
             }
             double f = (total - rss) / (rss / Math.max(n - 2, 1));
             if (f > best) {

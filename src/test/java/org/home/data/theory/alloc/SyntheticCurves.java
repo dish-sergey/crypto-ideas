@@ -35,7 +35,7 @@ final class SyntheticCurves {
         }
         List<Curve> pool = new ArrayList<>();
         for (int i = 0; i < rets.length; i++) {
-            pool.add(new Curve("S" + (i + 1), CurveKind.IN_SAMPLE, rets[i], avail[i], new double[t], "синтетика"));
+            pool.add(new Curve("S" + (i + 1), CurveKind.IN_SAMPLE, rets[i], avail[i], new double[t], "синтетика", false));
         }
         return new CurveSet(days, dayMs, pool, new LinkedHashMap<>(), cash,
                 new String[t], new String[t], Map.of());

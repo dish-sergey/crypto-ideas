@@ -237,6 +237,23 @@ public final class KellySizing {
         return correlation(x, y);
     }
 
+    /**
+     * Коэффициент наклона регрессии {@code y} на {@code x} — бета исхода события
+     * к ходу рынка. Нужна для остаточного контроля: премия события обязана
+     * пережить вычитание рыночной компоненты (правило 15 корпуса).
+     */
+    public static double beta(double[] x, double[] y) {
+        double mx = mean(x);
+        double my = mean(y);
+        double cov = 0;
+        double var = 0;
+        for (int i = 0; i < x.length; i++) {
+            cov += (x[i] - mx) * (y[i] - my);
+            var += (x[i] - mx) * (x[i] - mx);
+        }
+        return var > 0 ? cov / var : 0;
+    }
+
     public static double correlation(double[] x, double[] y) {
         double mx = mean(x);
         double my = mean(y);
