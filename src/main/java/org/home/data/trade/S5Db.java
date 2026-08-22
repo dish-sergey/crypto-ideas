@@ -38,6 +38,10 @@ public class S5Db implements TradedStore, TradeRecorder {
                         + " exit_px REAL, qty REAL, entry_notional_usd REAL, pnl_pct REAL, pnl_usd REAL,"
                         + " note TEXT, closed_at INTEGER)");
                 st.execute("CREATE TABLE IF NOT EXISTS tg_event(direction TEXT, kind TEXT, text TEXT, ts INTEGER)");
+                // миграция старой схемы trade_close (до фин. колонок): ADD COLUMN идемпотентно (ошибка «дубль» — игнор)
+                migrate(st, "ALTER TABLE trade_close ADD COLUMN qty REAL");
+                migrate(st, "ALTER TABLE trade_close ADD COLUMN entry_notional_usd REAL");
+                migrate(st, "ALTER TABLE trade_close ADD COLUMN pnl_usd REAL");
             }
             log.info("S5 БД открыта: {}", path);
         } catch (Exception e) {
@@ -93,6 +97,11 @@ public class S5Db implements TradedStore, TradeRecorder {
         exec("INSERT INTO tg_event(direction,kind,text,ts) VALUES(?,?,?,?)", ps -> {
             ps.setString(1, direction); ps.setString(2, kind); ps.setString(3, text); ps.setLong(4, now());
         });
+    }
+
+    /** Идемпотентная миграция: ADD COLUMN, «дубликат столбца» на уже-мигрированной БД игнорируем. */
+    private static void migrate(Statement st, String sql) {
+        try { st.execute(sql); } catch (Exception e) { /* колонка уже есть — ок */ }
     }
 
     private interface Binder { void bind(PreparedStatement ps) throws Exception; }
