@@ -60,7 +60,7 @@ public class TelegramCommandListener {
                     req.put("offset", offset);
                     req.put("timeout", 50);
                     handleUpdates(transport.call("getUpdates", M.writeValueAsString(req)));
-                } catch (Exception e) {
+                } catch (Throwable e) {                    // Throwable: даже Error (class-loading) не убивает поток
                     log.warn("Telegram getUpdates: {}", e.toString());
                     sleep(5000);                           // транзиентные 429/502/timeout — подождать и повторить
                 }

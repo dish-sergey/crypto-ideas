@@ -96,7 +96,7 @@ public class S5Live {
                 c.orch.pollReminders(nowSec);                      // эскалация напоминаний
                 c.orch.executeApproved(t);                         // подтверждённые → реальный ордер в день входа
                 c.orch.pollStops();                                // стоп по реальной марке
-            } catch (Exception e) {
+            } catch (Throwable e) {                                // даже Error не должен остановить торговый цикл
                 log.warn("S5 LIVE цикл: {}", e.toString());
             }
             Thread.sleep(60_000);
