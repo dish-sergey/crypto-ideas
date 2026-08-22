@@ -126,6 +126,23 @@ class KrakenFuturesExchangeTest {
         assertEquals("", new KrakenFuturesExchange(api).placeStopBuy("PF_XBTUSD", 0.001, 80000.0));
     }
 
+    @Test void lastFillPricePicksMostRecentForSymbol() throws Exception {
+        FakeKrakenApi api = new FakeKrakenApi();
+        api.getResponses.put("/api/v3/fills", "{\"result\":\"success\",\"fills\":["
+                + "{\"symbol\":\"pf_xbtusd\",\"side\":\"sell\",\"price\":63000,\"fillTime\":\"2026-08-20T09:00:00.000Z\"},"
+                + "{\"symbol\":\"pf_xbtusd\",\"side\":\"buy\",\"price\":81900,\"fillTime\":\"2026-08-21T14:30:00.000Z\"},"
+                + "{\"symbol\":\"pf_ethusd\",\"side\":\"buy\",\"price\":3000,\"fillTime\":\"2026-08-21T15:00:00.000Z\"}]}");
+        assertEquals(81900.0, new KrakenFuturesExchange(api).lastFillPrice("PF_XBTUSD"), 1e-9, "самое свежее по символу");
+    }
+
+    @Test void lastFillPriceZeroWhenNoneAndBestEffort() throws Exception {
+        FakeKrakenApi api = new FakeKrakenApi();
+        api.getResponses.put("/api/v3/fills", "{\"result\":\"success\",\"fills\":[]}");
+        assertEquals(0.0, new KrakenFuturesExchange(api).lastFillPrice("PF_XBTUSD"), 1e-9);
+        FakeKrakenApi boom = new FakeKrakenApi(); boom.failure = new RuntimeException("net");
+        assertEquals(0.0, new KrakenFuturesExchange(boom).lastFillPrice("PF_XBTUSD"), 1e-9, "сбой → 0, без исключения");
+    }
+
     @Test void cancelStopsCallsCancelAll() throws Exception {
         FakeKrakenApi api = new FakeKrakenApi();
         new KrakenFuturesExchange(api).cancelStops("PF_XBTUSD");

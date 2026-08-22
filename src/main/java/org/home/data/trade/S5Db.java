@@ -35,7 +35,8 @@ public class S5Db implements TradedStore, TradeRecorder {
                 st.execute("CREATE TABLE IF NOT EXISTS trade_open(event_id TEXT, symbol TEXT, unlock_day INTEGER,"
                         + " category TEXT, qty REAL, entry_px REAL, notional_usd REAL, opened_at INTEGER)");
                 st.execute("CREATE TABLE IF NOT EXISTS trade_close(symbol TEXT, category TEXT, entry_px REAL,"
-                        + " exit_px REAL, pnl_pct REAL, note TEXT, closed_at INTEGER)");
+                        + " exit_px REAL, qty REAL, entry_notional_usd REAL, pnl_pct REAL, pnl_usd REAL,"
+                        + " note TEXT, closed_at INTEGER)");
                 st.execute("CREATE TABLE IF NOT EXISTS tg_event(direction TEXT, kind TEXT, text TEXT, ts INTEGER)");
             }
             log.info("S5 БД открыта: {}", path);
@@ -76,11 +77,15 @@ public class S5Db implements TradedStore, TradeRecorder {
     }
 
     @Override public synchronized void recordClose(String symbol, String category, double entryPx, double exitPx,
-                                                   double pnlPct, String note) {
-        exec("INSERT INTO trade_close(symbol,category,entry_px,exit_px,pnl_pct,note,closed_at) VALUES(?,?,?,?,?,?,?)",
+                                                   double qty, double pnlPct, String note) {
+        double entryNotional = entryPx * qty;
+        double pnlUsd = (entryPx - exitPx) * qty;               // шорт: (вход − выход) × qty
+        exec("INSERT INTO trade_close(symbol,category,entry_px,exit_px,qty,entry_notional_usd,pnl_pct,pnl_usd,note,closed_at)"
+                + " VALUES(?,?,?,?,?,?,?,?,?,?)",
                 ps -> {
                     ps.setString(1, symbol); ps.setString(2, category); ps.setDouble(3, entryPx);
-                    ps.setDouble(4, exitPx); ps.setDouble(5, pnlPct); ps.setString(6, note); ps.setLong(7, now());
+                    ps.setDouble(4, exitPx); ps.setDouble(5, qty); ps.setDouble(6, entryNotional);
+                    ps.setDouble(7, pnlPct); ps.setDouble(8, pnlUsd); ps.setString(9, note); ps.setLong(10, now());
                 });
     }
 

@@ -9,14 +9,15 @@ public interface TradeRecorder {
     void recordOpen(String eventId, String symbol, long unlockDay, String category,
                     double qty, double entryPx, double notionalUsd);
 
-    void recordClose(String symbol, String category, double entryPx, double exitPx, double pnlPct, String note);
+    void recordClose(String symbol, String category, double entryPx, double exitPx, double qty,
+                     double pnlPct, String note);
 
     /** direction: "out" (бот→оператор) / "in" (оператор→бот); kind: approval/reminder/open/exit/command/callback/… */
     void recordTelegram(String direction, String kind, String text);
 
     TradeRecorder NONE = new TradeRecorder() {
         public void recordOpen(String e, String s, long u, String c, double q, double px, double n) { }
-        public void recordClose(String s, String c, double e, double x, double p, String n) { }
+        public void recordClose(String s, String c, double e, double x, double q, double p, String n) { }
         public void recordTelegram(String d, String k, String t) { }
     };
 }

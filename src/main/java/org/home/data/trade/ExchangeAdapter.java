@@ -50,4 +50,10 @@ public interface ExchangeAdapter {
 
     /** Снять все открытые ордера по символу (наши биржевые стопы). По умолчанию no-op. */
     default void cancelStops(String symbol) throws ExchangeDisconnectedException { }
+
+    /**
+     * Цена последнего исполнения по символу (для случая, когда позицию закрыл БИРЖЕВОЙ стоп вне нашей
+     * системы — читаем реальную цену выхода из истории сделок). 0 — неизвестно. По умолчанию 0.
+     */
+    default double lastFillPrice(String symbol) throws ExchangeDisconnectedException { return 0.0; }
 }

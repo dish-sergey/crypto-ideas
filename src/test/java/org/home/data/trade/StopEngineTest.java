@@ -153,13 +153,27 @@ class StopEngineTest {
         assertEquals(0, e.openCount());
     }
 
-    // ---- Сбой 4: позиция уже закрыта вне системы → без двойного закрытия ----
-    @Test void alreadyClosedNoDoubleClose() throws Exception {
+    // ---- Сбой 4: позиция закрыта вне системы → без двойного закрытия, реальная цена выхода с биржи ----
+    @Test void externalStopCloseReadsRealExitFromExchange() throws Exception {
+        MockExchange ex = new MockExchange(1000); TradeJournal j = new TradeJournal(); StopEngine e = engine(ex, j);
+        ex.tick("X", 100); assertTrue(e.openShort("e", approved("e"), "X", 2));
+        ex.closeExternally("X"); ex.setLastFill("X", 131);   // биржевой стоп закрыл на 131 (−31%)
+        ex.tick("X", 131); e.poll();                          // софт видит порог → позиции нет → дочитать выход
+        assertEquals(0, e.openCount());
+        var entry = j.entries().get(0);
+        assertEquals(131.0, entry.exitPx(), 1e-9, "реальная цена выхода дочитана с биржи");
+        assertEquals(2.0, entry.qty(), 1e-9);
+        assertEquals(-0.31, entry.pnlPct(), 1e-9);
+        assertEquals(-62.0, entry.pnlUsd(), 1e-9);            // (100−131)×2
+        assertEquals(1, j.count(TradeJournal.Category.STOP_GAP), "−31% > порог+0.5пп → гэп");
+    }
+
+    @Test void externalManualCloseIsAlreadyClosed() throws Exception {
         MockExchange ex = new MockExchange(1000); TradeJournal j = new TradeJournal(); StopEngine e = engine(ex, j);
         ex.tick("X", 100); assertTrue(e.openShort("e", approved("e"), "X", 1));
-        ex.closeExternally("X");              // закрыто вручную/ADL
+        ex.closeExternally("X"); ex.setLastFill("X", 98);    // закрыто вручную в небольшом плюсе
         ex.tick("X", 130); e.poll();
-        assertEquals(1, j.count(TradeJournal.Category.ALREADY_CLOSED));
+        assertEquals(1, j.count(TradeJournal.Category.ALREADY_CLOSED), "закрыто не по стопу → вне системы");
         assertEquals(0, j.count(TradeJournal.Category.STOP));
         assertEquals(0, e.openCount());
     }

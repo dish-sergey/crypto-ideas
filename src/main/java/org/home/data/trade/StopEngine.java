@@ -108,13 +108,11 @@ public class StopEngine {
     private void attemptClose(String symbol, TradeJournal.Category baseCat) {
         Managed m = managed.get(symbol);
         if (m == null) return;
-        // источник истины: если позиции уже нет — она закрыта вне системы, не закрываем повторно
+        // источник истины: если позиции уже нет — она закрыта вне системы (напр. биржевым стопом),
+        // не закрываем повторно, но дочитываем реальную цену выхода с биржи для честного PnL
         try {
             if (!hasPosition(symbol)) {
-                journal.record(symbol, TradeJournal.Category.ALREADY_CLOSED, m.entryPx, m.entryPx,
-                        "позиция закрыта вне системы");
-                managed.remove(symbol);
-                cancelExchangeStop(symbol);              // позиции нет — снять висящий биржевой стоп
+                recordExternalClose(symbol, m);
                 return;
             }
         } catch (ExchangeDisconnectedException e) { return; } // разрыв — попробуем на reconnect()
@@ -130,7 +128,7 @@ public class StopEngine {
                 String note = cat == TradeJournal.Category.STOP_GAP
                         ? String.format("гэп: факт %.1f%% против порога %.0f%%", adverse * 100, stopFrac * 100)
                         : "закрыто";
-                journal.record(symbol, cat, m.entryPx, exit, note);
+                journal.record(symbol, cat, m.entryPx, exit, m.qty, note);
                 managed.remove(symbol);
                 cancelExchangeStop(symbol);              // закрыли — снять биржевой стоп-дубликат
                 return;
@@ -138,18 +136,36 @@ public class StopEngine {
             // отклонено: возможно, позиция исчезла между проверкой и ордером
             try {
                 if (!hasPosition(symbol)) {
-                    journal.record(symbol, TradeJournal.Category.ALREADY_CLOSED, m.entryPx, m.entryPx,
-                            "позиция исчезла при закрытии");
-                    managed.remove(symbol);
-                    cancelExchangeStop(symbol);
+                    recordExternalClose(symbol, m);
                     return;
                 }
             } catch (ExchangeDisconnectedException e) { return; }
             // иначе — транзиентное отклонение, повторяем
         }
         // ретраи исчерпаны — эскалация, позицию не снимаем (докрытие на следующем poll/reconnect)
-        journal.record(symbol, TradeJournal.Category.CLOSE_FAILED, m.entryPx, 0,
+        journal.record(symbol, TradeJournal.Category.CLOSE_FAILED, m.entryPx, 0, m.qty,
                 "закрытие отклонено " + (maxRetries + 1) + " раз — АЛЕРТ");
+    }
+
+    /**
+     * Позиция закрыта вне нашей системы (обычно — БИРЖЕВЫМ стопом). Дочитываем реальную цену выхода из
+     * истории сделок Kraken; если не удалось — оценка по уровню стопа. Категорию определяем по факту:
+     * убыток на уровне порога → это сработал стоп, иначе — закрыто вне системы (ручное/ADL).
+     */
+    private void recordExternalClose(String symbol, Managed m) {
+        double exit = 0;
+        try { exit = ex.lastFillPrice(symbol); } catch (Exception ignore) { /* best-effort */ }
+        if (exit <= 0) exit = m.entryPx * (1 + stopFrac);   // не прочитали — оценка по уровню стопа
+        double adverse = exit / m.entryPx - 1.0;
+        TradeJournal.Category cat = adverse >= stopFrac
+                ? (adverse > stopFrac + GAP_EPS ? TradeJournal.Category.STOP_GAP : TradeJournal.Category.STOP)
+                : TradeJournal.Category.ALREADY_CLOSED;
+        String note = cat == TradeJournal.Category.ALREADY_CLOSED
+                ? "закрыто вне системы (цена дочитана с биржи)"
+                : "закрыто биржевым стопом (цена дочитана с биржи)";
+        journal.record(symbol, cat, m.entryPx, exit, m.qty, note);
+        managed.remove(symbol);
+        cancelExchangeStop(symbol);
     }
 
     private boolean hasPosition(String symbol) throws ExchangeDisconnectedException {

@@ -234,7 +234,7 @@ public class S5Orchestrator {
         for (int i = journalCursor; i < es.size(); i++) {
             TradeJournal.Entry e = es.get(i);
             monitor.record(e.pnlPct());
-            recorder.recordClose(e.symbol(), e.category().name(), e.entryPx(), e.exitPx(), e.pnlPct(), e.note());
+            recorder.recordClose(e.symbol(), e.category().name(), e.entryPx(), e.exitPx(), e.qty(), e.pnlPct(), e.note());
             notifier.push(alertFor(e));
         }
         journalCursor = es.size();

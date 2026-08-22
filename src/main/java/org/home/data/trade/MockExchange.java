@@ -88,4 +88,12 @@ public class MockExchange implements ExchangeAdapter {
     @Override public void cancelStops(String symbol) throws ExchangeDisconnectedException {
         checkConn(); stops.remove(symbol);
     }
+
+    // --- последняя цена исполнения (имитация закрытия биржевым стопом) ---
+    private final Map<String, Double> lastFills = new LinkedHashMap<>();
+    public void setLastFill(String symbol, double price) { lastFills.put(symbol, price); }
+
+    @Override public double lastFillPrice(String symbol) throws ExchangeDisconnectedException {
+        checkConn(); return lastFills.getOrDefault(symbol, 0.0);
+    }
 }

@@ -253,6 +253,26 @@ public class KrakenFuturesExchange implements ExchangeAdapter {
         }
     }
 
+    /** Цена последнего исполнения по символу из истории сделок (для закрытия биржевым стопом). 0 — не найдено. */
+    @Override
+    public double lastFillPrice(String symbol) throws ExchangeDisconnectedException {
+        try {
+            String resp = api.get("/api/v3/fills", true);
+            log.info("Kraken fills resp (искомый {}): {}", symbol, truncate(resp));
+            String bestTime = ""; double bestPx = 0;
+            for (JsonNode f : M.readTree(resp).path("fills")) {
+                if (!symbol.equalsIgnoreCase(f.path("symbol").asText())) continue;
+                double px = f.path("price").asDouble(0);
+                String t = f.path("fillTime").asText("");
+                if (px > 0 && t.compareTo(bestTime) > 0) { bestTime = t; bestPx = px; }   // самое свежее по времени
+            }
+            return bestPx;
+        } catch (Exception e) {
+            log.warn("Kraken fills ({}): {}", symbol, e.toString());
+            return 0.0;
+        }
+    }
+
     /** Округлить цену к tickSize инструмента (для buy-stop — вверх, чтобы триггер не оказался ниже допустимого). */
     private double roundToTick(String symbol, double price) throws ExchangeDisconnectedException {
         refreshInstruments();
