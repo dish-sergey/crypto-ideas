@@ -46,42 +46,41 @@ public class S5Reentry {
 
         for(int i=0;i<raw.size();i++){ String b=rbase.get(i); long day=raw.get(i)[0]; TreeMap<Long,Double> fm=fund.get(b); double f5=0; if(fm!=null){ for(long d=day-LEAD; d<day; d++){ Double f=fm.get(d); if(f!=null) f5+=f; } } EVENTS.add(new Ev(b, day, rpct.get(i), f5)); }
 
-        // ---- симуляция: оригинал + повторный вход по стопнутым ----
-        int nTrade=0, nStop=0, reStop=0;
-        List<Double> orig=new ArrayList<>();      // все сделки (как в проде)
-        List<Double> reentry=new ArrayList<>();   // результат повторного шорта (по стопнутым)
-        List<Double> combined=new ArrayList<>();  // стопнутая нога (−31%) + повторный вход
-        List<Double> holdThrough=new ArrayList<>(); // контрфакт: держать без стопа до разлока (по стопнутым)
-        for(Ev ev:EVENTS){ if(ev.pct<MINPCT||ev.fund5<FUNDTHR) continue;
-            TreeMap<Long,double[]> m=px.get(ev.base); if(m==null) continue;
-            double[] e0=near(m,ev.day-LEAD), e1=near(m,ev.day); if(e0==null||e1==null||e0[0]<=0) continue;
-            double entry=e0[0]; boolean hit=false; long stopDay=-1;
-            for(long d=ev.day-LEAD+1; d<=ev.day; d++){ double[] x=m.get(d); if(x!=null&&x[1]>=entry*(1+STOP)){ hit=true; stopDay=d; break; } }
-            double priceRet=hit? -(STOP+SLIP) : (entry-e1[0])/entry;
-            double abs=priceRet+ev.fund5-COST; orig.add(abs); nTrade++;
-            if(!hit) continue;
-            nStop++;
-            // повторный шорт по цене стопа, новый стоп −30% от неё, выход в день разлока
-            double reEntry=entry*(1+STOP), newStop=reEntry*(1+STOP);
-            boolean reHit=false; for(long d=stopDay+1; d<=ev.day; d++){ double[] x=m.get(d); if(x!=null&&x[1]>=newStop){ reHit=true; break; } }
-            double priceRet2=reHit? -(STOP+SLIP) : (reEntry-e1[0])/reEntry;
-            double fundRe=0; TreeMap<Long,Double> fm=fund.get(ev.base); if(fm!=null){ for(long d=stopDay; d<ev.day; d++){ Double f=fm.get(d); if(f!=null) fundRe+=f; } }
-            double abs2=priceRet2+fundRe-COST; reentry.add(abs2); if(reHit) reStop++;
-            combined.add(-(STOP+SLIP)-COST+ev.fund5 + abs2);   // стопнутая нога + повторный вход
-            holdThrough.add((entry-e1[0])/entry + ev.fund5 - COST); // если бы держали без стопа
-        }
+        // ---- сколько всего сделок/стопов (для контекста) ----
+        int nTrade=0, nStop=0;
+        for(Ev ev:EVENTS){ if(ev.pct<MINPCT||ev.fund5<FUNDTHR) continue; TreeMap<Long,double[]> m=px.get(ev.base); if(m==null) continue;
+            double[] e0=near(m,ev.day-LEAD),e1=near(m,ev.day); if(e0==null||e1==null||e0[0]<=0) continue; nTrade++;
+            double entry=e0[0]; for(long d=ev.day-LEAD+1;d<=ev.day;d++){ double[] x=m.get(d); if(x!=null&&x[1]>=entry*(1+STOP)){ nStop++; break; } } }
+        System.out.printf("%nвсего сделок=%d, из них стопнуто (+30%%)=%d (%.0f%%)%n", nTrade, nStop, 100.0*nStop/Math.max(1,nTrade));
 
-        System.out.println("\n===== ПОВТОРНЫЙ ВХОД ПОСЛЕ СТОПА (стоп −30%, выход в день разлока) =====");
-        System.out.printf("всего сделок=%d, из них стопнуто=%d (%.0f%%)%n", nTrade, nStop, 100.0*nStop/Math.max(1,nTrade));
-        System.out.println("\n-- Повторный шорт по цене стопа (n="+reentry.size()+"): --");
-        stat("повторный вход", reentry);
-        System.out.printf("  из повторных СНОВА стопнуто: %d (%.0f%%)%n", reStop, 100.0*reStop/Math.max(1,reentry.size()));
-        System.out.println("\n-- Контрфакт: держать оригинал БЕЗ стопа до разлока (по стопнутым, n="+holdThrough.size()+"): --");
-        stat("держать сквозь", holdThrough);
-        System.out.println("\n-- Комбинация: стопнутая нога (−31%) + повторный вход (n="+combined.size()+"): --");
-        stat("стоп+перезаход", combined);
-        System.out.println("\n(положительный средний повторного входа => после +30% цена откатывается к разлоку;");
-        System.out.println(" отрицательный => резкое движение продолжается, перезаход усугубляет убыток.)");
+        // ---- повторный вход по РАЗНЫМ уровням выброса (снова стоп −30% от новой цены, выход в разлок) ----
+        System.out.println("\n===== ПОВТОРНЫЙ ШОРТ ПРИ ВЫБРОСЕ +X%% (новый стоп −30%, выход в день разлока) =====");
+        System.out.printf("%-8s %6s %8s %8s %6s %8s %8s %8s%n","выброс","событ","сред","медиана","%>0","снова-стоп","худшая","лучшая");
+        for(double trig:new double[]{0.30,0.40,0.50,0.70,1.00}) reentryAt(trig);
+
+        System.out.println("\n«сред» — доходность повторного шорта на его размер ($10 → сред×$10).");
+        System.out.println("Положительная => после выброса цена откатывается к разлоку; растёт с уровнем выброса => глубже откат.");
+        System.out.println("ВНИМАНИЕ: события с большим выбросом всё малочисленнее — статзначимость падает.");
+    }
+
+    /** Повторный шорт при достижении ценой уровня entry×(1+trig); новый стоп −30%, выход в день разлока. */
+    static void reentryAt(double trig){
+        List<Double> re=new ArrayList<>(); int reStop=0;
+        for(Ev ev:EVENTS){ if(ev.pct<MINPCT||ev.fund5<FUNDTHR) continue; TreeMap<Long,double[]> m=px.get(ev.base); if(m==null) continue;
+            double[] e0=near(m,ev.day-LEAD),e1=near(m,ev.day); if(e0==null||e1==null||e0[0]<=0) continue;
+            double entry=e0[0], lvl=entry*(1+trig); long tDay=-1;
+            for(long d=ev.day-LEAD+1; d<=ev.day; d++){ double[] x=m.get(d); if(x!=null&&x[1]>=lvl){ tDay=d; break; } }
+            if(tDay<0) continue;                                   // цена не дошла до этого выброса
+            double reEntry=lvl, newStop=reEntry*(1+STOP); boolean reHit=false;
+            for(long d=tDay+1; d<=ev.day; d++){ double[] x=m.get(d); if(x!=null&&x[1]>=newStop){ reHit=true; break; } }
+            double pr=reHit? -(STOP+SLIP) : (reEntry-e1[0])/reEntry;
+            double fundRe=0; TreeMap<Long,Double> fm=fund.get(ev.base); if(fm!=null){ for(long d=tDay; d<ev.day; d++){ Double f=fm.get(d); if(f!=null) fundRe+=f; } }
+            re.add(pr+fundRe-COST); if(reHit) reStop++;
+        }
+        if(re.isEmpty()){ System.out.printf("+%-6.0f %6d%n", trig*100, 0); return; }
+        List<Double> s=new ArrayList<>(re); Collections.sort(s);
+        System.out.printf("+%-6.0f %6d %+7.2f%% %+7.2f%% %5.0f%% %7d %+7.1f%% %+7.1f%%%n",
+            trig*100, re.size(), mean(re)*100, s.get(s.size()/2)*100, 100.0*fracPos(re), reStop, s.get(0)*100, s.get(s.size()-1)*100);
     }
 
     static void stat(String label, List<Double> v){ if(v.isEmpty()){ System.out.println("  "+label+": нет данных"); return; }
