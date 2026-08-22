@@ -43,8 +43,10 @@ public class S5Db implements TradedStore, TradeRecorder {
                 migrate(st, "ALTER TABLE trade_close ADD COLUMN entry_notional_usd REAL");
                 migrate(st, "ALTER TABLE trade_close ADD COLUMN pnl_usd REAL");
             }
+            // прогрев JDBC4PreparedStatement — устранить интермиттентную гонку загрузки класса в nested-jar
+            try (PreparedStatement ps = c.prepareStatement("SELECT 1")) { ps.executeQuery(); }
             log.info("S5 БД открыта: {}", path);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             log.warn("S5 БД не открыта ({}): {} — аудит выключен, торговля продолжается", path, e.toString());
             c = null;
         }
@@ -64,7 +66,7 @@ public class S5Db implements TradedStore, TradeRecorder {
         if (conn == null) return out;
         try (Statement st = conn.createStatement(); ResultSet rs = st.executeQuery("SELECT event_id FROM dismissed")) {
             while (rs.next()) out.add(rs.getString(1));
-        } catch (Exception e) { log.warn("S5 БД load dismissed: {}", e.toString()); }
+        } catch (Throwable e) { log.warn("S5 БД load dismissed: {}", e.toString()); }
         return out;
     }
 
@@ -101,7 +103,7 @@ public class S5Db implements TradedStore, TradeRecorder {
 
     /** Идемпотентная миграция: ADD COLUMN, «дубликат столбца» на уже-мигрированной БД игнорируем. */
     private static void migrate(Statement st, String sql) {
-        try { st.execute(sql); } catch (Exception e) { /* колонка уже есть — ок */ }
+        try { st.execute(sql); } catch (Throwable e) { /* колонка уже есть — ок */ }
     }
 
     @Override public synchronized String recentHistory(int n) {
@@ -121,14 +123,14 @@ public class S5Db implements TradedStore, TradeRecorder {
                       .append(" (").append(pnlPct >= 0 ? "+" : "-").append(fmt1(Math.abs(pnlPct) * 100)).append("%)");
                 }
             }
-        } catch (Exception e) { return "история: ошибка чтения БД"; }
+        } catch (Throwable e) { return "история: ошибка чтения БД"; }
         if (cnt == 0) sb.append("\n(пока нет закрытых сделок)");
         try (Statement st = conn.createStatement();
              ResultSet rs = st.executeQuery("SELECT count(*), coalesce(sum(pnl_usd),0) FROM trade_close")) {
             if (rs.next()) sb.append("\n\nвсего сделок: ").append(rs.getInt(1))
                     .append(", суммарный результат: ").append(rs.getDouble(2) >= 0 ? "+" : "-")
                     .append("$").append(fmt2(Math.abs(rs.getDouble(2))));
-        } catch (Exception ignore) { }
+        } catch (Throwable ignore) { }
         return sb.toString();
     }
 
@@ -142,7 +144,7 @@ public class S5Db implements TradedStore, TradeRecorder {
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             binder.bind(ps);
             ps.executeUpdate();
-        } catch (Exception e) {
+        } catch (Throwable e) {
             log.warn("S5 БД запись: {}", e.toString());
         }
     }

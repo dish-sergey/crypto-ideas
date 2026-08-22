@@ -35,7 +35,8 @@ public class TelegramNotifier implements Notifier {
 
     @Override
     public void push(Alert alert) {
-        recorder.recordTelegram("out", alert.level().name(), alert.title() + ": " + alert.body());
+        try { recorder.recordTelegram("out", alert.level().name(), alert.title() + ": " + alert.body()); }
+        catch (Throwable t) { log.warn("аудит пуша не записан: {}", t.toString()); }   // аудит не должен ронять отправку
         try {
             transport.call("sendMessage", M.writeValueAsString(payload(alert)));
         } catch (Exception e) {
