@@ -283,6 +283,23 @@ class S5OrchestratorTest {
         assertEquals(0, c.orch.pendingApprovals());
     }
 
+    @Test void tradedEventNotReproposedAfterStop() throws Exception {
+        // одно событие разлока торгуется один раз: после входа и стопа его больше не предлагаем
+        Ctx c = ctx(CHEAP);
+        long today = 20000; c.ex.tick("PF_APTUSD", 10.0);
+        c.feed.events.add(ev("APT", today + 5));
+        c.orch.discover(today);
+        c.gate.approve("PF_APTUSD@" + (today + 5));
+        c.orch.executeApproved();
+        assertEquals(1, c.orch.openPositions());
+        c.ex.tick("PF_APTUSD", 13.0);                          // +30% → стоп закрыл позицию
+        c.orch.pollStops();
+        assertEquals(0, c.orch.openPositions(), "стоп закрыл");
+        // то же событие ещё в окне входа, но повторно НЕ предлагается
+        assertTrue(c.orch.discover(today).isEmpty(), "сыгранное событие не переоткрывается после стопа");
+        assertEquals(0, c.orch.pendingApprovals());
+    }
+
     @Test void approvedEarlyOpensOnlyOnEntryDay() throws Exception {
         Ctx c = ctx(CHEAP);
         long today = 20000; c.ex.tick("PF_APTUSD", 10.0);

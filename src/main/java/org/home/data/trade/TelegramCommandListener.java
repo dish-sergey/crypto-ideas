@@ -22,13 +22,19 @@ public class TelegramCommandListener {
     private final TelegramTransport transport;
     private final long chatId;
     private final S5Orchestrator orch;
+    private final TradeRecorder recorder;
     private long offset = 0;
     private volatile boolean running = false;
 
     public TelegramCommandListener(TelegramTransport transport, long chatId, S5Orchestrator orch) {
+        this(transport, chatId, orch, TradeRecorder.NONE);
+    }
+
+    public TelegramCommandListener(TelegramTransport transport, long chatId, S5Orchestrator orch, TradeRecorder recorder) {
         this.transport = transport;
         this.chatId = chatId;
         this.orch = orch;
+        this.recorder = recorder;
     }
 
     /** Демон-поток: бесконечный long-poll. Сбой сети логируется и не роняет поток. */
@@ -71,6 +77,7 @@ public class TelegramCommandListener {
     private void handleMessage(JsonNode msg) throws Exception {
         if (msg.path("chat").path("id").asLong() != chatId) return;          // чужой чат — игнор
         String text = msg.path("text").asText("").trim();
+        recorder.recordTelegram("in", "command", text);
         switch (text.split("\\s+")[0]) {
             case "/status" -> send(orch.status().render());
             case "/positions" -> send(renderPositions());
@@ -86,6 +93,7 @@ public class TelegramCommandListener {
         long fromChat = cb.path("message").path("chat").path("id").asLong();
         String cbId = cb.path("id").asText("");
         if (fromChat != chatId) { answerCallback(cbId, "не разрешено"); return; }
+        recorder.recordTelegram("in", "callback", data);
 
         if (data.startsWith("approve:")) {
             try {

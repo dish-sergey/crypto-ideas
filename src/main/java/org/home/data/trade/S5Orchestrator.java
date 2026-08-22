@@ -28,8 +28,13 @@ public class S5Orchestrator {
 
     /** eventId -> событие, поданное в Approval Gate и ждущее подтверждения. */
     private final Map<String, UnlockEvent> pending = new LinkedHashMap<>();
-    /** Отклонённые оператором eventId — чтобы дневной цикл не переотправлял их снова. */
+    /** eventId, которые больше не предлагаем: отклонённые оператором, просроченные ИЛИ уже сыгранные
+     *  (после открытия — одно событие разлока торгуется один раз, повторный вход после стопа/выхода запрещён). */
     private final java.util.Set<String> dismissed = new java.util.HashSet<>();
+    /** Персистентность dismissed — чтобы рестарт не переоткрыл сыгранное событие. По умолчанию — в память. */
+    private TradedStore tradedStore = TradedStore.NONE;
+    /** Аудит входов/выходов в БД (best-effort). */
+    private TradeRecorder recorder = TradeRecorder.NONE;
     /** eventId, по которым уже слали «недостаточно средств» — не спамить каждый цикл. */
     private final java.util.Set<String> underfundedNotified = new java.util.HashSet<>();
     private final ApprovalReminders reminders = new ApprovalReminders();
@@ -180,6 +185,9 @@ public class S5Orchestrator {
                     tracker.onEntry(e.krakenSymbol(), e.unlockDay(), e.category());
                     reminders.clear(id);
                     underfundedNotified.remove(id);
+                    dismiss(id);                                // событие сыграно — не предлагать повторно даже после стопа/выхода
+                    recorder.recordOpen(id, e.krakenSymbol(), e.unlockDay(), e.category(),
+                            s.qty(), engine.entryPrice(e.krakenSymbol()), s.notional());
                     notifier.push(Alert.info("Открыт шорт",
                             e.krakenSymbol() + " qty=" + num(s.qty()) + " (~$" + usd(s.notional()) + ") @ " + num(s.px())
                                     + "\nстоп −30% @ " + num(engine.stopLevel(e.krakenSymbol())) + " (софт + биржевой)"));
@@ -188,7 +196,7 @@ public class S5Orchestrator {
                 }
             } else if (gated && today >= e.unlockDay()) {        // разлок наступил без подтверждения — снять
                 reminders.clear(id);
-                dismissed.add(id);
+                dismiss(id);
                 notifier.push(Alert.info("Вход пропущен",
                         e.krakenSymbol() + " — не подтверждён до разлока, событие снято"));
                 it.remove();
@@ -226,6 +234,7 @@ public class S5Orchestrator {
         for (int i = journalCursor; i < es.size(); i++) {
             TradeJournal.Entry e = es.get(i);
             monitor.record(e.pnlPct());
+            recorder.recordClose(e.symbol(), e.category().name(), e.entryPx(), e.exitPx(), e.pnlPct(), e.note());
             notifier.push(alertFor(e));
         }
         journalCursor = es.size();
@@ -332,10 +341,24 @@ public class S5Orchestrator {
                 + "; точный размер пересчитается по цене и балансу на момент входа).");
     }
 
+    /** Подключить персистентный store сыгранных/снятых событий и загрузить их (переживают рестарт). */
+    public void useTradedStore(TradedStore store) {
+        this.tradedStore = store;
+        dismissed.addAll(store.load());
+    }
+
+    /** Подключить аудит входов/выходов в БД. */
+    public void useRecorder(TradeRecorder r) { this.recorder = r; }
+
+    /** Пометить событие «больше не предлагать» — в память и в персистентный store. */
+    private void dismiss(String eventId) {
+        if (dismissed.add(eventId)) tradedStore.record(eventId);
+    }
+
     /** Кнопка «Отклонить»: снять кандидата — не откроем и в следующем discover не переотправим. */
     public boolean reject(String eventId) {
         gate.reject(eventId);
-        dismissed.add(eventId);
+        dismiss(eventId);
         reminders.clear(eventId);
         underfundedNotified.remove(eventId);
         return pending.remove(eventId) != null;

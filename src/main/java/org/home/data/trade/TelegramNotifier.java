@@ -21,14 +21,21 @@ public class TelegramNotifier implements Notifier {
 
     private final TelegramTransport transport;
     private final long chatId;
+    private final TradeRecorder recorder;
 
     public TelegramNotifier(TelegramTransport transport, long chatId) {
+        this(transport, chatId, TradeRecorder.NONE);
+    }
+
+    public TelegramNotifier(TelegramTransport transport, long chatId, TradeRecorder recorder) {
         this.transport = transport;
         this.chatId = chatId;
+        this.recorder = recorder;
     }
 
     @Override
     public void push(Alert alert) {
+        recorder.recordTelegram("out", alert.level().name(), alert.title() + ": " + alert.body());
         try {
             transport.call("sendMessage", M.writeValueAsString(payload(alert)));
         } catch (Exception e) {

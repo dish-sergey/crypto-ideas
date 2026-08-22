@@ -47,8 +47,9 @@ public class S5Live {
 
     private Ctx build() throws Exception {
         S5TelegramConfig tg = S5TelegramConfig.load(telegramConfig);
+        S5Db db = new S5Db("state/s5.db");                          // аудит + персистентность сыгранных
         TelegramTransport tx = new HttpTelegramTransport(tg.token());
-        TelegramNotifier notifier = new TelegramNotifier(tx, tg.chatId());
+        TelegramNotifier notifier = new TelegramNotifier(tx, tg.chatId(), db);
 
         KrakenConfig kc = KrakenConfig.load(krakenConfig);
         KrakenApi api = new KrakenFuturesClient(kc.apiKey(), kc.apiSecretB64());
@@ -62,7 +63,9 @@ public class S5Live {
         StopEngine engine = new StopEngine(ex, j, S5Config.protocol().stopFrac(), 3);
         S5Orchestrator orch = new S5Orchestrator(ex, feed, funding, gate, engine,
                 new ScheduleTracker(), new DegradationMonitor(), j, S5Config.protocol(), notifier);
-        TelegramCommandListener listener = new TelegramCommandListener(tx, tg.chatId(), orch);
+        orch.useTradedStore(db);                                    // сыгранные события переживают рестарт
+        orch.useRecorder(db);                                       // аудит входов/выходов
+        TelegramCommandListener listener = new TelegramCommandListener(tx, tg.chatId(), orch, db);
         return new Ctx(feed, notifier, ex, orch, listener);
     }
 
