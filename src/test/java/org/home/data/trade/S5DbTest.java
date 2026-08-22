@@ -40,6 +40,18 @@ class S5DbTest {
         }
     }
 
+    @Test void recentHistoryFormatsClosedTrades() throws Exception {
+        Path dir = Files.createTempDirectory("s5db");
+        S5Db db = new S5Db(dir.resolve("s5.db").toString());
+        db.recordClose("PF_XPLUSD", "STOP_GAP", 0.0803, 0.1052, 26, -0.31, "стоп");   // pnl_usd = (0.0803-0.1052)*26 ≈ -0.65
+        db.recordClose("PF_APTUSD", "PLANNED_EXIT", 10.0, 9.4, 4.5, 0.06, "выход");    // pnl_usd = (10-9.4)*4.5 = +2.7
+        String h = db.recentHistory(10);
+        assertTrue(h.contains("PF_APTUSD"), h);
+        assertTrue(h.contains("PF_XPLUSD"), h);
+        assertTrue(h.contains("всего сделок: 2"), h);
+        assertTrue(h.contains("суммарный результат"), h);
+    }
+
     @Test void dbFailureIsBestEffort() throws Exception {
         // родитель — файл, а не каталог → БД не откроется; операции не должны бросать (торговля важнее аудита)
         Path file = Files.createTempFile("notadir", ".tmp");

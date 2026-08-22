@@ -15,6 +15,9 @@ public interface TradeRecorder {
     /** direction: "out" (бот→оператор) / "in" (оператор→бот); kind: approval/reminder/open/exit/command/callback/… */
     void recordTelegram(String direction, String kind, String text);
 
+    /** Текст последних N закрытых сделок с результатами (для команды /history). По умолчанию — пусто. */
+    default String recentHistory(int n) { return "история недоступна"; }
+
     TradeRecorder NONE = new TradeRecorder() {
         public void recordOpen(String e, String s, long u, String c, double q, double px, double n) { }
         public void recordClose(String s, String c, double e, double x, double q, double p, String n) { }

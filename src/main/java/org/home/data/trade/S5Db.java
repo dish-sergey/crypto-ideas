@@ -104,6 +104,37 @@ public class S5Db implements TradedStore, TradeRecorder {
         try { st.execute(sql); } catch (Exception e) { /* колонка уже есть — ок */ }
     }
 
+    @Override public synchronized String recentHistory(int n) {
+        if (conn == null) return "история недоступна (БД не открыта)";
+        StringBuilder sb = new StringBuilder("📒 Последние закрытые сделки:");
+        int cnt = 0;
+        try (PreparedStatement ps = conn.prepareStatement("SELECT symbol,category,entry_notional_usd,pnl_pct,pnl_usd"
+                + " FROM trade_close ORDER BY closed_at DESC LIMIT ?")) {
+            ps.setInt(1, n);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    cnt++;
+                    double pnlUsd = rs.getDouble("pnl_usd"), pnlPct = rs.getDouble("pnl_pct");
+                    sb.append("\n").append(rs.getString("symbol")).append(" ").append(rs.getString("category"))
+                      .append(": вход $").append(fmt2(rs.getDouble("entry_notional_usd")))
+                      .append(" → ").append(pnlUsd >= 0 ? "+" : "-").append("$").append(fmt2(Math.abs(pnlUsd)))
+                      .append(" (").append(pnlPct >= 0 ? "+" : "-").append(fmt1(Math.abs(pnlPct) * 100)).append("%)");
+                }
+            }
+        } catch (Exception e) { return "история: ошибка чтения БД"; }
+        if (cnt == 0) sb.append("\n(пока нет закрытых сделок)");
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT count(*), coalesce(sum(pnl_usd),0) FROM trade_close")) {
+            if (rs.next()) sb.append("\n\nвсего сделок: ").append(rs.getInt(1))
+                    .append(", суммарный результат: ").append(rs.getDouble(2) >= 0 ? "+" : "-")
+                    .append("$").append(fmt2(Math.abs(rs.getDouble(2))));
+        } catch (Exception ignore) { }
+        return sb.toString();
+    }
+
+    private static String fmt2(double v) { return String.format(java.util.Locale.ROOT, "%.2f", v); }
+    private static String fmt1(double v) { return String.format(java.util.Locale.ROOT, "%.1f", v); }
+
     private interface Binder { void bind(PreparedStatement ps) throws Exception; }
 
     private void exec(String sql, Binder binder) {

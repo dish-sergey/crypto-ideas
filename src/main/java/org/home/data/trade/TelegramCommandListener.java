@@ -37,9 +37,22 @@ public class TelegramCommandListener {
         this.recorder = recorder;
     }
 
+    /** Зарегистрировать команды в меню Telegram (кнопка «/»). Best-effort. */
+    private void registerCommands() {
+        try {
+            String body = "{\"commands\":["
+                    + cmd("status", "состояние") + "," + cmd("balance", "баланс счёта") + ","
+                    + cmd("positions", "открытые позиции") + "," + cmd("unlocks", "ближайшие разлоки") + ","
+                    + cmd("history", "история сделок и P&L") + "," + cmd("help", "список команд") + "]}";
+            transport.call("setMyCommands", body);
+        } catch (Exception e) { log.warn("setMyCommands: {}", e.toString()); }
+    }
+    private static String cmd(String c, String d) { return "{\"command\":\"" + c + "\",\"description\":\"" + d + "\"}"; }
+
     /** Демон-поток: бесконечный long-poll. Сбой сети логируется и не роняет поток. */
     public void start() {
         running = true;
+        registerCommands();
         Thread t = new Thread(() -> {
             while (running) {
                 try {
@@ -83,7 +96,8 @@ public class TelegramCommandListener {
             case "/positions" -> send(renderPositions());
             case "/balance" -> send(orch.balanceBreakdown());
             case "/unlocks", "/next" -> send(orch.upcomingText(java.time.LocalDate.now(java.time.ZoneOffset.UTC).toEpochDay()));
-            case "/help", "/start" -> send("Команды: /status — состояние, /balance — баланс счёта, /positions — позиции, /unlocks — ближайшие разлоки");
+            case "/history", "/pnl" -> send(recorder.recentHistory(15));
+            case "/help", "/start" -> send(helpText());
             default -> { /* не команда — молчим */ }
         }
     }
@@ -111,6 +125,17 @@ public class TelegramCommandListener {
         } else {
             answerCallback(cbId, "неизвестная кнопка");
         }
+    }
+
+    private static String helpText() {
+        return "S5 бот — команды:\n"
+                + "/status — состояние (позиции, ожидания, монитор)\n"
+                + "/positions — открытые позиции с ценой входа\n"
+                + "/balance — баланс счёта (flex/cash)\n"
+                + "/unlocks — ближайшие клифф-разлоки\n"
+                + "/history — последние закрытые сделки и суммарный P&L\n"
+                + "/help — этот список\n\n"
+                + "Входы подтверждаются кнопками ✅/✖️ под сообщением «Нужно подтверждение».";
     }
 
     private String renderPositions() throws Exception {

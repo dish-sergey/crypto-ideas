@@ -83,11 +83,13 @@ public class S5Orchestrator {
         List<UnlockEvent> submitted = new java.util.ArrayList<>();
         List<UnlockEvent> up = feed.upcoming(today);
         upcomingSnapshot = up;                              // снимок для команды /unlocks
-        // окно чуть шире дня входа (approvalLeadDays) — кандидат всплывает заранее, чтобы успела эскалация
-        // напоминаний; сам вход всё равно на unlockDay−entryLead. Плюс ускоренные разлоки (doc 59 §4).
+        // Окно входа по ДНЮ ВХОДА (unlockDay−entryLead): от сегодня (не входим поздно — после −5 это мёртвая
+        // зона, бэктест −3д=+0.09%) до +approvalLeadDays (всплываем заранее под эскалацию напоминаний).
+        // Т.е. today+entryLead <= unlockDay <= today+entryLead+approvalLeadDays.
+        long floor = today + cfg.entryLead();                         // entryDay >= today
         long horizon = today + cfg.entryLead() + cfg.approvalLeadDays();
         for (UnlockEvent e : up) {
-            if (e.unlockDay() > horizon) continue;          // вне окна входа
+            if (e.unlockDay() < floor || e.unlockDay() > horizon) continue;   // день входа прошёл или ещё далеко
             String id = eventId(e);
             if (engine.openSymbols().contains(e.krakenSymbol()) || pending.containsKey(id) || dismissed.contains(id)) continue;
             if (funding.estimate5dFunding(e.base()) < cfg.expensiveFundingThreshold()) continue; // дорогой шорт

@@ -94,21 +94,24 @@ class S5OrchestratorTest {
         assertEquals(18, c.orch.openPositions(), "18×4.5% = 81% ровно лимит; 19-я блокируется");
     }
 
-    @Test void acceleratedUnlockCaughtWithinWindow() throws Exception {
-        // doc 59 §4: событие с датой разлока через 5 дней должно ловиться; и УСКОРЕННОЕ (через 2 дня),
-        // впрыгнувшее в окно, тоже — не только ровно unlock−5.
+    @Test void entryWindowCatchesOnTimeSkipsLateAndFar() throws Exception {
+        // Окно по ДНЮ ВХОДА: сегодня..+approvalLead(2). Вход сегодня и ускоренный «в срок» — ловим;
+        // событие, чей −5 день УЖЕ ПРОШЁЛ (разлок через 3 дня = вход −3, мёртвая зона) — НЕ входим поздно;
+        // слишком далёкое (разлок через 8) — ещё рано.
         Ctx c = ctx(CHEAP);
         long today = 20000;
         c.ex.tick("PF_APTUSD", 10.0); c.ex.tick("PF_ARBUSD", 5.0);
-        c.feed.events.add(ev("APT", today + 5));   // обычный вход (ровно 5 дней)
-        c.feed.events.add(ev("ARB", today + 2));   // ускоренный: в окне, но не 5 дней
+        c.ex.tick("PF_XPLUSD", 0.08); c.ex.tick("PF_SOLUSD", 100.0);
+        c.feed.events.add(ev("APT", today + 5));   // entryDay сегодня — ловим
+        c.feed.events.add(ev("ARB", today + 7));   // entryDay через 2 дня (заранее) — ловим
+        c.feed.events.add(ev("XPL", today + 3));   // entryDay −2 (ПРОШЁЛ −5) — НЕ поздний вход
+        c.feed.events.add(ev("SOL", today + 8));   // entryDay через 3 дня — ещё далеко
         List<UnlockEvent> submitted = c.orch.discover(today);
-        assertEquals(2, submitted.size(), "ловятся оба: и +5, и ускоренный +2");
-        // событие за пределами окна (через 8 дней) не ловится
-        c.feed.events.add(ev("SOL", today + 8));
-        c.ex.tick("PF_SOLUSD", 100.0);
-        // повторный discover в тот же день: APT/ARB уже pending → дедуп, SOL вне окна
-        assertTrue(c.orch.discover(today).isEmpty(), "дубликаты дедуплятся, SOL вне окна");
+        assertEquals(2, submitted.size(), "только APT и ARB (день входа сегодня..+2)");
+        var syms = submitted.stream().map(UnlockEvent::krakenSymbol).toList();
+        assertTrue(syms.contains("PF_APTUSD") && syms.contains("PF_ARBUSD"));
+        assertFalse(syms.contains("PF_XPLUSD"), "поздний вход (−3) не предлагаем");
+        assertFalse(syms.contains("PF_SOLUSD"), "слишком далёкое ещё рано");
     }
 
     @Test void scheduleChangeClosesImmediately() throws Exception {

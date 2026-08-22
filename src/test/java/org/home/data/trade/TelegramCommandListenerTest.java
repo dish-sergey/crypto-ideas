@@ -86,6 +86,14 @@ class TelegramCommandListenerTest {
         assertTrue(r.tx.last().body().contains("PF_APTUSD"), "в ответе — ближайший разлок");
     }
 
+    @Test void helpAndHistoryCommandsReply() throws Exception {
+        Rig r = rig();
+        r.lis.handleUpdates(messageJson(7, "/help", CHAT));
+        assertTrue(r.tx.last().body().contains("/history"), "help перечисляет команды");
+        r.lis.handleUpdates(messageJson(8, "/history", CHAT));
+        assertEquals("sendMessage", r.tx.last().method());       // без БД (NONE) — «история недоступна», но отвечает
+    }
+
     @Test void foreignChatIgnored() throws Exception {
         Rig r = rig();
         r.lis.handleUpdates(messageJson(4, "/status", 999L));     // чужой чат
