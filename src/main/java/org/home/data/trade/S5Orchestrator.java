@@ -305,10 +305,10 @@ public class S5Orchestrator {
               .append(e.unlockDay() - today).append("д  ").append(e.pctLabel());
         }
         int lead = cfg.entryLead();
-        long horizon = today + lead + cfg.approvalLeadDays();
-        long inWindow = up.stream().filter(e -> e.unlockDay() <= horizon).count();
+        long floor = today + lead, horizon = today + lead + cfg.approvalLeadDays();
+        long inWindow = up.stream().filter(e -> e.unlockDay() >= floor && e.unlockDay() <= horizon).count();
         sb.append("\n\nвсего впереди: ").append(up.size())
-          .append(", в окне входа: ").append(inWindow);
+          .append(", в окне входа (день −5 сегодня..+").append(cfg.approvalLeadDays()).append("): ").append(inWindow);
         return sb.toString();
     }
 
