@@ -12,10 +12,8 @@
   остаточный контроль α/β и out-of-sample — см. [[method-mechanism-not-proof]], [[method-residual-control-and-longonly]].
   Малая выборка стопов S5 (36) недостаточна — брать широкую вселенную движений.
 
-## Обычный приоритет
+## Сделано
 
-- [ ] **Бэкап БД S5 (`~/s5/state/s5.db`).** Сейчас НЕ бэкапится (в отличие от `crypto-data` через Litestream→B2).
-  В ней аудит реальных сделок (входы/выходы/финансы/Telegram) и персистентность «сыгранных» событий —
-  потерять нельзя. Варианты: (а) отдельный Litestream-репликатор на этот файл в тот же B2-бакет
-  (`ideas-backup-dish7`, другой префикс); (б) простой cron: суточный `sqlite3 s5.db ".backup"` + rclone в B2.
-  Litestream предпочтительнее (непрерывно, PITR). См. `deploy/SERVERS.md` §2 (как настроен для crypto.db).
+- [x] **Бэкап БД S5 (`~/s5/state/s5.db`)** — 2026-08-22: добавлена вторым `dbs:`-entry в Litestream (тот же
+  бакет `ideas-backup-dish7`, префикс `s5-trade`, retention 72ч, PITR). Восстановление проверено (integrity ok).
+  См. `deploy/SERVERS.md` §2.

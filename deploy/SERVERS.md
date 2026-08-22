@@ -36,10 +36,12 @@
 - **NB:** `onchain` (cron 07:00 UTC) и `macro` (cron пн 07:30) на старте не бегут. На свежей БД сеять вручную: `cd ~/crypto-data && ~/jre25/bin/java -jar app.jar --collect=macro --backfill=onchain --from=2015-01-01`.
 
 ### 2. `litestream` — бэкап БД → Backblaze B2
-- **Что:** `litestream replicate` — непрерывная репликация `crypto.db` в B2, суточные снапшоты, retention 72ч (PITR 3 суток).
+- **Что:** `litestream replicate` — непрерывная репликация в B2, суточные снапшоты, retention 72ч (PITR 3 суток).
+  **Две БД** в одном процессе (`dbs:` с двумя entry): `crypto-data/data/crypto.db` (префикс `crypto-ideas`) и
+  **`~/s5/state/s5.db`** (префикс `s5-trade`, добавлено 2026-08-22 — аудит live-сделок S5, нельзя терять).
 - **Версия:** Litestream **v0.3.13** (демон `replicate`; v0.5.x — это VFS-`.so`, не годится).
 - **Юнит:** `/etc/systemd/system/litestream.service`
-- **Конфиг:** `/etc/litestream.yml` (ссылается на env-переменные).
+- **Конфиг:** `/etc/litestream.yml` (ссылается на env-переменные; бэкап прежнего — `.bak-pre-s5`).
 - **Секреты B2:** `/etc/litestream.env` (права `600 root`, читает systemd как root). Копия ключей у тебя в `D:\servers\backblaze\key.txt`. В git НЕ коммитим.
 - **B2:** бакет `ideas-backup-dish7` (id `1003dc43b957910c9ffd0915`), регион `eu-central-003`, endpoint `s3.eu-central-003.backblazeb2.com`.
 - **⚠️ Скрытые версии (ловушка Litestream+B2):** Litestream по retention постоянно удаляет WAL-сегменты,
@@ -50,8 +52,8 @@
   `rclone cleanup :b2:ideas-backup-dish7` (b2-backend, креды `RCLONE_B2_ACCOUNT`/`RCLONE_B2_KEY` из `key.txt`,
   файл в CRLF — стрипнуть `\r`). Проверить размеры: `rclone size :b2:<bucket>` (живые) vs `--b2-versions` (все).
 - **Проверить:** `systemctl status litestream` · `journalctl -u litestream -f`
-- **Список снапшотов:** `sudo bash -c 'set -a; . /etc/litestream.env; litestream snapshots -config /etc/litestream.yml ~/crypto-data/data/crypto.db'`
-- **Восстановить БД:** `sudo bash -c 'set -a; . /etc/litestream.env; litestream restore -config /etc/litestream.yml -o /tmp/restored.db ~/crypto-data/data/crypto.db'`
+- **Список снапшотов:** `sudo bash -c 'set -a; . /etc/litestream.env; litestream snapshots -config /etc/litestream.yml <ПУТЬ_К_БД>'` (crypto.db или `~/s5/state/s5.db`).
+- **Восстановить БД:** `sudo bash -c 'set -a; . /etc/litestream.env; litestream restore -config /etc/litestream.yml -o /tmp/restored.db <ПУТЬ_К_БД>'` — проверять под sudo (restore пишет root-owned файл): `sudo sqlite3 /tmp/restored.db "PRAGMA integrity_check;"`. Восстановление s5.db проверено 2026-08-22 (integrity ok).
 
 ### 3. `arm-catch` — ловушка ARM
 - **Что:** `~/arm_catch.sh` в цикле пытается запустить бесплатный A1.Flex по 3 зонам Frankfurt через OCI instance principal. Поймает — `exit 0`, сервис встаёт сам.
