@@ -40,7 +40,11 @@ public class BasisReport {
     }
 
     public void run(int hours, long bucketMs, String out) {
-        long toMs = System.currentTimeMillis();
+        run(hours, bucketMs, System.currentTimeMillis(), out);
+    }
+
+    /** Конец окна задаётся явно по той же причине, что и в {@code SimRunner}. */
+    public void run(int hours, long bucketMs, long toMs, String out) {
         long fromMs = toMs - hours * 3600_000L;
 
         SnapshotReader.Window window = reader.read(fromMs, toMs, cfg.fairMaxSkewMs());

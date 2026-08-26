@@ -147,6 +147,8 @@ public class CliRunner implements ApplicationRunner {
                 revx.getObject().basis(
                         Integer.parseInt(firstOr(args, "hours", "24")),
                         Long.parseLong(firstOr(args, "bucket-seconds", "5")) * 1000L,
+                        java.time.Instant.parse(firstOr(args, "to",
+                                java.time.Instant.now().toString())).toEpochMilli(),
                         firstOr(args, "out", "reports/revx_basis.md"));
             }
             if (args.containsOption("revx-sim")) {

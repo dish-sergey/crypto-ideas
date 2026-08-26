@@ -73,8 +73,8 @@ public class RevxCommands {
     }
 
     /** --revx-basis: курс USDC/USD, его устойчивость и пригодность пар (ТЗ §4.1). */
-    public void basis(int hours, long bucketMs, String out) {
-        basisReport.run(hours, bucketMs, out);
+    public void basis(int hours, long bucketMs, long toMs, String out) {
+        basisReport.run(hours, bucketMs, toMs, out);
     }
 
     /** --revx-sim: обязательные прогоны §4.7 и отчёт §5.3 по паре. */
