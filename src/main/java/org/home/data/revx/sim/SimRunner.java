@@ -132,6 +132,17 @@ public class SimRunner {
                     new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows()),
                     cfg.simMakerFee(), base.offset(), params.inventoryCap()));
         }
+        // Скос выключен: по BTC покупки стабильно лучше продаж на 5–7 б.п. во ВСЕХ
+        // режимах, включая падающий, — дрейфом рынка это не объясняется. Остаётся
+        // конструкция котировщика: скос сдвигает обе цены вниз при полном инвентаре,
+        // делая аск агрессивнее. Прогон с нулевым скосом отвечает, он ли это.
+        Quoter.Params noSkew = new Quoter.Params(base.offset(), base.size(), base.inventoryCap(),
+                0.0, base.requoteThreshold(), base.quoteStep());
+        SimEngine.Result noSkewResult = new SimEngine(noSkew, limits, cfg.simMakerFee())
+                .run(data.windows());
+        runs.add(new Run("скос выключен", noSkewResult, cfg.simMakerFee(), base.offset(),
+                base.inventoryCap()));
+
         // Контроль: случайные котировки (то же присутствие в книге, цены наугад)
         SimEngine.Result randomResult = new SimEngine(base, limits, cfg.simMakerFee(),
                 QuotePolicy.random(base, cfg.simRandomSeed())).run(data.windows());
@@ -163,7 +174,8 @@ public class SimRunner {
                     nullOf(rung, data));
         }
 
-        String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder);
+        String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
+                noSkewResult);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
@@ -210,6 +222,16 @@ public class SimRunner {
 
     private static double pct(double[] sorted, double q) {
         return sorted[Math.min(sorted.length - 1, Math.max(0, (int) Math.round(q * (sorted.length - 1))))];
+    }
+
+    private static void appendSkewRow(StringBuilder sb, String label, SimEngine.Result result) {
+        double buy = netEdgeBp(result, 60_000, Side.BUY);
+        double sell = netEdgeBp(result, 60_000, Side.SELL);
+        sb.append("| ").append(label)
+                .append(" | ").append(round(netEdgeBp(result, 60_000), 2))
+                .append(" | ").append(round(buy, 2))
+                .append(" | ").append(round(sell, 2))
+                .append(" | ").append(round(buy - sell, 2)).append(" |\n");
     }
 
     /** Секунды/минуты/часы: «4200000 мс» в отчёте не читается. */
@@ -355,7 +377,7 @@ public class SimRunner {
 
     private String render(String symbol, int hours, SimDataReader.Dataset data, Quoter.Params base,
                           ExecutionModel.Limits limits, List<Run> runs, SimEngine.Result baseResult,
-                          List<Rung> ladder) {
+                          List<Rung> ladder, SimEngine.Result noSkewResult) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
         sb.append("Прогоны ТЗ §4.7, отчёт §5.3. Код `").append(registry.gitHash())
@@ -465,6 +487,72 @@ public class SimRunner {
                 + "разница по захвату — это и есть вклад котирования. `total` смешивает "
                 + "его с бетой, и именно поэтому вердикт по `total` на одном seed'е "
                 + "(док. 74) оказался неустойчивым.\n\n");
+
+        sb.append("### Диагностика модели исполнения по ступеням (ТЗ §0)\n\n");
+        sb.append("Лестница монотонна, значит первое подозрение — на допущения об "
+                + "очереди. Заявка, улучшающая книгу, встаёт одна на новом уровне и "
+                + "очередь перед ней нулевая; заявка, совпавшая с существующим уровнем, "
+                + "встаёт в конец очереди. Если весь результат широкого отступа держится "
+                + "на исполнениях первого типа, значит модель просто разрешила нам "
+                + "стоять там, где в реальности пришлось бы ждать.\n\n");
+        sb.append("| Отступ | Улучшаем книгу, % окон | Встаём в очередь | Вне видимых уровней "
+                + "| Исполнений от улучшающих заявок | Очередь при исполнении: медиана / 90-й |\n");
+        sb.append("|---|---|---|---|---|---|\n");
+        for (Rung rung : ladder) {
+            ExecutionModel.Stats stats = rung.result().execution();
+            double[] queues = stats.queueAtFill().stream().mapToDouble(Double::doubleValue)
+                    .filter(Double::isFinite).sorted().toArray();
+            sb.append("| ").append(round(rung.offset() * 100, 3)).append("%")
+                    .append(" | ").append(round(100 * stats.improvingShare(), 1)).append("%")
+                    .append(" | ").append(round(100 * (1 - stats.improvingShare()
+                            - stats.invisibleShare()), 1)).append("%")
+                    .append(" | ").append(round(100 * stats.invisibleShare(), 1)).append("%")
+                    .append(" | ").append(round(100 * stats.improvingFillShare(), 1)).append("%")
+                    .append(" | ").append(queues.length == 0 ? "—"
+                            : round(pct(queues, 0.5), 4) + " / " + round(pct(queues, 0.9), 4))
+                    .append(" |\n");
+        }
+        sb.append("\nЧитать так: доля «улучшаем книгу», близкая к 100% на широком отступе, "
+                + "означала бы, что мы всё время котируем ВНУТРИ спреда и очередь нам "
+                + "просто не встречается — тогда преимущество широкой котировки создано "
+                + "моделью. Заметная доля исполнений из очереди, наоборот, показывает, "
+                + "что заявка реально ждала своей позиции.\n\n");
+
+        sb.append("### Кто кого ведёт: опора или котируемая книга\n\n");
+        LeadLag.Result leadLag = LeadLag.compute(data.windows(), 6);
+        sb.append("Положительный markout с обеих сторон объясняется двояко: либо это "
+                + "настоящая мини-реверсия, либо опорная книга ОТСТАЁТ и markout просто "
+                + "догоняет уже случившееся. Различает их сдвиг взаимной корреляции "
+                + "приращений: `lag > 0` означает, что опора повторяет котируемую книгу "
+                + "с запозданием.\n\n");
+        sb.append("| Показатель | Значение |\n|---|---|\n");
+        sb.append("| Окон в расчёте | ").append(leadLag.windows()).append(" |\n");
+        sb.append("| Доля окон, где менялась опора / книга USDC | ")
+                .append(round(100 * leadLag.referenceChangeRate(), 1)).append("% / ")
+                .append(round(100 * leadLag.quotedChangeRate(), 1)).append("% |\n");
+        if (leadLag.peak() != null) {
+            sb.append("| Пик корреляции | сдвиг ").append(leadLag.peak().lagWindows())
+                    .append(" окон (").append(leadLag.peak().lagWindows()
+                            * cfg.authBookPeriodSeconds()).append(" с), corr = ")
+                    .append(round(leadLag.peak().correlation(), 4)).append(" |\n");
+        }
+        sb.append("\n| Сдвиг, окон | Корреляция |\n|---|---|\n");
+        for (LeadLag.Point point : leadLag.points()) {
+            sb.append("| ").append(point.lagWindows()).append(" | ")
+                    .append(round(point.correlation(), 4)).append(" |\n");
+        }
+        sb.append("\nПик на нуле означает, что книги живут синхронно и объяснение "
+                + "«устаревшая опора» отпадает. Пик справа — опора отстаёт, и уровень "
+                + "захвата завышен ровно на величину этого запаздывания.\n\n");
+
+        sb.append("### Откуда асимметрия покупок и продаж: прогон без скоса\n\n");
+        sb.append("| Прогон | Чистый край 60 с | покупки | продажи | Разрыв |\n|---|---|---|---|---|\n");
+        appendSkewRow(sb, "базовый (скос включён)", baseResult);
+        appendSkewRow(sb, "скос выключен", noSkewResult);
+        sb.append("\nЕсли разрыв между сторонами схлопывается при выключенном скосе, "
+                + "асимметрия — свойство котировщика, а не рынка: скос сдвигает обе цены "
+                + "вниз при полном инвентаре, делая аск агрессивнее и хуже по цене. "
+                + "Если разрыв остаётся, дело в потоке.\n\n");
 
         sb.append("### Край по режимам рынка внутри окна\n\n");
         sb.append("Окно поймало рост BTC на 14%, поэтому «край, который есть в среднем» "

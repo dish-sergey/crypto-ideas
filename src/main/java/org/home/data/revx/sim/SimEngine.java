@@ -40,7 +40,8 @@ public final class SimEngine {
             double maxDrawdown,
             double fairFirst,
             double fairLast,
-            TreeMap<Long, Double> fairSeries) {
+            TreeMap<Long, Double> fairSeries,
+            ExecutionModel.Stats execution) {
 
         /** Перевыставлений в сутки — сверяется с лимитом запросов (ТЗ §4.2, §5.4 п.6). */
         public double requotesPerDay(long spanMs) {
@@ -149,6 +150,7 @@ public final class SimEngine {
                 requotes++;
             }
 
+            execution.observe();
             List<Fill> fills = execution.onWindow(window.trades(), window.fair());
             for (Fill fill : fills) {
                 pnl.add(fill);
@@ -184,6 +186,6 @@ public final class SimEngine {
         double avgInventory = inventorySamples == 0 ? 0 : inventorySum / inventorySamples;
         return new Result(pnl.decompose(fairLast), allFills, requotes, windows.size(), paused,
                 maxInventory, avgInventory, atCap, filledQty, marketQty, maxDrawdown,
-                fairFirst, fairLast, fairSeries);
+                fairFirst, fairLast, fairSeries, execution.stats());
     }
 }

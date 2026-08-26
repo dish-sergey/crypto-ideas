@@ -28,6 +28,68 @@ public final class ExecutionModel {
         }
     }
 
+    /**
+     * Диагностика самой модели (ТЗ §0). Лестница отступа монотонна — чем шире
+     * котируем, тем лучше результат, — и первое подозрение обязано падать на
+     * допущения об очереди. Отсюда три величины, которые нужно видеть по каждой
+     * ступени: где стоит наша цена относительно книги, какая очередь была перед
+     * нами в момент исполнения, и какая доля исполнений досталась заявкам,
+     * улучшавшим книгу (то есть тем, у кого очередь по построению нулевая).
+     *
+     * Классификация:
+     *  - {@code improving} — цена лучше лучшей в книге, встаём одни на новом уровне;
+     *  - {@code joining} — цена совпала с существующим уровнем, встаём в конец очереди;
+     *  - {@code invisible} — цена вне пяти видимых уровней, исполниться не можем.
+     */
+    public static final class Stats {
+        private long improvingWindows;
+        private long joiningWindows;
+        private long invisibleWindows;
+        private long improvingFills;
+        private long joiningFills;
+        private final List<Double> queueAtFill = new ArrayList<>();
+
+        public long improvingWindows() {
+            return improvingWindows;
+        }
+
+        public long joiningWindows() {
+            return joiningWindows;
+        }
+
+        public long invisibleWindows() {
+            return invisibleWindows;
+        }
+
+        public long improvingFills() {
+            return improvingFills;
+        }
+
+        public long joiningFills() {
+            return joiningFills;
+        }
+
+        /** Очередь перед заявкой по последнему снимку до исполнения. */
+        public List<Double> queueAtFill() {
+            return List.copyOf(queueAtFill);
+        }
+
+        public double improvingShare() {
+            long total = improvingWindows + joiningWindows + invisibleWindows;
+            return total == 0 ? Double.NaN : (double) improvingWindows / total;
+        }
+
+        public double invisibleShare() {
+            long total = improvingWindows + joiningWindows + invisibleWindows;
+            return total == 0 ? Double.NaN : (double) invisibleWindows / total;
+        }
+
+        public double improvingFillShare() {
+            long total = improvingFills + joiningFills;
+            return total == 0 ? Double.NaN : (double) improvingFills / total;
+        }
+    }
+
     /** Состояние стоящей заявки. */
     private static final class Resting {
         final Side side;
@@ -35,6 +97,8 @@ public final class ExecutionModel {
         final long placedAtMs;
         double remaining;
         double queueAhead;
+        double queueAtSnapshot;
+        boolean improving;
         boolean visible;
 
         Resting(Side side, double price, double qty, long placedAtMs) {
@@ -47,17 +111,44 @@ public final class ExecutionModel {
         Resting copy() {
             Resting c = new Resting(side, price, remaining, placedAtMs);
             c.queueAhead = queueAhead;
+            c.queueAtSnapshot = queueAtSnapshot;
+            c.improving = improving;
             c.visible = visible;
             return c;
         }
     }
 
     private final Limits limits;
+    private final Stats stats = new Stats();
     private Resting bid;
     private Resting ask;
 
     public ExecutionModel(Limits limits) {
         this.limits = limits;
+    }
+
+    public Stats stats() {
+        return stats;
+    }
+
+    /**
+     * Учесть текущее положение заявок относительно книги. Вызывается движком раз
+     * на окно — отдельно от {@code refresh}, чтобы счётчик считал окна, а не
+     * пересчёты видимости.
+     */
+    public void observe() {
+        for (Resting order : new Resting[]{bid, ask}) {
+            if (order == null) {
+                continue;
+            }
+            if (!order.visible) {
+                stats.invisibleWindows++;
+            } else if (order.improving) {
+                stats.improvingWindows++;
+            } else {
+                stats.joiningWindows++;
+            }
+        }
     }
 
     /**
@@ -135,19 +226,42 @@ public final class ExecutionModel {
             // остаётся ровно в прежнем состоянии, включая непройденную очередь.
             if (value(bidFills, fairAtWindowEnd) <= value(askFills, fairAtWindowEnd)) {
                 bid = commit(bidCopy);
+                record(bidCopy, bidFills);
                 return bidFills;
             }
             ask = commit(askCopy);
+            record(askCopy, askFills);
             return askFills;
         }
 
         bid = commit(bidCopy);
         ask = commit(askCopy);
+        record(bidCopy, bidFills);
+        record(askCopy, askFills);
         List<Fill> fills = new ArrayList<>(bidFills.size() + askFills.size());
         fills.addAll(bidFills);
         fills.addAll(askFills);
         fills.sort(java.util.Comparator.comparingLong(Fill::tsMs));
         return fills;
+    }
+
+    /**
+     * Статистика пишется ТОЛЬКО по стороне, чьи исполнения приняты. Считать её
+     * внутри {@code simulate} нельзя: стороны прогоняются на копиях, и при
+     * срабатывании обеих одна из них выбрасывается — её исполнения не состоялись.
+     */
+    private void record(Resting order, List<Fill> fills) {
+        if (order == null || fills.isEmpty()) {
+            return;
+        }
+        for (int i = 0; i < fills.size(); i++) {
+            if (order.improving) {
+                stats.improvingFills++;
+            } else {
+                stats.joiningFills++;
+            }
+            stats.queueAtFill.add(order.queueAtSnapshot);
+        }
     }
 
     private Resting commit(Resting simulated) {
@@ -225,6 +339,7 @@ public final class ExecutionModel {
                 : order.price <= deepest + limits.priceTolerance();
 
         order.visible = improves || insideVisible;
+        order.improving = improves;
         if (!order.visible) {
             order.queueAhead = Double.POSITIVE_INFINITY;
             return;
@@ -233,6 +348,9 @@ public final class ExecutionModel {
         order.queueAhead = improves
                 ? 0
                 : book.qtyAt(order.side, order.price, limits.priceTolerance());
+        // Очередь по последнему снимку до исполнения: внутри окна она вычитается
+        // прошедшим объёмом, и к моменту исполнения исходное значение теряется.
+        order.queueAtSnapshot = order.queueAhead;
     }
 
     private double roundDown(double qty) {
