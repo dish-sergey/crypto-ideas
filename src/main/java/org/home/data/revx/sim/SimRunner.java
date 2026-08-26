@@ -51,6 +51,20 @@ public class SimRunner {
                        double cap) {
     }
 
+    /** Ступень лестницы отступа: сама стратегия и её нулевое распределение. */
+    private record Rung(double offset, SimEngine.Result result, Null nulls) {
+    }
+
+    /**
+     * Нулевое распределение контроля: N прогонов случайных котировок с разными
+     * seed'ами. {@code capturePercentile} — доля прогонов контроля, которые
+     * стратегия обошла по захвату спреда; 50% означает «неотличима от случайной».
+     */
+    private record Null(int seeds, double captureMean, double captureSd, double captureP05,
+                        double captureP95, double capturePercentile,
+                        double totalMean, double totalPercentile) {
+    }
+
     public void run(String symbol, int hours, String out) {
         run(symbol, hours, System.currentTimeMillis(), out);
     }
@@ -110,23 +124,120 @@ public class SimRunner {
                     new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows()),
                     cfg.simMakerFee(), base.offset(), params.inventoryCap()));
         }
-        // Контроль: случайные котировки (тот же присутствие в книге, цены наугад)
+        // Контроль: случайные котировки (то же присутствие в книге, цены наугад)
         SimEngine.Result randomResult = new SimEngine(base, limits, cfg.simMakerFee(),
                 QuotePolicy.random(base, cfg.simRandomSeed())).run(data.windows());
         runs.add(new Run("контроль: случайные котировки", randomResult, cfg.simMakerFee(),
                 base.offset(), base.inventoryCap()));
 
+        // Лестница отступа с контролем на КАЖДОЙ ступени (док. 75 §5). Раньше и
+        // buy & hold, и случайные считались только при базовом d, а вердикт «kill-критерий
+        // сработал» переносился на всю конструкцию. Между тем d двигает и число
+        // исполнений, и знак markout — то есть ровно то, что этими критериями и меряется.
+        List<Rung> ladder = new ArrayList<>();
+        for (double offset : offsets(base)) {
+            Quoter.Params params = withOffset(base, offset);
+            SimEngine.Result result = offset == base.offset() ? baseResult
+                    : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
+            ladder.add(new Rung(offset, result, nullDistribution(params, limits, data, result)));
+        }
+
         for (Run run : runs) {
             registry.record(run.label(), symbol, data.fromMs(), data.toMs(),
                     configOf(run, base, limits), resultOf(run.result(), data));
         }
+        for (Rung rung : ladder) {
+            registry.record(String.format("нулевое распределение ×%d, отступ %.3f%%",
+                            cfg.simRandomSeeds(), rung.offset() * 100),
+                    symbol, data.fromMs(), data.toMs(),
+                    configOf(new Run("", rung.result(), cfg.simMakerFee(), rung.offset(),
+                            base.inventoryCap()), base, limits),
+                    nullOf(rung, data));
+        }
 
-        String markdown = render(symbol, hours, data, base, limits, runs, baseResult);
+        String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
                 round(baseResult.pnl().spreadCapture(), 4), round(baseResult.pnl().inventoryPnl(), 4),
                 baseResult.fills().size(), out);
+    }
+
+    /** Базовый отступ плюс лестница, по возрастанию и без дублей. */
+    private double[] offsets(Quoter.Params base) {
+        return java.util.stream.DoubleStream
+                .concat(java.util.stream.DoubleStream.of(base.offset()),
+                        java.util.Arrays.stream(cfg.simOffsetLadder()))
+                .distinct().sorted().toArray();
+    }
+
+    private Null nullDistribution(Quoter.Params params, ExecutionModel.Limits limits,
+                                  SimDataReader.Dataset data, SimEngine.Result strategy) {
+        int seeds = Math.max(1, cfg.simRandomSeeds());
+        double[] captures = new double[seeds];
+        double[] totals = new double[seeds];
+        for (int i = 0; i < seeds; i++) {
+            SimEngine.Result result = new SimEngine(params, limits, cfg.simMakerFee(),
+                    QuotePolicy.random(params, cfg.simRandomSeed() + i)).run(data.windows());
+            captures[i] = result.pnl().spreadCapture();
+            totals[i] = result.pnl().total();
+        }
+        double captureMean = java.util.Arrays.stream(captures).average().orElse(Double.NaN);
+        double variance = java.util.Arrays.stream(captures)
+                .map(v -> (v - captureMean) * (v - captureMean)).sum() / Math.max(1, seeds - 1);
+        double[] sortedCaptures = captures.clone();
+        java.util.Arrays.sort(sortedCaptures);
+        return new Null(seeds, captureMean, Math.sqrt(variance),
+                pct(sortedCaptures, 0.05), pct(sortedCaptures, 0.95),
+                share(captures, strategy.pnl().spreadCapture()),
+                java.util.Arrays.stream(totals).average().orElse(Double.NaN),
+                share(totals, strategy.pnl().total()));
+    }
+
+    /** Доля значений контроля, которые стратегия превзошла. */
+    private static double share(double[] values, double strategy) {
+        long below = java.util.Arrays.stream(values).filter(v -> v < strategy).count();
+        return 100.0 * below / values.length;
+    }
+
+    private static double pct(double[] sorted, double q) {
+        return sorted[Math.min(sorted.length - 1, Math.max(0, (int) Math.round(q * (sorted.length - 1))))];
+    }
+
+    /** Секунды/минуты/часы: «4200000 мс» в отчёте не читается. */
+    private static String humanMs(double ms) {
+        if (Double.isNaN(ms)) {
+            return "—";
+        }
+        if (ms < 60_000) {
+            return round(ms / 1000, 1) + " с";
+        }
+        if (ms < 3_600_000) {
+            return round(ms / 60_000, 1) + " мин";
+        }
+        return round(ms / 3_600_000, 1) + " ч";
+    }
+
+    private static double turnover(SimEngine.Result result) {
+        return result.fills().stream().mapToDouble(Fill::notional).sum();
+    }
+
+    /**
+     * Чистый край на единицу оборота — величина, которую только и можно сравнивать
+     * с комиссией (док. 75 §3). Захват меряется в markout(0), то есть ДО того, как
+     * неблагоприятный отбор заберёт своё; комиссия же платится с оборота. markout
+     * в этом стенде уже домножен на объём, поэтому сумма markout(0) тождественно
+     * равна захвату, а сумма markout(Δ) — это то, что от него осталось к горизонту Δ.
+     */
+    private static double netEdgeBp(SimEngine.Result result, long horizonMs) {
+        double turnover = turnover(result);
+        if (turnover <= 0) {
+            return Double.NaN;
+        }
+        Markout.Stats atFill = Markout.compute(result.fills(), result.fairSeries(), 0);
+        Markout.Stats later = Markout.compute(result.fills(), result.fairSeries(), horizonMs);
+        double net = atFill.mean() * atFill.fills() + later.mean() * later.fills();
+        return net / turnover * 10_000;
     }
 
     /** base_step и quote_step берутся из спецификации пары (ТЗ §4.6 п.6). */
@@ -168,6 +279,20 @@ public class SimRunner {
         return config;
     }
 
+    private Map<String, Object> nullOf(Rung rung, SimDataReader.Dataset data) {
+        Map<String, Object> out = new LinkedHashMap<>(resultOf(rung.result(), data));
+        Null nulls = rung.nulls();
+        out.put("null_seeds", nulls.seeds());
+        out.put("null_capture_mean", nulls.captureMean());
+        out.put("null_capture_sd", nulls.captureSd());
+        out.put("null_capture_p05", nulls.captureP05());
+        out.put("null_capture_p95", nulls.captureP95());
+        out.put("strategy_capture_percentile", nulls.capturePercentile());
+        out.put("null_total_mean", nulls.totalMean());
+        out.put("strategy_total_percentile", nulls.totalPercentile());
+        return out;
+    }
+
     private Map<String, Object> resultOf(SimEngine.Result result, SimDataReader.Dataset data) {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("total", result.pnl().total());
@@ -184,6 +309,17 @@ public class SimRunner {
         out.put("windows_at_cap", result.windowsAtCap());
         out.put("windows_paused", result.windowsPaused());
         out.put("buy_and_hold", result.buyAndHoldPnl());
+        double turnover = turnover(result);
+        out.put("turnover", turnover);
+        out.put("capture_per_turnover_bp",
+                turnover > 0 ? result.pnl().spreadCapture() / turnover * 10_000 : Double.NaN);
+        out.put("net_edge_60s_bp", netEdgeBp(result, 60_000));
+        out.put("net_edge_300s_bp", netEdgeBp(result, 300_000));
+        HoldingTime.Stats holding = HoldingTime.compute(result.fills());
+        out.put("holding_median_ms", holding.medianMs());
+        out.put("holding_p90_ms", holding.p90Ms());
+        out.put("holding_mean_ms", holding.meanMs());
+        out.put("holding_unclosed_share", holding.unclosedShare());
         for (long horizon : new long[]{0, 10_000, 60_000, 300_000}) {
             Markout.Stats stats = Markout.compute(result.fills(), result.fairSeries(), horizon);
             out.put("markout_" + horizon / 1000 + "s_mean", stats.mean());
@@ -194,7 +330,8 @@ public class SimRunner {
     }
 
     private String render(String symbol, int hours, SimDataReader.Dataset data, Quoter.Params base,
-                          ExecutionModel.Limits limits, List<Run> runs, SimEngine.Result baseResult) {
+                          ExecutionModel.Limits limits, List<Run> runs, SimEngine.Result baseResult,
+                          List<Rung> ladder) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
         sb.append("Прогоны ТЗ §4.7, отчёт §5.3. Код `").append(registry.gitHash())
@@ -234,7 +371,85 @@ public class SimRunner {
                     .append(" |\n");
         }
 
-        sb.append("\n## Контроли (ТЗ §4.7 — главные)\n\n");
+        sb.append("\n## Лестница отступа: где на самом деле рабочая точка (док. 75 §5)\n\n");
+        sb.append("Контроли считаются на КАЖДОЙ ступени, а не только при базовом `d`. "
+                + "Чистый край = `markout(0) + markout(Δ)` на единицу оборота: только его "
+                + "и можно сравнивать с комиссией.\n\n");
+        sb.append("| Отступ `d` | Исполнений/сут | Оборот стратегии | Захват, б.п. "
+                + "| Чистый край 60 с | Чистый край 300 с | Порог maker (60 с) "
+                + "| Постановок/сут | Total | Buy & hold | Случайные: процентиль |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
+        for (Rung rung : ladder) {
+            SimEngine.Result r = rung.result();
+            double perDay = r.fills().size() / (data.spanMs() / 86_400_000.0);
+            double net60 = netEdgeBp(r, 60_000);
+            sb.append("| ").append(round(rung.offset() * 100, 3)).append("%")
+                    .append(rung.offset() == base.offset() ? " (базовый)" : "")
+                    .append(" | ").append(Math.round(perDay))
+                    .append(" | ").append(round(turnover(r), 0))
+                    .append(" | ").append(round(turnover(r) > 0
+                            ? r.pnl().spreadCapture() / turnover(r) * 10_000 : Double.NaN, 2))
+                    .append(" | ").append(round(net60, 2))
+                    .append(" | ").append(round(netEdgeBp(r, 300_000), 2))
+                    .append(" | ").append(round(net60 / 100, 4)).append("%")
+                    .append(" | ").append(Math.round(perDay))
+                    .append(" | ").append(round(r.pnl().total(), 1))
+                    .append(" | ").append(round(r.buyAndHoldPnl(), 1))
+                    .append(" | ").append(round(rung.nulls().capturePercentile(), 0)).append("%")
+                    .append(" |\n");
+        }
+        sb.append("\n«Постановок/сут» равно числу исполнений: после каждого исполнения "
+                + "заявку надо создать заново (`POST /orders`, 1 000/сутки), тогда как "
+                + "перевыставление цены — это `replace` без суточного потолка. Поэтому "
+                + "ВМЕСТИМОСТЬ ПО ПАРАМ управляется отступом, а не темпом запросов.\n\n");
+
+        sb.append("### Нулевое распределение контроля (док. 75 §4)\n\n");
+        sb.append("Один seed случайных котировок — это монетка, а не вердикт. Ниже — ")
+                .append(cfg.simRandomSeeds())
+                .append(" независимых прогонов контроля на каждой ступени; процентиль ")
+                .append("показывает, какую долю из них стратегия обошла по захвату спреда. ")
+                .append("50% означает «неотличима от случайной», и вопрос «побит контроль ")
+                .append("или нет» на этом закрывается числом.\n\n");
+        sb.append("| Отступ | Захват стратегии | Контроль: среднее | σ | 5-й … 95-й процентиль "
+                + "| Стратегия выше, % прогонов | (σ от среднего) |\n");
+        sb.append("|---|---|---|---|---|---|---|\n");
+        for (Rung rung : ladder) {
+            Null n = rung.nulls();
+            double capture = rung.result().pnl().spreadCapture();
+            double z = n.captureSd() > 0 ? (capture - n.captureMean()) / n.captureSd() : Double.NaN;
+            sb.append("| ").append(round(rung.offset() * 100, 3)).append("%")
+                    .append(" | ").append(round(capture, 1))
+                    .append(" | ").append(round(n.captureMean(), 1))
+                    .append(" | ").append(round(n.captureSd(), 1))
+                    .append(" | ").append(round(n.captureP05(), 1)).append(" … ")
+                    .append(round(n.captureP95(), 1))
+                    .append(" | ").append(round(n.capturePercentile(), 0)).append("%")
+                    .append(" | ").append(round(z, 1)).append("σ |\n");
+        }
+        sb.append("\n");
+
+        sb.append("## Сколько живёт инвентарь (ТЗ §5.3)\n\n");
+        HoldingTime.Stats holding = HoldingTime.compute(baseResult.fills());
+        sb.append("От этого числа зависит, какой горизонт markout сравнивать с комиссией "
+                + "(док. 75 §3), поэтому оно стоит рядом с порогом, а не в приложении. "
+                + "Сопоставление лотов — FIFO, то есть самое длинное из возможных: "
+                + "ответ дан в невыгодную для стратегии сторону.\n\n");
+        sb.append("| Показатель | Значение |\n|---|---|\n");
+        sb.append("| Закрытых лотов | ").append(holding.lots()).append(" |\n");
+        sb.append("| Время удержания: медиана / 90-й процентиль | ")
+                .append(humanMs(holding.medianMs())).append(" / ")
+                .append(humanMs(holding.p90Ms())).append(" |\n");
+        sb.append("| Средневзвешенное по объёму | ").append(humanMs(holding.meanMs())).append(" |\n");
+        sb.append("| Инвентарь, не разгруженный до конца окна | ")
+                .append(round(holding.unclosedQty(), 4)).append(" (")
+                .append(round(100 * holding.unclosedShare(), 1)).append("% купленного) |\n\n");
+        long applicable = holding.medianMs() <= 60_000 ? 60_000 : 300_000;
+        sb.append("**Применимый горизонт: ").append(applicable / 1000).append(" с** — по медиане ")
+                .append("времени удержания. Порог по комиссии на нём: **")
+                .append(round(netEdgeBp(baseResult, applicable) / 100, 4)).append("%**")
+                .append(" (при базовом `d`).\n\n");
+
+        sb.append("## Контроли (ТЗ §4.7 — главные)\n\n");
         SimEngine.Result random = runs.stream()
                 .filter(r -> r.label().startsWith("контроль"))
                 .findFirst().orElseThrow().result();
@@ -305,16 +520,32 @@ public class SimRunner {
                     .append(" |\n");
             sb.append("| Средний объём на исполнение | ").append(round(totalQty / quantities.length, 6))
                     .append(" |\n");
-            sb.append("| Оборот (нотионал) | ").append(round(turnover, 2)).append(" |\n");
-            sb.append("| **Захват спреда на единицу оборота** | **")
+            // Оборот СТРАТЕГИИ (что прошло через наши заявки) — не путать с оборотом
+            // рынка в отчёте по парам: их отношение и есть доля потока (док. 75 §6).
+            sb.append("| Оборот стратегии (нотионал) | ").append(round(turnover, 2)).append(" |\n");
+            sb.append("| Захват спреда на единицу оборота, до отбора | ")
                     .append(turnover > 0 ? round(baseResult.pnl().spreadCapture() / turnover * 10_000, 2)
                             + " б.п." : "—")
-                    .append("** |\n");
+                    .append(" |\n");
+            sb.append("| **Чистый край на оборот, 60 с / 300 с** | **")
+                    .append(round(netEdgeBp(baseResult, 60_000), 2)).append(" / ")
+                    .append(round(netEdgeBp(baseResult, 300_000), 2)).append(" б.п.** |\n");
             sb.append("| Захват спреда на исполнение | ")
                     .append(round(baseResult.pnl().spreadCapture() / quantities.length, 4)).append(" |\n\n");
             sb.append("Метрика «на оборот» — основная: при частичных исполнениях «на исполнение» "
                     + "несопоставима между прогонами, потому что зависит от того, как поток "
                     + "раздробил заявку.\n\n");
+            // Захват по построению близок к котируемому отступу d, и совпадение этой
+            // величины между парами не говорит о площадке ничего (док. 75 §2). Смысл
+            // отношения другой: сколько котируемого края доходит до нас в момент
+            // исполнения, то есть чего стоят очередь и частичные исполнения.
+            sb.append("Захват — это ")
+                    .append(round(100 * (turnover > 0
+                            ? baseResult.pnl().spreadCapture() / turnover : 0) / base.offset(), 0))
+                    .append("% котируемого отступа `d` = ").append(round(base.offset() * 100, 3))
+                    .append("%. Совпадение этой доли между парами — арифметика, а не свойство "
+                            + "площадки: читать её нужно как «сколько котируемого края доживает "
+                            + "до исполнения», и потери дальше идут в markout, а не в очередь.\n\n");
         }
 
         sb.append("## Реализуемость (ТЗ §5.4 п.6)\n\n");

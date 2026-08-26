@@ -63,6 +63,7 @@ public class RevxConfig {
     private final double simMakerFee;
     private final double simPessimisticFee;
     private final long simRandomSeed;
+    private final int simRandomSeeds;
     private final List<Double> simFeeLadder;
     private final List<Double> simOffsetLadder;
 
@@ -118,6 +119,7 @@ public class RevxConfig {
             @Value("${revx.sim.maker-fee}") double simMakerFee,
             @Value("${revx.sim.pessimistic-fee}") double simPessimisticFee,
             @Value("${revx.sim.random-seed}") long simRandomSeed,
+            @Value("${revx.sim.random-seeds}") int simRandomSeeds,
             @Value("${revx.sim.fee-ladder}") List<Double> simFeeLadder,
             @Value("${revx.sim.offset-ladder}") List<Double> simOffsetLadder,
             @Value("${revx.probe.start-rps}") double probeStartRps,
@@ -170,6 +172,7 @@ public class RevxConfig {
         this.simMakerFee = simMakerFee;
         this.simPessimisticFee = simPessimisticFee;
         this.simRandomSeed = simRandomSeed;
+        this.simRandomSeeds = simRandomSeeds;
         this.simFeeLadder = simFeeLadder;
         this.simOffsetLadder = simOffsetLadder;
         this.probeStartRps = probeStartRps;
@@ -380,6 +383,16 @@ public class RevxConfig {
 
     public long simRandomSeed() {
         return simRandomSeed;
+    }
+
+    /**
+     * Сколько независимых seed'ов гонять для контроля «случайные котировки».
+     * Один seed даёт одно число и вопрос «побит контроль или нет» решается
+     * монеткой: разница по BTC была +4%, по ETH −11% (док. 75 §4). Нулевое
+     * распределение из N прогонов заменяет вердикт процентилем.
+     */
+    public int simRandomSeeds() {
+        return simRandomSeeds;
     }
 
     public double[] simFeeLadder() {
