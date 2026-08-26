@@ -45,6 +45,7 @@ import java.util.List;
  *   ./gradlew bootRun --args='--revx-collect'                     — стенд: непрерывный сбор (демон)
  *   ./gradlew bootRun --args='--revx-basis --hours=6'             — стенд: курс USDC/USD и пригодность пар
  *   ./gradlew bootRun --args='--revx-sim --symbol=BTC/USDC --hours=123 --to=2026-08-25T03:00:00Z'
+ *   ./gradlew bootRun --args='--revx-flow --symbol=BTC/USDC --hours=123'  — кто по ту сторону книги
  */
 @Component
 public class CliRunner implements ApplicationRunner {
@@ -159,6 +160,14 @@ public class CliRunner implements ApplicationRunner {
                         java.time.Instant.parse(firstOr(args, "to",
                                 java.time.Instant.now().toString())).toEpochMilli(),
                         firstOr(args, "out", "reports/revx_sim.md"));
+            }
+            if (args.containsOption("revx-flow")) {
+                revx.getObject().flow(
+                        firstOr(args, "symbol", "BTC/USDC"),
+                        Integer.parseInt(firstOr(args, "hours", "24")),
+                        java.time.Instant.parse(firstOr(args, "to",
+                                java.time.Instant.now().toString())).toEpochMilli(),
+                        firstOr(args, "out", "reports/revx_flow.md"));
             }
             if (args.containsOption("revx-probe-limits")) {
                 revx.getObject().probeLimits(new org.home.data.revx.RateLimitProbe.Ladder(

@@ -63,6 +63,10 @@ public class SimRunner {
     private record Rung(double offset, SimEngine.Result result, Null nulls) {
     }
 
+    /** Ступень лестницы скоса. Нулевое распределение тут не нужно: скос — не выбор цен. */
+    private record SkewRung(double skew, SimEngine.Result result) {
+    }
+
     /**
      * Нулевое распределение контроля: N прогонов случайных котировок с разными
      * seed'ами. {@code capturePercentile} — доля прогонов контроля, которые
@@ -132,16 +136,21 @@ public class SimRunner {
                     new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows()),
                     cfg.simMakerFee(), base.offset(), params.inventoryCap()));
         }
-        // Скос выключен: по BTC покупки стабильно лучше продаж на 5–7 б.п. во ВСЕХ
-        // режимах, включая падающий, — дрейфом рынка это не объясняется. Остаётся
-        // конструкция котировщика: скос сдвигает обе цены вниз при полном инвентаре,
-        // делая аск агрессивнее. Прогон с нулевым скосом отвечает, он ли это.
-        Quoter.Params noSkew = new Quoter.Params(base.offset(), base.size(), base.inventoryCap(),
-                0.0, base.requoteThreshold(), base.quoteStep());
-        SimEngine.Result noSkewResult = new SimEngine(noSkew, limits, cfg.simMakerFee())
-                .run(data.windows());
-        runs.add(new Run("скос выключен", noSkewResult, cfg.simMakerFee(), base.offset(),
-                base.inventoryCap()));
+        // Лестница скоса. Скос сдвигает обе цены вниз по мере роста инвентаря, делая
+        // аск агрессивнее; измеренная цена этой страховки лежит НЕ в захвате спреда,
+        // а в markout (док. 79 §7), поэтому ступени сравниваются по краю.
+        List<SkewRung> skewLadder = new ArrayList<>();
+        for (double skew : skews(base)) {
+            Quoter.Params params = new Quoter.Params(base.offset(), base.size(),
+                    base.inventoryCap(), skew, base.requoteThreshold(), base.quoteStep());
+            SimEngine.Result result = skew == base.skewK() ? baseResult
+                    : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
+            skewLadder.add(new SkewRung(skew, result));
+            if (skew != base.skewK()) {
+                runs.add(new Run(String.format("скос %.4f%%", skew * 100), result,
+                        cfg.simMakerFee(), base.offset(), base.inventoryCap()));
+            }
+        }
 
         // Контроль: случайные котировки (то же присутствие в книге, цены наугад)
         SimEngine.Result randomResult = new SimEngine(base, limits, cfg.simMakerFee(),
@@ -175,7 +184,7 @@ public class SimRunner {
         }
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
-                noSkewResult);
+                skewLadder);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
@@ -188,6 +197,14 @@ public class SimRunner {
         return java.util.stream.DoubleStream
                 .concat(java.util.stream.DoubleStream.of(base.offset()),
                         java.util.Arrays.stream(cfg.simOffsetLadder()))
+                .distinct().sorted().toArray();
+    }
+
+    /** Базовый скос плюс лестница, по возрастанию и без дублей. */
+    private double[] skews(Quoter.Params base) {
+        return java.util.stream.DoubleStream
+                .concat(java.util.stream.DoubleStream.of(base.skewK()),
+                        java.util.Arrays.stream(cfg.simSkewLadder()))
                 .distinct().sorted().toArray();
     }
 
@@ -222,16 +239,6 @@ public class SimRunner {
 
     private static double pct(double[] sorted, double q) {
         return sorted[Math.min(sorted.length - 1, Math.max(0, (int) Math.round(q * (sorted.length - 1))))];
-    }
-
-    private static void appendSkewRow(StringBuilder sb, String label, SimEngine.Result result) {
-        double buy = netEdgeBp(result, 60_000, Side.BUY);
-        double sell = netEdgeBp(result, 60_000, Side.SELL);
-        sb.append("| ").append(label)
-                .append(" | ").append(round(netEdgeBp(result, 60_000), 2))
-                .append(" | ").append(round(buy, 2))
-                .append(" | ").append(round(sell, 2))
-                .append(" | ").append(round(buy - sell, 2)).append(" |\n");
     }
 
     /** Секунды/минуты/часы: «4200000 мс» в отчёте не читается. */
@@ -377,7 +384,7 @@ public class SimRunner {
 
     private String render(String symbol, int hours, SimDataReader.Dataset data, Quoter.Params base,
                           ExecutionModel.Limits limits, List<Run> runs, SimEngine.Result baseResult,
-                          List<Rung> ladder, SimEngine.Result noSkewResult) {
+                          List<Rung> ladder, List<SkewRung> skewLadder) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
         sb.append("Прогоны ТЗ §4.7, отчёт §5.3. Код `").append(registry.gitHash())
@@ -496,12 +503,15 @@ public class SimRunner {
                 + "на исполнениях первого типа, значит модель просто разрешила нам "
                 + "стоять там, где в реальности пришлось бы ждать.\n\n");
         sb.append("| Отступ | Улучшаем книгу, % окон | Встаём в очередь | Вне видимых уровней "
-                + "| Исполнений от улучшающих заявок | Очередь при исполнении: медиана / 90-й |\n");
-        sb.append("|---|---|---|---|---|---|\n");
+                + "| Исполнений от улучшающих заявок | Очередь при исполнении: медиана / 90-й "
+                + "| **Перехваченных принтов** | Дальность перехвата, б.п.: медиана / 90-й |\n");
+        sb.append("|---|---|---|---|---|---|---|---|\n");
         for (Rung rung : ladder) {
             ExecutionModel.Stats stats = rung.result().execution();
             double[] queues = stats.queueAtFill().stream().mapToDouble(Double::doubleValue)
                     .filter(Double::isFinite).sorted().toArray();
+            double[] distances = stats.interceptDistanceBp().stream()
+                    .mapToDouble(Double::doubleValue).filter(Double::isFinite).sorted().toArray();
             sb.append("| ").append(round(rung.offset() * 100, 3)).append("%")
                     .append(" | ").append(round(100 * stats.improvingShare(), 1)).append("%")
                     .append(" | ").append(round(100 * (1 - stats.improvingShare()
@@ -510,13 +520,23 @@ public class SimRunner {
                     .append(" | ").append(round(100 * stats.improvingFillShare(), 1)).append("%")
                     .append(" | ").append(queues.length == 0 ? "—"
                             : round(pct(queues, 0.5), 4) + " / " + round(pct(queues, 0.9), 4))
+                    .append(" | **").append(round(100 * stats.interceptedFillShare(), 1))
+                    .append("%**")
+                    .append(" | ").append(distances.length == 0 ? "—"
+                            : round(pct(distances, 0.5), 2) + " / " + round(pct(distances, 0.9), 2))
                     .append(" |\n");
         }
-        sb.append("\nЧитать так: доля «улучшаем книгу», близкая к 100% на широком отступе, "
-                + "означала бы, что мы всё время котируем ВНУТРИ спреда и очередь нам "
-                + "просто не встречается — тогда преимущество широкой котировки создано "
-                + "моделью. Заметная доля исполнений из очереди, наоборот, показывает, "
-                + "что заявка реально ждала своей позиции.\n\n");
+        sb.append("\nЧитать так. Доля «улучшаем книгу», близкая к 100%, означает, что "
+                + "очередь нам просто не встречается — предохранитель ТЗ §4.3 в таких "
+                + "прогонах не работает, и считать их консервативными по этой причине "
+                + "нельзя.\n\n"
+                + "**Колонка «перехваченных принтов» важнее колонки очереди.** Перехват — "
+                + "это допущение, что принт, прошедший по цене ХУЖЕ нашей котировки, в "
+                + "реальности достался бы нам. Экономически оно защитимо (продавец, "
+                + "отдавший по дальнему биду, тем более отдал бы по нашему), но именно "
+                + "на нём держится результат, и проверить его можно только живыми "
+                + "заявками. Дальность перехвата показывает, насколько далеко модель "
+                + "«дотягивается» за чужой сделкой.\n\n");
 
         sb.append("### Кто кого ведёт: опора или котируемая книга\n\n");
         LeadLag.Result leadLag = LeadLag.compute(data.windows(), 6);
@@ -545,14 +565,35 @@ public class SimRunner {
                 + "«устаревшая опора» отпадает. Пик справа — опора отстаёт, и уровень "
                 + "захвата завышен ровно на величину этого запаздывания.\n\n");
 
-        sb.append("### Откуда асимметрия покупок и продаж: прогон без скоса\n\n");
-        sb.append("| Прогон | Чистый край 60 с | покупки | продажи | Разрыв |\n|---|---|---|---|---|\n");
-        appendSkewRow(sb, "базовый (скос включён)", baseResult);
-        appendSkewRow(sb, "скос выключен", noSkewResult);
-        sb.append("\nЕсли разрыв между сторонами схлопывается при выключенном скосе, "
-                + "асимметрия — свойство котировщика, а не рынка: скос сдвигает обе цены "
-                + "вниз при полном инвентаре, делая аск агрессивнее и хуже по цене. "
-                + "Если разрыв остаётся, дело в потоке.\n\n");
+        sb.append("### Лестница скоса — по краю, а не по `total`\n\n");
+        sb.append("Скос меняет не цену исполнения, а момент: при его выключении захват "
+                + "спреда остаётся прежним, а весь эффект приходит в markout. В `total` "
+                + "он тонет в бете, поэтому ступени сравниваются по краю и по разрыву "
+                + "между сторонами (док. 79 §7).\n\n");
+        sb.append("| Скос `skew_k` | Захват | Чистый край 60 с | покупки | продажи | Разрыв "
+                + "| Исполнений | Инвентарь: средний | Total |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|\n");
+        for (SkewRung rung : skewLadder) {
+            SimEngine.Result r = rung.result();
+            double buy = netEdgeBp(r, 60_000, Side.BUY);
+            double sell = netEdgeBp(r, 60_000, Side.SELL);
+            sb.append("| ").append(round(rung.skew() * 100, 4)).append("%")
+                    .append(rung.skew() == base.skewK() ? " (базовый)" : "")
+                    .append(" | ").append(round(r.pnl().spreadCapture(), 1))
+                    .append(" | ").append(round(netEdgeBp(r, 60_000), 2))
+                    .append(" | ").append(round(buy, 2))
+                    .append(" | ").append(round(sell, 2))
+                    .append(" | ").append(round(buy - sell, 2))
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(r.avgInventory(), 4))
+                    .append(" | ").append(round(r.pnl().total(), 1))
+                    .append(" |\n");
+        }
+        sb.append("\nЕсли разрыв между сторонами схлопывается при уменьшении скоса, "
+                + "асимметрия — свойство котировщика, а не рынка. Но и `total`, и средний "
+                + "инвентарь в этой таблице читать надо с оглядкой на режим окна: меньший "
+                + "скос означает «дольше держать позицию», и на растущем окне это "
+                + "автоматически прибавляет беты.\n\n");
 
         sb.append("### Край по режимам рынка внутри окна\n\n");
         sb.append("Окно поймало рост BTC на 14%, поэтому «край, который есть в среднем» "

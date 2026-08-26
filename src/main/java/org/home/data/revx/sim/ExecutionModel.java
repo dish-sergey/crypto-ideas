@@ -47,7 +47,9 @@ public final class ExecutionModel {
         private long invisibleWindows;
         private long improvingFills;
         private long joiningFills;
+        private long interceptedFills;
         private final List<Double> queueAtFill = new ArrayList<>();
+        private final List<Double> interceptDistanceBp = new ArrayList<>();
 
         public long improvingWindows() {
             return improvingWindows;
@@ -88,6 +90,27 @@ public final class ExecutionModel {
             long total = improvingFills + joiningFills;
             return total == 0 ? Double.NaN : (double) improvingFills / total;
         }
+
+        /**
+         * Доля исполнений, полученных ПЕРЕХВАТОМ: принт прошёл по цене хуже нашей
+         * котировки, и модель считает, что в реальности он достался бы нам.
+         *
+         * Это и есть единственное реально связывающее допущение стенда. Очередь на
+         * этой площадке вырождена (спред 21 б.п. при шаге 0.0013 б.п. — котировка
+         * почти всегда создаёт свой уровень), а вот перехват работает всегда, когда
+         * мы стоим внутри спреда. Экономически он защитим — продавец, отдавший по
+         * дальнему биду, тем более отдал бы по нашему, — но проверить это можно
+         * только живыми заявками.
+         */
+        public double interceptedFillShare() {
+            long total = improvingFills + joiningFills;
+            return total == 0 ? Double.NaN : (double) interceptedFills / total;
+        }
+
+        /** Насколько далеко приходилось «дотягиваться», в б.п. от нашей цены. */
+        public List<Double> interceptDistanceBp() {
+            return List.copyOf(interceptDistanceBp);
+        }
     }
 
     /** Состояние стоящей заявки. */
@@ -100,6 +123,8 @@ public final class ExecutionModel {
         double queueAtSnapshot;
         boolean improving;
         boolean visible;
+        /** Цены принтов, породивших исполнения в текущем окне — для учёта перехвата. */
+        final List<Double> fillTradePrices = new ArrayList<>();
 
         Resting(Side side, double price, double qty, long placedAtMs) {
             this.side = side;
@@ -261,6 +286,17 @@ public final class ExecutionModel {
                 stats.joiningFills++;
             }
             stats.queueAtFill.add(order.queueAtSnapshot);
+            if (i < order.fillTradePrices.size()) {
+                // Для покупки принт хуже нашей цены — это принт НИЖЕ неё, для продажи — выше.
+                double tradePrice = order.fillTradePrices.get(i);
+                double distance = order.side == Side.BUY
+                        ? order.price - tradePrice
+                        : tradePrice - order.price;
+                if (distance > limits.priceTolerance()) {
+                    stats.interceptedFills++;
+                    stats.interceptDistanceBp.add(distance / order.price * 10_000);
+                }
+            }
         }
     }
 
@@ -285,6 +321,9 @@ public final class ExecutionModel {
         if (order == null || !order.visible) {
             return fills;
         }
+        // Список цен принтов обязан соответствовать ИМЕННО этому окну: record()
+        // сопоставляет его с fills по индексу.
+        order.fillTradePrices.clear();
         for (MarketTrade trade : trades) {
             if (order.remaining <= 0) {
                 break;
@@ -310,6 +349,7 @@ public final class ExecutionModel {
             }
             order.remaining -= filled;
             fills.add(new Fill(trade.tsMs(), order.side, order.price, filled, fairAtWindowEnd));
+            order.fillTradePrices.add(trade.price());
         }
         return fills;
     }
