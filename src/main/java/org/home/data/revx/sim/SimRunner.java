@@ -320,10 +320,25 @@ public class SimRunner {
         sb.append("## Реализуемость (ТЗ §5.4 п.6)\n\n");
         double requotesPerDay = baseResult.requotesPerDay(data.spanMs());
         sb.append("| Показатель | Значение |\n|---|---|\n");
-        sb.append("| Перевыставлений в сутки | ").append(Math.round(requotesPerDay)).append(" |\n");
-        sb.append("| Лимит площадки на постановку ордеров | 1000 в сутки |\n");
-        sb.append("| Вердикт | ").append(requotesPerDay <= 1000
-                ? "влезаем" : "**НЕ ВЛЕЗАЕМ** — требуется replace вместо place либо реже котировать")
+        // Два РАЗНЫХ лимита площадки (developer.revolut.com/docs/x-api): POST /orders —
+        // 10/с и 1000/сутки, PUT /orders/{id} (replace) — 10/с и БЕЗ суточного потолка.
+        // Перевыставление цены — это replace, поэтому суточный потолок оно не ест;
+        // новую постановку требует только исполненная заявка. Считать перевыставления
+        // против 1000/сутки (как было в первой версии) — арифметически неверно.
+        double fillsPerDay = baseResult.fills().size() / (data.spanMs() / 86_400_000.0);
+        sb.append("| Перевыставлений в сутки (`replace`) | ").append(Math.round(requotesPerDay))
+                .append(" = ").append(round(requotesPerDay / 86_400.0, 2)).append(" /с |\n");
+        sb.append("| Лимит `PUT /orders/{id}` | 10/с, суточного потолка нет |\n");
+        sb.append("| Новых постановок в сутки (`place` после исполнения) | ")
+                .append(Math.round(fillsPerDay)).append(" |\n");
+        sb.append("| Лимит `POST /orders` | 10/с и **1000 в сутки** |\n");
+        boolean replaceOk = requotesPerDay / 86_400.0 <= 10.0;
+        boolean placeOk = fillsPerDay <= 1000;
+        sb.append("| Вердикт | ").append(replaceOk && placeOk
+                        ? "влезаем, но **условно**: схема обязана быть replace-first — "
+                          + "«отменить и поставить заново» упирается в 1000/сутки сразу"
+                        : (!replaceOk ? "**НЕ ВЛЕЗАЕМ по темпу replace**"
+                                      : "**НЕ ВЛЕЗАЕМ по постановкам** — исполнений больше 1000/сутки"))
                 .append(" |\n");
         sb.append("| Инвентарь: средний / максимум | ").append(round(baseResult.avgInventory(), 4))
                 .append(" / ").append(round(baseResult.maxInventory(), 4)).append(" |\n");
