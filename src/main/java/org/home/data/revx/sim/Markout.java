@@ -31,6 +31,18 @@ public final class Markout {
      * Если данных за горизонтом нет вовсе, исполнение в статистику не входит —
      * иначе хвост выборки молча смещал бы результат.
      */
+    /**
+     * То же по одной стороне. Нужно как предохранитель против беты: на растущем
+     * рынке markout покупок положителен, а продаж отрицателен просто потому, что
+     * цена шла вверх, и агрегат по обеим сторонам может показать «край» там, где
+     * работало направление. Если положительный markout держится ТОЛЬКО на покупках,
+     * это не преимущество котирования, а незакрытая длинная позиция.
+     */
+    public static Stats compute(List<Fill> fills, NavigableMap<Long, Double> fairSeries,
+                                long horizonMs, Side side) {
+        return compute(fills.stream().filter(f -> f.side() == side).toList(), fairSeries, horizonMs);
+    }
+
     public static Stats compute(List<Fill> fills, NavigableMap<Long, Double> fairSeries, long horizonMs) {
         List<Double> values = new ArrayList<>();
         long lastFairMs = fairSeries.isEmpty() ? Long.MIN_VALUE : fairSeries.lastKey();

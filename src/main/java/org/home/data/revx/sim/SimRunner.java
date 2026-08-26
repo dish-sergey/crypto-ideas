@@ -35,6 +35,14 @@ public class SimRunner {
 
     private static final Logger log = LoggerFactory.getLogger(SimRunner.class);
 
+    /**
+     * Горизонты markout. Час добавлен не для полноты: измеренная медиана времени
+     * удержания инвентаря по BTC — 1.6 часа, то есть горизонты из ТЗ §4.5 (до 5 минут)
+     * короче реальной жизни позиции в двадцать раз. Без часового горизонта порог
+     * по комиссии считался бы по куску, который позиция едва прожила.
+     */
+    private static final long[] HORIZONS_MS = {0, 10_000, 60_000, 300_000, 3_600_000};
+
     private final SimDataReader reader;
     private final RunRegistry registry;
     private final RevxConfig cfg;
@@ -320,7 +328,7 @@ public class SimRunner {
         out.put("holding_p90_ms", holding.p90Ms());
         out.put("holding_mean_ms", holding.meanMs());
         out.put("holding_unclosed_share", holding.unclosedShare());
-        for (long horizon : new long[]{0, 10_000, 60_000, 300_000}) {
+        for (long horizon : HORIZONS_MS) {
             Markout.Stats stats = Markout.compute(result.fills(), result.fairSeries(), horizon);
             out.put("markout_" + horizon / 1000 + "s_mean", stats.mean());
             out.put("markout_" + horizon / 1000 + "s_median", stats.median());
@@ -376,9 +384,9 @@ public class SimRunner {
                 + "Чистый край = `markout(0) + markout(Δ)` на единицу оборота: только его "
                 + "и можно сравнивать с комиссией.\n\n");
         sb.append("| Отступ `d` | Исполнений/сут | Оборот стратегии | Захват, б.п. "
-                + "| Чистый край 60 с | Чистый край 300 с | Порог maker (60 с) "
+                + "| Чистый край 60 с | 300 с | **1 ч** | Порог maker (1 ч) "
                 + "| Постановок/сут | Total | Buy & hold | Случайные: процентиль |\n");
-        sb.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
         for (Rung rung : ladder) {
             SimEngine.Result r = rung.result();
             double perDay = r.fills().size() / (data.spanMs() / 86_400_000.0);
@@ -391,7 +399,8 @@ public class SimRunner {
                             ? r.pnl().spreadCapture() / turnover(r) * 10_000 : Double.NaN, 2))
                     .append(" | ").append(round(net60, 2))
                     .append(" | ").append(round(netEdgeBp(r, 300_000), 2))
-                    .append(" | ").append(round(net60 / 100, 4)).append("%")
+                    .append(" | **").append(round(netEdgeBp(r, 3_600_000), 2)).append("**")
+                    .append(" | ").append(round(netEdgeBp(r, 3_600_000) / 100, 4)).append("%")
                     .append(" | ").append(Math.round(perDay))
                     .append(" | ").append(round(r.pnl().total(), 1))
                     .append(" | ").append(round(r.buyAndHoldPnl(), 1))
@@ -411,8 +420,8 @@ public class SimRunner {
                 .append("50% означает «неотличима от случайной», и вопрос «побит контроль ")
                 .append("или нет» на этом закрывается числом.\n\n");
         sb.append("| Отступ | Захват стратегии | Контроль: среднее | σ | 5-й … 95-й процентиль "
-                + "| Стратегия выше, % прогонов | (σ от среднего) |\n");
-        sb.append("|---|---|---|---|---|---|---|\n");
+                + "| Стратегия выше по захвату | (σ) | Стратегия выше по `total` |\n");
+        sb.append("|---|---|---|---|---|---|---|---|\n");
         for (Rung rung : ladder) {
             Null n = rung.nulls();
             double capture = rung.result().pnl().spreadCapture();
@@ -424,9 +433,14 @@ public class SimRunner {
                     .append(" | ").append(round(n.captureP05(), 1)).append(" … ")
                     .append(round(n.captureP95(), 1))
                     .append(" | ").append(round(n.capturePercentile(), 0)).append("%")
-                    .append(" | ").append(round(z, 1)).append("σ |\n");
+                    .append(" | ").append(round(z, 1)).append("σ")
+                    .append(" | ").append(round(n.totalPercentile(), 0)).append("% |\n");
         }
-        sb.append("\n");
+        sb.append("\nДве последние колонки отвечают на разные вопросы. Захват изолирует "
+                + "ВЫБОР ЦЕН: инвентарная компонента у контроля устроена так же, поэтому "
+                + "разница по захвату — это и есть вклад котирования. `total` смешивает "
+                + "его с бетой, и именно поэтому вердикт по `total` на одном seed'е "
+                + "(док. 74) оказался неустойчивым.\n\n");
 
         sb.append("## Сколько живёт инвентарь (ТЗ §5.3)\n\n");
         HoldingTime.Stats holding = HoldingTime.compute(baseResult.fills());
@@ -443,11 +457,29 @@ public class SimRunner {
         sb.append("| Инвентарь, не разгруженный до конца окна | ")
                 .append(round(holding.unclosedQty(), 4)).append(" (")
                 .append(round(100 * holding.unclosedShare(), 1)).append("% купленного) |\n\n");
-        long applicable = holding.medianMs() <= 60_000 ? 60_000 : 300_000;
-        sb.append("**Применимый горизонт: ").append(applicable / 1000).append(" с** — по медиане ")
-                .append("времени удержания. Порог по комиссии на нём: **")
-                .append(round(netEdgeBp(baseResult, applicable) / 100, 4)).append("%**")
-                .append(" (при базовом `d`).\n\n");
+        long longest = HORIZONS_MS[HORIZONS_MS.length - 1];
+        if (holding.medianMs() > longest) {
+            // Это не мелочь оформления: если позиция живёт дольше любого измеренного
+            // горизонта, то «неблагоприятный отбор» на этих горизонтах не описывает
+            // риск, который стратегия на себя берёт. Остаток уходит в inventory_pnl,
+            // то есть в бету — и никакой порог по комиссии его не покрывает.
+            sb.append("**Горизонты markout короче жизни позиции в ")
+                    .append(round(holding.medianMs() / longest, 1)).append(" раз.** Медиана ")
+                    .append("удержания — ").append(humanMs(holding.medianMs()))
+                    .append(", самый длинный измеренный горизонт — ").append(humanMs(longest))
+                    .append(". Значит порог по комиссии, посчитанный на любом из них, ")
+                    .append("**оптимистичен**: то, что происходит с ценой за оставшиеся ")
+                    .append(humanMs(holding.medianMs() - longest))
+                    .append(", попадает не в markout, а в переоценку инвентаря — в бету. ")
+                    .append("Конструкция с таким удержанием — не маркет-мейкинг в смысле ")
+                    .append("ТЗ §4.5, а позиционная торговля с котируемым входом.\n\n");
+        } else {
+            long applicable = holding.medianMs() <= 60_000 ? 60_000 : 300_000;
+            sb.append("**Применимый горизонт: ").append(applicable / 1000).append(" с** — по медиане ")
+                    .append("времени удержания. Порог по комиссии на нём: **")
+                    .append(round(netEdgeBp(baseResult, applicable) / 100, 4)).append("%**")
+                    .append(" (при базовом `d`).\n\n");
+        }
 
         sb.append("## Контроли (ТЗ §4.7 — главные)\n\n");
         SimEngine.Result random = runs.stream()
@@ -464,12 +496,24 @@ public class SimRunner {
                 .append(" |\n\n");
 
         sb.append("## Неблагоприятный отбор (ТЗ §4.5)\n\n");
-        sb.append("| Горизонт | Среднее | Медиана | Исполнений в выборке |\n|---|---|---|---|\n");
-        for (long horizon : new long[]{0, 10_000, 60_000, 300_000}) {
+        sb.append("Стороны разделены намеренно. На растущем рынке markout покупок "
+                + "положителен, а продаж отрицателен просто оттого, что цена шла вверх; "
+                + "агрегат по обеим сторонам в таком окне показывает «край» там, где "
+                + "работало направление. Если плюс держится ТОЛЬКО на покупках — это "
+                + "незакрытая длинная позиция, а не преимущество котирования.\n\n");
+        sb.append("| Горизонт | Среднее | Медиана | Только покупки | Только продажи "
+                + "| Исполнений в выборке |\n|---|---|---|---|---|---|\n");
+        for (long horizon : HORIZONS_MS) {
             Markout.Stats stats = Markout.compute(baseResult.fills(), baseResult.fairSeries(), horizon);
+            Markout.Stats buys = Markout.compute(baseResult.fills(), baseResult.fairSeries(),
+                    horizon, Side.BUY);
+            Markout.Stats sells = Markout.compute(baseResult.fills(), baseResult.fairSeries(),
+                    horizon, Side.SELL);
             sb.append("| ").append(horizon / 1000).append(" с | ").append(round(stats.mean(), 6))
                     .append(" | ").append(round(stats.median(), 6))
-                    .append(" | ").append(stats.fills()).append(" |\n");
+                    .append(" | ").append(round(buys.mean(), 6)).append(" (").append(buys.fills())
+                    .append(") | ").append(round(sells.mean(), 6)).append(" (").append(sells.fills())
+                    .append(") | ").append(stats.fills()).append(" |\n");
         }
         // ТЗ §5.5 в исходной формулировке закрывал направление на ЛЮБОМ отрицательном
         // markout — включая −0.010 при захваченном крае +0.156. Экономически значим
