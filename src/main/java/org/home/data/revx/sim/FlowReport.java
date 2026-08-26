@@ -60,7 +60,18 @@ public class FlowReport {
     /** Итог по пассивной стороне на одном горизонте, в б.п. оборота. */
     private record PassiveEdge(long horizonMs, int trades, double turnover,
                                double captureBp, double markoutBp, double netBp,
-                               double buyNetBp, double sellNetBp) {
+                               double buyNetBp, double sellNetBp,
+                               double buyCaptureBp, double sellCaptureBp) {
+    }
+
+    /**
+     * Где стоит книга USDC относительно опоры. Нужно, чтобы отличить настоящую
+     * асимметрию сторон от систематического смещения: если середина книги
+     * постоянно ниже справедливой цены, то ЛЮБАЯ покупка в ней выглядит удачной,
+     * а любая продажа — неудачной, и разрыв между сторонами не значит ничего.
+     */
+    private record BookOffset(int samples, double midBp, double bidBp, double askBp,
+                              double halfSpreadBp) {
     }
 
     public void run(String symbol, int hours, long toMs, String out) {
@@ -86,8 +97,9 @@ public class FlowReport {
             edges.add(passiveEdge(trades, fair, horizon));
         }
         Liquidity liquidity = classify(data, pairBaseStep(symbol));
+        BookOffset offset = bookOffset(data);
 
-        String markdown = render(symbol, hours, data, edges, liquidity);
+        String markdown = render(symbol, hours, data, edges, liquidity, offset);
         write(out, markdown);
         PassiveEdge at60 = edges.get(0);
         log.info("{}: пассивная сторона — захват {} б.п., чистый край {} б.п. на 60 с "
@@ -107,8 +119,10 @@ public class FlowReport {
         double capture = 0;
         double markout = 0;
         double buyNet = 0;
+        double buyCapture = 0;
         double buyTurnover = 0;
         double sellNet = 0;
+        double sellCapture = 0;
         double sellTurnover = 0;
         int used = 0;
         long lastFairMs = fair.isEmpty() ? Long.MIN_VALUE : fair.lastKey();
@@ -135,9 +149,11 @@ public class FlowReport {
             markout += markoutValue;
             if (passiveSign > 0) {
                 buyNet += captureValue + markoutValue;
+                buyCapture += captureValue;
                 buyTurnover += notional;
             } else {
                 sellNet += captureValue + markoutValue;
+                sellCapture += captureValue;
                 sellTurnover += notional;
             }
             used++;
@@ -149,7 +165,35 @@ public class FlowReport {
                 turnover > 0 ? markout / turnover * bp : Double.NaN,
                 turnover > 0 ? (capture + markout) / turnover * bp : Double.NaN,
                 buyTurnover > 0 ? buyNet / buyTurnover * bp : Double.NaN,
-                sellTurnover > 0 ? sellNet / sellTurnover * bp : Double.NaN);
+                sellTurnover > 0 ? sellNet / sellTurnover * bp : Double.NaN,
+                buyTurnover > 0 ? buyCapture / buyTurnover * bp : Double.NaN,
+                sellTurnover > 0 ? sellCapture / sellTurnover * bp : Double.NaN);
+    }
+
+    private static BookOffset bookOffset(SimDataReader.Dataset data) {
+        int samples = 0;
+        double mid = 0;
+        double bid = 0;
+        double ask = 0;
+        double halfSpread = 0;
+        for (SimEngine.Window window : data.windows()) {
+            BookView book = window.book();
+            if (book == null || book.empty() || !(window.fair() > 0)) {
+                continue;
+            }
+            double fair = window.fair();
+            double bestBid = book.bestBid();
+            double bestAsk = book.bestAsk();
+            samples++;
+            mid += ((bestBid + bestAsk) / 2 / fair - 1) * 10_000;
+            bid += (bestBid / fair - 1) * 10_000;
+            ask += (bestAsk / fair - 1) * 10_000;
+            halfSpread += (bestAsk - bestBid) / 2 / fair * 10_000;
+        }
+        return samples == 0
+                ? new BookOffset(0, Double.NaN, Double.NaN, Double.NaN, Double.NaN)
+                : new BookOffset(samples, mid / samples, bid / samples, ask / samples,
+                        halfSpread / samples);
     }
 
     /** След резервной ликвидности в книге. */
@@ -269,7 +313,7 @@ public class FlowReport {
     }
 
     private String render(String symbol, int hours, SimDataReader.Dataset data,
-                          List<PassiveEdge> edges, Liquidity liquidity) {
+                          List<PassiveEdge> edges, Liquidity liquidity, BookOffset offset) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Кто по ту сторону: ").append(symbol).append("\n\n");
         sb.append("Проверка по док. 79 §5. Считается на собранных данных, без единого "
@@ -287,7 +331,7 @@ public class FlowReport {
                 + "же через горизонт. Это ровно та метрика, которой меряется наша "
                 + "стратегия, но применённая ко ВСЕЙ торговле площадки.\n\n");
         sb.append("| Горизонт | Сделок | Оборот | Захват, б.п. | markout, б.п. "
-                + "| **Чистый край, б.п.** | покупки | продажи |\n");
+                + "| **Чистый край, б.п.** | покупки: захват / край | продажи: захват / край |\n");
         sb.append("|---|---|---|---|---|---|---|---|\n");
         for (PassiveEdge edge : edges) {
             sb.append("| ").append(edge.horizonMs() / 1000).append(" с")
@@ -296,10 +340,23 @@ public class FlowReport {
                     .append(" | ").append(round(edge.captureBp(), 2))
                     .append(" | ").append(round(edge.markoutBp(), 2))
                     .append(" | **").append(round(edge.netBp(), 2)).append("**")
-                    .append(" | ").append(round(edge.buyNetBp(), 2))
-                    .append(" | ").append(round(edge.sellNetBp(), 2))
+                    .append(" | ").append(round(edge.buyCaptureBp(), 2)).append(" / ")
+                    .append(round(edge.buyNetBp(), 2))
+                    .append(" | ").append(round(edge.sellCaptureBp(), 2)).append(" / ")
+                    .append(round(edge.sellNetBp(), 2))
                     .append(" |\n");
         }
+
+        sb.append("\n### Где стоит книга USDC относительно справедливой цены\n\n");
+        sb.append("Без этой поправки разрыв между сторонами читать нельзя: если "
+                + "середина книги систематически смещена, то одна сторона выглядит "
+                + "выгодной, а другая убыточной просто по построению.\n\n");
+        sb.append("| Показатель | Значение, б.п. от справедливой |\n|---|---|\n");
+        sb.append("| Середина книги | ").append(round(offset.midBp(), 2)).append(" |\n");
+        sb.append("| Лучший бид | ").append(round(offset.bidBp(), 2)).append(" |\n");
+        sb.append("| Лучший аск | ").append(round(offset.askBp(), 2)).append(" |\n");
+        sb.append("| Половина спреда | ").append(round(offset.halfSpreadBp(), 2)).append(" |\n");
+        sb.append("| Снимков | ").append(offset.samples()).append(" |\n\n");
         sb.append("\n**Как читать.** Положительный край пассивной стороны означает, что "
                 + "тейкеры площадки в среднем платят за немедленность, а не приносят "
                 + "информацию. Тогда наш край — доля общего пирога, и риск у него "
