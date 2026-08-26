@@ -238,12 +238,27 @@ public class SimRunner {
      * равна захвату, а сумма markout(Δ) — это то, что от него осталось к горизонту Δ.
      */
     private static double netEdgeBp(SimEngine.Result result, long horizonMs) {
-        double turnover = turnover(result);
+        return netEdgeBp(result.fills(), result, horizonMs);
+    }
+
+    /**
+     * Чистый край ОДНОЙ стороны — решающая проверка на бету. Если край держится
+     * только на покупках, а продажи в минусе, то это не преимущество котирования,
+     * а рынок, который рос: покупка «в среднем угадала» просто оттого, что после
+     * неё всё дорожало. Настоящий край обязан быть положительным с обеих сторон.
+     */
+    private static double netEdgeBp(SimEngine.Result result, long horizonMs, Side side) {
+        return netEdgeBp(result.fills().stream().filter(f -> f.side() == side).toList(),
+                result, horizonMs);
+    }
+
+    private static double netEdgeBp(List<Fill> fills, SimEngine.Result result, long horizonMs) {
+        double turnover = fills.stream().mapToDouble(Fill::notional).sum();
         if (turnover <= 0) {
             return Double.NaN;
         }
-        Markout.Stats atFill = Markout.compute(result.fills(), result.fairSeries(), 0);
-        Markout.Stats later = Markout.compute(result.fills(), result.fairSeries(), horizonMs);
+        Markout.Stats atFill = Markout.compute(fills, result.fairSeries(), 0);
+        Markout.Stats later = Markout.compute(fills, result.fairSeries(), horizonMs);
         double net = atFill.mean() * atFill.fills() + later.mean() * later.fills();
         return net / turnover * 10_000;
     }
@@ -384,8 +399,8 @@ public class SimRunner {
                 + "Чистый край = `markout(0) + markout(Δ)` на единицу оборота: только его "
                 + "и можно сравнивать с комиссией.\n\n");
         sb.append("| Отступ `d` | Исполнений/сут | Оборот стратегии | Захват, б.п. "
-                + "| Чистый край 60 с | 300 с | **1 ч** | Порог maker (1 ч) "
-                + "| Постановок/сут | Total | Buy & hold | Случайные: процентиль |\n");
+                + "| Чистый край 60 с | 300 с | 1 ч | Край 60 с: покупки / продажи "
+                + "| Порог maker (60 с) | Total | Buy & hold | Случайные: процентиль |\n");
         sb.append("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
         for (Rung rung : ladder) {
             SimEngine.Result r = rung.result();
@@ -399,18 +414,26 @@ public class SimRunner {
                             ? r.pnl().spreadCapture() / turnover(r) * 10_000 : Double.NaN, 2))
                     .append(" | ").append(round(net60, 2))
                     .append(" | ").append(round(netEdgeBp(r, 300_000), 2))
-                    .append(" | **").append(round(netEdgeBp(r, 3_600_000), 2)).append("**")
-                    .append(" | ").append(round(netEdgeBp(r, 3_600_000) / 100, 4)).append("%")
-                    .append(" | ").append(Math.round(perDay))
+                    .append(" | ").append(round(netEdgeBp(r, 3_600_000), 2))
+                    .append(" | ").append(round(netEdgeBp(r, 60_000, Side.BUY), 2)).append(" / ")
+                    .append(round(netEdgeBp(r, 60_000, Side.SELL), 2))
+                    .append(" | ").append(round(net60 / 100, 4)).append("%")
                     .append(" | ").append(round(r.pnl().total(), 1))
                     .append(" | ").append(round(r.buyAndHoldPnl(), 1))
                     .append(" | ").append(round(rung.nulls().capturePercentile(), 0)).append("%")
                     .append(" |\n");
         }
-        sb.append("\n«Постановок/сут» равно числу исполнений: после каждого исполнения "
+        sb.append("\n«Исполнений/сут» равно числу постановок: после каждого исполнения "
                 + "заявку надо создать заново (`POST /orders`, 1 000/сутки), тогда как "
                 + "перевыставление цены — это `replace` без суточного потолка. Поэтому "
                 + "ВМЕСТИМОСТЬ ПО ПАРАМ управляется отступом, а не темпом запросов.\n\n");
+        sb.append("**Колонка «покупки / продажи» — главная в этой таблице.** Край, "
+                + "положительный с обеих сторон, — это преимущество котирования. Край, "
+                + "который держится на покупках при отрицательных продажах, — это рынок, "
+                + "который рос в окне наблюдения, и на падении он сменит знак. "
+                + "Горизонт 1 ч приведён для сопоставления со временем удержания, но "
+                + "измеряет он уже не отбор, а дрейф: на нём разброс markout на порядок "
+                + "больше самого края.\n\n");
 
         sb.append("### Нулевое распределение контроля (док. 75 §4)\n\n");
         sb.append("Один seed случайных котировок — это монетка, а не вердикт. Ниже — ")
