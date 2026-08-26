@@ -253,12 +253,13 @@ public class SimRunner {
     }
 
     private static double netEdgeBp(List<Fill> fills, SimEngine.Result result, long horizonMs) {
-        double turnover = fills.stream().mapToDouble(Fill::notional).sum();
+        List<Fill> withHorizon = Markout.withHorizon(fills, result.fairSeries(), horizonMs);
+        double turnover = withHorizon.stream().mapToDouble(Fill::notional).sum();
         if (turnover <= 0) {
             return Double.NaN;
         }
-        Markout.Stats atFill = Markout.compute(fills, result.fairSeries(), 0);
-        Markout.Stats later = Markout.compute(fills, result.fairSeries(), horizonMs);
+        Markout.Stats atFill = Markout.compute(withHorizon, result.fairSeries(), 0);
+        Markout.Stats later = Markout.compute(withHorizon, result.fairSeries(), horizonMs);
         double net = atFill.mean() * atFill.fills() + later.mean() * later.fills();
         return net / turnover * 10_000;
     }
@@ -464,6 +465,29 @@ public class SimRunner {
                 + "разница по захвату — это и есть вклад котирования. `total` смешивает "
                 + "его с бетой, и именно поэтому вердикт по `total` на одном seed'е "
                 + "(док. 74) оказался неустойчивым.\n\n");
+
+        sb.append("### Край по режимам рынка внутри окна\n\n");
+        sb.append("Окно поймало рост BTC на 14%, поэтому «край, который есть в среднем» "
+                + "может оказаться краем, который есть только на росте. Признак режима — "
+                + "дрейф опорной цены за ЧАС ПЕРЕД исполнением: он известен до сделки и "
+                + "не пересекается с горизонтом markout, иначе связь появилась бы "
+                + "механически. Граница плоского режима — ±0.2% за час.\n\n");
+        sb.append("| Режим в час перед исполнением | Исполнений | Оборот "
+                + "| Чистый край 60 с | покупки | продажи |\n|---|---|---|---|---|---|\n");
+        for (RegimeSplit.Bucket bucket : RegimeSplit.compute(baseResult.fills(),
+                baseResult.fairSeries(), 3_600_000L, 60_000L, 0.2)) {
+            sb.append("| ").append(bucket.label())
+                    .append(" | ").append(bucket.fills())
+                    .append(" | ").append(round(bucket.turnover(), 0))
+                    .append(" | ").append(round(bucket.netEdgeBp(), 2))
+                    .append(" | ").append(round(bucket.buyEdgeBp(), 2))
+                    .append(" | ").append(round(bucket.sellEdgeBp(), 2))
+                    .append(" |\n");
+        }
+        sb.append("\nЧитать так: край, положительный ТОЛЬКО в строке «рынок рос», — это "
+                + "бета, и на развороте он исчезнет. Край, сохраняющий знак во всех трёх "
+                + "строках, пережил смену режима внутри окна — это самая сильная проверка, "
+                + "доступная на собранных данных, пока в выборке нет настоящего падения.\n\n");
 
         sb.append("## Сколько живёт инвентарь (ТЗ §5.3)\n\n");
         HoldingTime.Stats holding = HoldingTime.compute(baseResult.fills());

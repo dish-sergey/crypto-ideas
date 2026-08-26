@@ -43,6 +43,24 @@ public final class Markout {
         return compute(fills.stream().filter(f -> f.side() == side).toList(), fairSeries, horizonMs);
     }
 
+    /**
+     * Исполнения, для которых горизонт целиком лежит внутри данных. Нужно, чтобы
+     * числитель и знаменатель чистого края считались по ОДНОМУ множеству: иначе
+     * захват берётся по всем исполнениям, markout — по тем, что успели дожить до
+     * горизонта, и их разность — не край, а разность двух разных выборок.
+     */
+    public static List<Fill> withHorizon(List<Fill> fills, NavigableMap<Long, Double> fairSeries,
+                                         long horizonMs) {
+        if (fairSeries.isEmpty()) {
+            return List.of();
+        }
+        long lastFairMs = fairSeries.lastKey();
+        return fills.stream()
+                .filter(f -> f.tsMs() + horizonMs <= lastFairMs)
+                .filter(f -> fairSeries.floorEntry(f.tsMs() + horizonMs) != null)
+                .toList();
+    }
+
     public static Stats compute(List<Fill> fills, NavigableMap<Long, Double> fairSeries, long horizonMs) {
         List<Double> values = new ArrayList<>();
         long lastFairMs = fairSeries.isEmpty() ? Long.MIN_VALUE : fairSeries.lastKey();
