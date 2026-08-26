@@ -78,8 +78,8 @@ public class RevxCommands {
     }
 
     /** --revx-sim: обязательные прогоны §4.7 и отчёт §5.3 по паре. */
-    public void simulate(String symbol, int hours, String out) {
-        simRunner.run(symbol, hours, out);
+    public void simulate(String symbol, int hours, long toMs, String out) {
+        simRunner.run(symbol, hours, toMs, out);
     }
 
     /** Шаги бывают мельче 1e-8 (мемкоины), поэтому без %f — иначе печатается ноль. */

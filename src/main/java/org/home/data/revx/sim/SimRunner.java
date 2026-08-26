@@ -52,7 +52,15 @@ public class SimRunner {
     }
 
     public void run(String symbol, int hours, String out) {
-        long toMs = System.currentTimeMillis();
+        run(symbol, hours, System.currentTimeMillis(), out);
+    }
+
+    /**
+     * Конец окна задаётся явно, когда хвост данных непригоден. 25.08.2026 темп сбора
+     * упал с 720 снимков в час до 18 (завис ночной {@code sqlite3 .backup}), и окно
+     * «последние N часов» смешало бы чистые сутки с прорежёнными.
+     */
+    public void run(String symbol, int hours, long toMs, String out) {
         long fromMs = toMs - hours * 3600_000L;
         long bucketMs = cfg.authBookPeriodSeconds() * 1000L;
 
