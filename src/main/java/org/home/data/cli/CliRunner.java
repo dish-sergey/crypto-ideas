@@ -77,6 +77,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck;
     private final ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe;
     private final ObjectProvider<org.home.data.revx.exec.Panic> panic;
+    private final ObjectProvider<org.home.data.revx.exec.Executor> executor;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
 
@@ -92,6 +93,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck,
                      ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe,
                      ObjectProvider<org.home.data.revx.exec.Panic> panic,
+                     ObjectProvider<org.home.data.revx.exec.Executor> executor,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
         this.context = context;
@@ -115,6 +117,7 @@ public class CliRunner implements ApplicationRunner {
         this.tradeCheck = tradeCheck;
         this.orderProbe = orderProbe;
         this.panic = panic;
+        this.executor = executor;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
     }
@@ -189,6 +192,9 @@ public class CliRunner implements ApplicationRunner {
             }
             if (args.containsOption("revx-panic")) {
                 panic.getObject().run();
+            }
+            if (args.containsOption("revx-exec")) {
+                executor.getObject().run();          // блокирует: демон микро-live
             }
             if (args.containsOption("revx-flow")) {
                 revx.getObject().flow(

@@ -32,7 +32,7 @@ public class CliMode {
             "s5-dry-run", "s5-kraken-check", "s5-demo", "s5-live",
             "revx-pairs", "revx-probe-limits", "revx-collect", "revx-basis",
             "revx-sim", "revx-flow",
-            "revx-trade-check", "revx-order-probe", "revx-panic");
+            "revx-trade-check", "revx-order-probe", "revx-panic", "revx-exec");
 
     private final boolean scheduleMode;
     private final Set<String> unknownOptions;
