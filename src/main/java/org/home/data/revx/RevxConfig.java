@@ -37,6 +37,8 @@ public class RevxConfig {
     private final List<String> priority;
     private final int tradesPageLimit;
 
+    private final List<String> fastPairs;
+    private final long fastBookPeriodMs;
     private final List<String> tier1;
     private final List<String> tier2;
     private final int bookPeriodTier1Seconds;
@@ -98,6 +100,8 @@ public class RevxConfig {
             @Value("${revx.memecoins}") List<String> memecoins,
             @Value("${revx.priority}") List<String> priority,
             @Value("${revx.trades-page-limit}") int tradesPageLimit,
+            @Value("${revx.fast-pairs}") List<String> fastPairs,
+            @Value("${revx.fast-book-period-ms}") long fastBookPeriodMs,
             @Value("${revx.tier1}") List<String> tier1,
             @Value("${revx.tier2}") List<String> tier2,
             @Value("${revx.book-period-tier1-seconds}") int bookPeriodTier1Seconds,
@@ -154,6 +158,8 @@ public class RevxConfig {
         this.memecoins = memecoins;
         this.priority = priority;
         this.tradesPageLimit = tradesPageLimit;
+        this.fastPairs = fastPairs;
+        this.fastBookPeriodMs = fastBookPeriodMs;
         this.tier1 = tier1;
         this.tier2 = tier2;
         this.bookPeriodTier1Seconds = bookPeriodTier1Seconds;
@@ -294,6 +300,22 @@ public class RevxConfig {
     }
 
     /** Ярус 1 — единственный, по которому симуляция честна (снимки достаточно часты). */
+    /**
+     * Пары быстрого яруса (базовые символы). Пусто = ярус выключен.
+     *
+     * Задержка котирования — самый дорогой из измеренных параметров: устаревание
+     * заявки растёт как корень из периода опроса и на пяти секундах съедает
+     * 2.86 б.п. из четырнадцати (док. 88). Левая часть кривой в симуляции
+     * недоступна — данные собраны с шагом 5 с, — поэтому её собирают отдельно.
+     */
+    public List<String> fastPairs() {
+        return fastPairs;
+    }
+
+    public long fastBookPeriodMs() {
+        return fastBookPeriodMs;
+    }
+
     public List<String> tier1() {
         return tier1;
     }

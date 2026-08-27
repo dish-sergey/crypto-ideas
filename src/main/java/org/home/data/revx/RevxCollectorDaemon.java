@@ -211,14 +211,53 @@ public class RevxCollectorDaemon {
         if (endpoints.singleTier()) {
             long bookPeriodMs = endpoints.bookPeriodSeconds() * 1000L;
             long tradesPeriodMs = endpoints.tradesPeriodSeconds() * 1000L;
-            addBookTasks(queue, universe, bookPeriodMs, now, 0);
-            addTradeTasks(queue, universe, tradesPeriodMs, now + 2_000, 1);
+
+            // Быстрый ярус. Задержка котирования оказалась самым дорогим параметром
+            // из измеренных: устаревание заявки растёт как √t, и на пяти секундах
+            // съедает 2.86 б.п. из четырнадцати (док. 88). Проверить левую часть
+            // кривой можно только данными с мелким шагом — их и собираем.
+            List<PairsCatalog.Leg> fast = new ArrayList<>();
+            List<PairsCatalog.Leg> normal = new ArrayList<>();
+            for (PairsCatalog.Leg pair : universe) {
+                (cfg.fastPairs().contains(pair.base()) ? fast : normal).add(pair);
+            }
+            long fastPeriodMs = Math.max(200L, cfg.fastBookPeriodMs());
+            double plannedRps = 2.0 * normal.size() / endpoints.bookPeriodSeconds()
+                    + 2.0 * fast.size() * 1000.0 / fastPeriodMs
+                    + (double) universe.size() / endpoints.tradesPeriodSeconds();
+            // Бюджет проверяется ДО старта, а не по факту 429: пропущенный снимок
+            // книги невосполним (принцип 4 док. 09), а лимит площадки — 1000/мин.
+            if (plannedRps > endpoints.maxRequestsPerSecond()) {
+                log.warn("быстрый ярус ({} пар раз в {} мс) даёт {} req/s при потолке {} — "
+                                + "ВЫКЛЮЧАЮ его, иначе поедут 429 по всей вселенной",
+                        fast.size(), fastPeriodMs, Math.round(plannedRps * 100) / 100.0,
+                        endpoints.maxRequestsPerSecond());
+                normal.addAll(fast);
+                fast.clear();
+                plannedRps = 2.0 * normal.size() / endpoints.bookPeriodSeconds()
+                        + (double) universe.size() / endpoints.tradesPeriodSeconds();
+            }
+
+            addBookTasks(queue, normal, bookPeriodMs, now, 1);
+            if (!fast.isEmpty()) {
+                // Приоритет 0: быстрый ярус не должен опаздывать из-за хвоста вселенной,
+                // иначе его шаг перестанет быть тем, ради чего он заведён.
+                addBookTasks(queue, fast, fastPeriodMs, now, 0);
+            }
+            addTradeTasks(queue, universe, tradesPeriodMs, now + 2_000, 2);
             long refresh = cfg.pairsRefreshHours() * 3600_000L;
             queue.add(new Task("pairs", refresh, 5, now + refresh, catalog::refresh));
-            log.info("единый ярус: {} пар, книги раз в {} c, сделки раз в {} c; расчётная нагрузка {} req/s",
-                    universe.size(), endpoints.bookPeriodSeconds(), endpoints.tradesPeriodSeconds(),
-                    Math.round((2.0 * universe.size() / endpoints.bookPeriodSeconds()
-                            + (double) universe.size() / endpoints.tradesPeriodSeconds()) * 100) / 100.0);
+            log.info("единый ярус: {} пар раз в {} c" + (fast.isEmpty() ? "" : ", быстрых {} раз в {} мс")
+                            + ", сделки раз в {} c; расчётная нагрузка {} req/s при потолке {}",
+                    fast.isEmpty()
+                            ? new Object[]{normal.size(), endpoints.bookPeriodSeconds(),
+                                    endpoints.tradesPeriodSeconds(),
+                                    Math.round(plannedRps * 100) / 100.0,
+                                    endpoints.maxRequestsPerSecond()}
+                            : new Object[]{normal.size(), endpoints.bookPeriodSeconds(),
+                                    fast.size(), fastPeriodMs, endpoints.tradesPeriodSeconds(),
+                                    Math.round(plannedRps * 100) / 100.0,
+                                    endpoints.maxRequestsPerSecond()});
             return queue;
         }
 
