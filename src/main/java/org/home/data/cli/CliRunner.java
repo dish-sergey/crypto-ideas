@@ -75,7 +75,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.theory.TheoryCommands> theory;
     /** Проверка торгового ключа — тоже лениво: без переменных окружения бин упадёт. */
     private final ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck;
-    private final ObjectProvider<org.home.data.revx.exec.OrderSchemaProbe> orderSchema;
+    private final ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
 
@@ -89,7 +89,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<RevxCommands> revx,
                      ObjectProvider<org.home.data.theory.TheoryCommands> theory,
                      ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck,
-                     ObjectProvider<org.home.data.revx.exec.OrderSchemaProbe> orderSchema,
+                     ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
         this.context = context;
@@ -111,7 +111,7 @@ public class CliRunner implements ApplicationRunner {
         this.revx = revx;
         this.theory = theory;
         this.tradeCheck = tradeCheck;
-        this.orderSchema = orderSchema;
+        this.orderProbe = orderProbe;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
     }
@@ -172,8 +172,8 @@ public class CliRunner implements ApplicationRunner {
             if (args.containsOption("revx-trade-check")) {
                 tradeCheck.getObject().run();
             }
-            if (args.containsOption("revx-order-schema")) {
-                orderSchema.getObject().run();
+            if (args.containsOption("revx-order-probe")) {
+                orderProbe.getObject().run();
             }
             if (args.containsOption("revx-flow")) {
                 revx.getObject().flow(
