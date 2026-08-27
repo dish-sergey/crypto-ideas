@@ -47,6 +47,16 @@ public final class ExecJournal implements AutoCloseable {
                 detail TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_exec_event_ts ON exec_event(ts_ms);
+            CREATE TABLE IF NOT EXISTS exec_quote (
+                ts_ms     INTEGER NOT NULL,
+                fair      REAL,
+                bid       REAL,
+                ask       REAL,
+                inventory REAL,
+                quotable  INTEGER NOT NULL,
+                reason    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_exec_quote_ts ON exec_quote(ts_ms);
             """;
 
     private final Connection connection;
@@ -95,6 +105,32 @@ public final class ExecJournal implements AutoCloseable {
         } catch (Exception e) {
             // Журнал не должен ронять торговлю, но и молчать о своей поломке нельзя.
             log.error("не записался запрос в журнал: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Справедливая цена и наши котировки НА КАЖДОМ ТИКЕ.
+     *
+     * Без этого измерение не состоится вовсе: чтобы сравнить живое исполнение с
+     * моделью, нужен захват — расстояние от цены исполнения до справедливой цены
+     * В ТОТ МОМЕНТ. Восстановить его задним числом из базы стенда можно лишь
+     * приблизительно, а цена за секунду уходит на пару базисных пунктов.
+     */
+    public synchronized void quote(double fair, Double bid, Double ask, double inventory,
+                                   boolean quotable, String reason) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT INTO exec_quote(ts_ms, fair, bid, ask, inventory, quotable, reason)"
+                        + " VALUES (?,?,?,?,?,?,?)")) {
+            ps.setLong(1, System.currentTimeMillis());
+            ps.setDouble(2, fair);
+            if (bid == null) ps.setNull(3, java.sql.Types.REAL); else ps.setDouble(3, bid);
+            if (ask == null) ps.setNull(4, java.sql.Types.REAL); else ps.setDouble(4, ask);
+            ps.setDouble(5, inventory);
+            ps.setInt(6, quotable ? 1 : 0);
+            ps.setString(7, reason);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.error("не записалась котировка: {}", e.getMessage());
         }
     }
 

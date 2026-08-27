@@ -169,6 +169,7 @@ public final class QuoteLoop implements Runnable {
         if (!fair.quotable() || !(fair.price() > 0)) {
             // Гейт ТЗ §4.1: опора сломана — снимаем всё, а не ждём.
             pausedReason = fair.pausedReason() == null ? "курс ненадёжен" : fair.pausedReason();
+            journal.quote(fair.price(), null, null, inventory, false, pausedReason);
             cancelAll(pausedReason);
             return;
         }
@@ -181,6 +182,9 @@ public final class QuoteLoop implements Runnable {
         pausedReason = null;
 
         Quoter.Quotes target = quoter.quotes(fair.price(), inventory);
+        // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
+        // потом не восстановить, а именно он и сравнивается с моделью.
+        journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null);
         syncSide(Side.BUY, bid, target.bid(), fair.price());
         syncSide(Side.SELL, ask, target.ask(), fair.price());
     }

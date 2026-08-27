@@ -10,6 +10,8 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.List;
 
 /**
@@ -52,7 +54,7 @@ public final class StandReader implements AutoCloseable {
             FROM revx_book
             WHERE symbol = ? AND t_sent_ms >= ?
             ORDER BY t_sent_ms DESC
-            LIMIT 1
+            LIMIT 4
             """;
 
     private static final String SELECT_UNIVERSE = """
@@ -96,17 +98,30 @@ public final class StandReader implements AutoCloseable {
         List<PairQuote> quotes = new ArrayList<>();
         long asOf = 0;
         for (String pairBase : universe()) {
-            Leg usdc = leg(pairBase + "/USDC", since);
-            Leg usd = leg(pairBase + "/USD", since);
-            if (usdc == null || usd == null) {
-                continue;                            // одной ноги нет — пара не в счёт
+            // Ноги сопоставляются ПО snap_id, а не «последняя с последней».
+            //
+            // Наивная склейка ломалась гонкой с писателем: коллектор кладёт ноги
+            // одного цикла двумя строками, и запрос между этими записями брал
+            // USDC из цикла N, а USD из цикла N−1. Расхождение выходило равным
+            // периоду опроса — на быстром ярусе это 1000 мс при пороге 250, пара
+            // отбрасывалась, и если такой парой оказывалась торгуемая, срабатывал
+            // гейт «пары нет в последнем срезе»: обе заявки снимались и ставились
+            // заново. Каждая такая осечка тратит постановку, а суточный потолок
+            // постановок — единственный жёсткий ресурс площадки.
+            //
+            // Поэтому берём несколько последних снимков каждой ноги и выбираем
+            // самый свежий snap_id, который есть у обеих.
+            Map<Long, Leg> usdcLegs = legs(pairBase + "/USDC", since);
+            Map<Long, Leg> usdLegs = legs(pairBase + "/USD", since);
+            Long snapId = usdcLegs.keySet().stream()
+                    .filter(usdLegs::containsKey)
+                    .max(Long::compareTo).orElse(null);
+            if (snapId == null) {
+                continue;                            // общего снимка нет — пара не в счёт
             }
-            // Ноги берутся из разных запросов, поэтому расхождение считается по
-            // времени получения, а не по полю snap_id: снимки могут оказаться
-            // из соседних циклов, и молча склеивать их нельзя.
-            long skew = usdc.snapId == usd.snapId
-                    ? Math.max(usdc.skewMs, usd.skewMs)
-                    : Math.abs(usdc.recvMs - usd.recvMs);
+            Leg usdc = usdcLegs.get(snapId);
+            Leg usd = usdLegs.get(snapId);
+            long skew = Math.max(usdc.skewMs, usd.skewMs);
             if (skew > maxSkewMs) {
                 continue;
             }
@@ -141,26 +156,27 @@ public final class StandReader implements AutoCloseable {
         }
     }
 
-    private Leg leg(String symbol, long sinceMs) {
+    /** Несколько последних снимков ноги, разложенных по snap_id. */
+    private Map<Long, Leg> legs(String symbol, long sinceMs) {
+        Map<Long, Leg> out = new HashMap<>();
         try (PreparedStatement ps = connection.prepareStatement(SELECT_LATEST)) {
             ps.setString(1, symbol);
             ps.setLong(2, sinceMs);
             try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next()) {
-                    return null;
+                while (rs.next()) {
+                    double ask = rs.getDouble("ap1");
+                    double bid = rs.getDouble("bp1");
+                    if (!(ask > 0) || !(bid > 0)) {
+                        continue;                    // пустой ответ книги, такое бывает
+                    }
+                    out.put(rs.getLong("snap_id"), new Leg(rs.getLong("snap_id"), ask, bid,
+                            rs.getLong("skew_ms"), rs.getLong("t_recv_ms")));
                 }
-                double ask = rs.getDouble("ap1");
-                double bid = rs.getDouble("bp1");
-                if (!(ask > 0) || !(bid > 0)) {
-                    return null;                     // пустой ответ книги, такое бывает
-                }
-                return new Leg(rs.getLong("snap_id"), ask, bid,
-                        rs.getLong("skew_ms"), rs.getLong("t_recv_ms"));
             }
         } catch (Exception e) {
             log.error("не прочиталась нога {}: {}", symbol, e.getMessage());
-            return null;
         }
+        return out;
     }
 
     /** Вселенная читается один раз: пары не меняются в течение прогона. */
