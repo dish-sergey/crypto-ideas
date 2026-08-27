@@ -35,20 +35,25 @@ public class TradeCheck {
     private static final Logger log = LoggerFactory.getLogger(TradeCheck.class);
 
     /**
-     * Кандидаты. Пути не документированы у нас в проекте, поэтому проверяются
-     * перебором: 200 — нашли, 404 — нет такого, 401/403 — есть, но прав не хватает
-     * (и это тоже информация: значит адрес верный, а ключ выпущен не с теми правами).
+     * Поверхность API, НАЙДЕННАЯ перебором 27.08.2026 (ответы площадки в скобках):
+     *
+     * <pre>
+     * GET    /api/1.0/orders/active   — открытые заявки (200, {"data":[],...})
+     * GET    /api/1.0/orders/{id}     — одна заявка; на /orders/open площадка
+     *                                   ответила «Invalid order ID: 'open'», чем
+     *                                   и выдала форму пути
+     * GET    /api/1.0/balances        — остатки по валютам (200)
+     * POST   /api/1.0/orders          — постановка (по документации, 10/с + 1000/сутки)
+     * PUT    /api/1.0/orders/{id}     — замена (10/с, без суточного потолка)
+     * DELETE /api/1.0/orders/{id}     — отмена (100/с)
+     * </pre>
+     *
+     * Остальные кандидаты (`/balance`, `/accounts`, `/account`, `/wallet`,
+     * `/trades/my`, а также GET на `/orders`) дали 401 — их нет.
      */
     private static final List<String> CANDIDATES = List.of(
-            "/api/1.0/orders",
-            "/api/1.0/orders/open",
             "/api/1.0/orders/active",
-            "/api/1.0/balances",
-            "/api/1.0/balance",
-            "/api/1.0/accounts",
-            "/api/1.0/account",
-            "/api/1.0/wallet",
-            "/api/1.0/trades/my");
+            "/api/1.0/balances");
 
     private final RevxConfig cfg;
 
@@ -77,7 +82,9 @@ public class TradeCheck {
                 HttpResponse<String> response = http.send(request.build(),
                         HttpResponse.BodyHandlers.ofString());
                 report.append(String.format("%-28s %d  %s%n", path, response.statusCode(),
-                        summarize(response.body())));
+                        path.endsWith("/balances")
+                                ? nonZeroBalances(response.body())
+                                : summarize(response.body())));
                 // Пауза между запросами: у площадки ограничен минимальный интервал,
                 // и разведка не должна выглядеть как залп (см. CLAUDE.md).
                 Thread.sleep(200);
@@ -95,6 +102,29 @@ public class TradeCheck {
                 404 — такого адреса нет, кандидат отпадает.
                 """);
         log.info(report.toString());
+    }
+
+    /**
+     * Из списка остатков показываются только НЕНУЛЕВЫЕ. Площадка возвращает все
+     * валюты подряд, и в логе это сотня строк с нулями, среди которых не видно
+     * того единственного, ради чего смотрели: есть ли на счёте обе валюты пары.
+     * Котировать две стороны без обеих нельзя — постановка будет отклонена.
+     */
+    private static String nonZeroBalances(String body) {
+        if (body == null || body.isBlank()) {
+            return "(пусто)";
+        }
+        var matcher = java.util.regex.Pattern
+                .compile("\\{\"currency\":\"([A-Z0-9]+)\"[^}]*?\"total\":\"([0-9.]+)\"")
+                .matcher(body);
+        StringBuilder out = new StringBuilder();
+        while (matcher.find()) {
+            if (Double.parseDouble(matcher.group(2)) > 0) {
+                out.append(out.isEmpty() ? "" : ", ")
+                        .append(matcher.group(1)).append(' ').append(matcher.group(2));
+            }
+        }
+        return out.isEmpty() ? "все остатки нулевые — торговать нечем" : out.toString();
     }
 
     /** Тело урезается: в нём могут быть остатки на счёте, а в журнале это лишнее. */
