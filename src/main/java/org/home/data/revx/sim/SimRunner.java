@@ -71,6 +71,10 @@ public class SimRunner {
     private record CapRung(double factor, double cap, SimEngine.Result result) {
     }
 
+    /** Ступень лестницы задержки котирования. */
+    private record LatencyRung(int seconds, SimEngine.Result result) {
+    }
+
     /**
      * Нулевое распределение контроля: N прогонов случайных котировок с разными
      * seed'ами. {@code capturePercentile} — доля прогонов контроля, которые
@@ -163,6 +167,22 @@ public class SimRunner {
             }
         }
 
+        // Лестница задержки котирования — цена отсутствия WebSocket (док. 86 §7).
+        // Правка «захват против цены момента исполнения» создала механизм
+        // устаревания заявки; здесь он прогоняется с разным периодом решений.
+        List<LatencyRung> latencyLadder = new ArrayList<>();
+        for (int seconds : latencySeconds()) {
+            int periodWindows = Math.max(1, seconds / cfg.authBookPeriodSeconds());
+            SimEngine.Result result = periodWindows == 1 ? baseResult
+                    : new SimEngine(base, limits, cfg.simMakerFee(), new Quoter(base), periodWindows)
+                            .run(data.windows());
+            latencyLadder.add(new LatencyRung(seconds, result));
+            if (periodWindows != 1) {
+                runs.add(new Run(String.format("задержка %d с", seconds), result,
+                        cfg.simMakerFee(), base.offset(), base.inventoryCap()));
+            }
+        }
+
         // Контроль: случайные котировки (то же присутствие в книге, цены наугад)
         SimEngine.Result randomResult = new SimEngine(base, limits, cfg.simMakerFee(),
                 QuotePolicy.random(base, cfg.simRandomSeed())).run(data.windows());
@@ -195,7 +215,7 @@ public class SimRunner {
         }
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
-                skewLadder, capLadder);
+                skewLadder, capLadder, latencyLadder);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
@@ -208,6 +228,14 @@ public class SimRunner {
         return java.util.stream.DoubleStream
                 .concat(java.util.stream.DoubleStream.of(base.offset()),
                         java.util.Arrays.stream(cfg.simOffsetLadder()))
+                .distinct().sorted().toArray();
+    }
+
+    /** Период опроса плюс лестница задержки, по возрастанию и без дублей. */
+    private int[] latencySeconds() {
+        return java.util.stream.IntStream
+                .concat(java.util.stream.IntStream.of(cfg.authBookPeriodSeconds()),
+                        java.util.Arrays.stream(cfg.simLatencyLadder()))
                 .distinct().sorted().toArray();
     }
 
@@ -407,7 +435,8 @@ public class SimRunner {
 
     private String render(String symbol, int hours, SimDataReader.Dataset data, Quoter.Params base,
                           ExecutionModel.Limits limits, List<Run> runs, SimEngine.Result baseResult,
-                          List<Rung> ladder, List<SkewRung> skewLadder, List<CapRung> capLadder) {
+                          List<Rung> ladder, List<SkewRung> skewLadder, List<CapRung> capLadder,
+                          List<LatencyRung> latencyLadder) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
         sb.append("Прогоны ТЗ §4.7, отчёт §5.3. Код `").append(registry.gitHash())
@@ -616,6 +645,44 @@ public class SimRunner {
         sb.append("\nПик на нуле означает, что книги живут синхронно и объяснение "
                 + "«устаревшая опора» отпадает. Пик справа — опора отстаёт, и уровень "
                 + "захвата завышен ровно на величину этого запаздывания.\n\n");
+
+        sb.append("### Лестница задержки: чего стоит REST вместо WebSocket\n\n");
+        sb.append("Раз во сколько мы смотрим на рынок и переставляем заявку. Между "
+                + "решениями котировка висит по старой цене, рынок уходит, и часть "
+                + "исполнений достаётся нам устаревшими — те самые «разобрали». "
+                + "Быстрее периода опроса промоделировать нечего: данные собраны с "
+                + "этим шагом. Но наклон кривой показывает, сколько стоит каждая "
+                + "ступень задержки, и тем самым — чего стоило бы её сокращение.\n\n");
+        sb.append("| Задержка | Исполнений | Захват | **Чистый край 60 с** "
+                + "| **Разобрали, % оборота** | Оборот | Край × оборот "
+                + "| Перевыставлений/сут | Total |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|\n");
+        for (LatencyRung rung : latencyLadder) {
+            SimEngine.Result r = rung.result();
+            List<Fill> withHorizon = Markout.withHorizon(r.fills(), r.fairSeries(), 60_000);
+            double turnover = withHorizon.stream().mapToDouble(Fill::notional).sum();
+            double negative = withHorizon.stream()
+                    .filter(f -> f.spreadCapture() < 0)
+                    .mapToDouble(Fill::notional).sum();
+            double capture = withHorizon.stream().mapToDouble(Fill::spreadCapture).sum();
+            double edge = netEdgeBp(r, 60_000);
+            sb.append("| ").append(rung.seconds()).append(" с")
+                    .append(rung.seconds() == cfg.authBookPeriodSeconds() ? " (текущая)" : "")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(turnover > 0 ? round(capture / turnover * 10_000, 2) : "—")
+                    .append(" | **").append(round(edge, 2)).append("**")
+                    .append(" | **").append(turnover > 0
+                            ? round(100 * negative / turnover, 1) + "%" : "—").append("**")
+                    .append(" | ").append(round(turnover(r), 0))
+                    .append(" | ").append(round(edge * turnover(r) / 10_000, 1))
+                    .append(" | ").append(Math.round(r.requotesPerDay(data.spanMs())))
+                    .append(" | ").append(round(r.pnl().total(), 1))
+                    .append(" |\n");
+        }
+        sb.append("\nПобочно эта таблица отвечает и на вопрос лимита запросов: реже "
+                + "котируешь — меньше перевыставлений. Если край при этом падает "
+                + "медленно, у конструкции есть запас по частоте, которого мы не "
+                + "знали.\n\n");
 
         sb.append("### Лестница потолка инвентаря: ёмкость (док. 84 §3)\n\n");
         sb.append("Базисные пункты превращает в деньги именно потолок. Таблица "

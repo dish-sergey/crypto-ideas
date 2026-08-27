@@ -67,6 +67,7 @@ public final class SimEngine {
     private final Quoter.Params params;
     private final ExecutionModel.Limits limits;
     private final double makerFeeRate;
+    private final int quotePeriodWindows;
 
     public SimEngine(Quoter.Params params, ExecutionModel.Limits limits, double makerFeeRate) {
         this(params, limits, makerFeeRate, new Quoter(params));
@@ -74,11 +75,32 @@ public final class SimEngine {
 
     public SimEngine(Quoter.Params params, ExecutionModel.Limits limits, double makerFeeRate,
                      QuotePolicy policy) {
+        this(params, limits, makerFeeRate, policy, 1);
+    }
+
+    /**
+     * @param quotePeriodWindows раз во сколько окон мы СМОТРИМ НА РЫНОК и принимаем
+     *                           решение о котировке. 1 = каждое окно (текущие 5 с),
+     *                           12 = раз в минуту.
+     *
+     * Это и есть цена отсутствия WebSocket, переведённая в измеримую величину.
+     * Между решениями заявка висит по старой цене: рынок за это время уходит, и
+     * часть исполнений достаётся нам по устаревшей котировке. Быстрее пяти секунд
+     * промоделировать нечего — данные собраны с этим шагом, — но наклон кривой
+     * показывает, сколько стоит каждая ступень задержки.
+     *
+     * Гейт справедливой цены на неквотирующих окнах не перепроверяется намеренно:
+     * если мы смотрим на рынок раз в минуту, то и о поломке опоры узнаём раз в
+     * минуту. Иначе получилась бы задержка только в цене, но не в защите.
+     */
+    public SimEngine(Quoter.Params params, ExecutionModel.Limits limits, double makerFeeRate,
+                     QuotePolicy policy, int quotePeriodWindows) {
         this.params = params;
         this.quoter = new Quoter(params);
         this.policy = policy;
         this.limits = limits;
         this.makerFeeRate = makerFeeRate;
+        this.quotePeriodWindows = Math.max(1, quotePeriodWindows);
     }
 
     public Result run(List<Window> windows) {
@@ -113,7 +135,11 @@ public final class SimEngine {
                 marketQty += trade.qty();
             }
 
-            if (!window.quotable() || !(window.fair() > 0)) {
+            // Смотрим на рынок и принимаем решения только на квотирующих окнах.
+            // Между ними заявка висит по старой цене — это и есть задержка.
+            boolean decisionWindow = wi % quotePeriodWindows == 0;
+
+            if (decisionWindow && (!window.quotable() || !(window.fair() > 0))) {
                 // курс ненадёжен или опора сломана — снимаем котировки целиком
                 if (restingBid != null || restingAsk != null) {
                     execution.cancelAll();
@@ -124,9 +150,15 @@ public final class SimEngine {
                 paused++;
                 continue;
             }
+            if (!(window.fair() > 0)) {
+                paused++;
+                continue;                 // без справедливой цены нечего мерить
+            }
 
             execution.refresh(window.book());
-            Quoter.Quotes target = policy.quotes(window.fair(), pnl.inventory());
+            Quoter.Quotes target = decisionWindow
+                    ? policy.quotes(window.fair(), pnl.inventory())
+                    : new Quoter.Quotes(restingBid, restingAsk);
 
             if (quoter.shouldRequote(restingBid, target.bid())) {
                 execution.cancel(Side.BUY);

@@ -68,6 +68,7 @@ public class RevxConfig {
     private final List<Double> simOffsetLadder;
     private final List<Double> simSkewLadder;
     private final List<Double> simCapLadder;
+    private final List<Integer> simLatencyLadder;
 
     private final double probeStartRps;
     private final double probeStepRps;
@@ -126,6 +127,7 @@ public class RevxConfig {
             @Value("${revx.sim.offset-ladder}") List<Double> simOffsetLadder,
             @Value("${revx.sim.skew-ladder}") List<Double> simSkewLadder,
             @Value("${revx.sim.cap-ladder}") List<Double> simCapLadder,
+            @Value("${revx.sim.latency-ladder}") List<Integer> simLatencyLadder,
             @Value("${revx.probe.start-rps}") double probeStartRps,
             @Value("${revx.probe.step-rps}") double probeStepRps,
             @Value("${revx.probe.max-rps}") double probeMaxRps,
@@ -181,6 +183,7 @@ public class RevxConfig {
         this.simOffsetLadder = simOffsetLadder;
         this.simSkewLadder = simSkewLadder;
         this.simCapLadder = simCapLadder;
+        this.simLatencyLadder = simLatencyLadder;
         this.probeStartRps = probeStartRps;
         this.probeStepRps = probeStepRps;
         this.probeMaxRps = probeMaxRps;
@@ -431,6 +434,15 @@ public class RevxConfig {
      */
     public double[] simCapLadder() {
         return simCapLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    /**
+     * Ступени задержки котирования в секундах — цена отсутствия WebSocket.
+     * Базовая ступень (период опроса) добавляется отдельно; быстрее неё
+     * промоделировать нечего, данные собраны с этим шагом.
+     */
+    public int[] simLatencyLadder() {
+        return simLatencyLadder.stream().mapToInt(Integer::intValue).toArray();
     }
 
     public double probeStartRps() {
