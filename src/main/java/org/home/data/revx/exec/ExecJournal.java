@@ -57,6 +57,18 @@ public final class ExecJournal implements AutoCloseable {
                 reason    TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_exec_quote_ts ON exec_quote(ts_ms);
+            CREATE TABLE IF NOT EXISTS exec_fill (
+                ts_ms        INTEGER NOT NULL,
+                venue_id     TEXT,
+                side         TEXT,
+                qty          REAL,
+                price        REAL,
+                fair         REAL,
+                fee          REAL,
+                fee_currency TEXT,
+                status       TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_exec_fill_ts ON exec_fill(ts_ms);
             """;
 
     private final Connection connection;
@@ -131,6 +143,36 @@ public final class ExecJournal implements AutoCloseable {
             ps.executeUpdate();
         } catch (Exception e) {
             log.error("не записалась котировка: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Исполнение — с ФАКТИЧЕСКОЙ ценой, объёмом и КОМИССИЕЙ, взятыми у площадки,
+     * а не выведенными из изменения остатков.
+     *
+     * Комиссия здесь не для бухгалтерии. Вся конструкция измерялась при maker 0%,
+     * и это промо-тариф молодой площадки: в тот день, когда он кончится, край
+     * в 8 б.п. начнёт съедаться, а по остаткам это заметят не сразу. Поэтому
+     * комиссия читается из ответа по каждой сделке и любое ненулевое значение
+     * останавливает торговлю.
+     */
+    public synchronized void fill(String venueId, String side, double qty, double price,
+                                  double fair, double fee, String feeCurrency, String status) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT INTO exec_fill(ts_ms, venue_id, side, qty, price, fair, fee, fee_currency, status)"
+                        + " VALUES (?,?,?,?,?,?,?,?,?)")) {
+            ps.setLong(1, System.currentTimeMillis());
+            ps.setString(2, venueId);
+            ps.setString(3, side);
+            ps.setDouble(4, qty);
+            ps.setDouble(5, price);
+            ps.setDouble(6, fair);
+            ps.setDouble(7, fee);
+            ps.setString(8, feeCurrency);
+            ps.setString(9, status);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.error("не записалось исполнение: {}", e.getMessage());
         }
     }
 

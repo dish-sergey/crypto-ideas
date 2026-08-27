@@ -90,6 +90,12 @@ public final class QuoteLoop implements Runnable {
     private long dayStartMs = System.currentTimeMillis();
     private long minuteStartMs = System.currentTimeMillis();
     private int replacesThisMinute;
+    private double totalFees;
+    private double totalFilledNotional;
+    private double startInventory;
+    private double startQuote;
+    private boolean startCaptured;
+    private java.util.function.Consumer<String> alert = message -> { };
 
     public QuoteLoop(TradeClient client, StandReader stand, ExecJournal journal,
                      Quoter.Params params, String symbol, long periodMs) {
@@ -116,6 +122,11 @@ public final class QuoteLoop implements Runnable {
             cancelAll("остановка по команде");
             log.warn("котирование выключено");
         }
+    }
+
+    /** Куда сообщать о срабатывании предохранителей. Ставится исполнителем. */
+    public void alertTo(java.util.function.Consumer<String> sink) {
+        this.alert = sink == null ? message -> { } : sink;
     }
 
     public boolean isQuoting() {
@@ -288,12 +299,83 @@ public final class QuoteLoop implements Runnable {
             resting.price = price;
             resting.size = size;
         } else {
-            // Заявки уже нет — скорее всего исполнилась. Считаем это исполнением
-            // и обновляем остатки: истина о позиции — на бирже, а не у нас.
-            log.info("замена {} не прошла ({}), считаю заявку ушедшей", side, response.status());
+            // Заявки уже нет — скорее всего исполнилась. Не гадаем по остаткам,
+            // а спрашиваем площадку: она отдаёт цену, объём и КОМИССИЮ.
+            log.info("замена {} не прошла ({}), выясняю судьбу заявки", side, response.status());
+            inspectGoneOrder(side, resting.venueId);
             resting.venueId = null;
-            fills++;
             refreshBalances();
+        }
+    }
+
+    /**
+     * Что случилось с исчезнувшей заявкой. Ответ площадки содержит фактическую
+     * цену исполнения, объём и комиссию — всё то, что иначе пришлось бы выводить
+     * из разницы остатков, теряя точность и путаясь при нескольких исполнениях
+     * подряд.
+     *
+     * Здесь же срабатывает предохранитель по комиссии: конструкция измерялась
+     * при maker 0%, и появление любой ненулевой комиссии означает конец промо —
+     * то есть смену экономики, а не параметра. Решение принимает человек.
+     */
+    private void inspectGoneOrder(Side side, String venueId) {
+        TradeClient.Response order = client.order(venueId);
+        if (!order.ok() || order.body() == null) {
+            fills++;                      // судьбу не выяснили, но заявки нет
+            return;
+        }
+        String status = field(order.body(), "status");
+        double filled = number(order.body(), "filled_quantity");
+        double price = number(order.body(), "average_fill_price");
+        double fee = number(order.body(), "total_fee");
+        String feeCurrency = field(order.body(), "fee_currency");
+
+        if (filled > 0) {
+            fills++;
+            totalFilledNotional += filled * price;
+            journal.fill(venueId, side.name(), filled, price, lastFair, fee, feeCurrency, status);
+        }
+        if (fee > ExecLimits.MAX_FEE_USDC) {
+            totalFees += fee;
+            String message = ("ОСТАНОВКА: площадка списала комиссию %s %s по заявке %s. "
+                    + "Вся конструкция считалась при maker 0%%; отмена промо — это смена "
+                    + "экономики, а не параметра. Котирование выключено, заявки сняты.")
+                    .formatted(fmt(fee), feeCurrency == null ? "" : feeCurrency, venueId);
+            log.error(message);
+            journal.event("fee_detected", message);
+            alert.accept(message);
+            stopQuoting();
+        }
+    }
+
+    /** Торговый P&L против buy & hold: рыночное движение стартовой позиции не в счёт. */
+    private void checkTradingPnl() {
+        if (!startCaptured || !(lastFair > 0)) {
+            return;
+        }
+        double pnl = (quoteBalance - startQuote) + (inventory - startInventory) * lastFair;
+        if (pnl < -ExecLimits.MAX_TRADING_LOSS_USDC) {
+            String message = ("ОСТАНОВКА: торговый убыток %s USDC против buy & hold превысил "
+                    + "предел %s. Котирование выключено, заявки сняты.")
+                    .formatted(fmt(pnl), fmt(-ExecLimits.MAX_TRADING_LOSS_USDC));
+            log.error(message);
+            journal.event("loss_stop", message);
+            alert.accept(message);
+            stopQuoting();
+        }
+    }
+
+    private static String field(String json, String name) {
+        Matcher matcher = Pattern.compile("\"" + name + "\"\\s*:\\s*\"([^\"]*)\"").matcher(json);
+        return matcher.find() ? matcher.group(1) : null;
+    }
+
+    private static double number(String json, String name) {
+        String value = field(json, name);
+        try {
+            return value == null ? 0 : Double.parseDouble(value);
+        } catch (NumberFormatException e) {
+            return 0;
         }
     }
 
@@ -329,6 +411,12 @@ public final class QuoteLoop implements Runnable {
                 quoteBalance = available;     // а тут важно именно «на что можно поставить»
             }
         }
+        if (!startCaptured && inventory + quoteBalance > 0) {
+            startInventory = inventory;
+            startQuote = quoteBalance;
+            startCaptured = true;
+        }
+        checkTradingPnl();
     }
 
     private void rollCounters() {

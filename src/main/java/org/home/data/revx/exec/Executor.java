@@ -88,6 +88,10 @@ public class Executor {
             System.exit(0);
         };
         ExecBot bot = ExecBot.fromEnvironment(loop, journal, panic);
+        // Предохранители должны докрикиваться до человека, а не только до журнала.
+        if (bot != null) {
+            loop.alertTo(bot::send);
+        }
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             log.warn("выключение: снимаю заявки");
