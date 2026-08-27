@@ -41,7 +41,7 @@ public class SimRunner {
      * короче реальной жизни позиции в двадцать раз. Без часового горизонта порог
      * по комиссии считался бы по куску, который позиция едва прожила.
      */
-    private static final long[] HORIZONS_MS = {0, 10_000, 60_000, 300_000, 3_600_000};
+    private static final long[] HORIZONS_MS = {10_000, 60_000, 300_000, 3_600_000};
 
     private final SimDataReader reader;
     private final RunRegistry registry;
@@ -306,9 +306,13 @@ public class SimRunner {
         if (turnover <= 0) {
             return Double.NaN;
         }
-        Markout.Stats atFill = Markout.compute(withHorizon, result.fairSeries(), 0);
+        // Захват берётся из самих исполнений, markout — из ряда справедливых цен.
+        // Раньше вместо захвата стоял markout(0), который тождественно равен ему
+        // ТОЛЬКО при базе «цена заявки»; при такой базе markout(Δ) тоже содержал
+        // захват, и сумма считала его дважды — при нулевом дрейфе выходило 2·d.
+        double capture = withHorizon.stream().mapToDouble(Fill::spreadCapture).sum();
         Markout.Stats later = Markout.compute(withHorizon, result.fairSeries(), horizonMs);
-        double net = atFill.mean() * atFill.fills() + later.mean() * later.fills();
+        double net = capture + later.mean() * later.fills();
         return net / turnover * 10_000;
     }
 
@@ -827,23 +831,25 @@ public class SimRunner {
         // ТЗ §5.5 в исходной формулировке закрывал направление на ЛЮБОМ отрицательном
         // markout — включая −0.010 при захваченном крае +0.156. Экономически значим
         // край на сделку целиком: half_spread + markout (ТЗ §4.5), и он же тут считается.
-        Markout.Stats atFill = Markout.compute(baseResult.fills(), baseResult.fairSeries(), 0);
+        double captureMean = baseResult.fills().isEmpty() ? Double.NaN
+                : baseResult.fills().stream().mapToDouble(Fill::spreadCapture).sum()
+                        / baseResult.fills().size();
         Markout.Stats at60 = Markout.compute(baseResult.fills(), baseResult.fairSeries(), 60_000);
         Markout.Stats at300 = Markout.compute(baseResult.fills(), baseResult.fairSeries(), 300_000);
-        double edge60 = atFill.mean() + at60.mean();
+        double edge60 = captureMean + at60.mean();
         sb.append("\n### Край на сделку, а не знак markout (правка ТЗ §5.5 по док. 71 §3.1)\n\n");
         sb.append("| Величина | Значение |\n|---|---|\n");
-        sb.append("| Захваченный край на исполнение, `markout(0)` | ").append(round(atFill.mean(), 4))
+        sb.append("| Захваченный край на исполнение | ").append(round(captureMean, 4))
                 .append(" |\n");
         sb.append("| `markout(60 с)` | ").append(round(at60.mean(), 4)).append(" |\n");
         sb.append("| **Край на сделку через 60 с** | **").append(round(edge60, 4)).append("** |\n");
         sb.append("| Неблагоприятный отбор как доля края, 60 с | ")
-                .append(atFill.mean() > 0 ? round(-at60.mean() / atFill.mean() * 100, 1) + "%" : "—")
+                .append(captureMean > 0 ? round(-at60.mean() / captureMean * 100, 1) + "%" : "—")
                 .append(" |\n");
         sb.append("| То же, 300 с | ")
-                .append(atFill.mean() > 0 ? round(-at300.mean() / atFill.mean() * 100, 1) + "%" : "—")
+                .append(captureMean > 0 ? round(-at300.mean() / captureMean * 100, 1) + "%" : "—")
                 .append(" |\n\n");
-        if (atFill.fills() == 0 || Double.isNaN(edge60)) {
+        if (baseResult.fills().isEmpty() || Double.isNaN(edge60)) {
             sb.append("Исполнений в выборке нет — край на сделку не считается.\n\n");
         } else {
             sb.append(edge60 > 0

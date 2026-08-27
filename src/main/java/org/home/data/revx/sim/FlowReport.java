@@ -141,8 +141,11 @@ public class FlowReport {
             }
             int passiveSign = trade.aggressor() == Side.SELL ? 1 : -1;   // SELL-агрессор → пассив купил
             double notional = trade.price() * trade.qty();
+            // markout — от справедливой цены в момент сделки, а не от цены сделки:
+            // иначе он содержит захват, и сумма «захват + markout» считает захват
+            // дважды (та же правка, что в Markout).
             double captureValue = passiveSign * (atFill.getValue() - trade.price()) * trade.qty();
-            double markoutValue = passiveSign * (later.getValue() - trade.price()) * trade.qty();
+            double markoutValue = passiveSign * (later.getValue() - atFill.getValue()) * trade.qty();
 
             turnover += notional;
             capture += captureValue;
@@ -246,7 +249,7 @@ public class FlowReport {
             counts[bucket]++;
             turnovers[bucket] += notional;
             captures[bucket] += passiveSign * (atFill.getValue() - trade.price()) * trade.qty();
-            markouts[bucket] += passiveSign * (later.getValue() - trade.price()) * trade.qty();
+            markouts[bucket] += passiveSign * (later.getValue() - atFill.getValue()) * trade.qty();
         }
 
         List<DistanceBucket> out = new ArrayList<>();

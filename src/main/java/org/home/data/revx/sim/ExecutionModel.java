@@ -240,10 +240,33 @@ public final class ExecutionModel {
      * срабатывания: если исполнились бы обе, остаётся только невыгодная нам.
      */
     public List<Fill> onWindow(List<MarketTrade> trades, double fairAtWindowEnd) {
+        return onWindow(trades, fairAtWindowEnd, fairAtWindowEnd);
+    }
+
+    /**
+     * @param fairAtQuote  справедливая цена начала окна — по ней принято решение
+     *                     о котировке, и только она участвует в правиле
+     *                     одновременного срабатывания
+     * @param fairAtFill   первая справедливая цена, НАБЛЮДЁННАЯ ПОСЛЕ исполнения
+     *                     (начало следующего окна). Захват считается против неё.
+     *
+     * Почему не против цены котирования. Заявка выставлена по {@code fair(t)} и
+     * висит до {@code t + период опроса}; если за это время цена ушла против нас,
+     * исполнение достанется нам по устаревшей цене — и это убыток. При базе
+     * {@code fair(t)} захват тождественно равен отступу, отрицательных исполнений
+     * не бывает вовсе, и модель не способна показать, что нас разобрали. У живой
+     * площадки такие сделки составляют 23% оборота (док. 85 §1).
+     *
+     * Заглядывания вперёд в РЕШЕНИЯ это не вносит: котировка по-прежнему строится
+     * по {@code fair(t)}. Следующая цена участвует только в ИЗМЕРЕНИИ результата —
+     * ровно как markout, который тоже смотрит вперёд по построению.
+     */
+    public List<Fill> onWindow(List<MarketTrade> trades, double fairAtQuote, double fairAtFill) {
         Resting bidCopy = bid == null ? null : bid.copy();
         Resting askCopy = ask == null ? null : ask.copy();
-        List<Fill> bidFills = simulate(bidCopy, trades, fairAtWindowEnd);
-        List<Fill> askFills = simulate(askCopy, trades, fairAtWindowEnd);
+        List<Fill> bidFills = simulate(bidCopy, trades, fairAtFill);
+        List<Fill> askFills = simulate(askCopy, trades, fairAtFill);
+        double fairAtWindowEnd = fairAtQuote;
 
         if (!bidFills.isEmpty() && !askFills.isEmpty()) {
             // Обе стороны в одном окне — данные дискретны, порядок сделок внутри окна

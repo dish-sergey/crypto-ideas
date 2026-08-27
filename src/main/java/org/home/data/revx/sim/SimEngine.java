@@ -101,7 +101,8 @@ public final class SimEngine {
         double maxDrawdown = 0;
         double fairFirst = 0;
 
-        for (Window window : windows) {
+        for (int wi = 0; wi < windows.size(); wi++) {
+            Window window = windows.get(wi);
             if (window.fair() > 0) {
                 fairSeries.put(window.tsMs(), window.fair());
                 if (fairFirst == 0) {
@@ -151,7 +152,17 @@ public final class SimEngine {
             }
 
             execution.observe();
-            List<Fill> fills = execution.onWindow(window.trades(), window.fair());
+            // Захват считается против ПЕРВОЙ справедливой цены после исполнения:
+            // заявка висит целое окно и может устареть. Хвост окна сравнивать не с
+            // чем — там остаётся цена котирования.
+            double fairAfter = window.fair();
+            for (int next = wi + 1; next < windows.size(); next++) {
+                if (windows.get(next).fair() > 0) {
+                    fairAfter = windows.get(next).fair();
+                    break;
+                }
+            }
+            List<Fill> fills = execution.onWindow(window.trades(), window.fair(), fairAfter);
             for (Fill fill : fills) {
                 pnl.add(fill);
                 allFills.add(fill);

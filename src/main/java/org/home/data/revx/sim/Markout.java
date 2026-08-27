@@ -8,7 +8,13 @@ import java.util.NavigableMap;
 /**
  * Неблагоприятный отбор — решающее измерение (ТЗ §4.5).
  *
- * <pre>markout(Δ) = (fair(t_fill + Δ) − fill_price) · side</pre>
+ * <pre>markout(Δ) = (fair(t_fill + Δ) − fair(t_fill)) · side</pre>
+ *
+ * База — справедливая цена в момент исполнения, а НЕ цена заявки. Разница
+ * принципиальна: при базе «цена заявки» markout содержит в себе захват спреда,
+ * и величина «захват + markout» считает захват дважды — при нулевом дрейфе она
+ * даёт 2·d вместо d. С базой «справедливая цена» markout измеряет ровно то, ради
+ * чего он нужен: что рынок сделал с нами ПОСЛЕ исполнения.
  *
  * Как читать (ТЗ §4.5):
  *  - markout(0) > 0 и markout(60с) ≈ markout(0) — исполняет неинформированный
@@ -73,7 +79,12 @@ public final class Markout {
             if (entry == null) {
                 continue;
             }
-            values.add(fill.side().sign() * (entry.getValue() - fill.price()) * fill.qty());
+            // База — справедливая цена В МОМЕНТ ИСПОЛНЕНИЯ, а не цена заявки.
+            // Иначе markout(Δ) содержит в себе захват спреда целиком, и сумма
+            // «захват + markout» считает захват ДВАЖДЫ: при нулевом дрейфе она
+            // даёт 2·d вместо d. Здесь markout — только то, что рынок сделал с нами
+            // ПОСЛЕ исполнения, и тогда край = захват + markout честно.
+            values.add(fill.side().sign() * (entry.getValue() - fill.fairAtFill()) * fill.qty());
         }
         values.sort(Comparator.naturalOrder());
         return new Stats(horizonMs, values.size(), mean(values),
