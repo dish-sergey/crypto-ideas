@@ -121,6 +121,15 @@ public class CliRunner implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) {
+        // Неизвестная опция — это либо опечатка, либо джарник старее команды.
+        // Молча запускать вместо неё планировщик нельзя: на торговом сервере так
+        // однажды поднялся весь слой данных вместо аварийной отмены заявок.
+        if (!mode.unknownOptions().isEmpty()) {
+            log.error("неизвестные опции: {} — команда не выполнена. Проверь версию jar:"
+                    + " возможно, он собран до появления этой команды", mode.unknownOptions());
+            SpringApplication.exit(context, () -> 2);
+            return;
+        }
         if (mode.isScheduleMode()) {
             liquidations.start();
             log.info("Режим планировщика: {} коллекторов + WS-ликвидации", collectors.size());
