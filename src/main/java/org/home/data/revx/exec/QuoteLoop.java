@@ -38,8 +38,20 @@ public final class QuoteLoop implements Runnable {
 
     private static final Pattern VENUE_ID =
             Pattern.compile("\"venue_order_id\"\\s*:\\s*\"([^\"]+)\"");
+    /**
+     * Из остатков нужны ОБА числа, и путать их нельзя:
+     * {@code available} — на что можно поставить новую заявку,
+     * {@code total} — сколько мы на самом деле держим (включая зарезервированное
+     * под уже стоящей заявкой).
+     *
+     * Скос считается от ПОЗИЦИИ, то есть от {@code total}: пока аск стоит, его
+     * объём зарезервирован и из {@code available} исчезает, а позицией быть не
+     * перестаёт. Если брать {@code available}, инвентарь занижается ровно на
+     * размер стоящей заявки, скос выходит слабее задуманного, и живое перестаёт
+     * совпадать с симуляцией — где инвентарь всегда полный.
+     */
     private static final Pattern BALANCE = Pattern.compile(
-            "\\{\"currency\":\"([A-Z0-9]+)\"[^}]*?\"available\":\"([0-9.]+)\"");
+            "\\{\"currency\":\"([A-Z0-9]+)\",\"available\":\"([0-9.]+)\",\"reserved\":\"([0-9.]+)\",\"total\":\"([0-9.]+)\"");
 
     /** Стоящая заявка: id площадки и цена, по которой она стоит. */
     private static final class Resting {
@@ -305,11 +317,12 @@ public final class QuoteLoop implements Runnable {
         }
         Matcher matcher = BALANCE.matcher(response.body());
         while (matcher.find()) {
-            double value = Double.parseDouble(matcher.group(2));
+            double available = Double.parseDouble(matcher.group(2));
+            double total = Double.parseDouble(matcher.group(4));
             if (base.equals(matcher.group(1))) {
-                inventory = value;
+                inventory = total;            // позиция целиком, вместе с зарезервированным
             } else if ("USDC".equals(matcher.group(1))) {
-                quoteBalance = value;
+                quoteBalance = available;     // а тут важно именно «на что можно поставить»
             }
         }
     }
