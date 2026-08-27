@@ -79,7 +79,7 @@ public class RevxAuth {
      * Путь берётся из URI как есть — он уже начинается с /api, как требует
      * документация; query — без вопросительного знака.
      */
-    static String signatureMessage(String timestamp, String method, URI uri, String body) {
+    public static String signatureMessage(String timestamp, String method, URI uri, String body) {
         String query = uri.getRawQuery() == null ? "" : uri.getRawQuery();
         return timestamp + method.toUpperCase() + uri.getRawPath() + query + body;
     }

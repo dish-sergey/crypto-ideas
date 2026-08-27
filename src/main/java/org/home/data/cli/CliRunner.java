@@ -46,6 +46,7 @@ import java.util.List;
  *   ./gradlew bootRun --args='--revx-basis --hours=6'             — стенд: курс USDC/USD и пригодность пар
  *   ./gradlew bootRun --args='--revx-sim --symbol=BTC/USDC --hours=123 --to=2026-08-25T03:00:00Z'
  *   ./gradlew bootRun --args='--revx-flow --symbol=BTC/USDC --hours=123'  — кто по ту сторону книги
+ *   ./gradlew bootRun --args='--revx-trade-check'  — проверка ТОРГОВОГО ключа, без ордеров
  */
 @Component
 public class CliRunner implements ApplicationRunner {
@@ -72,6 +73,8 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<RevxCommands> revx;
     /** Счётные стенды теории оптимальности (ТЗ 65–68) — тоже через провайдер, data/theory.db лениво. */
     private final ObjectProvider<org.home.data.theory.TheoryCommands> theory;
+    /** Проверка торгового ключа — тоже лениво: без переменных окружения бин упадёт. */
+    private final ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
 
@@ -84,6 +87,7 @@ public class CliRunner implements ApplicationRunner {
                      LiquidationWsCollector liquidations,
                      ObjectProvider<RevxCommands> revx,
                      ObjectProvider<org.home.data.theory.TheoryCommands> theory,
+                     ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
         this.context = context;
@@ -104,6 +108,7 @@ public class CliRunner implements ApplicationRunner {
         this.liquidations = liquidations;
         this.revx = revx;
         this.theory = theory;
+        this.tradeCheck = tradeCheck;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
     }
@@ -160,6 +165,9 @@ public class CliRunner implements ApplicationRunner {
                         java.time.Instant.parse(firstOr(args, "to",
                                 java.time.Instant.now().toString())).toEpochMilli(),
                         firstOr(args, "out", "reports/revx_sim.md"));
+            }
+            if (args.containsOption("revx-trade-check")) {
+                tradeCheck.getObject().run();
             }
             if (args.containsOption("revx-flow")) {
                 revx.getObject().flow(

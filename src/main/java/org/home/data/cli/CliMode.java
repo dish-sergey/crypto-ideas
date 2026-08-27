@@ -20,6 +20,7 @@ public class CliMode {
                 && !args.containsOption("revx-pairs") && !args.containsOption("revx-probe-limits")
                 && !args.containsOption("revx-collect") && !args.containsOption("revx-basis")
                 && !args.containsOption("revx-sim") && !args.containsOption("revx-flow")
+                && !args.containsOption("revx-trade-check")
                 && !args.containsOption("theory");
     }
 
