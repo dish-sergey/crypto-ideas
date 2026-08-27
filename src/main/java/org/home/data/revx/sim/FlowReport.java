@@ -99,7 +99,7 @@ public class FlowReport {
         Liquidity liquidity = classify(data, pairBaseStep(symbol));
         BookOffset offset = bookOffset(data);
 
-        String markdown = render(symbol, hours, data, edges, liquidity, offset);
+        String markdown = render(symbol, hours, data, edges, liquidity, offset, byDistance(trades, fair, 60_000L));
         write(out, markdown);
         PassiveEdge at60 = edges.get(0);
         log.info("{}: пассивная сторона — захват {} б.п., чистый край {} б.п. на 60 с "
@@ -194,6 +194,70 @@ public class FlowReport {
                 ? new BookOffset(0, Double.NaN, Double.NaN, Double.NaN, Double.NaN)
                 : new BookOffset(samples, mid / samples, bid / samples, ask / samples,
                         halfSpread / samples);
+    }
+
+    /**
+     * Корзина по ФАКТИЧЕСКОЙ дистанции пассивной цены от справедливой.
+     *
+     * Зачем. Наша лестница отступа — это модель: мы котируем на d и смотрим, что
+     * получается. Здесь то же самое, но по РЕАЛЬНЫМ сделкам площадки: на какой
+     * дистанции фактически стоял пассив и что он на ней заработал. Наложение двух
+     * кривых — единственная проверка модели исполнения против живых сделок,
+     * доступная без единого своего ордера.
+     *
+     * Дистанция тождественно равна захвату на единицу оборота: обе величины суть
+     * {@code passiveSign · (fair − price) / fair}. Поэтому корзины по дистанции —
+     * это корзины по захвату, а интересен в них markout: сохраняется ли он
+     * положительным на больших дистанциях так же, как в нашей лестнице.
+     */
+    private record DistanceBucket(String label, int trades, double turnover,
+                                  double captureBp, double markoutBp, double netBp) {
+    }
+
+    private static List<DistanceBucket> byDistance(List<MarketTrade> trades,
+                                                   NavigableMap<Long, Double> fair, long horizonMs) {
+        double[] edges = {-1e9, 0, 5, 10, 15, 20, 30, 50, 1e9};
+        String[] labels = {"< 0 (разобрали)", "0–5", "5–10", "10–15", "15–20", "20–30",
+                "30–50", "> 50"};
+        int n = labels.length;
+        int[] counts = new int[n];
+        double[] turnovers = new double[n];
+        double[] captures = new double[n];
+        double[] markouts = new double[n];
+        long lastFairMs = fair.isEmpty() ? Long.MIN_VALUE : fair.lastKey();
+
+        for (MarketTrade trade : trades) {
+            if (trade.aggressor() == null || trade.tsMs() + horizonMs > lastFairMs) {
+                continue;
+            }
+            var atFill = fair.floorEntry(trade.tsMs());
+            var later = fair.floorEntry(trade.tsMs() + horizonMs);
+            if (atFill == null || later == null || !(atFill.getValue() > 0)) {
+                continue;
+            }
+            int passiveSign = trade.aggressor() == Side.SELL ? 1 : -1;
+            double distanceBp = passiveSign * (atFill.getValue() - trade.price())
+                    / atFill.getValue() * 10_000;
+            int bucket = 0;
+            while (bucket < n - 1 && distanceBp >= edges[bucket + 1]) {
+                bucket++;
+            }
+            double notional = trade.price() * trade.qty();
+            counts[bucket]++;
+            turnovers[bucket] += notional;
+            captures[bucket] += passiveSign * (atFill.getValue() - trade.price()) * trade.qty();
+            markouts[bucket] += passiveSign * (later.getValue() - trade.price()) * trade.qty();
+        }
+
+        List<DistanceBucket> out = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            double t = turnovers[i];
+            out.add(new DistanceBucket(labels[i], counts[i], t,
+                    t > 0 ? captures[i] / t * 10_000 : Double.NaN,
+                    t > 0 ? markouts[i] / t * 10_000 : Double.NaN,
+                    t > 0 ? (captures[i] + markouts[i]) / t * 10_000 : Double.NaN));
+        }
+        return out;
     }
 
     /** След резервной ликвидности в книге. */
@@ -313,7 +377,8 @@ public class FlowReport {
     }
 
     private String render(String symbol, int hours, SimDataReader.Dataset data,
-                          List<PassiveEdge> edges, Liquidity liquidity, BookOffset offset) {
+                          List<PassiveEdge> edges, Liquidity liquidity, BookOffset offset,
+                          List<DistanceBucket> buckets) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Кто по ту сторону: ").append(symbol).append("\n\n");
         sb.append("Проверка по док. 79 §5. Считается на собранных данных, без единого "
@@ -346,6 +411,40 @@ public class FlowReport {
                     .append(round(edge.sellNetBp(), 2))
                     .append(" |\n");
         }
+
+        sb.append("\n### Край против дистанции: эталон для модели исполнения\n\n");
+        sb.append("Наша лестница отступа — это модель: котируем на `d`, смотрим что "
+                + "выходит. Здесь то же по РЕАЛЬНЫМ сделкам площадки: на какой дистанции "
+                + "от справедливой цены фактически стоял пассив и что он на ней заработал. "
+                + "Наложение двух кривых — единственная проверка модели исполнения против "
+                + "живых сделок, доступная без единого своего ордера.\n\n");
+        sb.append("| Дистанция, б.п. | Сделок | Оборот | Доля оборота | Захват | markout "
+                + "| **Чистый край** |\n|---|---|---|---|---|---|---|\n");
+
+        double totalTurnover = buckets.stream().mapToDouble(DistanceBucket::turnover).sum();
+        for (DistanceBucket bucket : buckets) {
+            if (bucket.trades() == 0) {
+                continue;
+            }
+            sb.append("| ").append(bucket.label())
+                    .append(" | ").append(bucket.trades())
+                    .append(" | ").append(round(bucket.turnover(), 0))
+                    .append(" | ").append(totalTurnover > 0
+                            ? round(100 * bucket.turnover() / totalTurnover, 1) + "%" : "—")
+                    .append(" | ").append(round(bucket.captureBp(), 2))
+                    .append(" | ").append(round(bucket.markoutBp(), 2))
+                    .append(" | **").append(round(bucket.netBp(), 2)).append("** |\n");
+        }
+        sb.append("\n**Как накладывать на нашу лестницу.** Дистанция тождественно равна "
+                + "захвату на единицу оборота, поэтому корзина «10–15 б.п.» сопоставима "
+                + "с нашей ступенью `d` ≈ 0.10–0.15%. Совпадение формы кривой — сильная "
+                + "валидация модели; расхождение показывает, где именно она врёт. "
+                + "Строка «< 0» — сделки, где пассив отдал хуже справедливой цены: это "
+                + "те, кого разобрали, и их доля тоже сопоставима с нашей.\n\n"
+                + "Оговорка, снимающая половину выводов при небрежном чтении: у "
+                + "контрагента иной отбор. Он стоит в книге постоянно, мы — с гейтами, "
+                + "потолком инвентаря и односторонними ограничениями спота. Сравнивать "
+                + "можно форму кривой, но не уровень напрямую.\n\n");
 
         sb.append("\n### Где стоит книга USDC относительно справедливой цены\n\n");
         sb.append("Без этой поправки разрыв между сторонами читать нельзя: если "

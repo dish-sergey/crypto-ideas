@@ -67,6 +67,7 @@ public class RevxConfig {
     private final List<Double> simFeeLadder;
     private final List<Double> simOffsetLadder;
     private final List<Double> simSkewLadder;
+    private final List<Double> simCapLadder;
 
     private final double probeStartRps;
     private final double probeStepRps;
@@ -124,6 +125,7 @@ public class RevxConfig {
             @Value("${revx.sim.fee-ladder}") List<Double> simFeeLadder,
             @Value("${revx.sim.offset-ladder}") List<Double> simOffsetLadder,
             @Value("${revx.sim.skew-ladder}") List<Double> simSkewLadder,
+            @Value("${revx.sim.cap-ladder}") List<Double> simCapLadder,
             @Value("${revx.probe.start-rps}") double probeStartRps,
             @Value("${revx.probe.step-rps}") double probeStepRps,
             @Value("${revx.probe.max-rps}") double probeMaxRps,
@@ -178,6 +180,7 @@ public class RevxConfig {
         this.simFeeLadder = simFeeLadder;
         this.simOffsetLadder = simOffsetLadder;
         this.simSkewLadder = simSkewLadder;
+        this.simCapLadder = simCapLadder;
         this.probeStartRps = probeStartRps;
         this.probeStepRps = probeStepRps;
         this.probeMaxRps = probeMaxRps;
@@ -414,6 +417,20 @@ public class RevxConfig {
      */
     public double[] simSkewLadder() {
         return simSkewLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    /**
+     * Множители к потолку инвентаря. Отвечают на вопрос ёмкости: базисные пункты
+     * превращает в деньги именно потолок, а лестницы по нему не было.
+     *
+     * Что этот прогон МОЖЕТ показать: где наступает механическое насыщение, то есть
+     * где мы перестаём упираться в потолок и рост потолка больше ничего не добавляет.
+     * Чего он показать НЕ может: рыночного влияния. Модель проигрывает исторические
+     * сделки против гипотетической котировки и не знает, что при доле рынка в
+     * четверть поток стал бы другим. Поэтому результат — верхняя граница ёмкости.
+     */
+    public double[] simCapLadder() {
+        return simCapLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     public double probeStartRps() {

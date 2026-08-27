@@ -67,6 +67,10 @@ public class SimRunner {
     private record SkewRung(double skew, SimEngine.Result result) {
     }
 
+    /** Ступень лестницы потолка инвентаря — вопрос ёмкости, а не качества котировок. */
+    private record CapRung(double factor, double cap, SimEngine.Result result) {
+    }
+
     /**
      * Нулевое распределение контроля: N прогонов случайных котировок с разными
      * seed'ами. {@code capturePercentile} — доля прогонов контроля, которые
@@ -129,12 +133,19 @@ public class SimRunner {
                     new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows()),
                     cfg.simMakerFee(), offset, base.inventoryCap()));
         }
-        // Чувствительность к потолку инвентаря
-        for (double capFactor : new double[]{0.5, 2.0}) {
-            Quoter.Params params = withCap(base, base.inventoryCap() * capFactor);
-            runs.add(new Run(String.format("потолок инвентаря ×%.1f", capFactor),
-                    new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows()),
-                    cfg.simMakerFee(), base.offset(), params.inventoryCap()));
+        // Лестница потолка инвентаря — вопрос ЁМКОСТИ: базисные пункты превращает
+        // в деньги именно потолок (док. 84 §3). Показывает механическое насыщение;
+        // рыночного влияния модель не видит, поэтому это верхняя граница.
+        List<CapRung> capLadder = new ArrayList<>();
+        for (double factor : capFactors()) {
+            Quoter.Params params = withCap(base, base.inventoryCap() * factor);
+            SimEngine.Result result = factor == 1.0 ? baseResult
+                    : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
+            capLadder.add(new CapRung(factor, params.inventoryCap(), result));
+            if (factor != 1.0) {
+                runs.add(new Run(String.format("потолок инвентаря ×%.1f", factor), result,
+                        cfg.simMakerFee(), base.offset(), params.inventoryCap()));
+            }
         }
         // Лестница скоса. Скос сдвигает обе цены вниз по мере роста инвентаря, делая
         // аск агрессивнее; измеренная цена этой страховки лежит НЕ в захвате спреда,
@@ -184,7 +195,7 @@ public class SimRunner {
         }
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
-                skewLadder);
+                skewLadder, capLadder);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
@@ -197,6 +208,14 @@ public class SimRunner {
         return java.util.stream.DoubleStream
                 .concat(java.util.stream.DoubleStream.of(base.offset()),
                         java.util.Arrays.stream(cfg.simOffsetLadder()))
+                .distinct().sorted().toArray();
+    }
+
+    /** Множитель 1.0 (базовый потолок) плюс лестница, по возрастанию и без дублей. */
+    private double[] capFactors() {
+        return java.util.stream.DoubleStream
+                .concat(java.util.stream.DoubleStream.of(1.0),
+                        java.util.Arrays.stream(cfg.simCapLadder()))
                 .distinct().sorted().toArray();
     }
 
@@ -384,7 +403,7 @@ public class SimRunner {
 
     private String render(String symbol, int hours, SimDataReader.Dataset data, Quoter.Params base,
                           ExecutionModel.Limits limits, List<Run> runs, SimEngine.Result baseResult,
-                          List<Rung> ladder, List<SkewRung> skewLadder) {
+                          List<Rung> ladder, List<SkewRung> skewLadder, List<CapRung> capLadder) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
         sb.append("Прогоны ТЗ §4.7, отчёт §5.3. Код `").append(registry.gitHash())
@@ -593,6 +612,40 @@ public class SimRunner {
         sb.append("\nПик на нуле означает, что книги живут синхронно и объяснение "
                 + "«устаревшая опора» отпадает. Пик справа — опора отстаёт, и уровень "
                 + "захвата завышен ровно на величину этого запаздывания.\n\n");
+
+        sb.append("### Лестница потолка инвентаря: ёмкость (док. 84 §3)\n\n");
+        sb.append("Базисные пункты превращает в деньги именно потолок. Таблица "
+                + "отвечает, где наступает **механическое насыщение** — то есть где мы "
+                + "перестаём упираться в потолок и его дальнейший рост уже ничего "
+                + "не добавляет.\n\n");
+        sb.append("| Потолок | ×  | Исполнений | Оборот | Доля рыночного потока "
+                + "| Чистый край | **Край × оборот** | Время с полным инвентарём "
+                + "| Медиана удержания |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|\n");
+        for (CapRung rung : capLadder) {
+            SimEngine.Result r = rung.result();
+            double edge = netEdgeBp(r, 60_000);
+            HoldingTime.Stats holdingAtCap = HoldingTime.compute(r.fills());
+            sb.append("| ").append(round(rung.cap(), 4))
+                    .append(" | ×").append(round(rung.factor(), 1))
+                    .append(rung.factor() == 1.0 ? " (базовый)" : "")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(turnover(r), 0))
+                    .append(" | ").append(round(100 * r.flowShare(), 1)).append("%")
+                    .append(" | ").append(round(edge, 2))
+                    .append(" | **").append(round(edge * turnover(r) / 10_000, 1)).append("**")
+                    .append(" | ").append(round(100.0 * r.windowsAtCap()
+                            / Math.max(1, r.windows()), 1)).append("%")
+                    .append(" | ").append(humanMs(holdingAtCap.medianMs()))
+                    .append(" |\n");
+        }
+        sb.append("\n**Чего эта таблица НЕ показывает — ёмкости рынка.** Модель "
+                + "проигрывает исторические сделки против гипотетической котировки и не "
+                + "знает, что при доле потока в четверть поток стал бы другим: конкурент "
+                + "сузился бы, часть принтов не случилась бы вовсе. Поэтому строки с "
+                + "большой долей рынка — **верхняя граница ёмкости, а не ёмкость**. "
+                + "Ёмкость и маршрутизация — один и тот же вопрос, и отвечает на него "
+                + "только живое исполнение.\n\n");
 
         sb.append("### Лестница скоса — по краю, а не по `total`\n\n");
         sb.append("Скос меняет не цену исполнения, а момент: при его выключении захват "
