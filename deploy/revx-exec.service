@@ -1,0 +1,37 @@
+[Unit]
+# Микро-live Revolut X: РЕАЛЬНЫЕ ордера минимального размера.
+#
+# Зависит от сбора: справедливая цена читается из базы стенда. Если сбор стоит,
+# исполнитель это увидит сам (данные устарели) и снимет заявки — но запускать
+# его раньше сбора незачем.
+Description=Revolut X micro-live executor (REAL orders, micro size)
+After=network-online.target revx-collect.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx-exec
+
+# Торговый ключ и токен бота — только отсюда, root-owned 600 (ТЗ §6).
+# В конфиге приложения и в репозитории их нет и быть не должно.
+EnvironmentFile=/etc/revx-exec.env
+
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-exec/app.jar --revx-exec
+
+# Аварийная остановка при выключении сервиса: заявки на бирже переживают наш
+# процесс, и оставлять их там нельзя. Хук в приложении снимает их сам, но если
+# оно не успело — добиваем отдельной командой.
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec/app.jar --revx-panic || true'
+
+# ⚠️ Restart=no НАМЕРЕННО. Перезапуск после падения не должен сам возобновлять
+# торговлю: сначала человек смотрит, почему упало. Котирование в любом случае
+# стартует ВЫКЛЮЧЕННЫМ и включается только командой /start в Telegram.
+Restart=no
+
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
