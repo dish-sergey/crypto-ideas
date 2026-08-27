@@ -718,6 +718,64 @@ public class SimRunner {
                 + "строках, пережил смену режима внутри окна — это самая сильная проверка, "
                 + "доступная на собранных данных, пока в выборке нет настоящего падения.\n\n");
 
+        sb.append("## Распределение захвата по исполнениям — есть ли у нас «разобрали»\n\n");
+        sb.append("Корзины те же, что в отчёте по площадке (`--revx-flow`), поэтому "
+                + "таблицы сравнимы строка в строку. Строка «< 0» — исполнения, где "
+                + "справедливая цена к моменту сделки ушла дальше нашей котировки, то "
+                + "есть нас разобрали по устаревшей заявке. Пока захват считался против "
+                + "цены котирования, такой строки в модели не могло быть в принципе.\n\n");
+        sb.append("| Захват, б.п. | Исполнений | Оборот | Доля оборота | Средний захват "
+                + "| markout 60 с | **Чистый край** |\n|---|---|---|---|---|---|---|\n");
+        double[] bucketEdges = {-1e9, 0, 5, 10, 15, 20, 30, 50, 1e9};
+        String[] bucketLabels = {"< 0 (разобрали)", "0–5", "5–10", "10–15", "15–20",
+                "20–30", "30–50", "> 50"};
+        int buckets = bucketLabels.length;
+        int[] bucketFills = new int[buckets];
+        double[] bucketTurnover = new double[buckets];
+        double[] bucketCapture = new double[buckets];
+        double[] bucketMarkout = new double[buckets];
+        List<Fill> withHorizon = Markout.withHorizon(baseResult.fills(),
+                baseResult.fairSeries(), 60_000);
+        for (Fill fill : withHorizon) {
+            double notional = fill.notional();
+            if (!(notional > 0)) {
+                continue;
+            }
+            double captureBp = fill.spreadCapture() / notional * 10_000;
+            int index = 0;
+            while (index < buckets - 1 && captureBp >= bucketEdges[index + 1]) {
+                index++;
+            }
+            var later = baseResult.fairSeries().floorEntry(fill.tsMs() + 60_000);
+            bucketFills[index]++;
+            bucketTurnover[index] += notional;
+            bucketCapture[index] += fill.spreadCapture();
+            if (later != null) {
+                bucketMarkout[index] += fill.side().sign()
+                        * (later.getValue() - fill.fairAtFill()) * fill.qty();
+            }
+        }
+        double bucketTotal = java.util.Arrays.stream(bucketTurnover).sum();
+        for (int i = 0; i < buckets; i++) {
+            if (bucketFills[i] == 0) {
+                continue;
+            }
+            double t = bucketTurnover[i];
+            sb.append("| ").append(bucketLabels[i])
+                    .append(" | ").append(bucketFills[i])
+                    .append(" | ").append(round(t, 0))
+                    .append(" | ").append(bucketTotal > 0
+                            ? round(100 * t / bucketTotal, 1) + "%" : "—")
+                    .append(" | ").append(round(bucketCapture[i] / t * 10_000, 2))
+                    .append(" | ").append(round(bucketMarkout[i] / t * 10_000, 2))
+                    .append(" | **").append(round((bucketCapture[i] + bucketMarkout[i])
+                            / t * 10_000, 2)).append("** |\n");
+        }
+        sb.append("\nДоля строки «< 0» — прямая оценка того, как часто нас будут "
+                + "разбирать при нашем отступе и нашем темпе опроса. Это не перенос "
+                + "чужой ставки: у контрагента площадки книга обновляется вдвое реже, "
+                + "и его 23% относятся к его конфигурации, а не к нашей.\n\n");
+
         sb.append("## Правдоподобие величины (ТЗ §0)\n\n");
         // Проверка, которой в отчёте не было, а она сильнее любого отдельного прогона:
         // приведённая к году доходность на ЗАДЕЙСТВОВАННЫЙ капитал. Профессиональный
