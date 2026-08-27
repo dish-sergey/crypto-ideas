@@ -26,13 +26,22 @@ public interface QuotePolicy {
             if (!(fair > 0)) {
                 return new Quoter.Quotes(null, null);
             }
+            // Скос применяется ТОТ ЖЕ, что у стратегии. Иначе контроль перестаёт быть
+            // контролем: при сильном скосе стратегия сознательно держит вдвое меньший
+            // инвентарь, контроль без скоса держит вдвое больший, и на растущем окне
+            // он выигрывает по `total` просто потому, что он больше лонг. Сравнение
+            // должно отличаться ровно одним — ВЫБОРОМ ЦЕН.
+            double skew = params.inventoryCap() > 0 ? inventory / params.inventoryCap() : 0;
+            skew = Math.max(-1, Math.min(1, skew));
+            double shift = params.skewK() * skew;
+
             Double bid = null;
             Double ask = null;
             if (inventory < params.inventoryCap()) {
-                bid = fair * (1 - 2 * params.offset() * rng.nextDouble());
+                bid = fair * (1 - 2 * params.offset() * rng.nextDouble() - shift);
             }
             if (inventory > 0) {
-                ask = fair * (1 + 2 * params.offset() * rng.nextDouble());
+                ask = fair * (1 + 2 * params.offset() * rng.nextDouble() - shift);
             }
             return new Quoter.Quotes(bid, ask);
         };
