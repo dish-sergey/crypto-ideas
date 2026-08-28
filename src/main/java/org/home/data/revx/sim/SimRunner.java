@@ -81,6 +81,10 @@ public class SimRunner {
     private record RatioRung(double ratio, SimEngine.Result result) {
     }
 
+    /** Клетка кросса: два механизма торможения набора одновременно. */
+    private record CrossCell(double beta, double eta, SimEngine.Result result) {
+    }
+
     /**
      * Нулевое распределение контроля: N прогонов случайных котировок с разными
      * seed'ами. {@code capturePercentile} — доля прогонов контроля, которые
@@ -211,6 +215,20 @@ public class SimRunner {
             }
         }
 
+        // Кросс двух тормозов набора. Профили цены у них разные: η зависит только
+        // от собственной позиции, β — от внешней величины с нулевым IC, поэтому
+        // выбор между ними по одномерным лестницам делался вслепую (док. 103 §3).
+        List<CrossCell> cross = new ArrayList<>();
+        for (double beta : cfg.simCrossBeta()) {
+            for (double eta : cfg.simCrossEta()) {
+                Quoter.Params params = withShapeEta(withDriftBeta(base, beta), eta);
+                SimEngine.Result result =
+                        beta == base.driftBeta() && eta == base.sizeShapeEta() ? baseResult
+                                : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
+                cross.add(new CrossCell(beta, eta, result));
+            }
+        }
+
         // Лестница задержки котирования — цена отсутствия WebSocket (док. 86 §7).
         // Правка «захват против цены момента исполнения» создала механизм
         // устаревания заявки; здесь он прогоняется с разным периодом решений.
@@ -261,7 +279,7 @@ public class SimRunner {
         }
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
-                skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder);
+                skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder, cross);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
@@ -535,7 +553,7 @@ public class SimRunner {
                           List<Rung> ladder, List<SkewRung> skewLadder, List<CapRung> capLadder,
                           List<LatencyRung> latencyLadder,
                           List<DriftRung> driftLadder, List<RatioRung> ratioLadder,
-                          List<RatioRung> shapeLadder) {
+                          List<RatioRung> shapeLadder, List<CrossCell> cross) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
         sb.append("Прогоны ТЗ §4.7, отчёт §5.3. Код `").append(registry.gitHash())
@@ -795,6 +813,40 @@ public class SimRunner {
                 + "слагаемого `c`, которого в моделях нет вовсе, формула дала бы "
                 + "отступ, на котором наш измеренный край отрицателен.\n\n");
 
+        sb.append("**Остатки подгонки по ступеням.** Если хвост толще экспоненты, на "
+                + "дальних отступах факт окажется выше модели, и настоящий оптимум "
+                + "сдвинется вправо от формулы (док. 103 §4).\n\n");
+        sb.append("| Отступ, б.п. | Оборот факт | Модель | Факт/модель |\n|---|---|---|---|\n");
+        for (Rung rung : ladder) {
+            double actual = turnover(rung.result());
+            double predicted = fitTurnover.predict(rung.offset());
+            sb.append("| ").append(round(rung.offset() * 10_000, 1))
+                    .append(" | ").append(round(actual, 0))
+                    .append(" | ").append(round(predicted, 0))
+                    .append(" | ").append(predicted > 0 ? round(actual / predicted, 2) : "—")
+                    .append(" |\n");
+        }
+        double adverseSe = Markout.standardErrorBp(
+                Markout.withHorizon(baseResult.fills(), baseResult.fairSeries(), 60_000),
+                baseResult.fairSeries(), 60_000);
+        sb.append("\n| Оценка | Значение |\n|---|---|\n");
+        sb.append("| Неблагоприятный отбор | ").append(round(adverse, 2)).append(" б.п. |\n");
+        sb.append("| **Стандартная ошибка отбора** | **±").append(round(adverseSe, 2))
+                .append(" б.п.** |\n");
+        sb.append("| Исполнений в оценке | ").append(Markout.withHorizon(baseResult.fills(),
+                baseResult.fairSeries(), 60_000).size()).append(" |\n");
+        sb.append("| `δ*` при отборе +1 СО | ")
+                .append(round(fitTurnover.optimalOffset((staleBp + adverse + adverseSe) / 10_000)
+                        * 10_000, 2)).append(" б.п. |\n");
+        sb.append("| `δ*` при отборе −1 СО | ")
+                .append(round(fitTurnover.optimalOffset((staleBp + adverse - adverseSe) / 10_000)
+                        * 10_000, 2)).append(" б.п. |\n\n");
+        sb.append("Ошибка обязана стоять рядом с оценкой: на коротком окне отбор "
+                + "меряется по десяткам исполнений, и различие между режимами может "
+                + "оказаться одной и той же величиной, увиденной дважды. Пока "
+                + "доверительный интервал `δ*` перекрывает соседние режимы, делать "
+                + "отступ следящим за режимом нельзя.\n\n");
+
         sb.append("### Персистентность дрейфа: альфа или правило риска (док. 100 §6.1)\n\n");
         DriftPersistence.Stats persistence = DriftPersistence.compute(
                 baseResult.fairSeries(), base.driftWindowMs() > 0 ? base.driftWindowMs() : 1_800_000L,
@@ -909,6 +961,45 @@ public class SimRunner {
                 + "лестницы меняют НЕСОМУЮ ПОЗИЦИЮ, а «край × оборот» о ней ничего не "
                 + "знает (док. 96 §4): по нему выиграет ступень с наибольшим инвентарём. "
                 + "Вопрос здесь другой — уменьшается ли проигрыш простому удержанию.\n\n");
+
+        sb.append("### Кросс `β × η`: два тормоза набора вместе (док. 103 §3)\n\n");
+        sb.append("Обе лестницы выше шли по одной оси при нулевой второй, то есть выбор "
+                + "между механизмами делался вслепую. А профили у них разные: `η` "
+                + "тормозит набор ПО ФАКТУ ПОЗИЦИИ и на шум не реагирует вовсе, `β` — "
+                + "по внешней величине, у которой измеренный IC равен нулю. Цена "
+                + "починки поэтому тоже разная, и комбинация не обязана быть суммой.\n\n");
+        sb.append("| β \\ η |");
+        double[] etas = cfg.simCrossEta();
+        for (double eta : etas) {
+            sb.append(" η=").append(round(eta, 1)).append(" |");
+        }
+        sb.append("\n|---|");
+        for (int i = 0; i < etas.length; i++) {
+            sb.append("---|");
+        }
+        sb.append("\n");
+        for (double beta : cfg.simCrossBeta()) {
+            sb.append("| **β=").append(round(beta, 0)).append("** |");
+            for (double eta : etas) {
+                CrossCell cell = cross.stream()
+                        .filter(c -> c.beta() == beta && c.eta() == eta)
+                        .findFirst().orElse(null);
+                if (cell == null) {
+                    sb.append(" — |");
+                    continue;
+                }
+                double alpha = cell.result().pnl().total() - cell.result().buyAndHoldPnl();
+                sb.append(" ").append(round(alpha, 1))
+                        .append(" <br><sub>").append(cell.result().fills().size())
+                        .append(" филлов, инв ").append(round(cell.result().avgInventory(), 3))
+                        .append("</sub> |");
+            }
+            sb.append("\n");
+        }
+        sb.append("\nВ клетках — **альфа над buy & hold**, под ней число исполнений и "
+                + "средний инвентарь. `total` тут читать нельзя: механизмы меняют "
+                + "несомую позицию, и сравнивать надо с тем, сколько дало бы простое "
+                + "удержание той же позиции.\n\n");
 
         sb.append("### Лестница задержки: чего стоит REST вместо WebSocket\n\n");
         sb.append("Раз во сколько мы смотрим на рынок и переставляем заявку. Между "

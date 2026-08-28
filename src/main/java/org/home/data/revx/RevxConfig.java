@@ -79,6 +79,8 @@ public class RevxConfig {
     private final List<Double> simDriftBetaLadder;
     private final List<Double> simBuyRatioLadder;
     private final List<Double> simShapeLadder;
+    private final List<Double> simCrossBeta;
+    private final List<Double> simCrossEta;
     private final List<Integer> simLatencyLadder;
 
     private final double probeStartRps;
@@ -149,6 +151,8 @@ public class RevxConfig {
             @Value("${revx.sim.drift-beta-ladder}") List<Double> simDriftBetaLadder,
             @Value("${revx.sim.buy-ratio-ladder}") List<Double> simBuyRatioLadder,
             @Value("${revx.sim.shape-ladder}") List<Double> simShapeLadder,
+            @Value("${revx.sim.cross-beta}") List<Double> simCrossBeta,
+            @Value("${revx.sim.cross-eta}") List<Double> simCrossEta,
             @Value("${revx.sim.latency-ladder}") List<Integer> simLatencyLadder,
             @Value("${revx.probe.start-rps}") double probeStartRps,
             @Value("${revx.probe.step-rps}") double probeStepRps,
@@ -216,6 +220,8 @@ public class RevxConfig {
         this.simDriftBetaLadder = simDriftBetaLadder;
         this.simBuyRatioLadder = simBuyRatioLadder;
         this.simShapeLadder = simShapeLadder;
+        this.simCrossBeta = simCrossBeta;
+        this.simCrossEta = simCrossEta;
         this.simLatencyLadder = simLatencyLadder;
         this.probeStartRps = probeStartRps;
         this.probeStepRps = probeStepRps;
@@ -519,6 +525,14 @@ public class RevxConfig {
 
     public double[] simShapeLadder() {
         return simShapeLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    public double[] simCrossBeta() {
+        return simCrossBeta.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    public double[] simCrossEta() {
+        return simCrossEta.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     /**

@@ -91,6 +91,43 @@ public final class Markout {
                 percentile(values, 0.50), percentile(values, 0.25), percentile(values, 0.75));
     }
 
+    /**
+     * Стандартная ошибка среднего markout, в базисных пунктах оборота.
+     *
+     * Нужна там, где по markout принимаются решения. Неблагоприятный отбор на
+     * боковом окне измерен как 0.63 б.п. по 28 исполнениям — и без этой величины
+     * непонятно, отличается ли он от 2.71 на ралли или это одна и та же цифра,
+     * увиденная дважды. От ответа зависит вывод «оптимальный отступ гуляет по
+     * режимам» (док. 103 §4), поэтому ошибка обязана стоять рядом с оценкой.
+     */
+    public static double standardErrorBp(List<Fill> fills, NavigableMap<Long, Double> fairSeries,
+                                         long horizonMs) {
+        List<Double> perFill = new ArrayList<>();
+        long lastFairMs = fairSeries.isEmpty() ? Long.MIN_VALUE : fairSeries.lastKey();
+        for (Fill fill : fills) {
+            long at = fill.tsMs() + horizonMs;
+            if (at > lastFairMs) {
+                continue;
+            }
+            var entry = fairSeries.floorEntry(at);
+            double notional = fill.notional();
+            if (entry == null || !(notional > 0)) {
+                continue;
+            }
+            double value = fill.side().sign() * (entry.getValue() - fill.fairAtFill()) * fill.qty();
+            perFill.add(value / notional * 10_000);
+        }
+        if (perFill.size() < 2) {
+            return Double.NaN;
+        }
+        double mean = mean(perFill);
+        double sumSq = 0;
+        for (double v : perFill) {
+            sumSq += (v - mean) * (v - mean);
+        }
+        return Math.sqrt(sumSq / (perFill.size() - 1)) / Math.sqrt(perFill.size());
+    }
+
     private static double mean(List<Double> values) {
         return values.isEmpty() ? Double.NaN
                 : values.stream().mapToDouble(Double::doubleValue).sum() / values.size();
