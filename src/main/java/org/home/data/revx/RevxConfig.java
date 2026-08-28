@@ -67,6 +67,9 @@ public class RevxConfig {
     private final double simBuySizeRatio;
     private final double simSizeShapeEta;
     private final long simHoldHorizonMs;
+    private final double simDriftGateEr;
+    private final long simErWindowMs;
+    private final long simErSampleMs;
     private final double simRequoteThreshold;
     private final double simMakerFee;
     private final double simPessimisticFee;
@@ -139,6 +142,9 @@ public class RevxConfig {
             @Value("${revx.sim.buy-size-ratio}") double simBuySizeRatio,
             @Value("${revx.sim.size-shape-eta}") double simSizeShapeEta,
             @Value("${revx.sim.hold-horizon-ms}") long simHoldHorizonMs,
+            @Value("${revx.sim.drift-gate-er}") double simDriftGateEr,
+            @Value("${revx.sim.er-window-ms}") long simErWindowMs,
+            @Value("${revx.sim.er-sample-ms}") long simErSampleMs,
             @Value("${revx.sim.requote-threshold}") double simRequoteThreshold,
             @Value("${revx.sim.maker-fee}") double simMakerFee,
             @Value("${revx.sim.pessimistic-fee}") double simPessimisticFee,
@@ -208,6 +214,9 @@ public class RevxConfig {
         this.simBuySizeRatio = simBuySizeRatio;
         this.simSizeShapeEta = simSizeShapeEta;
         this.simHoldHorizonMs = simHoldHorizonMs;
+        this.simDriftGateEr = simDriftGateEr;
+        this.simErWindowMs = simErWindowMs;
+        this.simErSampleMs = simErSampleMs;
         this.simRequoteThreshold = simRequoteThreshold;
         this.simMakerFee = simMakerFee;
         this.simPessimisticFee = simPessimisticFee;
@@ -455,6 +464,18 @@ public class RevxConfig {
 
     public long simHoldHorizonMs() {
         return simHoldHorizonMs;
+    }
+
+    public double simDriftGateEr() {
+        return simDriftGateEr;
+    }
+
+    public long simErWindowMs() {
+        return simErWindowMs;
+    }
+
+    public long simErSampleMs() {
+        return simErSampleMs;
     }
 
     public double simRequoteThreshold() {

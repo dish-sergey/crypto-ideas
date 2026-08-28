@@ -36,6 +36,8 @@ public final class SimEngine {
             double avgInventory,
             int windowsAtCap,             // нет БИДА: инвентарь упёрся в потолок
             int windowsAtZero,            // нет АСКА: продавать нечем, спот
+            int gateOpenWindows,          // окон, где страховка от тренда была включена
+            double avgEr,                 // средний коэффициент эффективности
 
             double filledQty,
             double marketQty,
@@ -126,6 +128,12 @@ public final class SimEngine {
         double maxDrawdown = 0;
         double fairFirst = 0;
         int driftAnchor = 0;
+        EfficiencyRatio er = new EfficiencyRatio(
+                params.erWindowMs() > 0 ? params.erWindowMs() : 86_400_000L,
+                params.erSampleMs() > 0 ? params.erSampleMs() : 3_600_000L);
+        int gateOpenWindows = 0;
+        double erSum = 0;
+        int erSamples = 0;
 
         for (int wi = 0; wi < windows.size(); wi++) {
             Window window = windows.get(wi);
@@ -159,8 +167,20 @@ public final class SimEngine {
                 continue;                 // без справедливой цены нечего мерить
             }
 
+            double erNow = er.accept(window.tsMs(), window.fair());
+            if (!Double.isNaN(erNow)) {
+                erSum += erNow;
+                erSamples++;
+            }
+
             // Дрейф опоры за окно наблюдения. Якорь двигается монотонно вперёд,
             // поэтому весь ряд обходится один раз, а не заново на каждом тике.
+            boolean gateOpen = er.open(params.driftGateEr());
+            if (gateOpen) {
+                gateOpenWindows++;
+            }
+            // Страховка от тренда включается только в режиме, ради которого она
+            // куплена. Гейт закрывает СЛАГАЕМОЕ ДРЕЙФА, а не котирование целиком.
             double driftNow = 0;
             if (params.driftBeta() != 0 && params.driftWindowMs() > 0) {
                 long since = window.tsMs() - params.driftWindowMs();
@@ -171,6 +191,9 @@ public final class SimEngine {
                 if (anchorFair > 0 && windows.get(driftAnchor).tsMs() >= since - params.driftWindowMs()) {
                     driftNow = (window.fair() - anchorFair) / anchorFair;
                 }
+            }
+            if (!gateOpen) {
+                driftNow = 0;
             }
 
             execution.refresh(window.book());
@@ -252,7 +275,8 @@ public final class SimEngine {
         double fairLast = fairSeries.isEmpty() ? 0 : fairSeries.lastEntry().getValue();
         double avgInventory = inventorySamples == 0 ? 0 : inventorySum / inventorySamples;
         return new Result(pnl.decompose(fairLast), allFills, requotes, windows.size(), paused,
-                maxInventory, avgInventory, atCap, atZero, filledQty, marketQty, maxDrawdown,
+                maxInventory, avgInventory, atCap, atZero,
+                gateOpenWindows, erSamples == 0 ? Double.NaN : erSum / erSamples, filledQty, marketQty, maxDrawdown,
                 fairFirst, fairLast, fairSeries, execution.stats());
     }
 }

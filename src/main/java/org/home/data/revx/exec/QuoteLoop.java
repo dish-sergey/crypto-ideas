@@ -83,6 +83,7 @@ public final class QuoteLoop implements Runnable {
     private volatile double quoteBalance;
     private volatile double lastFair;
     private final java.util.ArrayDeque<long[]> fairHistory = new java.util.ArrayDeque<>();
+    private final org.home.data.revx.sim.EfficiencyRatio efficiency;
     private volatile String pausedReason = "не запущен";
     private long placements;
     private long replaces;
@@ -105,6 +106,9 @@ public final class QuoteLoop implements Runnable {
         this.journal = journal;
         this.params = params;
         this.quoter = new Quoter(params);
+        this.efficiency = new org.home.data.revx.sim.EfficiencyRatio(
+                params.erWindowMs() > 0 ? params.erWindowMs() : 86_400_000L,
+                params.erSampleMs() > 0 ? params.erSampleMs() : 3_600_000L);
         this.symbol = symbol;
         this.base = symbol.substring(0, symbol.indexOf('/'));
         this.periodMs = periodMs;
@@ -174,6 +178,9 @@ public final class QuoteLoop implements Runnable {
         StandReader.Fair fair = stand.latest(base, 30_000);
         lastFair = fair.price();
         rememberFair(fair.price());
+        if (fair.price() > 0) {
+            efficiency.accept(System.currentTimeMillis(), fair.price());
+        }
 
         if (!quoting.get()) {
             pausedReason = "не запущен";
@@ -194,7 +201,10 @@ public final class QuoteLoop implements Runnable {
         }
         pausedReason = null;
 
-        Quoter.Quotes target = quoter.quotes(fair.price(), inventory, drift());
+        // Страховка от тренда включается только в трендовом режиме (док. 105 §5).
+        // При выключенном гейте (порог 0) поведение прежнее.
+        double drift = efficiency.open(params.driftGateEr()) ? drift() : 0;
+        Quoter.Quotes target = quoter.quotes(fair.price(), inventory, drift);
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
         journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null);

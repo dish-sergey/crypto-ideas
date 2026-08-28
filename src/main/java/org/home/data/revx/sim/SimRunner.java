@@ -120,7 +120,8 @@ public class SimRunner {
         ExecutionModel.Limits limits = new ExecutionModel.Limits(steps[0], 1e-9);
         Quoter.Params base = new Quoter.Params(cfg.simOffset(), cfg.simSize(), cfg.simInventoryCap(),
                 cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
-                cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simRequoteThreshold(), steps[1]);
+                cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
+                cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simRequoteThreshold(), steps[1]);
 
         List<Run> runs = new ArrayList<>();
         SimEngine.Result baseResult = new SimEngine(base, limits, cfg.simMakerFee()).run(data.windows());
@@ -426,36 +427,26 @@ public class SimRunner {
     }
 
     private static Quoter.Params withSkewK(Quoter.Params base, double skewK) {
-        return new Quoter.Params(base.offset(), base.size(), base.inventoryCap(), skewK,
-                base.skewTarget(), base.driftBeta(), base.buySizeRatio(), base.driftWindowMs(),
-                base.sizeShapeEta(), base.requoteThreshold(), base.quoteStep());
+        return base.withSkewK(skewK);
     }
 
     /** Ступень веса дрейфа: всё остальное неизменно (док. 98 §3). */
     private static Quoter.Params withDriftBeta(Quoter.Params base, double beta) {
-        return new Quoter.Params(base.offset(), base.size(), base.inventoryCap(), base.skewK(),
-                base.skewTarget(), beta, base.buySizeRatio(), base.driftWindowMs(),
-                base.sizeShapeEta(), base.requoteThreshold(), base.quoteStep());
+        return base.withDriftBeta(beta);
     }
 
     /** Ступень асимметрии набора: покупаем медленнее, разгружаемся свободно (док. 98 §6). */
     private static Quoter.Params withBuyRatio(Quoter.Params base, double ratio) {
-        return new Quoter.Params(base.offset(), base.size(), base.inventoryCap(), base.skewK(),
-                base.skewTarget(), base.driftBeta(), ratio, base.driftWindowMs(),
-                base.sizeShapeEta(), base.requoteThreshold(), base.quoteStep());
+        return base.withBuyRatio(ratio);
     }
 
     /** Ступень непрерывного шейпирования размера покупки (док. 101 §3.2). */
     private static Quoter.Params withShapeEta(Quoter.Params base, double eta) {
-        return new Quoter.Params(base.offset(), base.size(), base.inventoryCap(), base.skewK(),
-                base.skewTarget(), base.driftBeta(), base.buySizeRatio(), base.driftWindowMs(),
-                eta, base.requoteThreshold(), base.quoteStep());
+        return base.withShapeEta(eta);
     }
 
     private static Quoter.Params withOffset(Quoter.Params base, double offset) {
-        return new Quoter.Params(offset, base.size(), base.inventoryCap(), base.skewK(),
-                base.skewTarget(), base.driftBeta(), base.buySizeRatio(), base.driftWindowMs(),
-                base.sizeShapeEta(), base.requoteThreshold(), base.quoteStep());
+        return base.withOffset(offset);
     }
 
     /**
@@ -473,10 +464,7 @@ public class SimRunner {
      * готовы нести (док. 97).
      */
     private static Quoter.Params withCap(Quoter.Params base, double cap) {
-        double factor = base.inventoryCap() > 0 ? cap / base.inventoryCap() : 1;
-        return new Quoter.Params(base.offset(), base.size() * factor, cap, base.skewK(),
-                base.skewTarget(), base.driftBeta(), base.buySizeRatio(), base.driftWindowMs(),
-                base.sizeShapeEta(), base.requoteThreshold(), base.quoteStep());
+        return base.withCap(cap);
     }
 
     private Map<String, Object> configOf(Run run, Quoter.Params base, ExecutionModel.Limits limits) {

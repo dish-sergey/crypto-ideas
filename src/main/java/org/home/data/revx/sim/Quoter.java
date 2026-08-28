@@ -22,20 +22,72 @@ public final class Quoter implements QuotePolicy {
             double buySizeRatio,      // доля лота на ПОКУПКУ (1 = симметрично)
             long driftWindowMs,       // окно измерения дрейфа
             double sizeShapeEta,      // непрерывное шейпирование размера покупки
+            double driftGateEr,       // порог ER, ниже которого дрейф-скос выключен (0 = гейта нет)
+            long erWindowMs,          // окно измерения ER
+            long erSampleMs,          // шаг прореживания ряда для ER
             double requoteThreshold,  // порог перевыставления, доля цены
             double quoteStep) {       // шаг цены пары
 
         /** Совместимость: цель — пустой инвентарь, дрейф выключен, набор симметричен. */
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double requoteThreshold, double quoteStep) {
-            this(offset, size, inventoryCap, skewK, 0.0, 0.0, 1.0, 0L, 0.0,
+            this(offset, size, inventoryCap, skewK, 0.0, 0.0, 1.0, 0L, 0.0, 0.0, 0L, 0L,
                     requoteThreshold, quoteStep);
         }
 
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double skewTarget, double requoteThreshold, double quoteStep) {
-            this(offset, size, inventoryCap, skewK, skewTarget, 0.0, 1.0, 0L, 0.0,
+            this(offset, size, inventoryCap, skewK, skewTarget, 0.0, 1.0, 0L, 0.0, 0.0, 0L, 0L,
                     requoteThreshold, quoteStep);
+        }
+
+        // Точечные изменения параметров живут ЗДЕСЬ, а не в лестницах стенда.
+        // Иначе каждое новое поле ломает полдюжины фабрик, разбросанных по
+        // SimRunner, и добавляется оно с риском молча потерять соседнее: именно
+        // так цель скоса однажды не доехала до лестницы отступа.
+
+        public Params withOffset(double v) {
+            return new Params(v, size, inventoryCap, skewK, skewTarget, driftBeta,
+                    buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
+                    erSampleMs, requoteThreshold, quoteStep);
+        }
+
+        /** Потолок вместе с ПРОПОРЦИОНАЛЬНЫМ лотом — см. док. 97 §1. */
+        public Params withCap(double v) {
+            double factor = inventoryCap > 0 ? v / inventoryCap : 1;
+            return new Params(offset, size * factor, v, skewK, skewTarget, driftBeta,
+                    buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
+                    erSampleMs, requoteThreshold, quoteStep);
+        }
+
+        public Params withSkewK(double v) {
+            return new Params(offset, size, inventoryCap, v, skewTarget, driftBeta,
+                    buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
+                    erSampleMs, requoteThreshold, quoteStep);
+        }
+
+        public Params withDriftBeta(double v) {
+            return new Params(offset, size, inventoryCap, skewK, skewTarget, v,
+                    buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
+                    erSampleMs, requoteThreshold, quoteStep);
+        }
+
+        public Params withBuyRatio(double v) {
+            return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
+                    v, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
+                    erSampleMs, requoteThreshold, quoteStep);
+        }
+
+        public Params withShapeEta(double v) {
+            return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
+                    buySizeRatio, driftWindowMs, v, driftGateEr, erWindowMs,
+                    erSampleMs, requoteThreshold, quoteStep);
+        }
+
+        public Params withDriftGateEr(double v) {
+            return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
+                    buySizeRatio, driftWindowMs, sizeShapeEta, v, erWindowMs,
+                    erSampleMs, requoteThreshold, quoteStep);
         }
 
         /**
