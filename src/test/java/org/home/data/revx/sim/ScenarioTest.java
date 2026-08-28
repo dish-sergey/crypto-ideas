@@ -84,6 +84,38 @@ class ScenarioTest {
     }
 
     /**
+     * Зеркало предыдущего сценария — и та беда, которую стенд год не измерял.
+     *
+     * Строго односторонний поток ВВЕРХ бьёт только по аску. Инвентарь стартует с
+     * нуля, продавать нечего, аск не выставляется вовсе — и поток проходит мимо:
+     * ни одного исполнения, всё время в одностороннем режиме. Полный инвентарь
+     * стенд считал с самого начала, нулевой — нет, и из-за этого модель не
+     * показывала состояние, которое на живом счёте заняло больше половины
+     * времени (док. 93).
+     */
+    @Test
+    void oneWayFlowUpFindsNoInventoryToSell() {
+        List<SimEngine.Window> windows = new ArrayList<>();
+        double fair = 100.0;
+        for (int i = 0; i < 60; i++) {
+            fair *= 1.001;                                   // рынок растёт
+            double ask = fair * (1 + D);                     // примерно наша котировка
+            windows.add(SimEngine.Window.of(i * 5_000L, fair, bookAround(fair),
+                    List.of(MarketTrade.buy(i * 5_000L + 100, ask * 1.001, 3))));
+        }
+
+        SimEngine.Result result = engine().run(windows);
+
+        assertEquals(0, result.fills().size(),
+                "продавать нечем, а покупателей в потоке нет — исполнений быть не может");
+        assertEquals(0.0, result.pnl().inventory(), 1e-12, "инвентарь обязан остаться нулевым");
+        assertEquals(0, result.windowsAtCap(), "до потолка тут не добраться");
+        assertTrue(result.windowsAtZero() >= windows.size() - 1,
+                "почти всё время аска нет вовсе: " + result.windowsAtZero()
+                        + " из " + windows.size());
+    }
+
+    /**
      * Идеальный колебательный поток без тренда: захват спреда близок к
      * теоретическому 2·d за round-trip, переоценка инвентаря около нуля.
      */

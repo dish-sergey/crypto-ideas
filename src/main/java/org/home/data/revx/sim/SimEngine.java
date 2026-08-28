@@ -34,7 +34,9 @@ public final class SimEngine {
             int windowsPaused,
             double maxInventory,
             double avgInventory,
-            int windowsAtCap,
+            int windowsAtCap,             // нет БИДА: инвентарь упёрся в потолок
+            int windowsAtZero,            // нет АСКА: продавать нечем, спот
+
             double filledQty,
             double marketQty,
             double maxDrawdown,
@@ -114,6 +116,7 @@ public final class SimEngine {
         int requotes = 0;
         int paused = 0;
         int atCap = 0;
+        int atZero = 0;
         double maxInventory = 0;
         double inventorySum = 0;
         int inventorySamples = 0;
@@ -218,6 +221,11 @@ public final class SimEngine {
             if (pnl.inventory() >= params.inventoryCap() - 1e-12) {
                 atCap++;
             }
+            // Зеркальная беда: при нулевом инвентаре нет АСКА — продавать нечем.
+            // Считается там же и так же, чтобы две колонки читались рядом.
+            if (pnl.inventory() <= 1e-12) {
+                atZero++;
+            }
 
             // просадка считается по переоценке на каждом окне, а не по итогу
             double equity = pnl.mark(window.fair());
@@ -228,7 +236,7 @@ public final class SimEngine {
         double fairLast = fairSeries.isEmpty() ? 0 : fairSeries.lastEntry().getValue();
         double avgInventory = inventorySamples == 0 ? 0 : inventorySum / inventorySamples;
         return new Result(pnl.decompose(fairLast), allFills, requotes, windows.size(), paused,
-                maxInventory, avgInventory, atCap, filledQty, marketQty, maxDrawdown,
+                maxInventory, avgInventory, atCap, atZero, filledQty, marketQty, maxDrawdown,
                 fairFirst, fairLast, fairSeries, execution.stats());
     }
 }

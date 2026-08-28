@@ -411,6 +411,7 @@ public class SimRunner {
         out.put("avg_inventory", result.avgInventory());
         out.put("max_inventory", result.maxInventory());
         out.put("windows_at_cap", result.windowsAtCap());
+        out.put("windows_at_zero", result.windowsAtZero());
         out.put("windows_paused", result.windowsPaused());
         out.put("buy_and_hold", result.buyAndHoldPnl());
         double turnover = turnover(result);
@@ -725,8 +726,8 @@ public class SimRunner {
                 + "между сторонами (док. 79 §7).\n\n");
         sb.append("| Скос `skew_k` | Чистый край 60 с | Разрыв сторон | Исполнений "
                 + "| Средний филл | Оборот | **Край × оборот** | Инвентарь: средний "
-                + "| **Время с полным инвентарём** | Total |\n");
-        sb.append("|---|---|---|---|---|---|---|---|---|---|\n");
+                + "| **Время с полным инвентарём** | **Время с нулевым** | Total |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
         for (SkewRung rung : skewLadder) {
             SimEngine.Result r = rung.result();
             double buy = netEdgeBp(r, 60_000, Side.BUY);
@@ -746,6 +747,8 @@ public class SimRunner {
                     .append(" | ").append(round(r.avgInventory(), 4))
                     .append(" | **").append(round(100.0 * r.windowsAtCap()
                             / Math.max(1, r.windows()), 1)).append("%**")
+                    .append(" | **").append(round(100.0 * r.windowsAtZero()
+                            / Math.max(1, r.windows()), 1)).append("%**")
                     .append(" | ").append(round(r.pnl().total(), 1))
                     .append(" |\n");
         }
@@ -753,6 +756,12 @@ public class SimRunner {
                 + "асимметрия — свойство котировщика, а не рынка. `total` в этой таблице "
                 + "читать надо с оглядкой на режим окна: меньший скос означает «дольше "
                 + "держать позицию», и на растущем окне это автоматически прибавляет беты.\n\n"
+                + "**Две колонки времени читать вместе.** Двусторонность теряется с ОБОИХ "
+                + "краёв: при полном инвентаре нет бида, при нулевом нет аска — спот, "
+                + "продавать нечем. Долго мерилась только левая беда, и правая ускользнула: "
+                + "на живом счёте аск оказался тёмным больше половины времени, потому что "
+                + "скос целится в НОЛЬ инвентаря, а не в середину (док. 93). Сумма двух "
+                + "колонок — это доля времени, когда стратегия односторонняя.\n\n"
                 + "**«Время с полным инвентарём» — решающая колонка.** При полном инвентаре "
                 + "бид не выставляется вовсе, то есть стратегия перестаёт быть двусторонней "
                 + "и превращается в удержание позиции. Слабый скос экономит край на бумаге, "
@@ -1059,6 +1068,14 @@ public class SimRunner {
                 .append(" / ").append(round(baseResult.maxInventory(), 4)).append(" |\n");
         sb.append("| Доля времени с полным инвентарём | ")
                 .append(round(100.0 * baseResult.windowsAtCap() / Math.max(1, baseResult.windows()), 1))
+                .append("% |\n");
+        // Зеркало предыдущей строки. Измерялось только «полный инвентарь», и из-за
+        // этого от модели ускользнуло состояние, которое на живом счёте оказалось
+        // куда более частым: инвентарь на нуле, продавать нечем, аск не выставляется
+        // вовсе. Односторонний режим — такая же потеря двусторонности, как и полный
+        // инвентарь, только с другого края (док. 93).
+        sb.append("| Доля времени с НУЛЕВЫМ инвентарём | ")
+                .append(round(100.0 * baseResult.windowsAtZero() / Math.max(1, baseResult.windows()), 1))
                 .append("% |\n");
         sb.append("| Разложение P&L сходится | ")
                 .append(baseResult.pnl().reconciles(1e-6) ? "да" : "**НЕТ — считать результат нельзя**")
