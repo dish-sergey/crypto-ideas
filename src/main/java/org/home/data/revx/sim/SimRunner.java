@@ -171,8 +171,10 @@ public class SimRunner {
         // Правка «захват против цены момента исполнения» создала механизм
         // устаревания заявки; здесь он прогоняется с разным периодом решений.
         List<LatencyRung> latencyLadder = new ArrayList<>();
-        for (int seconds : latencySeconds()) {
-            int periodWindows = Math.max(1, seconds / cfg.authBookPeriodSeconds());
+        double windowSec = data.windowPeriodSec();
+        for (int seconds : latencySeconds(windowSec)) {
+            // Рунг переводится в окна по ФАКТИЧЕСКОМУ шагу данных.
+            int periodWindows = Math.max(1, (int) Math.round(seconds / windowSec));
             SimEngine.Result result = periodWindows == 1 ? baseResult
                     : new SimEngine(base, limits, cfg.simMakerFee(), new Quoter(base), periodWindows)
                             .run(data.windows());
@@ -232,9 +234,9 @@ public class SimRunner {
     }
 
     /** Период опроса плюс лестница задержки, по возрастанию и без дублей. */
-    private int[] latencySeconds() {
+    private int[] latencySeconds(double windowSec) {
         return java.util.stream.IntStream
-                .concat(java.util.stream.IntStream.of(cfg.authBookPeriodSeconds()),
+                .concat(java.util.stream.IntStream.of(Math.max(1, (int) Math.round(windowSec))),
                         java.util.Arrays.stream(cfg.simLatencyLadder()))
                 .distinct().sorted().toArray();
     }
@@ -451,6 +453,11 @@ public class SimRunner {
         sb.append("| Окно | ").append(Instant.ofEpochMilli(data.fromMs())).append(" — ")
                 .append(Instant.ofEpochMilli(data.toMs())).append(" (").append(hours).append(" ч) |\n");
         sb.append("| Окон симуляции | ").append(data.windows().size()).append(" |\n");
+        // Шаг окна — не украшение: он и есть период котирования базового прогона,
+        // и именно его молча меняет быстрый ярус. Пока его не печатали, отчёт на
+        // пятисекундных данных нельзя было отличить от отчёта на секундных.
+        sb.append("| **Шаг окна (период котирования)** | **")
+                .append(round(data.windowPeriodSec(), 2)).append(" с** |\n");
         sb.append("| Окон с выключенным котированием | ").append(data.windowsPaused()).append(" (")
                 .append(round(100.0 * data.windowsPaused() / Math.max(1, data.windows().size()), 1))
                 .append("%) |\n");

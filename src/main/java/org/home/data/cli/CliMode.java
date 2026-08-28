@@ -34,19 +34,41 @@ public class CliMode {
             "revx-sim", "revx-flow",
             "revx-trade-check", "revx-order-probe", "revx-panic", "revx-exec");
 
+    /**
+     * Параметры команд. Их нельзя считать неизвестными опциями: они не запускают
+     * ничего сами, а уточняют команду рядом.
+     *
+     * Разделение появилось не сразу — проверка на неизвестную опцию сначала знала
+     * только команды и заворачивала законный вызов
+     * {@code --revx-sim --symbol=… --hours=…} целиком.
+     */
+    private static final Set<String> PARAMS = Set.of(
+            "symbol", "symbols", "hours", "from", "to", "interval",
+            "out", "table", "bucket-seconds");
+
     private final boolean scheduleMode;
     private final Set<String> unknownOptions;
 
     public CliMode(ApplicationArguments args) {
         Set<String> unknown = new LinkedHashSet<>();
+        Set<String> orphanParams = new LinkedHashSet<>();
         boolean anyCommand = false;
         for (String name : args.getOptionNames()) {
             if (COMMANDS.contains(name)) {
                 anyCommand = true;
+            } else if (PARAMS.contains(name)) {
+                orphanParams.add(name);       // законен только рядом с командой
             } else if (!name.contains(".")) {
                 unknown.add(name);
             }
         }
+        // Параметр без команды — тоже ошибка, и молчать о ней нельзя: иначе
+        // опечатка в имени команды (`--revx-sym --symbol=BTC/USDC`) оставила бы
+        // одни параметры и подняла планировщик вместо запрошенного прогона.
+        if (anyCommand) {
+            orphanParams.clear();
+        }
+        unknown.addAll(orphanParams);
         this.unknownOptions = Set.copyOf(unknown);
         this.scheduleMode = !anyCommand && unknown.isEmpty();
     }
