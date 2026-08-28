@@ -147,6 +147,7 @@ public final class ExecutionModel {
     private final Stats stats = new Stats();
     private Resting bid;
     private Resting ask;
+    private BookView lastBook;
 
     public ExecutionModel(Limits limits) {
         this.limits = limits;
@@ -182,6 +183,7 @@ public final class ExecutionModel {
      * либо оказываемся вне видимой части и тогда исполниться не можем.
      */
     public void place(Side side, double price, double qty, BookView book, long tsMs) {
+        this.lastBook = book;
         Resting order = new Resting(side, price, qty, tsMs);
         applyVisibility(order, book);
         if (side == Side.BUY) {
@@ -206,6 +208,9 @@ public final class ExecutionModel {
 
     /** Пересчёт видимости по новому снимку: заявка могла войти в видимую часть. */
     public void refresh(BookView book) {
+        // Снимок запоминается: контекст книги в момент исполнения (кто стоит внутри
+        // нас) — предмет задания Z9, и восстановить его задним числом нельзя.
+        this.lastBook = book;
         if (bid != null) {
             applyVisibility(bid, book);
         }
@@ -371,7 +376,8 @@ public final class ExecutionModel {
                 continue;                     // меньше шага лота — исполнения нет
             }
             order.remaining -= filled;
-            fills.add(new Fill(trade.tsMs(), order.side, order.price, filled, fairAtWindowEnd));
+            fills.add(new Fill(trade.tsMs(), order.side, order.price, filled, fairAtWindowEnd,
+                    Fill.context(lastBook, order.side, order.price)));
             order.fillTradePrices.add(trade.price());
         }
         return fills;

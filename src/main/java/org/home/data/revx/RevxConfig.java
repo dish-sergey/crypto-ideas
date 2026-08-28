@@ -73,6 +73,15 @@ public class RevxConfig {
     private final double simStopDrawdownPct;
     private final long simStopCoolOffMs;
     private final List<Double> simStopLadder;
+    private final boolean simStickyEnabled;
+    private final double simStickyOuter;
+    private final double simStickyInner;
+    private final long simStickyMaxAgeMs;
+    private final boolean simStickyReplaceOnFill;
+    private final double simStickySkewDelta;
+    private final boolean simStickyResetQueue;
+    private final List<Double> simStickyOuterLadder;
+    private final List<Double> simStickyInnerLadder;
     private final double simRequoteThreshold;
     private final double simMakerFee;
     private final double simPessimisticFee;
@@ -151,6 +160,15 @@ public class RevxConfig {
             @Value("${revx.sim.stop-drawdown-pct}") double simStopDrawdownPct,
             @Value("${revx.sim.stop-cool-off-ms}") long simStopCoolOffMs,
             @Value("${revx.sim.stop-ladder}") List<Double> simStopLadder,
+            @Value("${revx.sim.sticky-enabled}") boolean simStickyEnabled,
+            @Value("${revx.sim.sticky-outer}") double simStickyOuter,
+            @Value("${revx.sim.sticky-inner}") double simStickyInner,
+            @Value("${revx.sim.sticky-max-age-ms}") long simStickyMaxAgeMs,
+            @Value("${revx.sim.sticky-replace-on-fill}") boolean simStickyReplaceOnFill,
+            @Value("${revx.sim.sticky-skew-delta}") double simStickySkewDelta,
+            @Value("${revx.sim.sticky-reset-queue}") boolean simStickyResetQueue,
+            @Value("${revx.sim.sticky-outer-ladder}") List<Double> simStickyOuterLadder,
+            @Value("${revx.sim.sticky-inner-ladder}") List<Double> simStickyInnerLadder,
             @Value("${revx.sim.requote-threshold}") double simRequoteThreshold,
             @Value("${revx.sim.maker-fee}") double simMakerFee,
             @Value("${revx.sim.pessimistic-fee}") double simPessimisticFee,
@@ -226,6 +244,15 @@ public class RevxConfig {
         this.simStopDrawdownPct = simStopDrawdownPct;
         this.simStopCoolOffMs = simStopCoolOffMs;
         this.simStopLadder = simStopLadder;
+        this.simStickyEnabled = simStickyEnabled;
+        this.simStickyOuter = simStickyOuter;
+        this.simStickyInner = simStickyInner;
+        this.simStickyMaxAgeMs = simStickyMaxAgeMs;
+        this.simStickyReplaceOnFill = simStickyReplaceOnFill;
+        this.simStickySkewDelta = simStickySkewDelta;
+        this.simStickyResetQueue = simStickyResetQueue;
+        this.simStickyOuterLadder = simStickyOuterLadder;
+        this.simStickyInnerLadder = simStickyInnerLadder;
         this.simRequoteThreshold = simRequoteThreshold;
         this.simMakerFee = simMakerFee;
         this.simPessimisticFee = simPessimisticFee;
@@ -497,6 +524,20 @@ public class RevxConfig {
 
     public double[] simStopLadder() {
         return simStopLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    public org.home.data.revx.sim.Quoter.Sticky simSticky() {
+        return new org.home.data.revx.sim.Quoter.Sticky(simStickyEnabled, simStickyOuter,
+                simStickyInner, simStickyMaxAgeMs, simStickyReplaceOnFill,
+                simStickySkewDelta, simStickyResetQueue);
+    }
+
+    public double[] simStickyOuterLadder() {
+        return simStickyOuterLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    public double[] simStickyInnerLadder() {
+        return simStickyInnerLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     public double simRequoteThreshold() {

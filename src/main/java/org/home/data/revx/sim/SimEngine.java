@@ -109,6 +109,42 @@ public final class SimEngine {
         this.quotePeriodWindows = Math.max(1, quotePeriodWindows);
     }
 
+    /**
+     * Держим ли заявку на месте вместо переставления (задание Z8, док. 109 §II).
+     *
+     * Выключенная липкость возвращает {@code false} всегда — поведение в точности
+     * прежнее, и это приёмочное условие задания: базовый прогон обязан совпасть
+     * до последнего знака.
+     *
+     * Отступ считается ОТНОСИТЕЛЬНЫМ: {@code (fair − цена) / fair} для бида. Он
+     * растёт, когда цена уходит вверх (заявка отстала — безопасно, но бесполезно),
+     * и уменьшается вплоть до отрицательного, когда цена падает (заявка оказалась
+     * НАД справедливой — опасный снос, механизм M3).
+     */
+    private static boolean sticks(Quoter.Params params, Double resting, Side side,
+                                  double fair, long ageMs, double skewShift,
+                                  boolean filledLast) {
+        Quoter.Sticky sticky = params.sticky();
+        if (!sticky.enabled() || resting == null || !(fair > 0)) {
+            return false;
+        }
+        if (sticky.replaceOnFill() && filledLast) {
+            return false;
+        }
+        if (ageMs >= sticky.maxAgeMs()) {
+            return false;
+        }
+        if (Math.abs(skewShift) > sticky.skewDelta()) {
+            return false;
+        }
+        double delta = side == Side.BUY ? (fair - resting) / fair : (resting - fair) / fair;
+        double d = params.offset();
+        if (delta > sticky.outerMult() * d) {
+            return false;                     // пассивный снос: заявка уехала далеко
+        }
+        return !(delta < sticky.innerMult() * d);   // опасный снос: заявка у справедливой
+    }
+
     public Result run(List<Window> windows) {
         ExecutionModel execution = new ExecutionModel(limits);
         PnlBook pnl = new PnlBook(makerFeeRate);
@@ -137,6 +173,13 @@ public final class SimEngine {
         double erSum = 0;
         long stoppedUntilMs = Long.MIN_VALUE;
         int stopHits = 0;
+        // Состояние липкой котировки: когда и при каком скосе заявка выставлена.
+        long bidPlacedMs = 0;
+        long askPlacedMs = 0;
+        double bidSkewAtPlace = 0;
+        double askSkewAtPlace = 0;
+        boolean bidFilledLast = false;
+        boolean askFilledLast = false;
         int stoppedWindows = 0;
         int erSamples = 0;
 
@@ -236,16 +279,31 @@ public final class SimEngine {
                 Double liquidate = window.book().bestBid() > 0 ? window.book().bestBid() : null;
                 target = new Quoter.Quotes(null, pnl.inventory() > 0 ? liquidate : null);
             }
-            if (quoter.shouldRequote(restingBid, target.bid())) {
+            double skewNow = Quoter.skew(params, pnl.inventory(), driftNow);
+            boolean bidSticks = sticks(params, restingBid, Side.BUY, window.fair(),
+                    window.tsMs() - bidPlacedMs, skewNow - bidSkewAtPlace, bidFilledLast);
+            boolean askSticks = sticks(params, restingAsk, Side.SELL, window.fair(),
+                    window.tsMs() - askPlacedMs, skewNow - askSkewAtPlace, askFilledLast);
+            bidFilledLast = false;
+            askFilledLast = false;
+
+            if (!bidSticks && quoter.shouldRequote(restingBid, target.bid())) {
                 execution.cancel(Side.BUY);
                 restingBid = target.bid();
                 if (restingBid != null) {
                     execution.place(Side.BUY, restingBid, params.sizeFor(Side.BUY, pnl.inventory()),
                             window.book(), window.tsMs());
+                    bidPlacedMs = window.tsMs();
+                    bidSkewAtPlace = skewNow;
                 }
                 requotes++;
+            } else if (bidSticks && restingBid != null && params.sticky().resetQueue()) {
+                // Контроль M2: цена липкая, приоритет очереди сбрасывается.
+                execution.cancel(Side.BUY);
+                execution.place(Side.BUY, restingBid, params.sizeFor(Side.BUY, pnl.inventory()),
+                        window.book(), window.tsMs());
             }
-            if (quoter.shouldRequote(restingAsk, target.ask())) {
+            if (!askSticks && quoter.shouldRequote(restingAsk, target.ask())) {
                 execution.cancel(Side.SELL);
                 restingAsk = target.ask();
                 if (restingAsk != null) {
@@ -253,11 +311,19 @@ public final class SimEngine {
                     double size = Math.min(params.sizeFor(Side.SELL, pnl.inventory()), pnl.inventory());
                     if (size > 0) {
                         execution.place(Side.SELL, restingAsk, size, window.book(), window.tsMs());
+                        askPlacedMs = window.tsMs();
+                        askSkewAtPlace = skewNow;
                     } else {
                         restingAsk = null;
                     }
                 }
                 requotes++;
+            } else if (askSticks && restingAsk != null && params.sticky().resetQueue()) {
+                double size = Math.min(params.sizeFor(Side.SELL, pnl.inventory()), pnl.inventory());
+                if (size > 0) {
+                    execution.cancel(Side.SELL);
+                    execution.place(Side.SELL, restingAsk, size, window.book(), window.tsMs());
+                }
             }
 
             execution.observe();
@@ -280,6 +346,12 @@ public final class SimEngine {
             if (!fills.isEmpty()) {
                 // исполненную сторону надо будет выставить заново
                 for (Fill fill : fills) {
+                    // Исполнение с любой стороны помечает обе: исполнившаяся
+                    // выставляется заново по построению, а противоположную
+                    // переставляет правило replaceOnFill — инвентарь изменился,
+                    // и её положение больше не отражает нужный скос.
+                    bidFilledLast = true;
+                    askFilledLast = true;
                     if (fill.side() == Side.BUY && execution.remaining(Side.BUY) <= 0) {
                         restingBid = null;
                     }

@@ -26,6 +26,7 @@ public final class Quoter implements QuotePolicy {
             long erWindowMs,          // окно измерения ER
             long erSampleMs,          // шаг прореживания ряда для ER
             double stopDrawdownPct,   // стоп по просадке, % от номинала потолка (0 = выкл.)
+            Sticky sticky,            // липкая котировка (док. 109 §II)
             long stopCoolOffMs,       // сколько не набирать после срабатывания
             double requoteThreshold,  // порог перевыставления, доля цены
             double quoteStep) {       // шаг цены пары
@@ -34,13 +35,13 @@ public final class Quoter implements QuotePolicy {
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double requoteThreshold, double quoteStep) {
             this(offset, size, inventoryCap, skewK, 0.0, 0.0, 1.0, 0L, 0.0, 0.0, 0L, 0L,
-                    0.0, 0L, requoteThreshold, quoteStep);
+                    0.0, Sticky.OFF, 0L, requoteThreshold, quoteStep);
         }
 
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double skewTarget, double requoteThreshold, double quoteStep) {
             this(offset, size, inventoryCap, skewK, skewTarget, 0.0, 1.0, 0L, 0.0, 0.0, 0L, 0L,
-                    0.0, 0L, requoteThreshold, quoteStep);
+                    0.0, Sticky.OFF, 0L, requoteThreshold, quoteStep);
         }
 
         // Точечные изменения параметров живут ЗДЕСЬ, а не в лестницах стенда.
@@ -51,7 +52,7 @@ public final class Quoter implements QuotePolicy {
         public Params withOffset(double v) {
             return new Params(v, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         /** Потолок вместе с ПРОПОРЦИОНАЛЬНЫМ лотом — см. док. 97 §1. */
@@ -59,50 +60,56 @@ public final class Quoter implements QuotePolicy {
             double factor = inventoryCap > 0 ? v / inventoryCap : 1;
             return new Params(offset, size * factor, v, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withSkewK(double v) {
             return new Params(offset, size, inventoryCap, v, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withSkewTarget(double v) {
             return new Params(offset, size, inventoryCap, skewK, v, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withDriftBeta(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, v,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withBuyRatio(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     v, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withShapeEta(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, v, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         /** Стоп по просадке: порог в долях номинала потолка (док. 107 §5). */
+        public Params withSticky(Sticky v) {
+            return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
+                    buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
+                    erSampleMs, stopDrawdownPct, v, stopCoolOffMs, requoteThreshold, quoteStep);
+        }
+
         public Params withStopDrawdownPct(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, v, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, v, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withDriftGateEr(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, v, erWindowMs,
-                    erSampleMs, stopDrawdownPct, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         /**
@@ -125,6 +132,57 @@ public final class Quoter implements QuotePolicy {
                 shaped *= Math.exp(-sizeShapeEta * filled);
             }
             return shaped;
+        }
+    }
+
+    /**
+     * Липкая котировка: не снимать заявку на каждом тике (задание Z8).
+     *
+     * Гипотеза задания — значительная часть пошлины создаётся САМИМ
+     * переставлением, а не потоком. Три механизма работают одновременно и
+     * РАЗНОГО ЗНАКА, поэтому параметры разведены так, чтобы каждый изолировался
+     * отдельной лестницей:
+     *
+     * <ul>
+     *   <li>M1, за липкость: пошлина платится один раз на вход, а не на каждый
+     *       повторный — изолируется лестницей { outerMult};</li>
+     *   <li>M2, за липкость: приоритет очереди. Липкая заявка стоит впереди всех,
+     *       кто пришёл позже; переставленная каждую секунду уходит в конец —
+     *       изолируется флагом { resetQueue};</li>
+     *   <li>M3, ПРОТИВ липкости: опасный снос. У липкой заявки отступ не
+     *       фиксирован, и при движении цены бид может оказаться НАД справедливой,
+     *       то есть исполниться по худшей возможной цене — изолируется лестницей
+     *       { innerMult}.</li>
+     * </ul>
+     *
+     *  outerMult   переставить, если отступ вырос больше { outerMult × d}
+     *  innerMult   переставить, если отступ упал ниже { innerMult × d};
+     *                    отрицательное значение = терпеть заявку по ту сторону
+     *                    справедливой цены
+     *  maxAgeMs    жёсткий таймаут заявки
+     *  resetQueue  сбрасывать приоритет очереди каждый тик при липкой цене —
+     *                    контроль, изолирующий M2
+     *  skewDelta   переставить, если скос изменился больше чем на столько
+     */
+    public record Sticky(boolean enabled, double outerMult, double innerMult,
+                         long maxAgeMs, boolean replaceOnFill, double skewDelta,
+                         boolean resetQueue) {
+
+        /** Выключено: поведение в точности прежнее. */
+        public static final Sticky OFF =
+                new Sticky(false, 1, 1, 0, true, Double.POSITIVE_INFINITY, false);
+
+        public Sticky withOuter(double v) {
+            return new Sticky(true, v, innerMult, maxAgeMs, replaceOnFill, skewDelta, resetQueue);
+        }
+
+        public Sticky withInner(double v) {
+            return new Sticky(true, outerMult, v, maxAgeMs, replaceOnFill, skewDelta, resetQueue);
+        }
+
+        public Sticky withResetQueue(boolean v) {
+            return new Sticky(enabled, outerMult, innerMult, maxAgeMs, replaceOnFill,
+                    skewDelta, v);
         }
     }
 

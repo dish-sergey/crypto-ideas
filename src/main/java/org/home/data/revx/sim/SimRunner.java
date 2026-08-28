@@ -122,7 +122,7 @@ public class SimRunner {
                 cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
                 cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
                 cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simStopDrawdownPct(),
-                cfg.simStopCoolOffMs(), cfg.simRequoteThreshold(), steps[1]);
+                Quoter.Sticky.OFF, cfg.simStopCoolOffMs(), cfg.simRequoteThreshold(), steps[1]);
 
         List<Run> runs = new ArrayList<>();
         SimEngine.Result baseResult = new SimEngine(base, limits, cfg.simMakerFee()).run(data.windows());
@@ -229,6 +229,31 @@ public class SimRunner {
             }
         }
 
+        // Лестницы липкой котировки. Базовая точка — ВЫКЛЮЧЕННАЯ липкость, и это
+        // приёмочное условие задания: она обязана дать в точности прежние числа.
+        List<RatioRung> stickyOuter = new ArrayList<>();
+        for (double outer : cfg.simStickyOuterLadder()) {
+            Quoter.Params p = base.withSticky(cfg.simSticky().withOuter(outer));
+            stickyOuter.add(new RatioRung(outer,
+                    new SimEngine(p, limits, cfg.simMakerFee()).run(data.windows())));
+        }
+        List<RatioRung> stickyInner = new ArrayList<>();
+        for (double inner : cfg.simStickyInnerLadder()) {
+            Quoter.Params p = base.withSticky(cfg.simSticky().withInner(inner));
+            stickyInner.add(new RatioRung(inner,
+                    new SimEngine(p, limits, cfg.simMakerFee()).run(data.windows())));
+        }
+        List<java.util.Map.Entry<String, SimEngine.Result>> queueControl = new ArrayList<>();
+        queueControl.add(java.util.Map.entry("база (переставляем каждый тик)", baseResult));
+        double bestOuter = cfg.simStickyOuterLadder()[cfg.simStickyOuterLadder().length - 1];
+        Quoter.Sticky stickyBest = cfg.simSticky().withOuter(bestOuter);
+        queueControl.add(java.util.Map.entry(String.format("липкая outer=%.1f", bestOuter),
+                new SimEngine(base.withSticky(stickyBest), limits, cfg.simMakerFee())
+                        .run(data.windows())));
+        queueControl.add(java.util.Map.entry("та же, очередь сброшена",
+                new SimEngine(base.withSticky(stickyBest.withResetQueue(true)), limits,
+                        cfg.simMakerFee()).run(data.windows())));
+
         // Кросс двух тормозов набора. Профили цены у них разные: η зависит только
         // от собственной позиции, β — от внешней величины с нулевым IC, поэтому
         // выбор между ними по одномерным лестницам делался вслепую (док. 103 §3).
@@ -294,7 +319,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder);
+                cross, stopLadder, stickyOuter, stickyInner, queueControl);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
@@ -556,7 +581,9 @@ public class SimRunner {
                           List<LatencyRung> latencyLadder,
                           List<DriftRung> driftLadder, List<RatioRung> ratioLadder,
                           List<RatioRung> shapeLadder, List<CrossCell> cross,
-                          List<RatioRung> stopLadder) {
+                          List<RatioRung> stopLadder, List<RatioRung> stickyOuter,
+                          List<RatioRung> stickyInner,
+                          List<java.util.Map.Entry<String, SimEngine.Result>> queueControl) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
         sb.append("Прогоны ТЗ §4.7, отчёт §5.3. Код `").append(registry.gitHash())
@@ -964,6 +991,102 @@ public class SimRunner {
                 + "лестницы меняют НЕСОМУЮ ПОЗИЦИЮ, а «край × оборот» о ней ничего не "
                 + "знает (док. 96 §4): по нему выиграет ступень с наибольшим инвентарём. "
                 + "Вопрос здесь другой — уменьшается ли проигрыш простому удержанию.\n\n");
+
+        sb.append("### Липкая котировка — задание Z8 (док. 109 §II)\n\n");
+        sb.append("Гипотеза: часть измеренной пошлины создаётся **самим переставлением** "
+                + "заявки, а не потоком. Три механизма работают одновременно и разного "
+                + "знака, поэтому лестницы разведены: `outer` изолирует M1 (пошлина "
+                + "платится один раз на вход), `inner` — M3 (опасный снос: у липкой "
+                + "заявки отступ не фиксирован, и бид может оказаться НАД справедливой).\n\n");
+        sb.append("**Лестница `outer` при `inner` = 1 — изолирует M1**\n\n");
+        sb.append("| outer | Перевыставлений/сут | Исполнений | Захват, б.п. | Чистый край "
+                + "| Ср. инвентарь | **Total** | **Buy & hold** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : stickyOuter) {
+            SimEngine.Result r = rung.result();
+            sb.append("| ").append(round(rung.ratio(), 2))
+                    .append(" | ").append(round(r.requotesPerDay(data.spanMs()), 0))
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(netEdgeBp(r, 60_000), 2))
+                    .append(" | ").append(round(r.avgInventory(), 4))
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n**Лестница `inner` при `outer` = 1 — изолирует M3**\n\n");
+        sb.append("| inner | Перевыставлений/сут | Исполнений | Захват, б.п. | Чистый край "
+                + "| Ср. инвентарь | **Total** | **Buy & hold** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : stickyInner) {
+            SimEngine.Result r = rung.result();
+            sb.append("| ").append(round(rung.ratio(), 2))
+                    .append(" | ").append(round(r.requotesPerDay(data.spanMs()), 0))
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(netEdgeBp(r, 60_000), 2))
+                    .append(" | ").append(round(r.avgInventory(), 4))
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n**Контроль M2: цена липкая, приоритет очереди сброшен**\n\n");
+        sb.append("| Прогон | Исполнений | Чистый край | **Total** | **Buy & hold** |\n");
+        sb.append("|---|---|---|---|---|\n");
+        for (var entry : queueControl) {
+            SimEngine.Result r = entry.getValue();
+            sb.append("| ").append(entry.getKey())
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(netEdgeBp(r, 60_000), 2))
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\nЕсли липкая с сброшенной очередью ≈ базе — весь эффект в **приоритете "
+                + "очереди**, и правильный вывод не «липкость», а «не терять приоритет без "
+                + "причины». Если ≈ липкой — очередь не даёт ничего, работает M1.\n\n");
+        sb.append("**Условия несостоятельности** (объявлены заранее, док. 109 §Z8.7): "
+                + "ни одна точка лестниц не обыгрывает базу по двухрежимному `total`; "
+                + "или знак меняется между соседними ступенями; или победитель не "
+                + "обыгрывает контроль по активности.\n\n");
+
+        sb.append("### Пошлина по позиции в очереди — задание Z9 (док. 109 §III)\n\n");
+        sb.append("Зависит ли пошлина от того, КТО стоит внутри нас. Две гипотезы дают "
+                + "противоположные рекомендации: **фильтр** — узкий котировщик собирает "
+                + "мелкие касания и оставляет нам настоящие свипы (наш markout тогда "
+                + "лучше); **снятие сливок** — он успевает убрать заявку перед "
+                + "информированным потоком и оставляет токсичное нам (markout хуже, а "
+                + "лестница по `d` загрязнена).\n\n");
+        sb.append("⚠️ **Сравнивать между корзинами можно только markout.** Объём внутри "
+                + "нас входит в модель исполнения, поэтому ЧИСЛО исполнений по корзинам "
+                + "различается по построению — вывод из него был бы тавтологией. "
+                + "`markout` входом модели не является.\n\n");
+        for (var section : java.util.List.of(
+                java.util.Map.entry("Мы на лучшей цене или нет",
+                        QueueCost.byPresenceInside(baseResult.fills(), baseResult.fairSeries(), 60_000)),
+                java.util.Map.entry("По номиналу внутри нас, USDC",
+                        QueueCost.byQtyInside(baseResult.fills(), baseResult.fairSeries(), 60_000)),
+                java.util.Map.entry("По числу уровней внутри нас",
+                        QueueCost.byLevelsInside(baseResult.fills(), baseResult.fairSeries(), 60_000)))) {
+            sb.append("**").append(section.getKey()).append("**\n\n");
+            sb.append("| Корзина | Исполнений | markout 60 с, б.п. | ±СО | Захват, б.п. "
+                    + "| Чистый край |\n|---|---|---|---|---|---|\n");
+            for (QueueCost.Group g : section.getValue()) {
+                sb.append("| ").append(g.label())
+                        .append(" | ").append(g.fills())
+                        .append(" | **").append(round(g.markoutBp(), 2)).append("**")
+                        .append(" | ±").append(round(g.standardErrorBp(), 2))
+                        .append(" | ").append(round(g.captureBp(), 2))
+                        .append(" | ").append(round(g.netEdgeBp(), 2))
+                        .append(" |\n");
+            }
+            sb.append("\n");
+        }
+        sb.append("Ошибка обязана стоять рядом с оценкой: разница в 0.5 б.п. при СО 0.8 "
+                + "не значит ничего, и на этом уже обжигались (док. 104 §4). Если "
+                + "интервалы корзин перекрываются — верный вывод «разницы нет», и он не "
+                + "хуже остальных: он закрывает переменную и говорит, что `c(d)` есть "
+                + "полное описание пошлины.\n\n");
 
         sb.append("### Стоп по просадке инвентаря (док. 107 §5)\n\n");
         sb.append("Правило ничего не классифицирует. Гейт по режиму провалился потому, "
