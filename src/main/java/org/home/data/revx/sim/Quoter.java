@@ -21,24 +21,43 @@ public final class Quoter implements QuotePolicy {
             double driftBeta,         // вес дрейфа в скосе (0 = выключено)
             double buySizeRatio,      // доля лота на ПОКУПКУ (1 = симметрично)
             long driftWindowMs,       // окно измерения дрейфа
+            double sizeShapeEta,      // непрерывное шейпирование размера покупки
             double requoteThreshold,  // порог перевыставления, доля цены
             double quoteStep) {       // шаг цены пары
 
         /** Совместимость: цель — пустой инвентарь, дрейф выключен, набор симметричен. */
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double requoteThreshold, double quoteStep) {
-            this(offset, size, inventoryCap, skewK, 0.0, 0.0, 1.0, 0L, requoteThreshold, quoteStep);
+            this(offset, size, inventoryCap, skewK, 0.0, 0.0, 1.0, 0L, 0.0,
+                    requoteThreshold, quoteStep);
         }
 
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double skewTarget, double requoteThreshold, double quoteStep) {
-            this(offset, size, inventoryCap, skewK, skewTarget, 0.0, 1.0, 0L,
+            this(offset, size, inventoryCap, skewK, skewTarget, 0.0, 1.0, 0L, 0.0,
                     requoteThreshold, quoteStep);
         }
 
-        /** Размер заявки стороны: покупаем медленнее, разгружаемся свободно. */
-        public double sizeFor(Side side) {
-            return side == Side.BUY ? size * buySizeRatio : size;
+        /**
+         * Размер заявки стороны: покупаем медленнее, разгружаемся свободно.
+         *
+         * Ступенька {@code buySizeRatio} — грубая версия; при {@code sizeShapeEta > 0}
+         * работает непрерывная, {@code размер = лот · e^{−η·инвентарь/потолок}}.
+         * Она не имеет порога вовсе, и это причина её предпочесть: асимметричный
+         * набор в одиночку оказался неустойчив — знак альфы на падении менялся
+         * между ×0.5 и ×0.25 (док. 99 §4), а чувствительность к порогу обычно и
+         * означает, что дело в самом пороге (док. 101 §3.2).
+         */
+        public double sizeFor(Side side, double inventory) {
+            if (side != Side.BUY) {
+                return size;
+            }
+            double shaped = size * buySizeRatio;
+            if (sizeShapeEta > 0 && inventoryCap > 0) {
+                double filled = Math.max(0, Math.min(1, inventory / inventoryCap));
+                shaped *= Math.exp(-sizeShapeEta * filled);
+            }
+            return shaped;
         }
     }
 

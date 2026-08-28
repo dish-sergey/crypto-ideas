@@ -116,7 +116,7 @@ public class SimRunner {
         ExecutionModel.Limits limits = new ExecutionModel.Limits(steps[0], 1e-9);
         Quoter.Params base = new Quoter.Params(cfg.simOffset(), cfg.simSize(), cfg.simInventoryCap(),
                 cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
-                cfg.simDriftWindowMs(), cfg.simRequoteThreshold(), steps[1]);
+                cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simRequoteThreshold(), steps[1]);
 
         List<Run> runs = new ArrayList<>();
         SimEngine.Result baseResult = new SimEngine(base, limits, cfg.simMakerFee()).run(data.windows());
@@ -199,6 +199,18 @@ public class SimRunner {
             }
         }
 
+        List<RatioRung> shapeLadder = new ArrayList<>();
+        for (double eta : cfg.simShapeLadder()) {
+            Quoter.Params params = withShapeEta(base, eta);
+            SimEngine.Result result = eta == base.sizeShapeEta() ? baseResult
+                    : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
+            shapeLadder.add(new RatioRung(eta, result));
+            if (eta != base.sizeShapeEta()) {
+                runs.add(new Run(String.format("шейп η=%.1f", eta), result,
+                        cfg.simMakerFee(), base.offset(), base.inventoryCap()));
+            }
+        }
+
         // Лестница задержки котирования — цена отсутствия WebSocket (док. 86 §7).
         // Правка «захват против цены момента исполнения» создала механизм
         // устаревания заявки; здесь он прогоняется с разным периодом решений.
@@ -249,7 +261,7 @@ public class SimRunner {
         }
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
-                skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder);
+                skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
@@ -398,26 +410,34 @@ public class SimRunner {
     private static Quoter.Params withSkewK(Quoter.Params base, double skewK) {
         return new Quoter.Params(base.offset(), base.size(), base.inventoryCap(), skewK,
                 base.skewTarget(), base.driftBeta(), base.buySizeRatio(), base.driftWindowMs(),
-                base.requoteThreshold(), base.quoteStep());
+                base.sizeShapeEta(), base.requoteThreshold(), base.quoteStep());
     }
 
     /** Ступень веса дрейфа: всё остальное неизменно (док. 98 §3). */
     private static Quoter.Params withDriftBeta(Quoter.Params base, double beta) {
         return new Quoter.Params(base.offset(), base.size(), base.inventoryCap(), base.skewK(),
                 base.skewTarget(), beta, base.buySizeRatio(), base.driftWindowMs(),
-                base.requoteThreshold(), base.quoteStep());
+                base.sizeShapeEta(), base.requoteThreshold(), base.quoteStep());
     }
 
     /** Ступень асимметрии набора: покупаем медленнее, разгружаемся свободно (док. 98 §6). */
     private static Quoter.Params withBuyRatio(Quoter.Params base, double ratio) {
         return new Quoter.Params(base.offset(), base.size(), base.inventoryCap(), base.skewK(),
                 base.skewTarget(), base.driftBeta(), ratio, base.driftWindowMs(),
-                base.requoteThreshold(), base.quoteStep());
+                base.sizeShapeEta(), base.requoteThreshold(), base.quoteStep());
+    }
+
+    /** Ступень непрерывного шейпирования размера покупки (док. 101 §3.2). */
+    private static Quoter.Params withShapeEta(Quoter.Params base, double eta) {
+        return new Quoter.Params(base.offset(), base.size(), base.inventoryCap(), base.skewK(),
+                base.skewTarget(), base.driftBeta(), base.buySizeRatio(), base.driftWindowMs(),
+                eta, base.requoteThreshold(), base.quoteStep());
     }
 
     private static Quoter.Params withOffset(Quoter.Params base, double offset) {
         return new Quoter.Params(offset, base.size(), base.inventoryCap(), base.skewK(),
-                base.skewTarget(), base.requoteThreshold(), base.quoteStep());
+                base.skewTarget(), base.driftBeta(), base.buySizeRatio(), base.driftWindowMs(),
+                base.sizeShapeEta(), base.requoteThreshold(), base.quoteStep());
     }
 
     /**
@@ -437,7 +457,8 @@ public class SimRunner {
     private static Quoter.Params withCap(Quoter.Params base, double cap) {
         double factor = base.inventoryCap() > 0 ? cap / base.inventoryCap() : 1;
         return new Quoter.Params(base.offset(), base.size() * factor, cap, base.skewK(),
-                base.skewTarget(), base.requoteThreshold(), base.quoteStep());
+                base.skewTarget(), base.driftBeta(), base.buySizeRatio(), base.driftWindowMs(),
+                base.sizeShapeEta(), base.requoteThreshold(), base.quoteStep());
     }
 
     private Map<String, Object> configOf(Run run, Quoter.Params base, ExecutionModel.Limits limits) {
@@ -513,7 +534,8 @@ public class SimRunner {
                           ExecutionModel.Limits limits, List<Run> runs, SimEngine.Result baseResult,
                           List<Rung> ladder, List<SkewRung> skewLadder, List<CapRung> capLadder,
                           List<LatencyRung> latencyLadder,
-                          List<DriftRung> driftLadder, List<RatioRung> ratioLadder) {
+                          List<DriftRung> driftLadder, List<RatioRung> ratioLadder,
+                          List<RatioRung> shapeLadder) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
         sb.append("Прогоны ТЗ §4.7, отчёт §5.3. Код `").append(registry.gitHash())
@@ -728,6 +750,85 @@ public class SimRunner {
                 + "«устаревшая опора» отпадает. Пик справа — опора отстаёт, и уровень "
                 + "захвата завышен ровно на величину этого запаздывания.\n\n");
 
+        sb.append("### Закон прихода заявок и замкнутая формула отступа (док. 100)\n\n");
+        sb.append("Вся литература по маркет-мейкингу стоит на допущении "
+                + "`λ(δ) = A·e^{−κδ}`. Оно эмпирическое и обычно не проверяется. "
+                + "Наша лестница отступа — прямое его измерение.\n\n");
+        List<ArrivalLaw.Rung> byFills = new ArrayList<>();
+        List<ArrivalLaw.Rung> byTurnover = new ArrayList<>();
+        for (Rung rung : ladder) {
+            byFills.add(new ArrivalLaw.Rung(rung.offset(), rung.result().fills().size()));
+            byTurnover.add(new ArrivalLaw.Rung(rung.offset(), turnover(rung.result())));
+        }
+        ArrivalLaw.Fit fitFills = ArrivalLaw.fit(byFills);
+        ArrivalLaw.Fit fitTurnover = ArrivalLaw.fit(byTurnover);
+        sb.append("| Подгонка | κ | 1/κ, б.п. | R² | Держится |\n|---|---|---|---|---|\n");
+        sb.append("| по числу исполнений | ").append(round(fitFills.kappa(), 1))
+                .append(" | ").append(round(10_000 / Math.max(1e-9, fitFills.kappa()), 2))
+                .append(" | ").append(round(fitFills.rSquared(), 3))
+                .append(" | ").append(fitFills.holds() ? "да" : "**нет**").append(" |\n");
+        sb.append("| **по обороту** | ").append(round(fitTurnover.kappa(), 1))
+                .append(" | **").append(round(10_000 / Math.max(1e-9, fitTurnover.kappa()), 2))
+                .append("** | ").append(round(fitTurnover.rSquared(), 3))
+                .append(" | ").append(fitTurnover.holds() ? "да" : "**нет**").append(" |\n\n");
+        sb.append("Подгонок две, и это не педантизм: глубокие исполнения приходят от "
+                + "крупных выносов, поэтому средний филл РАСТЁТ с дистанцией, и "
+                + "оптимизировать надо по обороту, а не по числу сделок. `κ` для "
+                + "оборота меньше — то есть оптимальный отступ ШИРЕ учебничного.\n\n");
+        double staleBp = 2.86 * Math.sqrt(data.windowPeriodSec() / 5.0);
+        double adverse = Math.max(0, captureBp(baseResult) - netEdgeBp(baseResult, 60_000));
+        double costFraction = (staleBp + adverse) / 10_000;
+        sb.append("| Слагаемое пошлины `c` | б.п. |\n|---|---|\n");
+        sb.append("| устаревание при шаге ").append(round(data.windowPeriodSec(), 1))
+                .append(" с | ").append(round(staleBp, 2)).append(" |\n");
+        sb.append("| неблагоприятный отбор (захват − край 60 с) | ")
+                .append(round(adverse, 2)).append(" |\n");
+        sb.append("| **итого `c`** | **").append(round(staleBp + adverse, 2)).append("** |\n\n");
+        sb.append("| Отступ | б.п. |\n|---|---|\n");
+        sb.append("| учебничный `1/κ` (оборот) | ")
+                .append(round(10_000 / Math.max(1e-9, fitTurnover.kappa()), 2)).append(" |\n");
+        sb.append("| **формула `δ* = c + 1/κ`** | **")
+                .append(round(fitTurnover.optimalOffset(costFraction) * 10_000, 2)).append("** |\n");
+        sb.append("| наш рабочий `d` | ").append(round(base.offset() * 10_000, 2)).append(" |\n\n");
+        sb.append("Замкнутая формула — независимая проверка настройки с другой стороны: "
+                + "два измеренных параметра вместо перебора по трём окнам. Без "
+                + "слагаемого `c`, которого в моделях нет вовсе, формула дала бы "
+                + "отступ, на котором наш измеренный край отрицателен.\n\n");
+
+        sb.append("### Персистентность дрейфа: альфа или правило риска (док. 100 §6.1)\n\n");
+        DriftPersistence.Stats persistence = DriftPersistence.compute(
+                baseResult.fairSeries(), base.driftWindowMs() > 0 ? base.driftWindowMs() : 1_800_000L,
+                cfg.simHoldHorizonMs(), 60_000L);
+        sb.append("Теорема Guéant et al. предписывает сдвигать центр котировки на "
+                + "ОЖИДАЕМОЕ изменение цены за горизонт удержания. Эта величина "
+                + "измерима: регрессия будущей доходности на трейлинг-дрейф. Её "
+                + "коэффициент и есть теоретический `β` — вместо нашей геометрической "
+                + "эвристики.\n\n");
+        sb.append("| Показатель | Значение |\n|---|---|\n");
+        sb.append("| Точек регрессии | ").append(persistence.points()).append(" |\n");
+        sb.append("| Перекрытие окон | ×").append(round(persistence.overlap(), 0)).append(" |\n");
+        sb.append("| Наклон (доля дрейфа, доживающая до горизонта) | ")
+                .append(round(persistence.slope(), 4)).append(" |\n");
+        sb.append("| **IC (корреляция прошлого с будущим)** | **")
+                .append(round(persistence.correlation(), 4)).append("** |\n");
+        sb.append("| R² | ").append(round(persistence.rSquared(), 4)).append(" |\n");
+        sb.append("| Теоретический `β` = наклон / `k` | ")
+                .append(round(persistence.betaFor(base.skewK()), 0)).append(" |\n");
+        sb.append("| Наш геометрический `β` | ")
+                .append(round(Quoter.betaFromGeometry(base.offset()), 0)).append(" |\n");
+        sb.append("| **Вердикт** | ").append(persistence.predictive()
+                        ? "в дрейфе есть направленное содержание"
+                        : "**предсказуемости нет — дрейф-скос работает как ПРАВИЛО РИСКА, не как альфа**")
+                .append(" |\n\n");
+        sb.append("Это ответ о ПРИРОДЕ результата, а не о его величине. Если будущее "
+                + "из прошлого дрейфа не предсказывается, дрейф-скос законен, но "
+                + "описывать его надо как управление риском, и переносить на другие "
+                + "площадки как «сигнал» нельзя. Плато по `β` (док. 99 §3) указывало "
+                + "туда же заранее: настоящая альфа была бы чувствительна к весу.\n\n"
+                + "Перекрытие окон обязано стоять рядом с IC: соседние точки делят "
+                + "почти всё окно, независимых наблюдений во столько же раз меньше, и "
+                + "без этой поправки слабая корреляция выглядит значимой.\n\n");
+
         sb.append("### Скорость набора инвентаря: дрейф-скос и асимметрия (док. 98)\n\n");
         sb.append("Инвентарная нога буквально означает «набрали на падении — ждём "
                 + "возврата», то есть ставку на ВОЗВРАТ движения. Подтверждённый факт "
@@ -776,6 +877,34 @@ public class SimRunner {
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                     .append(" |\n");
         }
+        sb.append("\n| η шейпирования | Исполнений | Захват, б.п. | Чистый край 60 с "
+                + "| Край × оборот | Средний инвентарь | Время с полным "
+                + "| **Total** | **Buy & hold** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : shapeLadder) {
+            SimEngine.Result r = rung.result();
+            double edge = netEdgeBp(r, 60_000);
+            sb.append("| ").append(round(rung.ratio(), 1))
+                    .append(rung.ratio() == 0 ? " (выкл.)" : "")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(edge, 2))
+                    .append(" | ").append(round(edge * turnover(r) / 10_000, 1))
+                    .append(" | ").append(round(r.avgInventory(), 4))
+                    .append(" | ").append(round(100.0 * r.windowsAtCap()
+                            / Math.max(1, r.windows()), 1)).append("%")
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n**Непрерывное шейпирование против ступеньки.** `η` задаёт "
+                + "`размер покупки = лот · e^{−η·инвентарь/потолок}`: η = 1.4 означает "
+                + "четверть лота у самого потолка и полный лот на пустом счёте. У "
+                + "ступеньки `buy-size-ratio` есть порог, и именно к нему оказался "
+                + "чувствителен асимметричный набор — знак альфы на падении менялся "
+                + "между ×0.5 и ×0.25 (док. 99 §4). У непрерывной формы порога нет "
+                + "вовсе (док. 101 §3.2).\n\n");
+
         sb.append("\n**Читать по `total` против `buy & hold`, а не по краю.** Обе "
                 + "лестницы меняют НЕСОМУЮ ПОЗИЦИЮ, а «край × оборот» о ней ничего не "
                 + "знает (док. 96 §4): по нему выиграет ступень с наибольшим инвентарём. "

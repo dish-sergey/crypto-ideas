@@ -245,7 +245,7 @@ public final class QuoteLoop implements Runnable {
     private double sizeFor(Side side, double price) {
         // params.sizeFor учитывает асимметрию набора: покупаем медленнее, чем
         // разгружаемся (док. 98 §6). При симметричной настройке это прежний size().
-        double want = params.sizeFor(side);
+        double want = params.sizeFor(side, inventory);
         if (side == Side.SELL) {
             return Math.min(want, inventory);
         }

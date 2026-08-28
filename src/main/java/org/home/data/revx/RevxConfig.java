@@ -65,6 +65,8 @@ public class RevxConfig {
     private final double simDriftBeta;
     private final long simDriftWindowMs;
     private final double simBuySizeRatio;
+    private final double simSizeShapeEta;
+    private final long simHoldHorizonMs;
     private final double simRequoteThreshold;
     private final double simMakerFee;
     private final double simPessimisticFee;
@@ -76,6 +78,7 @@ public class RevxConfig {
     private final List<Double> simCapLadder;
     private final List<Double> simDriftBetaLadder;
     private final List<Double> simBuyRatioLadder;
+    private final List<Double> simShapeLadder;
     private final List<Integer> simLatencyLadder;
 
     private final double probeStartRps;
@@ -132,6 +135,8 @@ public class RevxConfig {
             @Value("${revx.sim.drift-beta}") double simDriftBeta,
             @Value("${revx.sim.drift-window-ms}") long simDriftWindowMs,
             @Value("${revx.sim.buy-size-ratio}") double simBuySizeRatio,
+            @Value("${revx.sim.size-shape-eta}") double simSizeShapeEta,
+            @Value("${revx.sim.hold-horizon-ms}") long simHoldHorizonMs,
             @Value("${revx.sim.requote-threshold}") double simRequoteThreshold,
             @Value("${revx.sim.maker-fee}") double simMakerFee,
             @Value("${revx.sim.pessimistic-fee}") double simPessimisticFee,
@@ -143,6 +148,7 @@ public class RevxConfig {
             @Value("${revx.sim.cap-ladder}") List<Double> simCapLadder,
             @Value("${revx.sim.drift-beta-ladder}") List<Double> simDriftBetaLadder,
             @Value("${revx.sim.buy-ratio-ladder}") List<Double> simBuyRatioLadder,
+            @Value("${revx.sim.shape-ladder}") List<Double> simShapeLadder,
             @Value("${revx.sim.latency-ladder}") List<Integer> simLatencyLadder,
             @Value("${revx.probe.start-rps}") double probeStartRps,
             @Value("${revx.probe.step-rps}") double probeStepRps,
@@ -196,6 +202,8 @@ public class RevxConfig {
         this.simDriftBeta = simDriftBeta;
         this.simDriftWindowMs = simDriftWindowMs;
         this.simBuySizeRatio = simBuySizeRatio;
+        this.simSizeShapeEta = simSizeShapeEta;
+        this.simHoldHorizonMs = simHoldHorizonMs;
         this.simRequoteThreshold = simRequoteThreshold;
         this.simMakerFee = simMakerFee;
         this.simPessimisticFee = simPessimisticFee;
@@ -207,6 +215,7 @@ public class RevxConfig {
         this.simCapLadder = simCapLadder;
         this.simDriftBetaLadder = simDriftBetaLadder;
         this.simBuyRatioLadder = simBuyRatioLadder;
+        this.simShapeLadder = simShapeLadder;
         this.simLatencyLadder = simLatencyLadder;
         this.probeStartRps = probeStartRps;
         this.probeStepRps = probeStepRps;
@@ -434,6 +443,14 @@ public class RevxConfig {
         return simBuySizeRatio;
     }
 
+    public double simSizeShapeEta() {
+        return simSizeShapeEta;
+    }
+
+    public long simHoldHorizonMs() {
+        return simHoldHorizonMs;
+    }
+
     public double simRequoteThreshold() {
         return simRequoteThreshold;
     }
@@ -498,6 +515,10 @@ public class RevxConfig {
 
     public double[] simBuyRatioLadder() {
         return simBuyRatioLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    public double[] simShapeLadder() {
+        return simShapeLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     /**

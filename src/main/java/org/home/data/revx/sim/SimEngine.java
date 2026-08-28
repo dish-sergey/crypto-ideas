@@ -182,7 +182,7 @@ public final class SimEngine {
                 execution.cancel(Side.BUY);
                 restingBid = target.bid();
                 if (restingBid != null) {
-                    execution.place(Side.BUY, restingBid, params.sizeFor(Side.BUY),
+                    execution.place(Side.BUY, restingBid, params.sizeFor(Side.BUY, pnl.inventory()),
                             window.book(), window.tsMs());
                 }
                 requotes++;
@@ -192,7 +192,7 @@ public final class SimEngine {
                 restingAsk = target.ask();
                 if (restingAsk != null) {
                     // продать можно только то, что есть: спот, шортить нечем
-                    double size = Math.min(params.sizeFor(Side.SELL), pnl.inventory());
+                    double size = Math.min(params.sizeFor(Side.SELL, pnl.inventory()), pnl.inventory());
                     if (size > 0) {
                         execution.place(Side.SELL, restingAsk, size, window.book(), window.tsMs());
                     } else {

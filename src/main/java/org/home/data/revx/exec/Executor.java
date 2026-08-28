@@ -66,7 +66,8 @@ public class Executor {
         // отличались ровно одним: реальностью исполнения.
         Quoter.Params params = new Quoter.Params(cfg.simOffset(), size, inventoryCap,
                 cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
-                cfg.simDriftWindowMs(), cfg.simRequoteThreshold(), quoteStep());
+                cfg.simDriftWindowMs(), cfg.simSizeShapeEta(),
+                cfg.simRequoteThreshold(), quoteStep());
         QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs);
 
         log.warn("""
