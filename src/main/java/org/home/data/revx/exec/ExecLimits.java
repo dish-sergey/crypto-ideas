@@ -83,8 +83,11 @@ public final class ExecLimits {
                   заявка не больше       %.2f USDC
                   экспозиция не больше   %.2f USDC
                   постановок в сутки     %d (у площадки 1000)
-                  перевыставлений в мин  %d""".formatted(
+                  перевыставлений в мин  %d
+                  комиссия не больше     %.2f USDC — иначе стоп
+                  торговый убыток        %.2f USDC — иначе стоп (против buy and hold)""".formatted(
                 MAX_ORDER_NOTIONAL_USDC, MAX_TOTAL_EXPOSURE_USDC,
-                MAX_PLACEMENTS_PER_DAY, MAX_REPLACES_PER_MINUTE);
+                MAX_PLACEMENTS_PER_DAY, MAX_REPLACES_PER_MINUTE,
+                MAX_FEE_USDC, MAX_TRADING_LOSS_USDC);
     }
 }
