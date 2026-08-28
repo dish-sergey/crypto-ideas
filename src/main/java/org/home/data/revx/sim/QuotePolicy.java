@@ -13,7 +13,16 @@ import java.util.random.RandomGeneratorFactory;
  */
 public interface QuotePolicy {
 
-    Quoter.Quotes quotes(double fair, double inventory);
+    /**
+     * @param drift относительный дрейф справедливой цены за окно наблюдения;
+     *              ноль означает «слагаемое дрейфа выключено»
+     */
+    Quoter.Quotes quotes(double fair, double inventory, double drift);
+
+    /** Без дрейфа — историческое поведение. */
+    default Quoter.Quotes quotes(double fair, double inventory) {
+        return quotes(fair, inventory, 0);
+    }
 
     /**
      * Случайные котировки: отступ равномерен на (0, 2d], то есть в среднем тот же
@@ -22,18 +31,17 @@ public interface QuotePolicy {
      */
     static QuotePolicy random(Quoter.Params params, long seed) {
         RandomGenerator rng = RandomGeneratorFactory.of("L64X128MixRandom").create(seed);
-        return (fair, inventory) -> {
+        return (fair, inventory, drift) -> {
             if (!(fair > 0)) {
                 return new Quoter.Quotes(null, null);
             }
-            // Скос применяется ТОТ ЖЕ, что у стратегии. Иначе контроль перестаёт быть
-            // контролем: при сильном скосе стратегия сознательно держит вдвое меньший
-            // инвентарь, контроль без скоса держит вдвое больший, и на растущем окне
-            // он выигрывает по `total` просто потому, что он больше лонг. Сравнение
-            // должно отличаться ровно одним — ВЫБОРОМ ЦЕН.
-            double skew = params.inventoryCap() > 0 ? inventory / params.inventoryCap() : 0;
-            skew = Math.max(-1, Math.min(1, skew));
-            double shift = params.skewK() * skew;
+            // Скос применяется ТОТ ЖЕ, что у стратегии, слагаемое дрейфа включительно.
+            // Иначе контроль перестаёт быть контролем: при сильном скосе стратегия
+            // сознательно держит вдвое меньший инвентарь, контроль без скоса держит
+            // вдвое больший, и на растущем окне он выигрывает по `total` просто потому,
+            // что он больше лонг. Сравнение должно отличаться ровно одним — ВЫБОРОМ ЦЕН,
+            // поэтому формула скоса берётся из общего места, а не переписывается здесь.
+            double shift = params.skewK() * Quoter.skew(params, inventory, drift);
 
             Double bid = null;
             Double ask = null;

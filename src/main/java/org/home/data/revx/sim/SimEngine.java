@@ -125,6 +125,7 @@ public final class SimEngine {
         double peakEquity = 0;
         double maxDrawdown = 0;
         double fairFirst = 0;
+        int driftAnchor = 0;
 
         for (int wi = 0; wi < windows.size(); wi++) {
             Window window = windows.get(wi);
@@ -158,16 +159,31 @@ public final class SimEngine {
                 continue;                 // без справедливой цены нечего мерить
             }
 
+            // Дрейф опоры за окно наблюдения. Якорь двигается монотонно вперёд,
+            // поэтому весь ряд обходится один раз, а не заново на каждом тике.
+            double driftNow = 0;
+            if (params.driftBeta() != 0 && params.driftWindowMs() > 0) {
+                long since = window.tsMs() - params.driftWindowMs();
+                while (driftAnchor + 1 < wi && windows.get(driftAnchor + 1).tsMs() < since) {
+                    driftAnchor++;
+                }
+                double anchorFair = windows.get(driftAnchor).fair();
+                if (anchorFair > 0 && windows.get(driftAnchor).tsMs() >= since - params.driftWindowMs()) {
+                    driftNow = (window.fair() - anchorFair) / anchorFair;
+                }
+            }
+
             execution.refresh(window.book());
             Quoter.Quotes target = decisionWindow
-                    ? policy.quotes(window.fair(), pnl.inventory())
+                    ? policy.quotes(window.fair(), pnl.inventory(), driftNow)
                     : new Quoter.Quotes(restingBid, restingAsk);
 
             if (quoter.shouldRequote(restingBid, target.bid())) {
                 execution.cancel(Side.BUY);
                 restingBid = target.bid();
                 if (restingBid != null) {
-                    execution.place(Side.BUY, restingBid, params.size(), window.book(), window.tsMs());
+                    execution.place(Side.BUY, restingBid, params.sizeFor(Side.BUY),
+                            window.book(), window.tsMs());
                 }
                 requotes++;
             }
@@ -176,7 +192,7 @@ public final class SimEngine {
                 restingAsk = target.ask();
                 if (restingAsk != null) {
                     // продать можно только то, что есть: спот, шортить нечем
-                    double size = Math.min(params.size(), pnl.inventory());
+                    double size = Math.min(params.sizeFor(Side.SELL), pnl.inventory());
                     if (size > 0) {
                         execution.place(Side.SELL, restingAsk, size, window.book(), window.tsMs());
                     } else {

@@ -18,13 +18,27 @@ public final class Quoter implements QuotePolicy {
             double inventoryCap,      // потолок инвентаря в базовой валюте
             double skewK,             // коэффициент скоса
             double skewTarget,        // ЦЕЛЬ скоса, доля потолка (0 = пустой инвентарь)
+            double driftBeta,         // вес дрейфа в скосе (0 = выключено)
+            double buySizeRatio,      // доля лота на ПОКУПКУ (1 = симметрично)
+            long driftWindowMs,       // окно измерения дрейфа
             double requoteThreshold,  // порог перевыставления, доля цены
             double quoteStep) {       // шаг цены пары
 
-        /** Совместимость: цель по умолчанию — пустой инвентарь. */
+        /** Совместимость: цель — пустой инвентарь, дрейф выключен, набор симметричен. */
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double requoteThreshold, double quoteStep) {
-            this(offset, size, inventoryCap, skewK, 0.0, requoteThreshold, quoteStep);
+            this(offset, size, inventoryCap, skewK, 0.0, 0.0, 1.0, 0L, requoteThreshold, quoteStep);
+        }
+
+        public Params(double offset, double size, double inventoryCap, double skewK,
+                      double skewTarget, double requoteThreshold, double quoteStep) {
+            this(offset, size, inventoryCap, skewK, skewTarget, 0.0, 1.0, 0L,
+                    requoteThreshold, quoteStep);
+        }
+
+        /** Размер заявки стороны: покупаем медленнее, разгружаемся свободно. */
+        public double sizeFor(Side side) {
+            return side == Side.BUY ? size * buySizeRatio : size;
         }
     }
 
@@ -47,11 +61,11 @@ public final class Quoter implements QuotePolicy {
     }
 
     @Override
-    public Quotes quotes(double fair, double inventory) {
+    public Quotes quotes(double fair, double inventory, double drift) {
         if (!(fair > 0)) {
             return new Quotes(null, null);
         }
-        double skew = skew(inventory);
+        double skew = skew(params, inventory, drift);
 
         Double bid = null;
         Double ask = null;
@@ -75,8 +89,28 @@ public final class Quoter implements QuotePolicy {
      *
      * Нормировка на {@code max(target, 1−target)} держит скос в [−1, 1] при любой
      * цели, поэтому коэффициент {@code k} сохраняет смысл «сколько б.п. на краю».
+     *
+     * <h2>Слагаемое дрейфа</h2>
+     *
+     * {@code skew = инвентарь/потолок − β·дрейф}.
+     *
+     * Инвентарная часть буквально означает «набрали на падении — хотим вернуться
+     * к нулю», то есть ставку на ВОЗВРАТ движения. А подтверждённый факт проекта,
+     * измеренный дважды независимо (S3 и S7), гласит обратное: резкие движения
+     * продолжаются. Инвентарная нога торгует против самого прочного эмпирического
+     * результата, который у проекта есть, — отсюда систематичность её убытка
+     * (док. 98 §2).
+     *
+     * Слагаемое дрейфа не предсказывает направление и не открывает позицию по
+     * сигналу. Оно задаёт СКОРОСТЬ НАБОРА инвентаря — величину, которую всё равно
+     * приходится чем-то задавать, и которая сейчас задана неявным допущением о
+     * возврате. Это правило риска, а не прогноз.
+     *
+     * На падении ({@code дрейф < 0}) вклад положителен: обе котировки уезжают
+     * вниз, бид перестаёт набирать в дешевеющий актив, аск разгружает охотнее.
+     * На росте — наоборот, позиция держится дольше.
      */
-    private double skew(double inventory) {
+    static double skew(Params params, double inventory, double drift) {
         double cap = params.inventoryCap();
         if (!(cap > 0)) {
             return 0;
@@ -86,8 +120,22 @@ public final class Quoter implements QuotePolicy {
         if (!(span > 0)) {
             return 0;
         }
-        double skew = (inventory / cap - target) / span;
+        double skew = (inventory / cap - target) / span - params.driftBeta() * drift;
         return Math.max(-1, Math.min(1, skew));
+    }
+
+    /**
+     * Вес дрейфа, выведенный из ГЕОМЕТРИИ стратегии, а не подобранный по данным.
+     *
+     * Насыщение наступает там, где рынок за окно дрейфа прошёл всю нашу ширину
+     * котировки {@code 2d}: такое движение уже нельзя считать колебанием вокруг
+     * справедливой цены. Отсюда {@code β = 1/(2d)}.
+     *
+     * Подбор β по результату превратил бы правило риска в подгонку и вернул бы
+     * ту же болезнь, от которой проект закрыл детектор режима (док. 98 §3).
+     */
+    public static double betaFromGeometry(double offset) {
+        return offset > 0 ? 1.0 / (2 * offset) : 0;
     }
 
     /**

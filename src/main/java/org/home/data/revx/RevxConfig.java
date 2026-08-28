@@ -62,6 +62,9 @@ public class RevxConfig {
     private final double simInventoryCap;
     private final double simSkewK;
     private final double simSkewTarget;
+    private final double simDriftBeta;
+    private final long simDriftWindowMs;
+    private final double simBuySizeRatio;
     private final double simRequoteThreshold;
     private final double simMakerFee;
     private final double simPessimisticFee;
@@ -71,6 +74,8 @@ public class RevxConfig {
     private final List<Double> simOffsetLadder;
     private final List<Double> simSkewLadder;
     private final List<Double> simCapLadder;
+    private final List<Double> simDriftBetaLadder;
+    private final List<Double> simBuyRatioLadder;
     private final List<Integer> simLatencyLadder;
 
     private final double probeStartRps;
@@ -124,6 +129,9 @@ public class RevxConfig {
             @Value("${revx.sim.inventory-cap}") double simInventoryCap,
             @Value("${revx.sim.skew-k}") double simSkewK,
             @Value("${revx.sim.skew-target}") double simSkewTarget,
+            @Value("${revx.sim.drift-beta}") double simDriftBeta,
+            @Value("${revx.sim.drift-window-ms}") long simDriftWindowMs,
+            @Value("${revx.sim.buy-size-ratio}") double simBuySizeRatio,
             @Value("${revx.sim.requote-threshold}") double simRequoteThreshold,
             @Value("${revx.sim.maker-fee}") double simMakerFee,
             @Value("${revx.sim.pessimistic-fee}") double simPessimisticFee,
@@ -133,6 +141,8 @@ public class RevxConfig {
             @Value("${revx.sim.offset-ladder}") List<Double> simOffsetLadder,
             @Value("${revx.sim.skew-ladder}") List<Double> simSkewLadder,
             @Value("${revx.sim.cap-ladder}") List<Double> simCapLadder,
+            @Value("${revx.sim.drift-beta-ladder}") List<Double> simDriftBetaLadder,
+            @Value("${revx.sim.buy-ratio-ladder}") List<Double> simBuyRatioLadder,
             @Value("${revx.sim.latency-ladder}") List<Integer> simLatencyLadder,
             @Value("${revx.probe.start-rps}") double probeStartRps,
             @Value("${revx.probe.step-rps}") double probeStepRps,
@@ -183,6 +193,9 @@ public class RevxConfig {
         this.simInventoryCap = simInventoryCap;
         this.simSkewK = simSkewK;
         this.simSkewTarget = simSkewTarget;
+        this.simDriftBeta = simDriftBeta;
+        this.simDriftWindowMs = simDriftWindowMs;
+        this.simBuySizeRatio = simBuySizeRatio;
         this.simRequoteThreshold = simRequoteThreshold;
         this.simMakerFee = simMakerFee;
         this.simPessimisticFee = simPessimisticFee;
@@ -192,6 +205,8 @@ public class RevxConfig {
         this.simOffsetLadder = simOffsetLadder;
         this.simSkewLadder = simSkewLadder;
         this.simCapLadder = simCapLadder;
+        this.simDriftBetaLadder = simDriftBetaLadder;
+        this.simBuyRatioLadder = simBuyRatioLadder;
         this.simLatencyLadder = simLatencyLadder;
         this.probeStartRps = probeStartRps;
         this.probeStepRps = probeStepRps;
@@ -407,6 +422,18 @@ public class RevxConfig {
         return simSkewTarget;
     }
 
+    public double simDriftBeta() {
+        return simDriftBeta;
+    }
+
+    public long simDriftWindowMs() {
+        return simDriftWindowMs;
+    }
+
+    public double simBuySizeRatio() {
+        return simBuySizeRatio;
+    }
+
     public double simRequoteThreshold() {
         return simRequoteThreshold;
     }
@@ -463,6 +490,14 @@ public class RevxConfig {
      */
     public double[] simCapLadder() {
         return simCapLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    public double[] simDriftBetaLadder() {
+        return simDriftBetaLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    public double[] simBuyRatioLadder() {
+        return simBuyRatioLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     /**

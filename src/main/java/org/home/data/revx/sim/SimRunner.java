@@ -75,6 +75,12 @@ public class SimRunner {
     private record LatencyRung(int seconds, SimEngine.Result result) {
     }
 
+    private record DriftRung(double beta, SimEngine.Result result) {
+    }
+
+    private record RatioRung(double ratio, SimEngine.Result result) {
+    }
+
     /**
      * Нулевое распределение контроля: N прогонов случайных котировок с разными
      * seed'ами. {@code capturePercentile} — доля прогонов контроля, которые
@@ -109,7 +115,8 @@ public class SimRunner {
         double[] steps = pairSteps(symbol);
         ExecutionModel.Limits limits = new ExecutionModel.Limits(steps[0], 1e-9);
         Quoter.Params base = new Quoter.Params(cfg.simOffset(), cfg.simSize(), cfg.simInventoryCap(),
-                cfg.simSkewK(), cfg.simSkewTarget(), cfg.simRequoteThreshold(), steps[1]);
+                cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
+                cfg.simDriftWindowMs(), cfg.simRequoteThreshold(), steps[1]);
 
         List<Run> runs = new ArrayList<>();
         SimEngine.Result baseResult = new SimEngine(base, limits, cfg.simMakerFee()).run(data.windows());
@@ -156,14 +163,38 @@ public class SimRunner {
         // а в markout (док. 79 §7), поэтому ступени сравниваются по краю.
         List<SkewRung> skewLadder = new ArrayList<>();
         for (double skew : skews(base)) {
-            Quoter.Params params = new Quoter.Params(base.offset(), base.size(),
-                    base.inventoryCap(), skew, base.skewTarget(),
-                    base.requoteThreshold(), base.quoteStep());
+            Quoter.Params params = withSkewK(base, skew);
             SimEngine.Result result = skew == base.skewK() ? baseResult
                     : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
             skewLadder.add(new SkewRung(skew, result));
             if (skew != base.skewK()) {
                 runs.add(new Run(String.format("скос %.4f%%", skew * 100), result,
+                        cfg.simMakerFee(), base.offset(), base.inventoryCap()));
+            }
+        }
+
+        // Лестница веса дрейфа и лестница асимметрии набора (док. 98 §3, §6).
+        // Обе двигают одно и то же — СКОРОСТЬ НАБОРА инвентаря, — поэтому стоят
+        // рядом: если грубая асимметрия даёт то же, что дрейф, брать надо её.
+        List<DriftRung> driftLadder = new ArrayList<>();
+        for (double beta : cfg.simDriftBetaLadder()) {
+            Quoter.Params params = withDriftBeta(base, beta);
+            SimEngine.Result result = beta == base.driftBeta() ? baseResult
+                    : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
+            driftLadder.add(new DriftRung(beta, result));
+            if (beta != base.driftBeta()) {
+                runs.add(new Run(String.format("дрейф-скос β=%.0f", beta), result,
+                        cfg.simMakerFee(), base.offset(), base.inventoryCap()));
+            }
+        }
+        List<RatioRung> ratioLadder = new ArrayList<>();
+        for (double ratio : cfg.simBuyRatioLadder()) {
+            Quoter.Params params = withBuyRatio(base, ratio);
+            SimEngine.Result result = ratio == base.buySizeRatio() ? baseResult
+                    : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
+            ratioLadder.add(new RatioRung(ratio, result));
+            if (ratio != base.buySizeRatio()) {
+                runs.add(new Run(String.format("набор ×%.2f", ratio), result,
                         cfg.simMakerFee(), base.offset(), base.inventoryCap()));
             }
         }
@@ -218,7 +249,7 @@ public class SimRunner {
         }
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
-                skewLadder, capLadder, latencyLadder);
+                skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
@@ -358,6 +389,32 @@ public class SimRunner {
         return rows.get(0);
     }
 
+    /** Захват на единицу оборота, в базисных пунктах. */
+    private static double captureBp(SimEngine.Result result) {
+        double turnover = turnover(result);
+        return turnover > 0 ? result.pnl().spreadCapture() / turnover * 10_000 : Double.NaN;
+    }
+
+    private static Quoter.Params withSkewK(Quoter.Params base, double skewK) {
+        return new Quoter.Params(base.offset(), base.size(), base.inventoryCap(), skewK,
+                base.skewTarget(), base.driftBeta(), base.buySizeRatio(), base.driftWindowMs(),
+                base.requoteThreshold(), base.quoteStep());
+    }
+
+    /** Ступень веса дрейфа: всё остальное неизменно (док. 98 §3). */
+    private static Quoter.Params withDriftBeta(Quoter.Params base, double beta) {
+        return new Quoter.Params(base.offset(), base.size(), base.inventoryCap(), base.skewK(),
+                base.skewTarget(), beta, base.buySizeRatio(), base.driftWindowMs(),
+                base.requoteThreshold(), base.quoteStep());
+    }
+
+    /** Ступень асимметрии набора: покупаем медленнее, разгружаемся свободно (док. 98 §6). */
+    private static Quoter.Params withBuyRatio(Quoter.Params base, double ratio) {
+        return new Quoter.Params(base.offset(), base.size(), base.inventoryCap(), base.skewK(),
+                base.skewTarget(), base.driftBeta(), ratio, base.driftWindowMs(),
+                base.requoteThreshold(), base.quoteStep());
+    }
+
     private static Quoter.Params withOffset(Quoter.Params base, double offset) {
         return new Quoter.Params(offset, base.size(), base.inventoryCap(), base.skewK(),
                 base.skewTarget(), base.requoteThreshold(), base.quoteStep());
@@ -455,7 +512,8 @@ public class SimRunner {
     private String render(String symbol, int hours, SimDataReader.Dataset data, Quoter.Params base,
                           ExecutionModel.Limits limits, List<Run> runs, SimEngine.Result baseResult,
                           List<Rung> ladder, List<SkewRung> skewLadder, List<CapRung> capLadder,
-                          List<LatencyRung> latencyLadder) {
+                          List<LatencyRung> latencyLadder,
+                          List<DriftRung> driftLadder, List<RatioRung> ratioLadder) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
         sb.append("Прогоны ТЗ §4.7, отчёт §5.3. Код `").append(registry.gitHash())
@@ -669,6 +727,59 @@ public class SimRunner {
         sb.append("\nПик на нуле означает, что книги живут синхронно и объяснение "
                 + "«устаревшая опора» отпадает. Пик справа — опора отстаёт, и уровень "
                 + "захвата завышен ровно на величину этого запаздывания.\n\n");
+
+        sb.append("### Скорость набора инвентаря: дрейф-скос и асимметрия (док. 98)\n\n");
+        sb.append("Инвентарная нога буквально означает «набрали на падении — ждём "
+                + "возврата», то есть ставку на ВОЗВРАТ движения. Подтверждённый факт "
+                + "проекта, измеренный дважды независимо (S3 и S7), гласит обратное: "
+                + "резкие движения продолжаются. Обе лестницы ниже меняют одно и то же — "
+                + "скорость набора позиции, — и стоят рядом намеренно: если грубая "
+                + "асимметрия даёт то же, что дрейф-скос, брать надо её, она проще и не "
+                + "требует никакого сигнала.\n\n");
+        sb.append("| β дрейфа | Исполнений | Захват, б.п. | Чистый край 60 с "
+                + "| Край × оборот | Средний инвентарь | Время с полным "
+                + "| **Total** | **Buy & hold** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|\n");
+        for (DriftRung rung : driftLadder) {
+            SimEngine.Result r = rung.result();
+            double edge = netEdgeBp(r, 60_000);
+            sb.append("| ").append(round(rung.beta(), 0))
+                    .append(rung.beta() == 0 ? " (выкл.)" : "")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(edge, 2))
+                    .append(" | ").append(round(edge * turnover(r) / 10_000, 1))
+                    .append(" | ").append(round(r.avgInventory(), 4))
+                    .append(" | ").append(round(100.0 * r.windowsAtCap()
+                            / Math.max(1, r.windows()), 1)).append("%")
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n| Доля лота на покупку | Исполнений | Захват, б.п. | Чистый край 60 с "
+                + "| Край × оборот | Средний инвентарь | Время с полным "
+                + "| **Total** | **Buy & hold** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : ratioLadder) {
+            SimEngine.Result r = rung.result();
+            double edge = netEdgeBp(r, 60_000);
+            sb.append("| ×").append(round(rung.ratio(), 2))
+                    .append(rung.ratio() == 1.0 ? " (симметрично)" : "")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(edge, 2))
+                    .append(" | ").append(round(edge * turnover(r) / 10_000, 1))
+                    .append(" | ").append(round(r.avgInventory(), 4))
+                    .append(" | ").append(round(100.0 * r.windowsAtCap()
+                            / Math.max(1, r.windows()), 1)).append("%")
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n**Читать по `total` против `buy & hold`, а не по краю.** Обе "
+                + "лестницы меняют НЕСОМУЮ ПОЗИЦИЮ, а «край × оборот» о ней ничего не "
+                + "знает (док. 96 §4): по нему выиграет ступень с наибольшим инвентарём. "
+                + "Вопрос здесь другой — уменьшается ли проигрыш простому удержанию.\n\n");
 
         sb.append("### Лестница задержки: чего стоит REST вместо WebSocket\n\n");
         sb.append("Раз во сколько мы смотрим на рынок и переставляем заявку. Между "

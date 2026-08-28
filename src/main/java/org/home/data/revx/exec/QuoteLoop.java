@@ -82,6 +82,7 @@ public final class QuoteLoop implements Runnable {
     private volatile double inventory;
     private volatile double quoteBalance;
     private volatile double lastFair;
+    private final java.util.ArrayDeque<long[]> fairHistory = new java.util.ArrayDeque<>();
     private volatile String pausedReason = "не запущен";
     private long placements;
     private long replaces;
@@ -172,6 +173,7 @@ public final class QuoteLoop implements Runnable {
         rollCounters();
         StandReader.Fair fair = stand.latest(base, 30_000);
         lastFair = fair.price();
+        rememberFair(fair.price());
 
         if (!quoting.get()) {
             pausedReason = "не запущен";
@@ -192,7 +194,7 @@ public final class QuoteLoop implements Runnable {
         }
         pausedReason = null;
 
-        Quoter.Quotes target = quoter.quotes(fair.price(), inventory);
+        Quoter.Quotes target = quoter.quotes(fair.price(), inventory, drift());
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
         journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null);
@@ -241,11 +243,55 @@ public final class QuoteLoop implements Runnable {
      * Это физика площадки, а не настройка, и проверять её надо ДО отправки.
      */
     private double sizeFor(Side side, double price) {
+        // params.sizeFor учитывает асимметрию набора: покупаем медленнее, чем
+        // разгружаемся (док. 98 §6). При симметричной настройке это прежний size().
+        double want = params.sizeFor(side);
         if (side == Side.SELL) {
-            return Math.min(params.size(), inventory);
+            return Math.min(want, inventory);
         }
         double affordable = price > 0 ? quoteBalance / price : 0;
-        return Math.min(params.size(), affordable);
+        return Math.min(want, affordable);
+    }
+
+    /**
+     * Дрейф опоры за окно из конфига — по СВОЕЙ истории справедливых цен.
+     *
+     * Считается здесь, а не берётся из стенда, потому что источник цены у
+     * исполнителя один и тот же ряд, который он уже видит раз в секунду. Кольцо
+     * ограничено окном: память не растёт.
+     *
+     * Живое и модель обязаны считать дрейф ОДИНАКОВО — расхождение шага окна
+     * (док. 94 §1) стоило дня разбирательств, повторять не надо.
+     */
+    private void rememberFair(double fair) {
+        long window = params.driftWindowMs();
+        if (!(fair > 0) || params.driftBeta() == 0 || window <= 0) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        fairHistory.addLast(new long[]{now, Double.doubleToRawLongBits(fair)});
+        while (!fairHistory.isEmpty() && fairHistory.peekFirst()[0] < now - 2 * window) {
+            fairHistory.pollFirst();
+        }
+    }
+
+    private double drift() {
+        long window = params.driftWindowMs();
+        if (params.driftBeta() == 0 || window <= 0 || fairHistory.isEmpty()) {
+            return 0;
+        }
+        long since = System.currentTimeMillis() - window;
+        double anchor = 0;
+        for (long[] point : fairHistory) {
+            if (point[0] <= since) {
+                anchor = Double.longBitsToDouble(point[1]);
+            } else {
+                break;
+            }
+        }
+        // Якоря нет — истории ещё не накопилось; дрейф считаем нулевым, а не
+        // выдумываем его по огрызку окна.
+        return anchor > 0 && lastFair > 0 ? (lastFair - anchor) / anchor : 0;
     }
 
     private double exposure() {

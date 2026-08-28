@@ -65,7 +65,8 @@ public class Executor {
         // Отступ, скос и порог — из конфига симуляции, чтобы живое и посчитанное
         // отличались ровно одним: реальностью исполнения.
         Quoter.Params params = new Quoter.Params(cfg.simOffset(), size, inventoryCap,
-                cfg.simSkewK(), cfg.simSkewTarget(), cfg.simRequoteThreshold(), quoteStep());
+                cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
+                cfg.simDriftWindowMs(), cfg.simRequoteThreshold(), quoteStep());
         QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs);
 
         log.warn("""
