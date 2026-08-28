@@ -61,6 +61,7 @@ public class RevxConfig {
     private final double simSize;
     private final double simInventoryCap;
     private final double simSkewK;
+    private final double simSkewTarget;
     private final double simRequoteThreshold;
     private final double simMakerFee;
     private final double simPessimisticFee;
@@ -122,6 +123,7 @@ public class RevxConfig {
             @Value("${revx.sim.size}") double simSize,
             @Value("${revx.sim.inventory-cap}") double simInventoryCap,
             @Value("${revx.sim.skew-k}") double simSkewK,
+            @Value("${revx.sim.skew-target}") double simSkewTarget,
             @Value("${revx.sim.requote-threshold}") double simRequoteThreshold,
             @Value("${revx.sim.maker-fee}") double simMakerFee,
             @Value("${revx.sim.pessimistic-fee}") double simPessimisticFee,
@@ -180,6 +182,7 @@ public class RevxConfig {
         this.simSize = simSize;
         this.simInventoryCap = simInventoryCap;
         this.simSkewK = simSkewK;
+        this.simSkewTarget = simSkewTarget;
         this.simRequoteThreshold = simRequoteThreshold;
         this.simMakerFee = simMakerFee;
         this.simPessimisticFee = simPessimisticFee;
@@ -398,6 +401,10 @@ public class RevxConfig {
 
     public double simSkewK() {
         return simSkewK;
+    }
+
+    public double simSkewTarget() {
+        return simSkewTarget;
     }
 
     public double simRequoteThreshold() {

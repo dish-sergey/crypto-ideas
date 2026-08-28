@@ -109,7 +109,7 @@ public class SimRunner {
         double[] steps = pairSteps(symbol);
         ExecutionModel.Limits limits = new ExecutionModel.Limits(steps[0], 1e-9);
         Quoter.Params base = new Quoter.Params(cfg.simOffset(), cfg.simSize(), cfg.simInventoryCap(),
-                cfg.simSkewK(), cfg.simRequoteThreshold(), steps[1]);
+                cfg.simSkewK(), cfg.simSkewTarget(), cfg.simRequoteThreshold(), steps[1]);
 
         List<Run> runs = new ArrayList<>();
         SimEngine.Result baseResult = new SimEngine(base, limits, cfg.simMakerFee()).run(data.windows());
@@ -157,7 +157,8 @@ public class SimRunner {
         List<SkewRung> skewLadder = new ArrayList<>();
         for (double skew : skews(base)) {
             Quoter.Params params = new Quoter.Params(base.offset(), base.size(),
-                    base.inventoryCap(), skew, base.requoteThreshold(), base.quoteStep());
+                    base.inventoryCap(), skew, base.skewTarget(),
+                    base.requoteThreshold(), base.quoteStep());
             SimEngine.Result result = skew == base.skewK() ? baseResult
                     : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
             skewLadder.add(new SkewRung(skew, result));
@@ -359,12 +360,12 @@ public class SimRunner {
 
     private static Quoter.Params withOffset(Quoter.Params base, double offset) {
         return new Quoter.Params(offset, base.size(), base.inventoryCap(), base.skewK(),
-                base.requoteThreshold(), base.quoteStep());
+                base.skewTarget(), base.requoteThreshold(), base.quoteStep());
     }
 
     private static Quoter.Params withCap(Quoter.Params base, double cap) {
         return new Quoter.Params(base.offset(), base.size(), cap, base.skewK(),
-                base.requoteThreshold(), base.quoteStep());
+                base.skewTarget(), base.requoteThreshold(), base.quoteStep());
     }
 
     private Map<String, Object> configOf(Run run, Quoter.Params base, ExecutionModel.Limits limits) {

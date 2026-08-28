@@ -17,8 +17,15 @@ public final class Quoter implements QuotePolicy {
             double size,              // номинал заявки в базовой валюте
             double inventoryCap,      // потолок инвентаря в базовой валюте
             double skewK,             // коэффициент скоса
+            double skewTarget,        // ЦЕЛЬ скоса, доля потолка (0 = пустой инвентарь)
             double requoteThreshold,  // порог перевыставления, доля цены
             double quoteStep) {       // шаг цены пары
+
+        /** Совместимость: цель по умолчанию — пустой инвентарь. */
+        public Params(double offset, double size, double inventoryCap, double skewK,
+                      double requoteThreshold, double quoteStep) {
+            this(offset, size, inventoryCap, skewK, 0.0, requoteThreshold, quoteStep);
+        }
     }
 
     /** null в цене = сторона не котируется. */
@@ -44,8 +51,7 @@ public final class Quoter implements QuotePolicy {
         if (!(fair > 0)) {
             return new Quotes(null, null);
         }
-        double skew = params.inventoryCap() > 0 ? inventory / params.inventoryCap() : 0;
-        skew = Math.max(-1, Math.min(1, skew));
+        double skew = skew(inventory);
 
         Double bid = null;
         Double ask = null;
@@ -56,6 +62,32 @@ public final class Quoter implements QuotePolicy {
             ask = round(fair * (1 + params.offset() - params.skewK() * skew), false);
         }
         return new Quotes(bid, ask);
+    }
+
+    /**
+     * Скос относительно ЦЕЛЕВОГО инвентаря, а не относительно пустого счёта.
+     *
+     * Скос вычитается из обеих цен, поэтому симметричны они ровно там, где он
+     * равен нулю: эта точка и есть цель контроллера. При {@code skewTarget = 0}
+     * целью оказывается пустой инвентарь — а на споте это угол, в котором аск
+     * выставить нечем, и стратегия становится односторонней. Живой прогон провёл
+     * там 58% времени (док. 93 §4).
+     *
+     * Нормировка на {@code max(target, 1−target)} держит скос в [−1, 1] при любой
+     * цели, поэтому коэффициент {@code k} сохраняет смысл «сколько б.п. на краю».
+     */
+    private double skew(double inventory) {
+        double cap = params.inventoryCap();
+        if (!(cap > 0)) {
+            return 0;
+        }
+        double target = params.skewTarget();
+        double span = Math.max(target, 1 - target);
+        if (!(span > 0)) {
+            return 0;
+        }
+        double skew = (inventory / cap - target) / span;
+        return Math.max(-1, Math.min(1, skew));
     }
 
     /**
