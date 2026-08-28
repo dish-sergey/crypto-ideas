@@ -20,7 +20,7 @@ class QuoterSkewTargetTest {
     private static final double CAP = 20.0;
 
     private static Quoter quoter(double target) {
-        return new Quoter(new Quoter.Params(D, 1.0, CAP, K, target, 0.00005, 0.0));
+        return new Quoter(new Quoter.Params(D, 1.0, CAP, K, 0.00005, 0.0).withSkewTarget(target));
     }
 
     /** Расстояния до бида и до аска в долях от справедливой цены. */

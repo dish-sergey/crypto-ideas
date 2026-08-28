@@ -121,7 +121,8 @@ public class SimRunner {
         Quoter.Params base = new Quoter.Params(cfg.simOffset(), cfg.simSize(), cfg.simInventoryCap(),
                 cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
                 cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
-                cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simRequoteThreshold(), steps[1]);
+                cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simStopDrawdownPct(),
+                cfg.simStopCoolOffMs(), cfg.simRequoteThreshold(), steps[1]);
 
         List<Run> runs = new ArrayList<>();
         SimEngine.Result baseResult = new SimEngine(base, limits, cfg.simMakerFee()).run(data.windows());
@@ -216,6 +217,18 @@ public class SimRunner {
             }
         }
 
+        List<RatioRung> stopLadder = new ArrayList<>();
+        for (double pct : cfg.simStopLadder()) {
+            Quoter.Params params = base.withStopDrawdownPct(pct);
+            SimEngine.Result result = pct == base.stopDrawdownPct() ? baseResult
+                    : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
+            stopLadder.add(new RatioRung(pct, result));
+            if (pct != base.stopDrawdownPct()) {
+                runs.add(new Run(String.format("стоп %.2f%%", pct), result,
+                        cfg.simMakerFee(), base.offset(), base.inventoryCap()));
+            }
+        }
+
         // Кросс двух тормозов набора. Профили цены у них разные: η зависит только
         // от собственной позиции, β — от внешней величины с нулевым IC, поэтому
         // выбор между ними по одномерным лестницам делался вслепую (док. 103 §3).
@@ -280,7 +293,8 @@ public class SimRunner {
         }
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
-                skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder, cross);
+                skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
+                cross, stopLadder);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
@@ -541,7 +555,8 @@ public class SimRunner {
                           List<Rung> ladder, List<SkewRung> skewLadder, List<CapRung> capLadder,
                           List<LatencyRung> latencyLadder,
                           List<DriftRung> driftLadder, List<RatioRung> ratioLadder,
-                          List<RatioRung> shapeLadder, List<CrossCell> cross) {
+                          List<RatioRung> shapeLadder, List<CrossCell> cross,
+                          List<RatioRung> stopLadder) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
         sb.append("Прогоны ТЗ §4.7, отчёт §5.3. Код `").append(registry.gitHash())
@@ -949,6 +964,37 @@ public class SimRunner {
                 + "лестницы меняют НЕСОМУЮ ПОЗИЦИЮ, а «край × оборот» о ней ничего не "
                 + "знает (док. 96 §4): по нему выиграет ступень с наибольшим инвентарём. "
                 + "Вопрос здесь другой — уменьшается ли проигрыш простому удержанию.\n\n");
+
+        sb.append("### Стоп по просадке инвентаря (док. 107 §5)\n\n");
+        sb.append("Правило ничего не классифицирует. Гейт по режиму провалился потому, "
+                + "что различающий признак — «вернётся ли цена» — наблюдаем только "
+                + "постфактум (док. 106 §5). Стоп этого вопроса не задаёт: он реагирует "
+                + "на **реализованный ущерб**, величину полностью наблюдаемую.\n\n");
+        sb.append("Порог — в процентах от номинала потолка, чтобы ступени были "
+                + "сопоставимы между размерами. Срабатывание снимает бид и "
+                + "переставляет аск на лучший бид: разгрузка платная, половина спреда "
+                + "учитывается как обычное исполнение.\n\n");
+        sb.append("| Порог, % потолка | Срабатываний | Время в остановке | Исполнений "
+                + "| Средний инвентарь | Просадка | **Total** | **Buy & hold** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : stopLadder) {
+            SimEngine.Result r = rung.result();
+            sb.append("| ").append(round(rung.ratio(), 2))
+                    .append(rung.ratio() == 0 ? " (выкл.)" : "")
+                    .append(" | ").append(r.stopHits())
+                    .append(" | ").append(round(100.0 * r.stoppedWindows()
+                            / Math.max(1, r.windows()), 1)).append("%")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(r.avgInventory(), 4))
+                    .append(" | ").append(round(r.maxDrawdown(), 1))
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n**Что сделает правило несостоятельным:** смена знака альфы между "
+                + "соседними ступенями. Это то же условие, что дисквалифицировало "
+                + "асимметричный набор в одиночку (док. 99 §4): чувствительность к "
+                + "порогу означает, что дело в самом пороге, а не в механизме.\n\n");
 
         sb.append("### Кросс `β × η`: два тормоза набора вместе (док. 103 §3)\n\n");
         sb.append("Обе лестницы выше шли по одной оси при нулевой второй, то есть выбор "

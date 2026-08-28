@@ -70,6 +70,9 @@ public class RevxConfig {
     private final double simDriftGateEr;
     private final long simErWindowMs;
     private final long simErSampleMs;
+    private final double simStopDrawdownPct;
+    private final long simStopCoolOffMs;
+    private final List<Double> simStopLadder;
     private final double simRequoteThreshold;
     private final double simMakerFee;
     private final double simPessimisticFee;
@@ -145,6 +148,9 @@ public class RevxConfig {
             @Value("${revx.sim.drift-gate-er}") double simDriftGateEr,
             @Value("${revx.sim.er-window-ms}") long simErWindowMs,
             @Value("${revx.sim.er-sample-ms}") long simErSampleMs,
+            @Value("${revx.sim.stop-drawdown-pct}") double simStopDrawdownPct,
+            @Value("${revx.sim.stop-cool-off-ms}") long simStopCoolOffMs,
+            @Value("${revx.sim.stop-ladder}") List<Double> simStopLadder,
             @Value("${revx.sim.requote-threshold}") double simRequoteThreshold,
             @Value("${revx.sim.maker-fee}") double simMakerFee,
             @Value("${revx.sim.pessimistic-fee}") double simPessimisticFee,
@@ -217,6 +223,9 @@ public class RevxConfig {
         this.simDriftGateEr = simDriftGateEr;
         this.simErWindowMs = simErWindowMs;
         this.simErSampleMs = simErSampleMs;
+        this.simStopDrawdownPct = simStopDrawdownPct;
+        this.simStopCoolOffMs = simStopCoolOffMs;
+        this.simStopLadder = simStopLadder;
         this.simRequoteThreshold = simRequoteThreshold;
         this.simMakerFee = simMakerFee;
         this.simPessimisticFee = simPessimisticFee;
@@ -476,6 +485,18 @@ public class RevxConfig {
 
     public long simErSampleMs() {
         return simErSampleMs;
+    }
+
+    public double simStopDrawdownPct() {
+        return simStopDrawdownPct;
+    }
+
+    public long simStopCoolOffMs() {
+        return simStopCoolOffMs;
+    }
+
+    public double[] simStopLadder() {
+        return simStopLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     public double simRequoteThreshold() {

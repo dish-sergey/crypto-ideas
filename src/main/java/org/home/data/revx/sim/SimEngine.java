@@ -38,6 +38,8 @@ public final class SimEngine {
             int windowsAtZero,            // нет АСКА: продавать нечем, спот
             int gateOpenWindows,          // окон, где страховка от тренда была включена
             double avgEr,                 // средний коэффициент эффективности
+            int stopHits,                 // срабатываний стопа по просадке
+            int stoppedWindows,           // окон в режиме остановки
 
             double filledQty,
             double marketQty,
@@ -133,6 +135,9 @@ public final class SimEngine {
                 params.erSampleMs() > 0 ? params.erSampleMs() : 3_600_000L);
         int gateOpenWindows = 0;
         double erSum = 0;
+        long stoppedUntilMs = Long.MIN_VALUE;
+        int stopHits = 0;
+        int stoppedWindows = 0;
         int erSamples = 0;
 
         for (int wi = 0; wi < windows.size(); wi++) {
@@ -196,11 +201,41 @@ public final class SimEngine {
                 driftNow = 0;
             }
 
+            // Стоп по просадке инвентаря. Он ничего не КЛАССИФИЦИРУЕТ — реагирует на
+            // реализованный ущерб, величину полностью наблюдаемую. Гейт провалился
+            // именно на классификации ненаблюдаемого признака (док. 106 §5), стоп
+            // этого вопроса не задаёт вовсе (док. 107 §5).
+            boolean stopped = window.tsMs() < stoppedUntilMs;
+            if (params.stopDrawdownPct() > 0) {
+                double limit = params.stopDrawdownPct() / 100.0
+                        * params.inventoryCap() * window.fair();
+                double equityNow = pnl.mark(window.fair());
+                if (!stopped && peakEquity - equityNow > limit && limit > 0) {
+                    stopped = true;
+                    stopHits++;
+                    stoppedUntilMs = window.tsMs() + params.stopCoolOffMs();
+                    // Пик сбрасывается на выходе, иначе правило срабатывает один раз
+                    // и навсегда: старая вершина недостижима, просадка от неё вечна.
+                    peakEquity = equityNow;
+                }
+            }
+            if (stopped) {
+                stoppedWindows++;
+            }
+
             execution.refresh(window.book());
             Quoter.Quotes target = decisionWindow
                     ? policy.quotes(window.fair(), pnl.inventory(), driftNow)
                     : new Quoter.Quotes(restingBid, restingAsk);
 
+            if (stopped) {
+                // Набирать перестаём совсем, а разгрузку делаем маркетабельной:
+                // аск переставляется на лучший бид. Это платная продажа — половина
+                // спреда, — и она в модели учитывается как обычное исполнение, а не
+                // дарится по справедливой цене.
+                Double liquidate = window.book().bestBid() > 0 ? window.book().bestBid() : null;
+                target = new Quoter.Quotes(null, pnl.inventory() > 0 ? liquidate : null);
+            }
             if (quoter.shouldRequote(restingBid, target.bid())) {
                 execution.cancel(Side.BUY);
                 restingBid = target.bid();
@@ -276,7 +311,8 @@ public final class SimEngine {
         double avgInventory = inventorySamples == 0 ? 0 : inventorySum / inventorySamples;
         return new Result(pnl.decompose(fairLast), allFills, requotes, windows.size(), paused,
                 maxInventory, avgInventory, atCap, atZero,
-                gateOpenWindows, erSamples == 0 ? Double.NaN : erSum / erSamples, filledQty, marketQty, maxDrawdown,
+                gateOpenWindows, erSamples == 0 ? Double.NaN : erSum / erSamples,
+                stopHits, stoppedWindows, filledQty, marketQty, maxDrawdown,
                 fairFirst, fairLast, fairSeries, execution.stats());
     }
 }

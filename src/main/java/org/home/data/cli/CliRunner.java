@@ -77,6 +77,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck;
     private final ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe;
     private final ObjectProvider<org.home.data.revx.exec.Panic> panic;
+    private final ObjectProvider<org.home.data.revx.sim.RegimeFrequencyReport> regimeReport;
     private final ObjectProvider<org.home.data.revx.exec.Executor> executor;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
@@ -93,6 +94,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck,
                      ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe,
                      ObjectProvider<org.home.data.revx.exec.Panic> panic,
+                     ObjectProvider<org.home.data.revx.sim.RegimeFrequencyReport> regimeReport,
                      ObjectProvider<org.home.data.revx.exec.Executor> executor,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
@@ -117,6 +119,7 @@ public class CliRunner implements ApplicationRunner {
         this.tradeCheck = tradeCheck;
         this.orderProbe = orderProbe;
         this.panic = panic;
+        this.regimeReport = regimeReport;
         this.executor = executor;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
@@ -203,6 +206,16 @@ public class CliRunner implements ApplicationRunner {
                         java.time.Instant.parse(firstOr(args, "to",
                                 java.time.Instant.now().toString())).toEpochMilli(),
                         firstOr(args, "out", "reports/revx_flow.md"));
+            }
+            if (args.containsOption("revx-regimes")) {
+                regimeReport.getObject().run(
+                        firstOr(args, "symbol", "BTCUSDT"),
+                        Integer.parseInt(firstOr(args, "days", "5")),
+                        Double.parseDouble(firstOr(args, "edge", "10")),
+                        Double.parseDouble(firstOr(args, "up", "188.5")),
+                        Double.parseDouble(firstOr(args, "down", "152.5")),
+                        Double.parseDouble(firstOr(args, "flat", "-50.6")),
+                        firstOr(args, "out", "reports/revx_regimes.md"));
             }
             if (args.containsOption("revx-probe-limits")) {
                 revx.getObject().probeLimits(new org.home.data.revx.RateLimitProbe.Ladder(

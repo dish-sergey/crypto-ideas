@@ -32,7 +32,7 @@ public class CliMode {
             "s5-dry-run", "s5-kraken-check", "s5-demo", "s5-live",
             "revx-pairs", "revx-probe-limits", "revx-collect", "revx-basis",
             "revx-sim", "revx-flow",
-            "revx-trade-check", "revx-order-probe", "revx-panic", "revx-exec");
+            "revx-trade-check", "revx-order-probe", "revx-panic", "revx-exec", "revx-regimes");
 
     /**
      * Параметры команд. Их нельзя считать неизвестными опциями: они не запускают
@@ -44,7 +44,7 @@ public class CliMode {
      */
     private static final Set<String> PARAMS = Set.of(
             "symbol", "symbols", "hours", "from", "to", "interval",
-            "out", "table", "bucket-seconds");
+            "out", "table", "bucket-seconds", "days", "edge", "up", "down", "flat");
 
     private final boolean scheduleMode;
     private final Set<String> unknownOptions;

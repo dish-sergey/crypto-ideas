@@ -20,8 +20,7 @@ class DriftSkewTest {
     private static final double CAP = 20.0;
 
     private static Quoter quoter(double beta) {
-        return new Quoter(new Quoter.Params(D, 1.0, CAP, K, 0.0, beta, 1.0,
-                1_800_000L, 0.0, 0.0, 0L, 0L, 0.00005, 0.0));
+        return new Quoter(new Quoter.Params(D, 1.0, CAP, K, 0.00005, 0.0).withDriftBeta(beta));
     }
 
     /** Расстояния до бида и аска в долях справедливой цены. */
@@ -88,8 +87,8 @@ class DriftSkewTest {
     @Test
     void controlUsesTheSameSkewIncludingDrift() {
         // Иначе контроль перестаёт быть контролем: он окажется просто более лонг.
-        Quoter.Params params = new Quoter.Params(D, 1.0, CAP, K, 0.0,
-                Quoter.betaFromGeometry(D), 1.0, 1_800_000L, 0.0, 0.0, 0L, 0L, 0.00005, 0.0);
+        Quoter.Params params = new Quoter.Params(D, 1.0, CAP, K, 0.00005, 0.0)
+                .withDriftBeta(Quoter.betaFromGeometry(D));
         QuotePolicy control = QuotePolicy.random(params, 42);
 
         Quoter.Quotes flat = control.quotes(100.0, CAP / 2, 0.0);
@@ -102,8 +101,7 @@ class DriftSkewTest {
 
     @Test
     void asymmetricBuyRatioSlowsAccumulationOnly() {
-        Quoter.Params params = new Quoter.Params(D, 1.0, CAP, K, 0.0, 0.0, 0.25,
-                0L, 0.0, 0.0, 0L, 0L, 0.00005, 0.0);
+        Quoter.Params params = new Quoter.Params(D, 1.0, CAP, K, 0.00005, 0.0).withBuyRatio(0.25);
         assertEquals(0.25, params.sizeFor(Side.BUY, 0), 1e-12, "покупаем вчетверо медленнее");
         assertEquals(1.0, params.sizeFor(Side.SELL, 0), 1e-12, "а разгружаемся полным лотом");
     }

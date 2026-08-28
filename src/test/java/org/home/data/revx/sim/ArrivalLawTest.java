@@ -108,8 +108,8 @@ class ArrivalLawTest {
 
     @Test
     void continuousShapingHasNoThreshold() {
-        Quoter.Params params = new Quoter.Params(0.0014, 1.0, 20.0, 0.001, 0.0, 0.0, 1.0,
-                0L, Math.log(4), 0.0, 0L, 0L, 0.00005, 0.0);
+        Quoter.Params params = new Quoter.Params(0.0014, 1.0, 20.0, 0.001, 0.00005, 0.0)
+                .withShapeEta(Math.log(4));
 
         double atEmpty = params.sizeFor(Side.BUY, 0);
         double atHalf = params.sizeFor(Side.BUY, 10);
