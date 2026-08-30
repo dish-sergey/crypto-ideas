@@ -21,7 +21,7 @@ import java.util.regex.Pattern;
  * отрицательным захватом**. Поэтому размеры минимальные, а весь риск ограничен
  * пределами из {@link ExecLimits}.
  *
- * Три правила, без которых цикл опасен:
+ * Пять правил, без которых цикл опасен:
  *
  * 1. **Стартует остановленным.** Котирование начинается только по явной команде.
  *    Перезапуск после падения не должен сам возобновлять торговлю — сначала
@@ -31,10 +31,28 @@ import java.util.regex.Pattern;
  * 3. **Замена создаёт НОВУЮ заявку.** Площадка возвращает новый
  *    {@code venue_order_id}, и состояние читается из ответа, а не помнится
  *    (проверено живой заявкой 27.08.2026).
+ * 4. **Истина о заявках — у площадки, а не в нашей памяти.** Ошибка на замене
+ *    не значит, что замены не было: 30.08.2026 ответ 422 пришёл на уже
+ *    выполненную замену, и наследник шесть часов простоял в книге без хозяина.
+ *    Поэтому список активных заявок сверяется раз в минуту и после каждого
+ *    отказа — см. {@link #reconcile(String)}.
+ * 5. **Проверять надо {@code available}, а не {@code total}.** Средства под
+ *    стоящей заявкой в позиции видны, а поставить на них нельзя — см.
+ *    {@link #affordable}.
  */
 public final class QuoteLoop implements Runnable {
 
     private static final Logger log = LoggerFactory.getLogger(QuoteLoop.class);
+
+    /** Потолок паузы после отказа постановки. */
+    private static final long MAX_PLACE_BACKOFF_MS = 60_000L;
+    /**
+     * Сколько заявка считается «свежей». Список активных отстаёт от постановки,
+     * и вывод «её там нет, значит исполнилась» на свежем id даёт дубль.
+     */
+    private static final long ADOPT_GRACE_MS = 5_000L;
+    /** Как часто сверяться с книгой площадки, даже когда всё выглядит хорошо. */
+    private static final long RECONCILE_PERIOD_MS = 60_000L;
 
     private static final Pattern VENUE_ID =
             Pattern.compile("\"venue_order_id\"\\s*:\\s*\"([^\"]+)\"");
@@ -58,6 +76,12 @@ public final class QuoteLoop implements Runnable {
         String venueId;
         double price;
         double size;
+        /** Когда id стал текущим. Пока свежий, отсутствие в списке активных — не факт. */
+        long sinceMs;
+        /** До какого момента не пробовать ставить снова (после отказа площадки). */
+        long blockedUntilMs;
+        int failures;
+        long fundsWarnedMs;
     }
 
     public record Stats(long placements, long replaces, long cancels, long fills,
@@ -72,6 +96,8 @@ public final class QuoteLoop implements Runnable {
     private final String symbol;
     private final String base;
     private final long periodMs;
+    /** Минимальный номинал заявки на площадке: ниже него постановка отвергается. */
+    private final double minNotional;
 
     private final AtomicBoolean quoting = new AtomicBoolean(false);
     private volatile boolean alive = true;
@@ -80,6 +106,7 @@ public final class QuoteLoop implements Runnable {
     private final Resting ask = new Resting();
 
     private volatile double inventory;
+    private volatile double baseAvailable;
     private volatile double quoteBalance;
     private volatile double lastFair;
     private final java.util.ArrayDeque<long[]> fairHistory = new java.util.ArrayDeque<>();
@@ -91,6 +118,7 @@ public final class QuoteLoop implements Runnable {
     private long fills;
     private long dayStartMs = System.currentTimeMillis();
     private long minuteStartMs = System.currentTimeMillis();
+    private long lastReconcileMs = System.currentTimeMillis();
     private int replacesThisMinute;
     private double totalFees;
     private double totalFilledNotional;
@@ -100,7 +128,7 @@ public final class QuoteLoop implements Runnable {
     private java.util.function.Consumer<String> alert = message -> { };
 
     public QuoteLoop(TradeClient client, StandReader stand, ExecJournal journal,
-                     Quoter.Params params, String symbol, long periodMs) {
+                     Quoter.Params params, String symbol, long periodMs, double minNotional) {
         this.client = client;
         this.stand = stand;
         this.journal = journal;
@@ -112,6 +140,7 @@ public final class QuoteLoop implements Runnable {
         this.symbol = symbol;
         this.base = symbol.substring(0, symbol.indexOf('/'));
         this.periodMs = periodMs;
+        this.minNotional = minNotional;
     }
 
     public void startQuoting() {
@@ -125,6 +154,8 @@ public final class QuoteLoop implements Runnable {
         if (quoting.compareAndSet(true, false)) {
             journal.event("stop", "котирование выключено, снимаю заявки");
             cancelAll("остановка по команде");
+            // Снять по своей памяти мало: она и бывает неверна. Проверяем факт.
+            reconcile("остановка");
             log.warn("котирование выключено");
         }
     }
@@ -140,7 +171,11 @@ public final class QuoteLoop implements Runnable {
 
     public void shutdown() {
         alive = false;
+        // Сначала снимаем флаг: сверка при включённом котировании усыновила бы
+        // заявки обратно вместо того, чтобы их снять.
+        quoting.set(false);
         cancelAll("выключение процесса");
+        reconcile("выключение процесса");
     }
 
     public Stats stats() {
@@ -151,6 +186,9 @@ public final class QuoteLoop implements Runnable {
     @Override
     public void run() {
         refreshBalances();
+        // Стартуем остановленными, значит и книга должна быть пуста: заявки
+        // переживают наш процесс, и оставшиеся после падения — уже не наши.
+        reconcile("старт");
         while (alive) {
             long started = System.currentTimeMillis();
             try {
@@ -220,14 +258,18 @@ public final class QuoteLoop implements Runnable {
             }
             return;
         }
-        double size = sizeFor(side, targetPrice);
-        if (size <= 0) {
+        double size = sizeFor(side, targetPrice, resting);
+        double notional = size * targetPrice;
+        // Ниже минимума площадки заявка не встанет, а попытка потратит суточный
+        // лимит постановок. Остаток от частичного исполнения бывает мельче
+        // минимума (5.5e-7 BTC = 0.04 USDC при пороге 0.1) — это не повод стучаться.
+        if (size <= 0 || notional < minNotional) {
             if (resting.venueId != null) {
                 cancel(side, resting, "нечем котировать эту сторону");
             }
+            warnNoFunds(side, resting);
             return;
         }
-        double notional = size * targetPrice;
         if (!ExecLimits.orderAllowed(notional)) {
             log.error("заявка {} на {} USDC превышает предел {} — не ставлю", side, notional,
                     ExecLimits.MAX_ORDER_NOTIONAL_USDC);
@@ -242,6 +284,9 @@ public final class QuoteLoop implements Runnable {
         }
 
         if (resting.venueId == null) {
+            if (System.currentTimeMillis() < resting.blockedUntilMs) {
+                return;                   // площадка только что отказала — не долбимся
+            }
             place(side, resting, targetPrice, size);
         } else if (quoter.shouldRequote(resting.price, targetPrice)) {
             replace(side, resting, targetPrice, size);
@@ -252,15 +297,56 @@ public final class QuoteLoop implements Runnable {
      * Спот: продать можно только то, что есть, купить — только на что есть USDC.
      * Это физика площадки, а не настройка, и проверять её надо ДО отправки.
      */
-    private double sizeFor(Side side, double price) {
+    private double sizeFor(Side side, double price, Resting resting) {
         // params.sizeFor учитывает асимметрию набора: покупаем медленнее, чем
         // разгружаемся (док. 98 §6). При симметричной настройке это прежний size().
         double want = params.sizeFor(side, inventory);
+        double ownSize = resting.venueId == null ? 0 : resting.size;
+        return Math.min(want, affordable(side, price, baseAvailable, quoteBalance,
+                ownSize, resting.price));
+    }
+
+    /**
+     * Сколько РЕАЛЬНО можно поставить на сторону.
+     *
+     * Считается по {@code available}, а не по {@code total}, и это не придирка:
+     * средства под уже стоящей заявкой площадка держит в резерве, в {@code total}
+     * они видны, а поставить на них нельзя. Ночь 29.08.2026 стоила 766 отказов
+     * «Insufficient balance of ₿0» подряд и всего суточного лимита постановок:
+     * инвентарь был весь в резерве под чужой (потерянной) заявкой, счётчик
+     * позиции показывал его целиком, и цикл раз в секунду просил продать то,
+     * чего у него не было.
+     *
+     * Своя же стоящая заявка резерв РАСШИРЯЕТ: замена его возвращает, поэтому её
+     * объём прибавляется к доступному. Иначе перевыставить полностью
+     * зарезервированную заявку стало бы невозможно.
+     */
+    static double affordable(Side side, double price, double baseAvailable,
+                             double quoteAvailable, double ownSize, double ownPrice) {
         if (side == Side.SELL) {
-            return Math.min(want, inventory);
+            return Math.max(0, baseAvailable + ownSize);
         }
-        double affordable = price > 0 ? quoteBalance / price : 0;
-        return Math.min(want, affordable);
+        if (!(price > 0)) {
+            return 0;
+        }
+        return Math.max(0, quoteAvailable + ownSize * ownPrice) / price;
+    }
+
+    /**
+     * Отсутствие средств — не ошибка, но и не норма: на споте это означает, что
+     * стратегия стала односторонней. Молчать об этом нельзя (именно тишина
+     * скрывала ночную аварию), а писать каждую секунду — бесполезно.
+     */
+    private void warnNoFunds(Side side, Resting resting) {
+        long now = System.currentTimeMillis();
+        if (now - resting.fundsWarnedMs < 60_000) {
+            return;
+        }
+        resting.fundsWarnedMs = now;
+        String detail = side + ": доступно " + fmt(side == Side.SELL ? baseAvailable : quoteBalance)
+                + ", позиция " + fmt(inventory);
+        log.warn("сторона {} не котируется — нечем ({})", side, detail);
+        journal.event("no_funds", detail);
     }
 
     /**
@@ -331,8 +417,24 @@ public final class QuoteLoop implements Runnable {
             resting.venueId = extract(response.body());
             resting.price = price;
             resting.size = size;
+            resting.sinceMs = System.currentTimeMillis();
+            resting.failures = 0;
+            resting.blockedUntilMs = 0;
         } else {
-            log.warn("постановка {} не прошла: {} {}", side, response.status(), response.body());
+            // Отказ на постановке тратит суточный лимит и ничего не даёт. Пауза
+            // растёт с каждым отказом подряд: даже неизвестная причина не должна
+            // успевать съесть тысячу постановок, как в ночь на 29.08.2026.
+            resting.failures++;
+            long pause = Math.min(MAX_PLACE_BACKOFF_MS, 5_000L << Math.min(4, resting.failures - 1));
+            resting.blockedUntilMs = System.currentTimeMillis() + pause;
+            log.warn("постановка {} не прошла: {} {} — пауза {} с", side, response.status(),
+                    response.body(), pause / 1000);
+            journal.event("place_failed", side + " " + response.status() + ", пауза "
+                    + pause / 1000 + " с");
+            // Самая частая причина отказа — средства заняты заявкой, о которой мы
+            // забыли. Сверка её найдёт и либо усыновит, либо снимет.
+            refreshBalances();
+            reconcile("отказ постановки");
         }
     }
 
@@ -354,6 +456,7 @@ public final class QuoteLoop implements Runnable {
             resting.venueId = newId != null ? newId : resting.venueId;
             resting.price = price;
             resting.size = size;
+            resting.sinceMs = System.currentTimeMillis();
         } else {
             // Заявки уже нет — скорее всего исполнилась. Не гадаем по остаткам,
             // а спрашиваем площадку: она отдаёт цену, объём и КОМИССИЮ.
@@ -361,7 +464,97 @@ public final class QuoteLoop implements Runnable {
             inspectGoneOrder(side, resting.venueId);
             resting.venueId = null;
             refreshBalances();
+            // ⚠️ 422 на замене НЕ ЗНАЧИТ, что замены не было. 30.08.2026 площадка
+            // ответила «Cannot replace an order that is not in the NEW state», а
+            // сама заявка при этом уже числилась cancelled/replaced — то есть
+            // наследник был создан и остался в книге без хозяина на шесть часов.
+            // Судьбу заявки нельзя выводить из её собственного статуса: нужен
+            // список активных.
+            reconcile("отказ замены");
         }
+    }
+
+    /**
+     * Сверка с площадкой: в книге должны стоять РОВНО те заявки, которые мы
+     * помним, — по одной на сторону, и ни одной, пока котирование выключено.
+     *
+     * Инвариант проверяется у площадки, а не у себя, потому что расхождение
+     * ровно в том и состоит, что наша память неверна. Три исхода:
+     *
+     * <ul>
+     *   <li>заявка на стороне есть, id другой — УСЫНОВЛЯЕМ. Так выглядит замена,
+     *       выполненная площадкой и отвергнутая в ответе;</li>
+     *   <li>заявок на стороне больше одной — лишние СНИМАЕМ. На сторону может
+     *       стоять только одна: вторая удваивает риск и морозит средства;</li>
+     *   <li>заявки нет, а мы её помним — выясняем судьбу (исполнилась) и
+     *       забываем. Но только если id уже не свежий: список активных может
+     *       отставать от постановки, и поспешный вывод «исчезла» приведёт к
+     *       дублю.</li>
+     * </ul>
+     */
+    private void reconcile(String why) {
+        TradeClient.Response active = client.activeOrders();
+        if (!active.ok() || active.body() == null) {
+            return;                       // не знаем состояние — ничего не трогаем
+        }
+        java.util.List<ActiveOrder> orders = ActiveOrder.parse(active.body()).stream()
+                .filter(o -> ActiveOrder.normalize(symbol).equals(o.symbol()))
+                .toList();
+        if (!quoting.get()) {
+            // Правило 1: пока котирование выключено, наших заявок в книге быть
+            // не должно. Ни одной, независимо от того, что мы о них помним.
+            for (ActiveOrder order : orders) {
+                cancelStray(order, why);
+            }
+            bid.venueId = null;
+            ask.venueId = null;
+            return;
+        }
+        adopt(Side.BUY, bid, orders, why);
+        adopt(Side.SELL, ask, orders, why);
+    }
+
+    private void adopt(Side side, Resting resting, java.util.List<ActiveOrder> orders, String why) {
+        java.util.List<ActiveOrder> mine = orders.stream()
+                .filter(o -> o.side() == side)
+                .sorted(java.util.Comparator.comparingLong(ActiveOrder::createdMs).reversed())
+                .toList();
+        if (mine.isEmpty()) {
+            boolean fresh = System.currentTimeMillis() - resting.sinceMs < ADOPT_GRACE_MS;
+            if (resting.venueId != null && !fresh) {
+                inspectGoneOrder(side, resting.venueId);
+                resting.venueId = null;
+                refreshBalances();
+            }
+            return;
+        }
+        ActiveOrder keep = mine.stream()
+                .filter(o -> o.id().equals(resting.venueId))
+                .findFirst()
+                .orElse(mine.get(0));
+        if (!keep.id().equals(resting.venueId)) {
+            log.warn("усыновляю заявку {} {} по {} ({})", side, keep.id(), keep.price(), why);
+            journal.event("adopt", side + " " + keep.id() + " по " + fmt(keep.price())
+                    + " (" + why + ")");
+            resting.venueId = keep.id();
+            resting.price = keep.price();
+            resting.size = keep.size();
+            resting.sinceMs = System.currentTimeMillis();
+        }
+        for (ActiveOrder extra : mine) {
+            if (!extra.id().equals(keep.id())) {
+                cancelStray(extra, why);
+            }
+        }
+    }
+
+    private void cancelStray(ActiveOrder order, String why) {
+        TradeClient.Response response = client.cancel(order.id());
+        cancels++;
+        log.warn("снимаю бесхозную заявку {} {} по {} ({}) → {}", order.side(), order.id(),
+                order.price(), why, response.status());
+        journal.event("stray_cancel", order.side() + " " + order.id() + " по "
+                + fmt(order.price()) + " (" + why + ") → " + response.status());
     }
 
     /**
@@ -463,6 +656,7 @@ public final class QuoteLoop implements Runnable {
             double total = Double.parseDouble(matcher.group(4));
             if (base.equals(matcher.group(1))) {
                 inventory = total;            // позиция целиком, вместе с зарезервированным
+                baseAvailable = available;    // а поставить можно только на это
             } else if ("USDC".equals(matcher.group(1))) {
                 quoteBalance = available;     // а тут важно именно «на что можно поставить»
             }
@@ -480,15 +674,17 @@ public final class QuoteLoop implements Runnable {
         if (now - minuteStartMs >= 60_000) {
             minuteStartMs = now;
             replacesThisMinute = 0;
+            // Остатки перечитываются раз в минуту: исполнение могло случиться молча.
+            refreshBalances();
         }
         if (now - dayStartMs >= 86_400_000L) {
             dayStartMs = now;
             placements = 0;
             journal.event("day_roll", "суточные счётчики обнулены");
         }
-        // Остатки перечитываются раз в минуту: исполнение могло случиться молча.
-        if (now - minuteStartMs < periodMs) {
-            refreshBalances();
+        if (now - lastReconcileMs >= RECONCILE_PERIOD_MS) {
+            lastReconcileMs = now;
+            reconcile("плановая сверка");
         }
     }
 

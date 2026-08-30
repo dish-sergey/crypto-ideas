@@ -229,6 +229,22 @@ public class SimRunner {
             }
         }
 
+        // Лестница ЦЕЛИ скоса. Отдельно от лестницы его силы: сила задаёт, как
+        // резко контроллер тянет инвентарь, цель — КУДА он его тянет. При цели 0
+        // это пустой счёт, а на споте там нельзя выставить аск, и стратегия
+        // становится односторонней (док. 93 §4).
+        List<RatioRung> targetLadder = new ArrayList<>();
+        for (double target : cfg.simSkewTargetLadder()) {
+            Quoter.Params params = base.withSkewTarget(target);
+            SimEngine.Result result = target == base.skewTarget() ? baseResult
+                    : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
+            targetLadder.add(new RatioRung(target, result));
+            if (target != base.skewTarget()) {
+                runs.add(new Run(String.format("цель скоса %.2f", target), result,
+                        cfg.simMakerFee(), base.offset(), base.inventoryCap()));
+            }
+        }
+
         // Лестницы липкой котировки. Базовая точка — ВЫКЛЮЧЕННАЯ липкость, и это
         // приёмочное условие задания: она обязана дать в точности прежние числа.
         List<RatioRung> stickyOuter = new ArrayList<>();
@@ -319,7 +335,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, stickyOuter, stickyInner, queueControl);
+                cross, stopLadder, targetLadder, stickyOuter, stickyInner, queueControl);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
@@ -581,8 +597,8 @@ public class SimRunner {
                           List<LatencyRung> latencyLadder,
                           List<DriftRung> driftLadder, List<RatioRung> ratioLadder,
                           List<RatioRung> shapeLadder, List<CrossCell> cross,
-                          List<RatioRung> stopLadder, List<RatioRung> stickyOuter,
-                          List<RatioRung> stickyInner,
+                          List<RatioRung> stopLadder, List<RatioRung> targetLadder,
+                          List<RatioRung> stickyOuter, List<RatioRung> stickyInner,
                           List<java.util.Map.Entry<String, SimEngine.Result>> queueControl) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
@@ -991,6 +1007,41 @@ public class SimRunner {
                 + "лестницы меняют НЕСОМУЮ ПОЗИЦИЮ, а «край × оборот» о ней ничего не "
                 + "знает (док. 96 §4): по нему выиграет ступень с наибольшим инвентарём. "
                 + "Вопрос здесь другой — уменьшается ли проигрыш простому удержанию.\n\n");
+
+        sb.append("### Лестница ЦЕЛИ скоса — куда контроллер тянет инвентарь\n\n");
+        sb.append("Сила скоса задаёт, насколько резко котировки уходят при отклонении "
+                + "инвентаря; цель задаёт, от чего это отклонение считается. При цели 0 "
+                + "контроллер целится в ПУСТОЙ счёт, а на споте там аск выставить нечем: "
+                + "стратегия односторонняя ровно столько времени, сколько стоит в нуле "
+                + "(колонка «время с нулевым»).\n\n");
+        sb.append("**Читать по краю × оборот, а не по `total`.** Цель прямо меняет "
+                + "несомую позицию, поэтому `total` растёт с ней механически — это бета, "
+                + "а не заработок котировщика. Вопрос лестницы один: прибавляется ли "
+                + "КРАЙ, когда котировка становится двусторонней.\n\n");
+        sb.append("| Цель | Исполнений | Захват, б.п. | Чистый край | **Край × оборот** "
+                + "| Ср. инвентарь | **Время с нулевым** | Время с полным | Просадка "
+                + "| **Total** | **Buy & hold** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : targetLadder) {
+            SimEngine.Result r = rung.result();
+            double edge = netEdgeBp(r, 60_000);
+            sb.append("| ").append(round(rung.ratio(), 2))
+                    .append(rung.ratio() == base.skewTarget() ? " (базовый)" : "")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(edge, 2))
+                    .append(" | **").append(round(edge * turnover(r) / 10_000, 1)).append("**")
+                    .append(" | ").append(round(r.avgInventory(), 4))
+                    .append(" | **").append(round(100.0 * r.windowsAtZero()
+                            / Math.max(1, r.windows()), 1)).append("%**")
+                    .append(" | ").append(round(100.0 * r.windowsAtCap()
+                            / Math.max(1, r.windows()), 1)).append("%")
+                    .append(" | ").append(round(r.maxDrawdown(), 1))
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n");
 
         sb.append("### Липкая котировка — задание Z8 (док. 109 §II)\n\n");
         sb.append("Гипотеза: часть измеренной пошлины создаётся **самим переставлением** "

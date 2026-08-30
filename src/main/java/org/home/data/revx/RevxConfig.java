@@ -80,6 +80,7 @@ public class RevxConfig {
     private final boolean simStickyReplaceOnFill;
     private final double simStickySkewDelta;
     private final boolean simStickyResetQueue;
+    private final List<Double> simSkewTargetLadder;
     private final List<Double> simStickyOuterLadder;
     private final List<Double> simStickyInnerLadder;
     private final double simRequoteThreshold;
@@ -167,6 +168,7 @@ public class RevxConfig {
             @Value("${revx.sim.sticky-replace-on-fill}") boolean simStickyReplaceOnFill,
             @Value("${revx.sim.sticky-skew-delta}") double simStickySkewDelta,
             @Value("${revx.sim.sticky-reset-queue}") boolean simStickyResetQueue,
+            @Value("${revx.sim.skew-target-ladder}") List<Double> simSkewTargetLadder,
             @Value("${revx.sim.sticky-outer-ladder}") List<Double> simStickyOuterLadder,
             @Value("${revx.sim.sticky-inner-ladder}") List<Double> simStickyInnerLadder,
             @Value("${revx.sim.requote-threshold}") double simRequoteThreshold,
@@ -251,6 +253,7 @@ public class RevxConfig {
         this.simStickyReplaceOnFill = simStickyReplaceOnFill;
         this.simStickySkewDelta = simStickySkewDelta;
         this.simStickyResetQueue = simStickyResetQueue;
+        this.simSkewTargetLadder = simSkewTargetLadder;
         this.simStickyOuterLadder = simStickyOuterLadder;
         this.simStickyInnerLadder = simStickyInnerLadder;
         this.simRequoteThreshold = simRequoteThreshold;
@@ -530,6 +533,10 @@ public class RevxConfig {
         return new org.home.data.revx.sim.Quoter.Sticky(simStickyEnabled, simStickyOuter,
                 simStickyInner, simStickyMaxAgeMs, simStickyReplaceOnFill,
                 simStickySkewDelta, simStickyResetQueue);
+    }
+
+    public double[] simSkewTargetLadder() {
+        return simSkewTargetLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     public double[] simStickyOuterLadder() {

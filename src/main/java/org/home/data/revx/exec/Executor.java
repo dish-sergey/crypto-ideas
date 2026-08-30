@@ -69,7 +69,8 @@ public class Executor {
                 cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
                 cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simStopDrawdownPct(),
                 Quoter.Sticky.OFF, cfg.simStopCoolOffMs(), cfg.simRequoteThreshold(), quoteStep());
-        QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs);
+        QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs,
+                minNotional());
 
         log.warn("""
 
@@ -122,5 +123,16 @@ public class Executor {
      */
     private double quoteStep() {
         return 0.01;                     // BTC/USDC: проверено в revx_pair
+    }
+
+    /**
+     * Минимальный номинал заявки. Связывает не {@code min_order_size} (1e-8 BTC,
+     * пренебрежимо), а {@code min_order_size_quote} — 0.1 USDC. Наш лот примерно
+     * вдесятеро больше, но остаток от частичного исполнения бывает мельче, и
+     * стучаться с ним в площадку значит тратить суточный лимит постановок на
+     * гарантированные отказы.
+     */
+    private double minNotional() {
+        return 0.1;                      // BTC/USDC: проверено в revx_pair
     }
 }
