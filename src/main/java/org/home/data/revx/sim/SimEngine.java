@@ -49,6 +49,11 @@ public final class SimEngine {
             TreeMap<Long, Double> fairSeries,
             double pnlAtStart,            // P&L, если бы цена вернулась к началу окна (b&h там = 0)
             double capAtDropPct,          // просадка цены в момент ПЕРВОГО заполнения потолка, %
+            double hedgePnl,              // переоценка шорта на перпе
+            double hedgeCost,             // комиссии перпа
+            double hedgeFunding,          // фондирование: шорт его ПОЛУЧАЕТ при положительной ставке
+            double hedgeResidual,         // средняя непокрытая позиция, базовой валюты
+            int hedgeTrades,              // сколько раз пришлось доводить шорт
             int frozenCycles,             // сколько раз замороженная пара выпускалась заново
             long frozenHeldWindows,       // окон, в которые пара стояла нетронутой
             ExecutionModel.Stats execution) {
@@ -69,6 +74,20 @@ public final class SimEngine {
          */
         public double buyAndHoldPnl() {
             return avgInventory * (fairLast - fairFirst);
+        }
+
+        /**
+         * Результат с хеджем: спот плюс переоценка шорта, минус комиссии перпа,
+         * плюс фондирование.
+         *
+         * Контроль здесь ДРУГОЙ, и это главное отличие от нехеджированного
+         * прогона. Захеджированная конструкция рыночно нейтральна, поэтому
+         * сравнивать её с {@code buyAndHoldPnl} бессмысленно — сравнивать надо с
+         * НУЛЁМ: весь результат обязан приходить из захвата спреда, а не из того,
+         * что рынок куда-то сходил.
+         */
+        public double hedgedTotal() {
+            return pnl.total() + hedgePnl + hedgeFunding - hedgeCost;
         }
     }
 
@@ -173,6 +192,18 @@ public final class SimEngine {
         // на покупку, а просто держит позицию.
         double fairPeak = 0;
         double capAtDropPct = Double.NaN;
+        // Ð¥ÐµÐ´Ð¶: ÑÐ¾ÑÑ Ð½Ð° Ð¿ÐµÑÐ¿Ðµ, Ð´Ð¾Ð²Ð¾Ð´Ð¸Ð¼ÑÐ¹ Ð´Ð¾ âÐ¸Ð½Ð²ÐµÐ½ÑÐ°ÑÑ ÑÐ°Ð· Ð² Ð¿ÐµÑÐ¸Ð¾Ð´.
+        double hedgeQty = 0;
+        // НЕ Long.MIN_VALUE: разность tsMs − MIN_VALUE переполняется в отрицательное
+        // и период никогда не наступает (та же ловушка была в EfficiencyRatio).
+        long lastHedgeMs = 0;
+        double hedgePnl = 0;
+        double hedgeCost = 0;
+        double hedgeFunding = 0;
+        double hedgeResidualSum = 0;
+        int hedgeTrades = 0;
+        double prevFair = 0;
+        long prevTsMs = 0;
         double fairFirst = 0;
         int driftAnchor = 0;
         EfficiencyRatio er = new EfficiencyRatio(
@@ -414,6 +445,39 @@ public final class SimEngine {
                 }
             }
 
+            // --- Хедж: шорт на перпе, доводимый до −инвентаря раз в период ---
+            //
+            // Почему НЕ на каждое исполнение: минимальный шаг количества на
+            // Kraken (PF_XBTUSD) — 0.0001 BTC, а наш лот 0.0000125. Захеджировать
+            // одну сделку физически нельзя, единица хеджа в восемь раз крупнее.
+            // Остаётся доводить НЕТТО-позицию с некоторым периодом, и период —
+            // это размен: реже значит дешевле по комиссии и грязнее по риску.
+            if (params.hedge().enabled()) {
+                Quoter.Hedge h = params.hedge();
+                if (prevFair > 0 && hedgeQty != 0) {
+                    // Переоценка шорта и фондирование за прошедшее время.
+                    hedgePnl += hedgeQty * (window.fair() - prevFair);
+                    double hours = Math.max(0, window.tsMs() - prevTsMs) / 3_600_000.0;
+                    // Шорт ПОЛУЧАЕТ фондирование при положительной ставке: знак
+                    // hedgeQty отрицателен, поэтому минус перед произведением.
+                    hedgeFunding += -hedgeQty * window.fair() * h.fundingPerHour() * hours;
+                }
+                if (window.tsMs() - lastHedgeMs >= h.rebalanceMs()) {
+                    double want = h.step() > 0
+                            ? -Math.round(pnl.inventory() / h.step()) * h.step()
+                            : -pnl.inventory();
+                    if (Math.abs(want - hedgeQty) > 1e-12) {
+                        hedgeCost += Math.abs(want - hedgeQty) * window.fair() * h.feeRate();
+                        hedgeTrades++;
+                        hedgeQty = want;
+                    }
+                    lastHedgeMs = window.tsMs();
+                }
+                hedgeResidualSum += Math.abs(pnl.inventory() + hedgeQty);
+            }
+            prevFair = window.fair();
+            prevTsMs = window.tsMs();
+
             fairPeak = Math.max(fairPeak, window.fair());
             maxInventory = Math.max(maxInventory, pnl.inventory());
             inventorySum += pnl.inventory();
@@ -443,6 +507,8 @@ public final class SimEngine {
                 gateOpenWindows, erSamples == 0 ? Double.NaN : erSum / erSamples,
                 stopHits, stoppedWindows, filledQty, marketQty, maxDrawdown,
                 fairFirst, fairLast, fairSeries, pnl.markAtStart(fairFirst), capAtDropPct,
+                hedgePnl, hedgeCost, hedgeFunding,
+                inventorySamples == 0 ? 0 : hedgeResidualSum / inventorySamples, hedgeTrades,
                 frozenCycles, frozenHeldWindows, execution.stats());
     }
 }

@@ -127,7 +127,7 @@ public class SimRunner {
                 cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
                 cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
                 cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simStopDrawdownPct(),
-                Quoter.Sticky.OFF, Quoter.Frozen.OFF, cfg.simStopCoolOffMs(),
+                Quoter.Sticky.OFF, Quoter.Frozen.OFF, Quoter.Hedge.OFF, cfg.simStopCoolOffMs(),
                 cfg.simRequoteThreshold(), steps[1]);
 
         List<Run> runs = new ArrayList<>();
@@ -261,6 +261,16 @@ public class SimRunner {
             QuotePolicy policy = new CostFloorPolicy(new Quoter(params), 0.0, base.quoteStep());
             targetFloored.add(new RatioRung(target,
                     new SimEngine(params, limits, cfg.simMakerFee(), policy).run(data.windows())));
+        }
+
+        // Хедж шортом на перпе (док. 122). Единственный механизм, который может
+        // сделать падение БЕЗУБЫТОЧНЫМ, а не отложенным: всё остальное, что
+        // проверялось, лишь переносило убыток во времени.
+        List<RatioRung> hedgeLadder = new ArrayList<>();
+        for (long ms : cfg.simHedgeRebalanceLadder()) {
+            Quoter.Params p = base.withHedge(cfg.simHedge().withRebalance(ms));
+            hedgeLadder.add(new RatioRung(ms,
+                    new SimEngine(p, limits, cfg.simMakerFee()).run(data.windows())));
         }
 
         // Бид от ЦЕНЫ ВХОДА с поводком (док. 119). Отвечает на вопрос, который
@@ -432,7 +442,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, targetFloored, leashLadder, wideStep, costFloor, gridMargin, gridWidening, gridLots,
+                cross, stopLadder, targetLadder, targetFloored, hedgeLadder, leashLadder, wideStep, costFloor, gridMargin, gridWidening, gridLots,
                 frozenCool, frozenAge, stickyOuter, stickyInner, queueControl);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
@@ -803,7 +813,7 @@ public class SimRunner {
                           List<RatioRung> shapeLadder, List<CrossCell> cross,
                           List<RatioRung> stopLadder, List<RatioRung> targetLadder,
                           List<RatioRung> targetFloored,
-                          List<RatioRung> leashLadder,
+                          List<RatioRung> hedgeLadder, List<RatioRung> leashLadder,
                           List<RatioRung> wideStep, List<RatioRung> costFloor,
                           List<GridRung> gridMargin, List<GridRung> gridWidening,
                           List<GridRung> gridLots,
@@ -1243,6 +1253,43 @@ public class SimRunner {
             appendTargetRow(sb, rung, base, false);
         }
         sb.append("\n");
+
+        sb.append("### Хедж шортом на перпе: лестница периода (док. 122)\n\n");
+        sb.append("Против спотового инвентаря держим шорт PF_XBTUSD на Kraken, доводя "
+                + "его до `−инвентарь` раз в период. Схема «купили — сразу шорт» на наших "
+                + "размерах невозможна: минимальный шаг количества там 0.0001 BTC, а лот "
+                + "живого бота 0.0000125 — единица хеджа **в восемь раз крупнее сделки**. "
+                + "Хеджируется нетто-позиция, и период — главный размен.\n\n");
+        sb.append("**Контроль здесь другой.** Захеджированная конструкция рыночно "
+                + "нейтральна, поэтому сравнивать её с `buy & hold` бессмысленно — "
+                + "сравнивать надо с **нулём**: весь результат обязан приходить из захвата "
+                + "спреда, а не из того, что рынок куда-то сходил.\n\n");
+        sb.append("Числа не выдуманы: комиссия 0.05% — фактический тариф Kraken из их же "
+                + "API, ставка фондирования 11.5 ppm/ч — среднее по нашей таблице "
+                + "`kraken_funding` за 20.08–01.09.2026. Ставка положительна, значит шорт "
+                + "её ПОЛУЧАЕТ: это попутный ветер, а не издержка.\n\n");
+        sb.append("| Период | Сделок на перпе | Комиссии | Фондирование | Переоценка шорта "
+                + "| Остаточная позиция | Спот `total` | **С хеджем** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : hedgeLadder) {
+            SimEngine.Result r = rung.result();
+            long ms = (long) rung.ratio();
+            String label = ms >= 3_600_000 ? (ms / 3_600_000) + " ч"
+                    : ms >= 60_000 ? (ms / 60_000) + " мин" : (ms / 1000) + " с";
+            sb.append("| ").append(label)
+                    .append(" | ").append(r.hedgeTrades())
+                    .append(" | ").append(round(r.hedgeCost(), 1))
+                    .append(" | ").append(round(r.hedgeFunding(), 1))
+                    .append(" | ").append(round(r.hedgePnl(), 1))
+                    .append(" | ").append(round(r.hedgeResidual(), 5))
+                    .append(" | ").append(round(r.pnl().total(), 1))
+                    .append(" | **").append(round(r.hedgedTotal(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n**Как читать.** «Остаточная позиция» — средняя непокрытая часть "
+                + "инвентаря: она равна нулю только при хедже каждое окно и растёт с "
+                + "периодом. Именно она и есть то, за что мы платим, экономя на комиссии. "
+                + "Разность между `спот total` и `с хеджем` — цена нейтральности.\n\n");
 
         sb.append("### Бид от цены входа с поводком (док. 119)\n\n");
         sb.append("Обычный бид висит на `справедливая × (1 − шаг)` и пересчитывается "

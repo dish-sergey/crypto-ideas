@@ -123,7 +123,7 @@ public class Executor {
                 cfg.simSkewK(), skewTarget, cfg.simDriftBeta(), cfg.simBuySizeRatio(),
                 cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
                 cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simStopDrawdownPct(),
-                Quoter.Sticky.OFF, Quoter.Frozen.OFF, cfg.simStopCoolOffMs(),
+                Quoter.Sticky.OFF, Quoter.Frozen.OFF, Quoter.Hedge.OFF, cfg.simStopCoolOffMs(),
                 cfg.simRequoteThreshold(), quoteStep());
         QuotePolicy policy = buildPolicy(params);
         QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs,

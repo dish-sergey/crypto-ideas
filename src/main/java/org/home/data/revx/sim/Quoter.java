@@ -28,6 +28,7 @@ public final class Quoter implements QuotePolicy {
             double stopDrawdownPct,   // стоп по просадке, % от номинала потолка (0 = выкл.)
             Sticky sticky,            // липкая котировка (док. 109 §II)
             Frozen frozen,            // замороженная пара: двигаем только после исполнения
+            Hedge hedge,              // шорт на перпе против инвентаря (док. 122)
             long stopCoolOffMs,       // сколько не набирать после срабатывания
             double requoteThreshold,  // порог перевыставления, доля цены
             double quoteStep) {       // шаг цены пары
@@ -36,13 +37,13 @@ public final class Quoter implements QuotePolicy {
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double requoteThreshold, double quoteStep) {
             this(offset, size, inventoryCap, skewK, 0.0, 0.0, 1.0, 0L, 0.0, 0.0, 0L, 0L,
-                    0.0, Sticky.OFF, Frozen.OFF, 0L, requoteThreshold, quoteStep);
+                    0.0, Sticky.OFF, Frozen.OFF, Hedge.OFF, 0L, requoteThreshold, quoteStep);
         }
 
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double skewTarget, double requoteThreshold, double quoteStep) {
             this(offset, size, inventoryCap, skewK, skewTarget, 0.0, 1.0, 0L, 0.0, 0.0, 0L, 0L,
-                    0.0, Sticky.OFF, Frozen.OFF, 0L, requoteThreshold, quoteStep);
+                    0.0, Sticky.OFF, Frozen.OFF, Hedge.OFF, 0L, requoteThreshold, quoteStep);
         }
 
         // Точечные изменения параметров живут ЗДЕСЬ, а не в лестницах стенда.
@@ -53,7 +54,7 @@ public final class Quoter implements QuotePolicy {
         public Params withOffset(double v) {
             return new Params(v, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         /** Потолок вместе с ПРОПОРЦИОНАЛЬНЫМ лотом — см. док. 97 §1. */
@@ -61,62 +62,68 @@ public final class Quoter implements QuotePolicy {
             double factor = inventoryCap > 0 ? v / inventoryCap : 1;
             return new Params(offset, size * factor, v, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withSkewK(double v) {
             return new Params(offset, size, inventoryCap, v, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withSkewTarget(double v) {
             return new Params(offset, size, inventoryCap, skewK, v, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withDriftBeta(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, v,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withBuyRatio(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     v, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withShapeEta(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, v, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         /** Стоп по просадке: порог в долях номинала потолка (док. 107 §5). */
         public Params withSticky(Sticky v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, v, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, v, frozen, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
+        }
+
+        public Params withHedge(Hedge v) {
+            return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
+                    buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
+                    erSampleMs, stopDrawdownPct, sticky, frozen, v, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withFrozen(Frozen v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, v, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, v, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withStopDrawdownPct(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, v, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, v, sticky, frozen, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withDriftGateEr(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, v, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         /**
@@ -228,6 +235,37 @@ public final class Quoter implements QuotePolicy {
 
         public Frozen withMaxAge(long v) {
             return new Frozen(true, coolOffMs, v);
+        }
+    }
+
+    /**
+     * Хедж: шорт на перпе против спотового инвентаря.
+     *
+     * Схема «купили — сразу шорт, продали — закрыли» на наших размерах
+     * невозможна. Минимальный шаг количества на Kraken PF_XBTUSD —
+     * {@code contractValueTradePrecision = 4}, то есть 0.0001 BTC, а лот живого
+     * бота 0.0000125: **единица хеджа ВОСЕМЬ РАЗ крупнее сделки**. Поэтому
+     * хеджируется НЕТТО-позиция с периодом, и период — главный размен: реже
+     * дешевле по комиссии и грязнее по остаточному риску.
+     *
+     * <ul>
+     *   <li>{@code rebalanceMs} — как часто доводить шорт до −инвентаря;</li>
+     *   <li>{@code step} — минимальный шаг количества на перпе;</li>
+     *   <li>{@code feeRate} — комиссия перпа: 0.0005 тейкером, 0.0002 мейкером
+     *       (фактический тариф Kraken, взят из их же API);</li>
+     *   <li>{@code fundingPerHour} — относительная ставка за час. При
+     *       положительной ставке шорт её ПОЛУЧАЕТ. Измерено по нашей же
+     *       {@code kraken_funding}: 11.5 ppm/ч = 10.1% годовых за 20.08–01.09.2026,
+     *       то есть это попутный ветер, а не издержка.</li>
+     * </ul>
+     */
+    public record Hedge(boolean enabled, long rebalanceMs, double step,
+                        double feeRate, double fundingPerHour) {
+
+        public static final Hedge OFF = new Hedge(false, 0, 0, 0, 0);
+
+        public Hedge withRebalance(long ms) {
+            return new Hedge(true, ms, step, feeRate, fundingPerHour);
         }
     }
 

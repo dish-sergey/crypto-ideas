@@ -80,6 +80,10 @@ public class RevxConfig {
     private final boolean simStickyReplaceOnFill;
     private final double simStickySkewDelta;
     private final boolean simStickyResetQueue;
+    private final List<Long> simHedgeRebalanceLadder;
+    private final double simHedgeStep;
+    private final double simHedgeFee;
+    private final double simHedgeFundingPerHour;
     private final List<Double> simAnchorLeashLadder;
     private final List<Double> simWideningLadder;
     private final double simWideningMaxStep;
@@ -184,6 +188,10 @@ public class RevxConfig {
             @Value("${revx.sim.sticky-replace-on-fill}") boolean simStickyReplaceOnFill,
             @Value("${revx.sim.sticky-skew-delta}") double simStickySkewDelta,
             @Value("${revx.sim.sticky-reset-queue}") boolean simStickyResetQueue,
+            @Value("${revx.sim.hedge-rebalance-ladder}") List<Long> simHedgeRebalanceLadder,
+            @Value("${revx.sim.hedge-step}") double simHedgeStep,
+            @Value("${revx.sim.hedge-fee}") double simHedgeFee,
+            @Value("${revx.sim.hedge-funding-per-hour}") double simHedgeFundingPerHour,
             @Value("${revx.sim.anchor-leash-ladder}") List<Double> simAnchorLeashLadder,
             @Value("${revx.sim.widening-ladder}") List<Double> simWideningLadder,
             @Value("${revx.sim.widening-max-step}") double simWideningMaxStep,
@@ -285,6 +293,10 @@ public class RevxConfig {
         this.simStickyReplaceOnFill = simStickyReplaceOnFill;
         this.simStickySkewDelta = simStickySkewDelta;
         this.simStickyResetQueue = simStickyResetQueue;
+        this.simHedgeRebalanceLadder = simHedgeRebalanceLadder;
+        this.simHedgeStep = simHedgeStep;
+        this.simHedgeFee = simHedgeFee;
+        this.simHedgeFundingPerHour = simHedgeFundingPerHour;
         this.simAnchorLeashLadder = simAnchorLeashLadder;
         this.simWideningLadder = simWideningLadder;
         this.simWideningMaxStep = simWideningMaxStep;
@@ -581,6 +593,15 @@ public class RevxConfig {
         return new org.home.data.revx.sim.Quoter.Sticky(simStickyEnabled, simStickyOuter,
                 simStickyInner, simStickyMaxAgeMs, simStickyReplaceOnFill,
                 simStickySkewDelta, simStickyResetQueue);
+    }
+
+    public long[] simHedgeRebalanceLadder() {
+        return simHedgeRebalanceLadder.stream().mapToLong(Long::longValue).toArray();
+    }
+
+    public org.home.data.revx.sim.Quoter.Hedge simHedge() {
+        return new org.home.data.revx.sim.Quoter.Hedge(true, 0, simHedgeStep, simHedgeFee,
+                simHedgeFundingPerHour);
     }
 
     public double[] simAnchorLeashLadder() {
