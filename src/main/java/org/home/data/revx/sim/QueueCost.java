@@ -37,7 +37,7 @@ public final class QueueCost {
      * @param captureBp средний захват на единицу оборота
      */
     public record Group(String label, int fills, double markoutBp, double standardErrorBp,
-                        double captureBp) {
+                        double captureBp, double netEdgeSeBp, int n) {
 
         /** Чистый край корзины: захват плюс то, что от него осталось к горизонту. */
         public double netEdgeBp() {
@@ -110,13 +110,15 @@ public final class QueueCost {
                 fairSeries, horizonMs);
         double turnover = selected.stream().mapToDouble(Fill::notional).sum();
         if (selected.isEmpty() || !(turnover > 0)) {
-            return new Group(label, selected.size(), Double.NaN, Double.NaN, Double.NaN);
+            return new Group(label, selected.size(), Double.NaN, Double.NaN, Double.NaN,
+                    Double.NaN, 0);
         }
         Markout.Stats stats = Markout.compute(selected, fairSeries, horizonMs);
         double markoutBp = stats.mean() * stats.fills() / turnover * 10_000;
         double captureBp = selected.stream().mapToDouble(Fill::spreadCapture).sum()
                 / turnover * 10_000;
         double se = Markout.standardErrorBp(selected, fairSeries, horizonMs);
-        return new Group(label, selected.size(), markoutBp, se, captureBp);
+        double edgeSe = Markout.netEdgeStandardErrorBp(selected, fairSeries, horizonMs);
+        return new Group(label, selected.size(), markoutBp, se, captureBp, edgeSe, stats.fills());
     }
 }

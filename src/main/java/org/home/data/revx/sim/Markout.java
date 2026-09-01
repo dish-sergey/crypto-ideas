@@ -100,6 +100,49 @@ public final class Markout {
      * увиденная дважды. От ответа зависит вывод «оптимальный отступ гуляет по
      * режимам» (док. 103 §4), поэтому ошибка обязана стоять рядом с оценкой.
      */
+    /**
+     * Ð¡ÑÐ°Ð½Ð´Ð°ÑÑÐ½Ð°Ñ Ð¾ÑÐ¸Ð±ÐºÐ° Ð§ÐÐ¡Ð¢ÐÐÐ ÐÐ ÐÐ¯ Ð½Ð° Ð¸ÑÐ¿Ð¾Ð»Ð½ÐµÐ½Ð¸Ðµ, Ð±.Ð¿.
+     *
+     * ÐÑÐ¶Ð½Ð° Ð¾ÑÐ´ÐµÐ»ÑÐ½Ð¾ Ð¾Ñ {@link #standardErrorBp}, Ð¸ ÑÑÐ¾ Ð½Ðµ Ð¿ÐµÐ´Ð°Ð½ÑÐ¸Ð·Ð¼. ÐÑÐ°Ð¹
+     * Ð¾Ð¿ÑÐµÐ´ÐµÐ»ÑÐ½ ÐºÐ°Ðº {@code Ð·Ð°ÑÐ²Ð°Ñ + markout}, Ð¿Ð¾ÑÑÐ¾Ð¼Ñ Ð¿Ð¾ Ð»ÑÐ±Ð¾Ð¼Ñ ÑÐ°Ð·Ð±Ð¸ÐµÐ½Ð¸Ñ
+     * {@code ÎÐºÑÐ°Ð¹ = ÎÐ·Ð°ÑÐ²Ð°Ñ + Îmarkout} â ÑÐ¾Ð¶Ð´ÐµÑÑÐ²ÐµÐ½Ð½Ð¾. ÐÐ½Ð°ÑÐ¸Ñ Â«markout ÑÑÐ¶Ðµ, Ð°
+     * Ð·Ð°ÑÐ²Ð°Ñ ÑÐ¾Ð²Ð½Ð¾ Ð½Ð° ÑÑÐ¾Ð»ÑÐºÐ¾ Ð¶Ðµ Ð²ÑÑÐµÂ» ÐµÑÑÑ ÐÐÐÐ ÑÐ°ÐºÑ, Ð·Ð°Ð¿Ð¸ÑÐ°Ð½Ð½ÑÐ¹ Ð´Ð²Ð°Ð¶Ð´Ñ, Ð°
+     * ÐµÐ´Ð¸Ð½ÑÑÐ²ÐµÐ½Ð½Ð°Ñ Ð½ÐµÐ·Ð°Ð²Ð¸ÑÐ¸Ð¼Ð°Ñ Ð²ÐµÐ»Ð¸ÑÐ¸Ð½Ð° â ÑÐ°Ð¼ ÐºÑÐ°Ð¹ (Ð´Ð¾Ðº. 123 Â§2).
+     *
+     * Ð ÐºÑÐ°Ð¹ Ð¨Ð£ÐÐÐÐ markout, Ð° Ð½Ðµ ÑÐ¸ÑÐµ: Ð² Ð½ÐµÐ³Ð¾ Ð²ÑÐ¾Ð´Ð¸Ñ Ð¸ Ð´Ð¸ÑÐ¿ÐµÑÑÐ¸Ñ Ð·Ð°ÑÐ²Ð°ÑÐ°.
+     * ÐÐ¾ÑÑÐ¾Ð¼Ñ Ð²ÑÐ²Ð¾Ð´ Â«ÐºÑÐ°Ð¹ Ð½Ðµ Ð¾ÑÐ»Ð¸ÑÐ°ÐµÑÑÑÂ» Ð±ÐµÐ· ÑÑÐ¾Ð¹ Ð¾ÑÐ¸Ð±ÐºÐ¸ Ð½Ðµ Ð¿Ð¾Ð´ÑÐ²ÐµÑÐ¶Ð´ÑÐ½ â Ð¾Ð½ Ð»Ð¸ÑÑ
+     * Ð½Ðµ Ð¾Ð¿ÑÐ¾Ð²ÐµÑÐ³Ð½ÑÑ.
+     */
+    public static double netEdgeStandardErrorBp(List<Fill> fills,
+                                                NavigableMap<Long, Double> fairSeries,
+                                                long horizonMs) {
+        List<Double> perFill = new ArrayList<>();
+        long lastFairMs = fairSeries.isEmpty() ? Long.MIN_VALUE : fairSeries.lastKey();
+        for (Fill fill : fills) {
+            long at = fill.tsMs() + horizonMs;
+            if (at > lastFairMs) {
+                continue;
+            }
+            var entry = fairSeries.floorEntry(at);
+            double notional = fill.notional();
+            if (entry == null || !(notional > 0)) {
+                continue;
+            }
+            double markout = fill.side().sign() * (entry.getValue() - fill.fairAtFill()) * fill.qty();
+            perFill.add((fill.spreadCapture() + markout) / notional * 10_000);
+        }
+        if (perFill.size() < 2) {
+            return Double.NaN;
+        }
+        double mean = mean(perFill);
+        double sumSq = 0;
+        for (double v : perFill) {
+            sumSq += (v - mean) * (v - mean);
+        }
+        return Math.sqrt(sumSq / (perFill.size() - 1) / perFill.size());
+    }
+
+
     public static double standardErrorBp(List<Fill> fills, NavigableMap<Long, Double> fairSeries,
                                          long horizonMs) {
         List<Double> perFill = new ArrayList<>();
