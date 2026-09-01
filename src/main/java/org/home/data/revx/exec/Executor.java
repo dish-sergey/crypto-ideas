@@ -2,7 +2,10 @@ package org.home.data.revx.exec;
 
 import org.home.data.revx.RevxConfig;
 import org.home.data.revx.sim.FairPrice;
+import org.home.data.revx.sim.CostFloorPolicy;
+import org.home.data.revx.sim.QuotePolicy;
 import org.home.data.revx.sim.Quoter;
+import org.home.data.revx.sim.WideningBidPolicy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -49,6 +52,13 @@ public class Executor {
     private final double inventoryCap;
     private final long periodMs;
     private final double offset;
+    private final BotTag tag;
+    private final String journalPath;
+    private final double skewTarget;
+    private final double costFloorMargin;
+    private final double widening;
+    private final double wideningMaxStep;
+    private final Panic panic;
 
     public Executor(RevxConfig cfg,
                     @Value("${revx.exec.stand-db}") String standDbPath,
@@ -56,7 +66,14 @@ public class Executor {
                     @Value("${revx.exec.size}") double size,
                     @Value("${revx.exec.inventory-cap}") double inventoryCap,
                     @Value("${revx.exec.period-ms}") long periodMs,
-                    @Value("${revx.exec.offset}") double offset) {
+                    @Value("${revx.exec.offset}") double offset,
+                    @Value("${revx.exec.bot-id}") String botId,
+                    @Value("${revx.exec.journal}") String journalPath,
+                    @Value("${revx.exec.skew-target}") double skewTarget,
+                    @Value("${revx.exec.cost-floor-margin}") double costFloorMargin,
+                    @Value("${revx.exec.widening}") double widening,
+                    @Value("${revx.exec.widening-max-step}") double wideningMaxStep,
+                    Panic panic) {
         this.cfg = cfg;
         this.standDbPath = standDbPath;
         this.symbol = symbol;
@@ -64,11 +81,18 @@ public class Executor {
         this.inventoryCap = inventoryCap;
         this.periodMs = periodMs;
         this.offset = offset;
+        this.tag = new BotTag(botId);
+        this.journalPath = journalPath;
+        this.skewTarget = skewTarget;
+        this.costFloorMargin = costFloorMargin;
+        this.widening = widening;
+        this.wideningMaxStep = wideningMaxStep;
+        this.panic = panic;
     }
 
     public void run() {
         TradeAuth auth = TradeAuth.fromEnvironment();
-        ExecJournal journal = new ExecJournal("state/exec.db");
+        ExecJournal journal = new ExecJournal(journalPath);
         StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
@@ -83,13 +107,14 @@ public class Executor {
         // ВЫБОРКИ (док. 113 §5). Сверять живое надо со ступенью лестницы, равной
         // `revx.exec.offset`, а не с базовым прогоном симуляции.
         Quoter.Params params = new Quoter.Params(offset, size, inventoryCap,
-                cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
+                cfg.simSkewK(), skewTarget, cfg.simDriftBeta(), cfg.simBuySizeRatio(),
                 cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
                 cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simStopDrawdownPct(),
                 Quoter.Sticky.OFF, Quoter.Frozen.OFF, cfg.simStopCoolOffMs(),
                 cfg.simRequoteThreshold(), quoteStep());
+        QuotePolicy policy = buildPolicy(params);
         QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs,
-                minNotional());
+                minNotional(), tag, policy);
 
         log.warn("""
 
@@ -115,13 +140,13 @@ public class Executor {
 
         // Паника обязана работать и из бота, и из хука выключения: заявки на
         // бирже переживают наш процесс, и оставить их там нельзя.
-        Runnable panic = () -> {
+        Runnable panicAction = () -> {
             journal.event("panic", "аварийная остановка");
             loop.shutdown();
-            new Panic(cfg).run();
+            panic.run();
             System.exit(0);
         };
-        ExecBot bot = ExecBot.fromEnvironment(loop, journal, panic);
+        ExecBot bot = ExecBot.fromEnvironment(loop, journal, panicAction);
         // Предохранители должны докрикиваться до человека, а не только до журнала.
         if (bot != null) {
             loop.alertTo(bot::send);
@@ -145,6 +170,36 @@ public class Executor {
         }
         stand.close();
         journal.close();
+    }
+
+    /**
+     * Политика котирования этого бота.
+     *
+     * Бот A — голый {@link Quoter}: цель 0, пола нет, шаг постоянный. Бот B — он же
+     * под двумя надстройками, каждая измерена отдельно:
+     *
+     * <ul>
+     *   <li>{@link CostFloorPolicy} — не продавать ниже средней цены входа
+     *       (док. 116: на падении убирает −439 реализованного убытка);</li>
+     *   <li>{@link WideningBidPolicy} — шаг покупок растёт с набранным
+     *       (док. 117: ёмкость падения с 3% до десятков процентов).</li>
+     * </ul>
+     *
+     * Порядок обёрток важен: пол ближе к котировщику, растущий шаг снаружи. Пол
+     * трогает только аск, шаг — только бид, поэтому они не конфликтуют, но
+     * менять их местами всё равно не надо: внешняя обёртка видит уже исправленный
+     * аск, а не сырой.
+     */
+    private QuotePolicy buildPolicy(Quoter.Params params) {
+        QuotePolicy policy = new Quoter(params);
+        if (costFloorMargin >= 0) {
+            policy = new CostFloorPolicy(policy, costFloorMargin, quoteStep());
+        }
+        if (widening > 0) {
+            policy = new WideningBidPolicy(policy, params.offset(), widening,
+                    wideningMaxStep, size, inventoryCap, quoteStep());
+        }
+        return policy;
     }
 
     /**

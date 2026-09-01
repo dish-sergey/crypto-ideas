@@ -5,7 +5,6 @@ import org.home.data.revx.sim.Side;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -92,12 +91,20 @@ public final class QuoteLoop implements Runnable {
     private final StandReader stand;
     private final ExecJournal journal;
     private final Quoter quoter;
+    /**
+     * Откуда берутся цены. У бота A это сам {@link Quoter}, у бота B — он же
+     * под надстройками (пол по себестоимости, растущий шаг). Порог
+     * перевыставления по-прежнему у quoter: он про геометрию, а не про цены.
+     */
+    private final org.home.data.revx.sim.QuotePolicy policy;
     private final Quoter.Params params;
     private final String symbol;
     private final String base;
     private final long periodMs;
     /** Минимальный номинал заявки на площадке: ниже него постановка отвергается. */
     private final double minNotional;
+    /** Метка бота: она же владелец заявки, см. {@link BotTag}. */
+    private final BotTag tag;
 
     private final AtomicBoolean quoting = new AtomicBoolean(false);
     private volatile boolean alive = true;
@@ -129,7 +136,8 @@ public final class QuoteLoop implements Runnable {
     private java.util.function.Consumer<String> alert = message -> { };
 
     public QuoteLoop(TradeClient client, StandReader stand, ExecJournal journal,
-                     Quoter.Params params, String symbol, long periodMs, double minNotional) {
+                     Quoter.Params params, String symbol, long periodMs, double minNotional,
+                     BotTag tag, org.home.data.revx.sim.QuotePolicy policy) {
         this.client = client;
         this.stand = stand;
         this.journal = journal;
@@ -142,6 +150,8 @@ public final class QuoteLoop implements Runnable {
         this.base = symbol.substring(0, symbol.indexOf('/'));
         this.periodMs = periodMs;
         this.minNotional = minNotional;
+        this.tag = tag;
+        this.policy = policy != null ? policy : this.quoter;
     }
 
     public void startQuoting() {
@@ -243,7 +253,7 @@ public final class QuoteLoop implements Runnable {
         // Страховка от тренда включается только в трендовом режиме (док. 105 §5).
         // При выключенном гейте (порог 0) поведение прежнее.
         double drift = efficiency.open(params.driftGateEr()) ? drift() : 0;
-        Quoter.Quotes target = quoter.quotes(fair.price(), inventory, drift);
+        Quoter.Quotes target = policy.quotes(fair.price(), inventory, drift);
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
         journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null);
@@ -412,7 +422,7 @@ public final class QuoteLoop implements Runnable {
                 {"client_order_id":"%s","symbol":"%s","side":"%s",
                  "order_configuration":{"limit":{"base_size":"%s","price":"%s",
                  "execution_instructions":["post_only"]}}}"""
-                .formatted(UUID.randomUUID(), symbol.replace('/', '-'),
+                .formatted(tag.newClientOrderId(), symbol.replace('/', '-'),
                         side == Side.BUY ? "buy" : "sell", fmt(size), fmt(price))
                 .replaceAll("\\s*\\n\\s*", "");
         TradeClient.Response response = client.place(body);
@@ -449,7 +459,7 @@ public final class QuoteLoop implements Runnable {
         String body = """
                 {"client_order_id":"%s","base_size":"%s","price":"%s",
                  "execution_instructions":["post_only"]}"""
-                .formatted(UUID.randomUUID(), fmt(size), fmt(price))
+                .formatted(tag.newClientOrderId(), fmt(size), fmt(price))
                 .replaceAll("\\s*\\n\\s*", "");
         TradeClient.Response response = client.replace(resting.venueId, body);
         replaces++;
@@ -509,9 +519,21 @@ public final class QuoteLoop implements Runnable {
         if (!active.ok() || active.body() == null) {
             return;                       // не знаем состояние — ничего не трогаем
         }
-        java.util.List<ActiveOrder> orders = ActiveOrder.parse(active.body()).stream()
+        java.util.List<ActiveOrder> all = ActiveOrder.parse(active.body()).stream()
                 .filter(o -> ActiveOrder.normalize(symbol).equals(o.symbol()))
                 .toList();
+        // ⚠️ Фильтр по МЕТКЕ обязателен: на одном аккаунте и одной паре список
+        // активных отдаёт и заявки соседнего бота. Без него сверка снимала бы их
+        // как «бесхозные» каждую минуту — первое, что ломается при параллельном
+        // запуске. Заявка без клиентского идентификатора считается ЧУЖОЙ: молчаливо
+        // присвоить чужое хуже, чем оставить в книге хвост.
+        java.util.List<ActiveOrder> orders = all.stream()
+                .filter(o -> tag.owns(o.clientId()))
+                .toList();
+        int foreign = all.size() - orders.size();
+        if (foreign > 0) {
+            log.debug("в книге {} чужих заявок по {} — не трогаю", foreign, symbol);
+        }
         if (!quoting.get()) {
             // Правило 1: пока котирование выключено, наших заявок в книге быть
             // не должно. Ни одной, независимо от того, что мы о них помним.
@@ -599,6 +621,10 @@ public final class QuoteLoop implements Runnable {
             fills++;
             totalFilledNotional += filled * price;
             journal.fill(venueId, side.name(), filled, price, lastFair, fee, feeCurrency, status);
+            // Политике, чьи цены зависят от собственных сделок (пол по
+            // себестоимости), факт исполнения нужен раньше следующего тика.
+            policy.onFill(new org.home.data.revx.sim.Fill(
+                    System.currentTimeMillis(), side, price, filled, lastFair));
         }
         if (fee > ExecLimits.MAX_FEE_USDC) {
             totalFees += fee;

@@ -23,8 +23,8 @@ import java.util.List;
  * постановки — через дефис ({@code BTC-USDC}). Сравнивать их можно только
  * после приведения.
  */
-public record ActiveOrder(String id, String symbol, Side side, double price,
-                          double size, long createdMs) {
+public record ActiveOrder(String id, String clientId, String symbol, Side side,
+                          double price, double size, long createdMs) {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -69,6 +69,7 @@ public record ActiveOrder(String id, String symbol, Side side, double price,
         // заявке это не то же самое, что quantity, и резерв держится именно им.
         double size = number(node, "leaves_quantity", "quantity", "base_size");
         return new ActiveOrder(id,
+                text(node, "client_order_id"),
                 normalize(text(node, "symbol")),
                 "sell".equalsIgnoreCase(side) ? Side.SELL : Side.BUY,
                 number(node, "price"),

@@ -1,0 +1,37 @@
+[Unit]
+Description=Revolut X micro-live BOT B (REAL orders) — пол по себестоимости + растущий шаг
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx-exec-b
+EnvironmentFile=/etc/revx-exec-b.env
+
+# Профиль B (доки 116-118). Отличия от бота A ровно три, каждое измерено:
+#   skew-target=0.3        цель инвентаря вместо пустого счёта (док. 118)
+#   cost-floor-margin=0    не продавать ниже средней цены входа (док. 116)
+#   widening=0.42          шаг покупок растёт с набранным (док. 117)
+# Всё остальное — то же самое, включая отступ 10 б.п.
+#
+# bot-id=b кладёт метку в client_order_id: сверка и паника трогают только свои
+# заявки, иначе два бота снимали бы заявки друг друга каждую минуту.
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-exec-b/app.jar --revx-exec \
+  --revx.exec.bot-id=b \
+  --revx.exec.journal=state/exec-b.db \
+  --revx.exec.skew-target=0.3 \
+  --revx.exec.cost-floor-margin=0 \
+  --revx.exec.widening=0.42
+
+# Добивает ТОЛЬКО свои заявки: panic-all по умолчанию false, иначе остановка
+# бота B снимала бы живые заявки бота A.
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-b/app.jar --revx-panic --revx.exec.bot-id=b --revx.exec.journal=state/exec-b.db || true'
+
+# Намеренно НЕТ автоперезапуска: перезапуск после падения не должен сам
+# возобновлять торговлю. Котирование в любом случае стартует выключенным.
+Restart=no
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

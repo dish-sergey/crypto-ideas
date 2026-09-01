@@ -43,14 +43,23 @@ public class Panic {
     private static final Pattern ID = Pattern.compile("\"(?:venue_order_)?id\"\\s*:\\s*\"([^\"]+)\"");
 
     private final RevxConfig cfg;
+    private final BotTag tag;
+    private final boolean panicAll;
+    private final String journalPath;
 
-    public Panic(RevxConfig cfg) {
+    public Panic(RevxConfig cfg,
+                 @org.springframework.beans.factory.annotation.Value("${revx.exec.bot-id}") String botId,
+                 @org.springframework.beans.factory.annotation.Value("${revx.exec.panic-all}") boolean panicAll,
+                 @org.springframework.beans.factory.annotation.Value("${revx.exec.journal}") String journalPath) {
         this.cfg = cfg;
+        this.tag = botId == null || botId.isBlank() ? null : new BotTag(botId);
+        this.panicAll = panicAll;
+        this.journalPath = journalPath;
     }
 
     public void run() {
         TradeAuth auth = TradeAuth.fromEnvironment();
-        try (ExecJournal journal = new ExecJournal("state/exec.db")) {
+        try (ExecJournal journal = new ExecJournal(journalPath)) {
             TradeClient client = new TradeClient(cfg.baseUrl(), auth, journal);
             journal.event("panic", "аварийная отмена всех заявок");
 
@@ -78,16 +87,33 @@ public class Panic {
         }
     }
 
-    private static List<String> openOrderIds(TradeClient client) {
+    /**
+     * Идентификаторы открытых заявок ЭТОГО бота.
+     *
+     * ⚠️ С появлением второго бота на том же аккаунте «снять всё» перестало быть
+     * безопасным: {@code ExecStopPost} одного бота убивал бы живые заявки другого.
+     * Поэтому фильтр по метке ({@link BotTag}) — по умолчанию, а «снять вообще
+     * всё» включается отдельно, {@code revx.exec.panic-all=true}, и это осознанное
+     * действие человека, а не побочный эффект рестарта.
+     */
+    private List<String> openOrderIds(TradeClient client) {
         TradeClient.Response active = client.activeOrders();
         List<String> ids = new ArrayList<>();
         if (active.body() == null) {
             return ids;
         }
-        Matcher matcher = ID.matcher(active.body());
-        while (matcher.find()) {
-            if (!ids.contains(matcher.group(1))) {
-                ids.add(matcher.group(1));
+        if (panicAll || tag == null) {
+            Matcher matcher = ID.matcher(active.body());
+            while (matcher.find()) {
+                if (!ids.contains(matcher.group(1))) {
+                    ids.add(matcher.group(1));
+                }
+            }
+            return ids;
+        }
+        for (ActiveOrder order : ActiveOrder.parse(active.body())) {
+            if (tag.owns(order.clientId()) && !ids.contains(order.id())) {
+                ids.add(order.id());
             }
         }
         return ids;
