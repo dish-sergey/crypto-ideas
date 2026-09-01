@@ -12,7 +12,10 @@ EnvironmentFile=/etc/revx-exec-b.env
 # Профиль B (доки 116-118). Отличия от бота A ровно три, каждое измерено:
 #   skew-target=0.3        цель инвентаря вместо пустого счёта (док. 118)
 #   cost-floor-margin=0    не продавать ниже средней цены входа (док. 116)
-#   widening=0.42          шаг покупок растёт с набранным (док. 117)
+#   anchor-leash=0.002     бид ЖДЁТ приход цены, подтягиваясь не дальше 20 б.п.
+#                          от того места, где его хочет видеть котировщик (док. 119).
+#                          Заменил растущий шаг из док. 117: тот отодвигал заявку
+#                          от рынка, и она переставала исполняться вовсе.
 # Всё остальное — то же самое, включая отступ 10 б.п.
 #
 # bot-id=b кладёт метку в client_order_id: сверка и паника трогают только свои
@@ -22,7 +25,8 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-ex
   --revx.exec.journal=state/exec-b.db \
   --revx.exec.skew-target=0.3 \
   --revx.exec.cost-floor-margin=0 \
-  --revx.exec.widening=0.42 \
+  --revx.exec.anchor-leash=0.002 \
+  --revx.exec.anchor-widening=0.5 \
   --revx.exec.own-position=true \
   --revx.exec.position-seed=0
 

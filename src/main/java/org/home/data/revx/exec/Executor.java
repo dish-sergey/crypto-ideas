@@ -2,6 +2,7 @@ package org.home.data.revx.exec;
 
 import org.home.data.revx.RevxConfig;
 import org.home.data.revx.sim.FairPrice;
+import org.home.data.revx.sim.AnchoredBidPolicy;
 import org.home.data.revx.sim.CostFloorPolicy;
 import org.home.data.revx.sim.QuotePolicy;
 import org.home.data.revx.sim.Quoter;
@@ -58,6 +59,8 @@ public class Executor {
     private final double costFloorMargin;
     private final double widening;
     private final double wideningMaxStep;
+    private final double anchorLeash;
+    private final double anchorWidening;
     private final boolean ownPosition;
     private final double positionSeed;
     private final Panic panic;
@@ -75,6 +78,8 @@ public class Executor {
                     @Value("${revx.exec.cost-floor-margin}") double costFloorMargin,
                     @Value("${revx.exec.widening}") double widening,
                     @Value("${revx.exec.widening-max-step}") double wideningMaxStep,
+                    @Value("${revx.exec.anchor-leash}") double anchorLeash,
+                    @Value("${revx.exec.anchor-widening}") double anchorWidening,
                     @Value("${revx.exec.own-position}") boolean ownPosition,
                     @Value("${revx.exec.position-seed}") double positionSeed,
                     Panic panic) {
@@ -91,6 +96,8 @@ public class Executor {
         this.costFloorMargin = costFloorMargin;
         this.widening = widening;
         this.wideningMaxStep = wideningMaxStep;
+        this.anchorLeash = anchorLeash;
+        this.anchorWidening = anchorWidening;
         this.ownPosition = ownPosition;
         this.positionSeed = positionSeed;
         this.panic = panic;
@@ -201,7 +208,14 @@ public class Executor {
         if (costFloorMargin >= 0) {
             policy = new CostFloorPolicy(policy, costFloorMargin, quoteStep());
         }
-        if (widening > 0) {
+        // Поводок и растущий шаг решают ОДНУ задачу — пережить падение, — и
+        // ставить их вместе бессмысленно: оба двигают бид вниз, и разложить
+        // результат потом будет нельзя. Поводок измерен лучше по всем колонкам
+        // (док. 119 §5), поэтому при заданном поводке растущий шаг не ставится.
+        if (anchorLeash >= 0) {
+            policy = new AnchoredBidPolicy(policy, params.offset(), anchorWidening,
+                    params.offset(), anchorLeash, size, inventoryCap, quoteStep());
+        } else if (widening > 0) {
             policy = new WideningBidPolicy(policy, params.offset(), widening,
                     wideningMaxStep, size, inventoryCap, quoteStep());
         }
