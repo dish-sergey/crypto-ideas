@@ -250,6 +250,18 @@ public class SimRunner {
                         cfg.simMakerFee(), base.offset(), base.inventoryCap()));
             }
         }
+        // Та же лестница, но с ПОЛОМ ПО СЕБЕСТОИМОСТИ. Порознь эти две правки
+        // отвечают на разные вопросы, а вместе — на один: цель говорит «держи
+        // столько-то», пол не даёт сбросить это в убыток. Без пола ненулевая цель
+        // означала «держи и продавай дешевле, чем купил», и мерилось именно оно
+        // (док. 111 §7).
+        List<RatioRung> targetFloored = new ArrayList<>();
+        for (double target : cfg.simSkewTargetLadder()) {
+            Quoter.Params params = base.withSkewTarget(target);
+            QuotePolicy policy = new CostFloorPolicy(new Quoter(params), 0.0, base.quoteStep());
+            targetFloored.add(new RatioRung(target,
+                    new SimEngine(params, limits, cfg.simMakerFee(), policy).run(data.windows())));
+        }
 
         // Растущий шаг покупок (док. 117). Отвечает на вопрос ЁМКОСТИ: сколько
         // процентов падения конструкция отрабатывает, прежде чем упрётся в потолок.
@@ -405,7 +417,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, wideStep, costFloor, gridMargin, gridWidening, gridLots,
+                cross, stopLadder, targetLadder, targetFloored, wideStep, costFloor, gridMargin, gridWidening, gridLots,
                 frozenCool, frozenAge, stickyOuter, stickyInner, queueControl);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
@@ -435,6 +447,36 @@ public class SimRunner {
         SimEngine.Result result = new SimEngine(params, limits, cfg.simMakerFee(), grid)
                 .run(data.windows());
         return new GridRung(margin, widening, lots, cap, grid, result);
+    }
+
+    private static void appendTargetHeader(StringBuilder sb) {
+        sb.append("| Цель | Исполнений | Захват, б.п. | Чистый край | **Край × оборот** "
+                + "| Ср. инвентарь | **Время с нулевым** | Время с полным | Просадка "
+                + "| **Total** | **Buy & hold** | **Альфа** | **При возврате** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    }
+
+    private static void appendTargetRow(StringBuilder sb, RatioRung rung,
+                                        Quoter.Params base, boolean markBase) {
+        SimEngine.Result r = rung.result();
+        double edge = netEdgeBp(r, 60_000);
+        sb.append("| ").append(round(rung.ratio(), 2))
+                .append(markBase && rung.ratio() == base.skewTarget() ? " (базовый)" : "")
+                .append(" | ").append(r.fills().size())
+                .append(" | ").append(round(captureBp(r), 2))
+                .append(" | ").append(round(edge, 2))
+                .append(" | **").append(round(edge * turnover(r) / 10_000, 1)).append("**")
+                .append(" | ").append(round(r.avgInventory(), 4))
+                .append(" | **").append(round(100.0 * r.windowsAtZero()
+                        / Math.max(1, r.windows()), 1)).append("%**")
+                .append(" | ").append(round(100.0 * r.windowsAtCap()
+                        / Math.max(1, r.windows()), 1)).append("%")
+                .append(" | ").append(round(r.maxDrawdown(), 1))
+                .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                .append(" | **").append(round(r.pnl().total() - r.buyAndHoldPnl(), 1)).append("**")
+                .append(" | **").append(round(r.pnlAtStart(), 1)).append("**")
+                .append(" |\n");
     }
 
     /** Ёмкость падения: просадка цены в момент первого заполнения потолка. */
@@ -745,6 +787,7 @@ public class SimRunner {
                           List<DriftRung> driftLadder, List<RatioRung> ratioLadder,
                           List<RatioRung> shapeLadder, List<CrossCell> cross,
                           List<RatioRung> stopLadder, List<RatioRung> targetLadder,
+                          List<RatioRung> targetFloored,
                           List<RatioRung> wideStep, List<RatioRung> costFloor,
                           List<GridRung> gridMargin, List<GridRung> gridWidening,
                           List<GridRung> gridLots,
@@ -1169,28 +1212,19 @@ public class SimRunner {
                 + "несомую позицию, поэтому `total` растёт с ней механически — это бета, "
                 + "а не заработок котировщика. Вопрос лестницы один: прибавляется ли "
                 + "КРАЙ, когда котировка становится двусторонней.\n\n");
-        sb.append("| Цель | Исполнений | Захват, б.п. | Чистый край | **Край × оборот** "
-                + "| Ср. инвентарь | **Время с нулевым** | Время с полным | Просадка "
-                + "| **Total** | **Buy & hold** |\n");
-        sb.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
+        sb.append("**Без пола по себестоимости** (как мерилось в док. 111)\n\n");
+        appendTargetHeader(sb);
         for (RatioRung rung : targetLadder) {
-            SimEngine.Result r = rung.result();
-            double edge = netEdgeBp(r, 60_000);
-            sb.append("| ").append(round(rung.ratio(), 2))
-                    .append(rung.ratio() == base.skewTarget() ? " (базовый)" : "")
-                    .append(" | ").append(r.fills().size())
-                    .append(" | ").append(round(captureBp(r), 2))
-                    .append(" | ").append(round(edge, 2))
-                    .append(" | **").append(round(edge * turnover(r) / 10_000, 1)).append("**")
-                    .append(" | ").append(round(r.avgInventory(), 4))
-                    .append(" | **").append(round(100.0 * r.windowsAtZero()
-                            / Math.max(1, r.windows()), 1)).append("%**")
-                    .append(" | ").append(round(100.0 * r.windowsAtCap()
-                            / Math.max(1, r.windows()), 1)).append("%")
-                    .append(" | ").append(round(r.maxDrawdown(), 1))
-                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
-                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
-                    .append(" |\n");
+            appendTargetRow(sb, rung, base, true);
+        }
+        sb.append("\n**С полом по себестоимости** — так устроен второй бот\n\n");
+        sb.append("Порознь цель и пол отвечают на разные вопросы, вместе — на один. "
+                + "Без пола ненулевая цель означала «держи столько-то И продавай дешевле, "
+                + "чем купил», и в док. 111 мерилось именно это. Пол убирает вторую "
+                + "половину, оставляя первую.\n\n");
+        appendTargetHeader(sb);
+        for (RatioRung rung : targetFloored) {
+            appendTargetRow(sb, rung, base, false);
         }
         sb.append("\n");
 
