@@ -108,6 +108,7 @@ public final class QuoteLoop implements Runnable {
     private volatile double inventory;
     private volatile double baseAvailable;
     private volatile double quoteBalance;
+    private volatile double quoteTotal;
     private volatile double lastFair;
     private final java.util.ArrayDeque<long[]> fairHistory = new java.util.ArrayDeque<>();
     private final org.home.data.revx.sim.EfficiencyRatio efficiency;
@@ -283,10 +284,13 @@ public final class QuoteLoop implements Runnable {
             return;
         }
 
+        // Пауза после отказа площадки распространяется на ОБА действия. Отказ на
+        // замене стоит четырёх запросов, и повторять его каждую секунду так же
+        // вредно, как долбиться постановкой.
+        if (System.currentTimeMillis() < resting.blockedUntilMs) {
+            return;
+        }
         if (resting.venueId == null) {
-            if (System.currentTimeMillis() < resting.blockedUntilMs) {
-                return;                   // площадка только что отказала — не долбимся
-            }
             place(side, resting, targetPrice, size);
         } else if (quoter.shouldRequote(resting.price, targetPrice)) {
             replace(side, resting, targetPrice, size);
@@ -457,20 +461,28 @@ public final class QuoteLoop implements Runnable {
             resting.price = price;
             resting.size = size;
             resting.sinceMs = System.currentTimeMillis();
+            resting.failures = 0;
+            resting.blockedUntilMs = 0;
         } else {
-            // Заявки уже нет — скорее всего исполнилась. Не гадаем по остаткам,
-            // а спрашиваем площадку: она отдаёт цену, объём и КОМИССИЮ.
-            log.info("замена {} не прошла ({}), выясняю судьбу заявки", side, response.status());
-            inspectGoneOrder(side, resting.venueId);
-            resting.venueId = null;
-            refreshBalances();
             // ⚠️ 422 на замене НЕ ЗНАЧИТ, что замены не было. 30.08.2026 площадка
             // ответила «Cannot replace an order that is not in the NEW state», а
-            // сама заявка при этом уже числилась cancelled/replaced — то есть
-            // наследник был создан и остался в книге без хозяина на шесть часов.
-            // Судьбу заявки нельзя выводить из её собственного статуса: нужен
-            // список активных.
+            // сама заявка уже числилась cancelled/replaced — наследник был создан
+            // и остался в книге без хозяина. Судьбу заявки нельзя выводить из её
+            // собственного статуса: спрашиваем СПИСОК АКТИВНЫХ, и он же решает,
+            // усыновить наследника, снять дубль или признать заявку исполненной.
+            //
+            // Забывать заявку здесь нельзя. Первая версия обнуляла id сразу, и
+            // если сверка слот не восстанавливала, следующий тик ставил ВТОРУЮ
+            // заявку поверх живой (01.09.2026, 06:26 — резерв удвоился).
+            log.info("замена {} не прошла ({}), сверяюсь с книгой", side, response.status());
+            resting.failures++;
+            // Пауза на сторону: без неё каждый отказ тянет за собой четыре запроса
+            // (замена, статус, остатки, активные), и на устойчивом отказе это
+            // 8 запросов в секунду по кругу — наблюдалось 01.09.2026.
+            resting.blockedUntilMs = System.currentTimeMillis()
+                    + Math.min(MAX_PLACE_BACKOFF_MS, 2_000L << Math.min(5, resting.failures - 1));
             reconcile("отказ замены");
+            refreshBalances();
         }
     }
 
@@ -540,6 +552,10 @@ public final class QuoteLoop implements Runnable {
             resting.price = keep.price();
             resting.size = keep.size();
             resting.sinceMs = System.currentTimeMillis();
+            // Наследник найден — значит предыдущий отказ был мнимым, и держать
+            // за него паузу не за что.
+            resting.failures = 0;
+            resting.blockedUntilMs = 0;
         }
         for (ActiveOrder extra : mine) {
             if (!extra.id().equals(keep.id())) {
@@ -597,12 +613,23 @@ public final class QuoteLoop implements Runnable {
         }
     }
 
-    /** Торговый P&L против buy & hold: рыночное движение стартовой позиции не в счёт. */
+    /**
+     * Торговый P&L против buy & hold: рыночное движение стартовой позиции не в счёт.
+     *
+     * ⚠️ Считается по {@code total}, и это не мелочь. Первая версия брала
+     * {@code quoteBalance}, то есть {@code available}, — а он не содержит средств,
+     * зарезервированных под стоящей заявкой. Предохранитель занижал P&L ровно на
+     * размер резерва: при заявке в 1 USDC и пороге в 1 USDC любой висящий бид уже
+     * означал «убыток». 30.08–01.09.2026 стоп сработал трижды, и каждый раз
+     * фактический счёт был на своём стартовом значении с точностью до цента
+     * (док. 113 §2). Позиция — это {@code total}, независимо от того, лежит она
+     * свободно или в резерве.
+     */
     private void checkTradingPnl() {
         if (!startCaptured || !(lastFair > 0)) {
             return;
         }
-        double pnl = (quoteBalance - startQuote) + (inventory - startInventory) * lastFair;
+        double pnl = tradingPnl(quoteTotal, startQuote, inventory, startInventory, lastFair);
         if (pnl < -ExecLimits.MAX_TRADING_LOSS_USDC) {
             String message = ("ОСТАНОВКА: торговый убыток %s USDC против buy & hold превысил "
                     + "предел %s. Котирование выключено, заявки сняты.")
@@ -612,6 +639,18 @@ public final class QuoteLoop implements Runnable {
             alert.accept(message);
             stopQuoting();
         }
+    }
+
+    /**
+     * Изменение стоимости счёта против удержания стартовой позиции.
+     *
+     * Обе валюты берутся по {@code total}: резерв под стоящей заявкой — это наши
+     * деньги, просто занятые. Подстановка сюда {@code available} превращает
+     * висящий бид в убыток на его номинал (док. 113 §2).
+     */
+    static double tradingPnl(double quoteTotal, double startQuote,
+                             double inventory, double startInventory, double fair) {
+        return (quoteTotal - startQuote) + (inventory - startInventory) * fair;
     }
 
     private static String field(String json, String name) {
@@ -658,12 +697,13 @@ public final class QuoteLoop implements Runnable {
                 inventory = total;            // позиция целиком, вместе с зарезервированным
                 baseAvailable = available;    // а поставить можно только на это
             } else if ("USDC".equals(matcher.group(1))) {
-                quoteBalance = available;     // а тут важно именно «на что можно поставить»
+                quoteBalance = available;     // на что можно поставить новую заявку
+                quoteTotal = total;           // а это — сколько денег у нас есть
             }
         }
-        if (!startCaptured && inventory + quoteBalance > 0) {
+        if (!startCaptured && inventory + quoteTotal > 0) {
             startInventory = inventory;
-            startQuote = quoteBalance;
+            startQuote = quoteTotal;
             startCaptured = true;
         }
         checkTradingPnl();
