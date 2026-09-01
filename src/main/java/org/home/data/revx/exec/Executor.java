@@ -58,6 +58,8 @@ public class Executor {
     private final double costFloorMargin;
     private final double widening;
     private final double wideningMaxStep;
+    private final boolean ownPosition;
+    private final double positionSeed;
     private final Panic panic;
 
     public Executor(RevxConfig cfg,
@@ -73,6 +75,8 @@ public class Executor {
                     @Value("${revx.exec.cost-floor-margin}") double costFloorMargin,
                     @Value("${revx.exec.widening}") double widening,
                     @Value("${revx.exec.widening-max-step}") double wideningMaxStep,
+                    @Value("${revx.exec.own-position}") boolean ownPosition,
+                    @Value("${revx.exec.position-seed}") double positionSeed,
                     Panic panic) {
         this.cfg = cfg;
         this.standDbPath = standDbPath;
@@ -87,6 +91,8 @@ public class Executor {
         this.costFloorMargin = costFloorMargin;
         this.widening = widening;
         this.wideningMaxStep = wideningMaxStep;
+        this.ownPosition = ownPosition;
+        this.positionSeed = positionSeed;
         this.panic = panic;
     }
 
@@ -114,7 +120,7 @@ public class Executor {
                 cfg.simRequoteThreshold(), quoteStep());
         QuotePolicy policy = buildPolicy(params);
         QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs,
-                minNotional(), tag, policy);
+                minNotional(), tag, policy, ownPosition, positionSeed);
 
         log.warn("""
 

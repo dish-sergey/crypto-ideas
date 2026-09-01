@@ -69,6 +69,11 @@ public final class ExecJournal implements AutoCloseable {
                 status       TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_exec_fill_ts ON exec_fill(ts_ms);
+            CREATE TABLE IF NOT EXISTS exec_state (
+                key    TEXT PRIMARY KEY,
+                value  REAL NOT NULL,
+                ts_ms  INTEGER NOT NULL
+            );
             """;
 
     private final Connection connection;
@@ -92,6 +97,41 @@ public final class ExecJournal implements AutoCloseable {
             log.info("журнал исполнителя: {}", path);
         } catch (Exception e) {
             throw new IllegalStateException("не открыть журнал исполнителя " + path, e);
+        }
+    }
+
+    /**
+     * Долгоживущее состояние бота: позиция и касса.
+     *
+     * С двумя ботами на одном аккаунте остатки площадки перестали быть «нашей»
+     * позицией — там лежит сумма обоих. Поэтому позицию каждый ведёт сам, по
+     * своим исполнениям, и хранит здесь, чтобы пережить перезапуск. Остатки
+     * остаются контролем: наша позиция не может превышать общую.
+     */
+    public synchronized void putState(String key, double value) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT INTO exec_state(key, value, ts_ms) VALUES(?,?,?) "
+                        + "ON CONFLICT(key) DO UPDATE SET value=excluded.value, ts_ms=excluded.ts_ms")) {
+            ps.setString(1, key);
+            ps.setDouble(2, value);
+            ps.setLong(3, System.currentTimeMillis());
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.error("не записать состояние {}: {}", key, e.toString());
+        }
+    }
+
+    /** {@code null} = значения нет, и это отличается от нуля. */
+    public synchronized Double getState(String key) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT value FROM exec_state WHERE key = ?")) {
+            ps.setString(1, key);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getDouble(1) : null;
+            }
+        } catch (Exception e) {
+            log.error("не прочитать состояние {}: {}", key, e.toString());
+            return null;
         }
     }
 

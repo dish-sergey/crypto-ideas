@@ -53,6 +53,11 @@ public final class QuoteLoop implements Runnable {
     /** Как часто сверяться с книгой площадки, даже когда всё выглядит хорошо. */
     private static final long RECONCILE_PERIOD_MS = 60_000L;
 
+    /** Ключи долгоживущего состояния в журнале. */
+    private static final String STATE_POSITION = "position";
+    private static final String STATE_CASH = "cash";
+    private static final String STATE_SEED = "seed_position";
+
     private static final Pattern VENUE_ID =
             Pattern.compile("\"venue_order_id\"\\s*:\\s*\"([^\"]+)\"");
     /**
@@ -105,6 +110,13 @@ public final class QuoteLoop implements Runnable {
     private final double minNotional;
     /** Метка бота: она же владелец заявки, см. {@link BotTag}. */
     private final BotTag tag;
+    /** Вести ли позицию по своим сделкам вместо остатков аккаунта (два бота). */
+    private final boolean ownPosition;
+    private volatile double ownCash;
+    /** Затравка позиции при первом запуске: отрицательная = взять из остатка аккаунта. */
+    private final double positionSeed;
+    /** Позиция, принятая за точку отсчёта P&L: с неё началась жизнь этого бота. */
+    private volatile double seedPosition;
 
     private final AtomicBoolean quoting = new AtomicBoolean(false);
     private volatile boolean alive = true;
@@ -137,7 +149,8 @@ public final class QuoteLoop implements Runnable {
 
     public QuoteLoop(TradeClient client, StandReader stand, ExecJournal journal,
                      Quoter.Params params, String symbol, long periodMs, double minNotional,
-                     BotTag tag, org.home.data.revx.sim.QuotePolicy policy) {
+                     BotTag tag, org.home.data.revx.sim.QuotePolicy policy,
+                     boolean ownPosition, double positionSeed) {
         this.client = client;
         this.stand = stand;
         this.journal = journal;
@@ -152,6 +165,8 @@ public final class QuoteLoop implements Runnable {
         this.minNotional = minNotional;
         this.tag = tag;
         this.policy = policy != null ? policy : this.quoter;
+        this.ownPosition = ownPosition;
+        this.positionSeed = positionSeed;
     }
 
     public void startQuoting() {
@@ -196,6 +211,7 @@ public final class QuoteLoop implements Runnable {
 
     @Override
     public void run() {
+        restorePosition();
         refreshBalances();
         // Стартуем остановленными, значит и книга должна быть пуста: заявки
         // переживают наш процесс, и оставшиеся после падения — уже не наши.
@@ -621,6 +637,9 @@ public final class QuoteLoop implements Runnable {
             fills++;
             totalFilledNotional += filled * price;
             journal.fill(venueId, side.name(), filled, price, lastFair, fee, feeCurrency, status);
+            // Своя позиция и касса меняются ЗДЕСЬ, а не по остаткам аккаунта:
+            // при двух ботах остатки содержат чужие сделки.
+            applyFill(side, filled, price);
             // Политике, чьи цены зависят от собственных сделок (пол по
             // себестоимости), факт исполнения нужен раньше следующего тика.
             policy.onFill(new org.home.data.revx.sim.Fill(
@@ -655,7 +674,11 @@ public final class QuoteLoop implements Runnable {
         if (!startCaptured || !(lastFair > 0)) {
             return;
         }
-        double pnl = tradingPnl(quoteTotal, startQuote, inventory, startInventory, lastFair);
+        // При своей позиции касса тоже своя: разница остатков аккаунта содержит
+        // сделки соседнего бота и торговым результатом этого бота не является.
+        double pnl = ownPosition
+                ? tradingPnl(ownCash, 0, inventory, seedPosition, lastFair)
+                : tradingPnl(quoteTotal, startQuote, inventory, startInventory, lastFair);
         if (pnl < -ExecLimits.MAX_TRADING_LOSS_USDC) {
             String message = ("ОСТАНОВКА: торговый убыток %s USDC против buy & hold превысил "
                     + "предел %s. Котирование выключено, заявки сняты.")
@@ -730,23 +753,47 @@ public final class QuoteLoop implements Runnable {
         cancel(Side.SELL, ask, why);
     }
 
-    /** Истина о позиции — остатки на бирже, а не наш счётчик исполнений. */
+    /**
+     * Остатки площадки. Раньше отсюда бралась и ПОЗИЦИЯ — «истина о позиции у
+     * биржи, а не в нашем счётчике».
+     *
+     * ⚠️ С двумя ботами на одном аккаунте это перестало быть верным: в остатках
+     * лежит СУММА обоих, и каждый принял бы чужой биткойн за свой. Скос, пол по
+     * себестоимости и стоп по убытку поехали бы у обоих сразу.
+     *
+     * Поэтому при {@code ownPosition} позиция ведётся по своим исполнениям
+     * ({@link #applyFill}) и хранится в журнале, а остатки остаются **контролем**:
+     * наша позиция не может быть больше общей. Расхождение — не повод
+     * подстраиваться под остатки (там чужое), а повод кричать.
+     */
     private void refreshBalances() {
         TradeClient.Response response = client.balances();
         if (!response.ok() || response.body() == null) {
             return;
         }
+        double baseTotal = Double.NaN;
         Matcher matcher = BALANCE.matcher(response.body());
         while (matcher.find()) {
             double available = Double.parseDouble(matcher.group(2));
             double total = Double.parseDouble(matcher.group(4));
             if (base.equals(matcher.group(1))) {
-                inventory = total;            // позиция целиком, вместе с зарезервированным
-                baseAvailable = available;    // а поставить можно только на это
+                baseTotal = total;
+                baseAvailable = available;    // поставить можно только на это
+                if (!ownPosition) {
+                    inventory = total;        // одинокий бот: вся позиция наша
+                }
             } else if ("USDC".equals(matcher.group(1))) {
                 quoteBalance = available;     // на что можно поставить новую заявку
                 quoteTotal = total;           // а это — сколько денег у нас есть
             }
+        }
+        if (ownPosition && !Double.isNaN(baseTotal) && inventory > baseTotal + 1e-12) {
+            String message = ("РАСХОЖДЕНИЕ: своя позиция %s больше остатка аккаунта %s. "
+                    + "Либо потеряно исполнение, либо позицию тронули извне.")
+                    .formatted(fmt(inventory), fmt(baseTotal));
+            log.error(message);
+            journal.event("position_mismatch", message);
+            alert.accept(message);
         }
         if (!startCaptured && inventory + quoteTotal > 0) {
             startInventory = inventory;
@@ -754,6 +801,65 @@ public final class QuoteLoop implements Runnable {
             startCaptured = true;
         }
         checkTradingPnl();
+    }
+
+    /**
+     * Восстановить свою позицию после перезапуска.
+     *
+     * Журнал — единственное, что её переживает: вывести позицию из остатков при
+     * двух ботах нельзя, там сумма обоих. Если состояния ещё нет (первый запуск
+     * этого бота), берётся затравка из конфига: у одинокого бота это остаток
+     * аккаунта, у второго — ноль, иначе он присвоил бы себе чужой биткойн.
+     */
+    private void restorePosition() {
+        if (!ownPosition) {
+            return;
+        }
+        Double saved = journal.getState(STATE_POSITION);
+        Double savedCash = journal.getState(STATE_CASH);
+        if (saved != null) {
+            inventory = saved;
+            ownCash = savedCash == null ? 0 : savedCash;
+            Double savedSeed = journal.getState(STATE_SEED);
+            seedPosition = savedSeed == null ? 0 : savedSeed;
+            log.warn("позиция восстановлена из журнала: {} {}, касса {}",
+                    fmt(inventory), base, fmt(ownCash));
+            return;
+        }
+        if (positionSeed >= 0) {
+            inventory = positionSeed;
+        } else {
+            // Затравка «из аккаунта»: осмысленна только пока бот один.
+            TradeClient.Response response = client.balances();
+            Matcher matcher = BALANCE.matcher(response.body() == null ? "" : response.body());
+            while (matcher.find()) {
+                if (base.equals(matcher.group(1))) {
+                    inventory = Double.parseDouble(matcher.group(4));
+                }
+            }
+        }
+        ownCash = 0;
+        seedPosition = inventory;
+        journal.putState(STATE_POSITION, inventory);
+        journal.putState(STATE_CASH, ownCash);
+        journal.putState(STATE_SEED, seedPosition);
+        log.warn("первый запуск: позиция принята за {} {}", fmt(inventory), base);
+        journal.event("position_seed", fmt(inventory) + " " + base);
+    }
+
+    /**
+     * Своя позиция и своя касса после исполнения. Обе сохраняются сразу: журнал —
+     * единственное, что переживёт перезапуск, а вывести позицию из остатков при
+     * двух ботах больше нельзя.
+     */
+    private void applyFill(Side side, double qty, double price) {
+        if (!ownPosition) {
+            return;
+        }
+        inventory += side.sign() * qty;
+        ownCash -= side.sign() * qty * price;
+        journal.putState(STATE_POSITION, inventory);
+        journal.putState(STATE_CASH, ownCash);
     }
 
     private void rollCounters() {

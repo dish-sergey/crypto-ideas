@@ -22,7 +22,9 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-ex
   --revx.exec.journal=state/exec-b.db \
   --revx.exec.skew-target=0.3 \
   --revx.exec.cost-floor-margin=0 \
-  --revx.exec.widening=0.42
+  --revx.exec.widening=0.42 \
+  --revx.exec.own-position=true \
+  --revx.exec.position-seed=0
 
 # Добивает ТОЛЬКО свои заявки: panic-all по умолчанию false, иначе остановка
 # бота B снимала бы живые заявки бота A.
