@@ -18,10 +18,20 @@ import org.springframework.stereotype.Component;
  * (доки 74–90); единственное, чего она не проверяет по построению, — доходит ли
  * поток до нашей заявки. Ответ стоит десятки долларов и сутки работы.
  *
- * Параметры котирования берутся из ТОГО ЖЕ конфига, что и симуляция: отступ,
- * скос, порог перевыставления. Отличается только размер — он микроскопический
- * и задаётся отдельно ({@code revx.exec.size}), потому что мерить надо
- * попадание в предсказание, а не P&L.
+ * Параметры котирования берутся из ТОГО ЖЕ конфига, что и симуляция: скос, порог
+ * перевыставления, гейты. Отличаются два:
+ *
+ * <ul>
+ *   <li><b>размер</b> ({@code revx.exec.size}) — микроскопический, потому что
+ *       мерить надо попадание в предсказание, а не P&L;</li>
+ *   <li><b>отступ</b> ({@code revx.exec.offset}) — рабочая точка, измеренная вне
+ *       выборки (док. 113 §5), тогда как {@code revx.sim.offset} остаётся
+ *       историческим базисом доков 74–113. Сверять живое надо со ступенью
+ *       лестницы отступа, равной {@code revx.exec.offset}.</li>
+ * </ul>
+ *
+ * Расхождение печатается при старте и пишется в журнал: незамеченное, оно через
+ * месяц превратится в «модель не сходится с живым».
  *
  * Справедливая цена читается из базы стенда, а не опрашивается заново: иначе
  * расхождение можно будет списать на разные данные (док. 89 §4).
@@ -38,19 +48,22 @@ public class Executor {
     private final double size;
     private final double inventoryCap;
     private final long periodMs;
+    private final double offset;
 
     public Executor(RevxConfig cfg,
                     @Value("${revx.exec.stand-db}") String standDbPath,
                     @Value("${revx.exec.symbol}") String symbol,
                     @Value("${revx.exec.size}") double size,
                     @Value("${revx.exec.inventory-cap}") double inventoryCap,
-                    @Value("${revx.exec.period-ms}") long periodMs) {
+                    @Value("${revx.exec.period-ms}") long periodMs,
+                    @Value("${revx.exec.offset}") double offset) {
         this.cfg = cfg;
         this.standDbPath = standDbPath;
         this.symbol = symbol;
         this.size = size;
         this.inventoryCap = inventoryCap;
         this.periodMs = periodMs;
+        this.offset = offset;
     }
 
     public void run() {
@@ -62,9 +75,14 @@ public class Executor {
                 cfg.fairMaxSkewMs());
         TradeClient client = new TradeClient(cfg.baseUrl(), auth, journal);
 
-        // Отступ, скос и порог — из конфига симуляции, чтобы живое и посчитанное
-        // отличались ровно одним: реальностью исполнения.
-        Quoter.Params params = new Quoter.Params(cfg.simOffset(), size, inventoryCap,
+        // Скос, порог и всё остальное — из конфига симуляции, чтобы живое и
+        // посчитанное отличались ровно одним: реальностью исполнения.
+        //
+        // Отступ — единственное исключение. `revx.sim.offset` остаётся историческим
+        // базисом доков 74-113, а живое стоит на рабочей точке, измеренной ВНЕ
+        // ВЫБОРКИ (док. 113 §5). Сверять живое надо со ступенью лестницы, равной
+        // `revx.exec.offset`, а не с базовым прогоном симуляции.
+        Quoter.Params params = new Quoter.Params(offset, size, inventoryCap,
                 cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
                 cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
                 cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simStopDrawdownPct(),
@@ -75,10 +93,21 @@ public class Executor {
         log.warn("""
 
                 === МИКРО-LIVE, РЕАЛЬНЫЕ ОРДЕРА ===
-                пара {}, размер {} {}, отступ {}%, скос {}%, период {} мс
+                пара {}, размер {} {}, период {} мс
+                отступ {} б.п. (базис симуляции {} б.п.), скос {}%
                 котирование ВЫКЛЮЧЕНО до команды /start
-                {}""", symbol, size, symbol.substring(0, symbol.indexOf('/')),
-                cfg.simOffset() * 100, cfg.simSkewK() * 100, periodMs, ExecLimits.describe());
+                {}""", symbol, size, symbol.substring(0, symbol.indexOf('/')), periodMs,
+                offset * 10_000, cfg.simOffset() * 10_000, cfg.simSkewK() * 100,
+                ExecLimits.describe());
+        if (offset != cfg.simOffset()) {
+            // Расхождение намеренное, но молчать о нём нельзя: иначе через месяц
+            // живое сравнят с базовым прогоном и не поймут, почему не сходится.
+            log.warn("отступ живого ({} б.п.) НЕ равен базису симуляции ({} б.п.) — "
+                    + "сверять со ступенью лестницы {} б.п. (док. 113 §5)",
+                    offset * 10_000, cfg.simOffset() * 10_000, offset * 10_000);
+            journal.event("offset", "живое " + offset * 10_000 + " б.п., базис симуляции "
+                    + cfg.simOffset() * 10_000 + " б.п.");
+        }
 
         Thread loopThread = new Thread(loop, "revx-quote-loop");
         loopThread.setDaemon(false);
