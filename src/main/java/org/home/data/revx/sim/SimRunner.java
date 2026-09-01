@@ -423,6 +423,11 @@ public class SimRunner {
         return new GridRung(margin, widening, lots, cap, grid, result);
     }
 
+    /** Ёмкость падения: просадка цены в момент первого заполнения потолка. */
+    private static String capacity(SimEngine.Result r) {
+        return Double.isNaN(r.capAtDropPct()) ? "—" : round(r.capAtDropPct(), 2) + "%";
+    }
+
     private static void appendGridHeader(StringBuilder sb, String first) {
         sb.append("| ").append(first).append(" | Исполнений | Покупок / продаж "
                 + "| Захват, б.п. | Ср. инвентарь | Время с полным | **Просадка** "
@@ -1184,10 +1189,15 @@ public class SimRunner {
                 + "котировщик теряет **−439 даже при полном возврате цены**, то есть "
                 + "убыток реализованный. Колонка «при возврате цены» и есть проверка: "
                 + "если правка работает, там должен исчезнуть минус.\n\n");
+        sb.append("**Ёмкость падения** — насколько успела упасть цена от своего пика к "
+                + "моменту, когда инвентарь ВПЕРВЫЕ упёрся в потолок. Дальше конструкция "
+                + "на покупку не котирует вовсе и просто держит позицию, поэтому это и "
+                + "есть глубина падения, которую она способна отработать. «—» означает, "
+                + "что потолок не был достигнут ни разу.\n\n");
         sb.append("| Маржа над входом | Исполнений | Покупок / продаж | Захват, б.п. "
-                + "| Ср. инвентарь | Время с полным | **Просадка** | **Total** | **Buy & hold** "
-                + "| **При возврате цены** |\n");
-        sb.append("|---|---|---|---|---|---|---|---|---|---|\n");
+                + "| Ср. инвентарь | Время с полным | **Ёмкость падения** | **Просадка** "
+                + "| **Total** | **Buy & hold** | **При возврате цены** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
         sb.append("| **пола нет (база)** | ").append(baseResult.fills().size())
                 .append(" | ").append(baseResult.fills().stream()
                         .filter(f -> f.side() == Side.BUY).count())
@@ -1197,6 +1207,7 @@ public class SimRunner {
                 .append(" | ").append(round(baseResult.avgInventory(), 4))
                 .append(" | ").append(round(100.0 * baseResult.windowsAtCap()
                         / Math.max(1, baseResult.windows()), 1)).append("%")
+                .append(" | **").append(capacity(baseResult)).append("**")
                 .append(" | **").append(round(baseResult.maxDrawdown(), 1)).append("**")
                 .append(" | **").append(round(baseResult.pnl().total(), 1)).append("**")
                 .append(" | **").append(round(baseResult.buyAndHoldPnl(), 1)).append("**")
@@ -1214,6 +1225,7 @@ public class SimRunner {
                     .append(" | ").append(round(r.avgInventory(), 4))
                     .append(" | ").append(round(100.0 * r.windowsAtCap()
                             / Math.max(1, r.windows()), 1)).append("%")
+                    .append(" | **").append(capacity(r)).append("**")
                     .append(" | **").append(round(r.maxDrawdown(), 1)).append("**")
                     .append(" | **").append(round(r.pnl().total(), 1)).append("**")
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")

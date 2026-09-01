@@ -48,6 +48,7 @@ public final class SimEngine {
             double fairLast,
             TreeMap<Long, Double> fairSeries,
             double pnlAtStart,            // P&L, если бы цена вернулась к началу окна (b&h там = 0)
+            double capAtDropPct,          // просадка цены в момент ПЕРВОГО заполнения потолка, %
             int frozenCycles,             // сколько раз замороженная пара выпускалась заново
             long frozenHeldWindows,       // окон, в которые пара стояла нетронутой
             ExecutionModel.Stats execution) {
@@ -167,6 +168,11 @@ public final class SimEngine {
         double marketQty = 0;
         double peakEquity = 0;
         double maxDrawdown = 0;
+        // Насколько глубоко успела упасть цена, когда инвентарь впервые упёрся в
+        // потолок. Это и есть ЁМКОСТЬ ПАДЕНИЯ: дальше конструкция уже не котирует
+        // на покупку, а просто держит позицию.
+        double fairPeak = 0;
+        double capAtDropPct = Double.NaN;
         double fairFirst = 0;
         int driftAnchor = 0;
         EfficiencyRatio er = new EfficiencyRatio(
@@ -408,11 +414,15 @@ public final class SimEngine {
                 }
             }
 
+            fairPeak = Math.max(fairPeak, window.fair());
             maxInventory = Math.max(maxInventory, pnl.inventory());
             inventorySum += pnl.inventory();
             inventorySamples++;
             if (pnl.inventory() >= params.inventoryCap() - 1e-12) {
                 atCap++;
+                if (Double.isNaN(capAtDropPct) && fairPeak > 0) {
+                    capAtDropPct = 100.0 * (window.fair() / fairPeak - 1);
+                }
             }
             // Зеркальная беда: при нулевом инвентаре нет АСКА — продавать нечем.
             // Считается там же и так же, чтобы две колонки читались рядом.
@@ -432,7 +442,7 @@ public final class SimEngine {
                 maxInventory, avgInventory, atCap, atZero,
                 gateOpenWindows, erSamples == 0 ? Double.NaN : erSum / erSamples,
                 stopHits, stoppedWindows, filledQty, marketQty, maxDrawdown,
-                fairFirst, fairLast, fairSeries, pnl.markAtStart(fairFirst),
+                fairFirst, fairLast, fairSeries, pnl.markAtStart(fairFirst), capAtDropPct,
                 frozenCycles, frozenHeldWindows, execution.stats());
     }
 }
