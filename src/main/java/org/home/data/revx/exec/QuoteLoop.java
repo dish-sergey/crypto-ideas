@@ -667,15 +667,36 @@ public final class QuoteLoop implements Runnable {
         }
     }
 
+    /**
+     * Снять заявку. Отказ отмены НЕ означает, что заявка отменена — она могла
+     * ИСПОЛНИТЬСЯ за мгновение до нашего запроса.
+     *
+     * ⚠️ 01.09.2026 это стоило потерянного исполнения. Аск сработал в 13:08:14,
+     * следующий тик решил, что сторона больше не котируется, и послал отмену;
+     * площадка ответила {@code 409 "Can't cancel order in inactive state"}, цикл
+     * счёл заявку снятой и пошёл дальше. Сделка не попала ни в журнал, ни в
+     * счётчик, ни под предохранитель по комиссии — а деньги по ней прошли.
+     *
+     * Третий случай подряд, когда ответ площадки об ошибке означает не то, чем
+     * выглядит (см. правило 4 в шапке класса). Вывод общий: **после любого отказа
+     * по заявке надо спрашивать её судьбу, а не додумывать.**
+     */
     private void cancel(Side side, Resting resting, String why) {
         if (resting.venueId == null) {
             return;
         }
-        TradeClient.Response response = client.cancel(resting.venueId);
-        cancels++;
-        journal.event("cancel", side + " " + resting.venueId + " (" + why + ") → "
-                + response.status());
+        String dead = resting.venueId;
+        // Обнуляем ДО выяснения: предохранитель по комиссии внутри может позвать
+        // остановку, а та — снова сюда, и рекурсия должна упереться в этот null.
         resting.venueId = null;
+        TradeClient.Response response = client.cancel(dead);
+        cancels++;
+        journal.event("cancel", side + " " + dead + " (" + why + ") → " + response.status());
+        if (!response.ok()) {
+            log.info("отмена {} не прошла ({}), выясняю судьбу заявки", side, response.status());
+            inspectGoneOrder(side, dead);
+            refreshBalances();
+        }
     }
 
     private void cancelAll(String why) {
