@@ -80,6 +80,8 @@ public class RevxConfig {
     private final boolean simStickyReplaceOnFill;
     private final double simStickySkewDelta;
     private final boolean simStickyResetQueue;
+    private final List<Double> simWideningLadder;
+    private final double simWideningMaxStep;
     private final List<Double> simCostFloorLadder;
     private final double simGridMargin;
     private final double simGridBaseStep;
@@ -181,6 +183,8 @@ public class RevxConfig {
             @Value("${revx.sim.sticky-replace-on-fill}") boolean simStickyReplaceOnFill,
             @Value("${revx.sim.sticky-skew-delta}") double simStickySkewDelta,
             @Value("${revx.sim.sticky-reset-queue}") boolean simStickyResetQueue,
+            @Value("${revx.sim.widening-ladder}") List<Double> simWideningLadder,
+            @Value("${revx.sim.widening-max-step}") double simWideningMaxStep,
             @Value("${revx.sim.cost-floor-ladder}") List<Double> simCostFloorLadder,
             @Value("${revx.sim.grid-margin}") double simGridMargin,
             @Value("${revx.sim.grid-base-step}") double simGridBaseStep,
@@ -279,6 +283,8 @@ public class RevxConfig {
         this.simStickyReplaceOnFill = simStickyReplaceOnFill;
         this.simStickySkewDelta = simStickySkewDelta;
         this.simStickyResetQueue = simStickyResetQueue;
+        this.simWideningLadder = simWideningLadder;
+        this.simWideningMaxStep = simWideningMaxStep;
         this.simCostFloorLadder = simCostFloorLadder;
         this.simGridMargin = simGridMargin;
         this.simGridBaseStep = simGridBaseStep;
@@ -573,6 +579,12 @@ public class RevxConfig {
                 simStickyInner, simStickyMaxAgeMs, simStickyReplaceOnFill,
                 simStickySkewDelta, simStickyResetQueue);
     }
+
+    public double[] simWideningLadder() {
+        return simWideningLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    public double simWideningMaxStep() { return simWideningMaxStep; }
 
     public double[] simCostFloorLadder() {
         return simCostFloorLadder.stream().mapToDouble(Double::doubleValue).toArray();

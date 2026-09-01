@@ -251,6 +251,20 @@ public class SimRunner {
             }
         }
 
+        // Растущий шаг покупок (док. 117). Отвечает на вопрос ЁМКОСТИ: сколько
+        // процентов падения конструкция отрабатывает, прежде чем упрётся в потолок.
+        // Ставится ВМЕСТЕ с полом по себестоимости — это и есть кандидат-конструкция
+        // второго бота, поэтому мерить их надо в паре, а не по отдельности.
+        List<RatioRung> wideStep = new ArrayList<>();
+        for (double eta : cfg.simWideningLadder()) {
+            QuotePolicy inner = new CostFloorPolicy(new Quoter(base), 0.0, base.quoteStep());
+            QuotePolicy policy = new WideningBidPolicy(inner, base.offset(), eta,
+                    cfg.simWideningMaxStep(), base.size(), base.inventoryCap(),
+                    base.quoteStep());
+            wideStep.add(new RatioRung(eta,
+                    new SimEngine(base, limits, cfg.simMakerFee(), policy).run(data.windows())));
+        }
+
         // Пол по себестоимости (док. 116). Точечная правка нынешней конструкции:
         // всё как в базовом прогоне, но аск не опускается ниже средней цены входа.
         // Вмешательство происходит ТОЛЬКО там, где старое правило велело продать
@@ -391,7 +405,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, costFloor, gridMargin, gridWidening, gridLots,
+                cross, stopLadder, targetLadder, wideStep, costFloor, gridMargin, gridWidening, gridLots,
                 frozenCool, frozenAge, stickyOuter, stickyInner, queueControl);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
@@ -731,7 +745,7 @@ public class SimRunner {
                           List<DriftRung> driftLadder, List<RatioRung> ratioLadder,
                           List<RatioRung> shapeLadder, List<CrossCell> cross,
                           List<RatioRung> stopLadder, List<RatioRung> targetLadder,
-                          List<RatioRung> costFloor,
+                          List<RatioRung> wideStep, List<RatioRung> costFloor,
                           List<GridRung> gridMargin, List<GridRung> gridWidening,
                           List<GridRung> gridLots,
                           List<RatioRung> frozenCool, List<RatioRung> frozenAge,
@@ -1179,6 +1193,52 @@ public class SimRunner {
                     .append(" |\n");
         }
         sb.append("\n");
+
+        sb.append("### Растущий шаг покупок: ёмкость падения (док. 117)\n\n");
+        sb.append("Кандидат-конструкция второго бота: **пол по себестоимости на аске "
+                + "плюс растущий шаг на биде**. Шаг = `шаг₀ × (1 + η · лотов)`, потолок 2%. "
+                + "Обе правки стоят вместе, потому что порознь они отвечают на разные "
+                + "половины одного вопроса: пол убирает продажу в убыток, шаг решает, "
+                + "насколько глубокое падение мы вообще отрабатываем.\n\n");
+        sb.append("Ёмкость по геометрии: `шаг₀ × (N + η·N(N−1)/2)`. Колонка «ёмкость "
+                + "факт» — измеренная просадка в момент первого упора в потолок; она "
+                + "обязана сойтись с расчётной, иначе модель шага неверна.\n\n");
+        sb.append("| η | Ёмкость расчётная | **Ёмкость факт** | Исполнений | Покупок / продаж "
+                + "| Захват, б.п. | Ср. инвентарь | Время с полным | **Просадка** | **Total** "
+                + "| **Buy & hold** | **При возврате цены** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+        int lots = defaultGridLots(base);
+        for (RatioRung rung : wideStep) {
+            SimEngine.Result r = rung.result();
+            sb.append("| ").append(round(rung.ratio(), 2))
+                    .append(" | ").append(round(WideningBidPolicy.capacityPct(
+                            base.offset(), rung.ratio(), lots), 2)).append("%")
+                    .append(" | **").append(capacity(r)).append("**")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(r.fills().stream()
+                            .filter(f -> f.side() == Side.BUY).count())
+                    .append(" / ").append(r.fills().stream()
+                            .filter(f -> f.side() == Side.SELL).count())
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(r.avgInventory(), 4))
+                    .append(" | ").append(round(100.0 * r.windowsAtCap()
+                            / Math.max(1, r.windows()), 1)).append("%")
+                    .append(" | **").append(round(r.maxDrawdown(), 1)).append("**")
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                    .append(" | **").append(round(r.pnlAtStart(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n⚠️ **η = 0 — это НЕ нынешний бот.** Политика заменяет бид целиком и "
+                + "тем самым убирает вклад скоса в него: при η = 0 расстояние до покупки "
+                + "постоянно и от набранного не зависит вовсе. Нижняя ступень поэтому "
+                + "покупает АГРЕССИВНЕЕ сегодняшней конструкции, а не так же. Сравнивать "
+                + "надо с разделом «пол по себестоимости».\n\n"
+                + "**Расчётная ёмкость расходится с фактической, и это результат, а не "
+                + "ошибка.** Формула считает, что каждая покупка требует ровно своего шага "
+                + "цены; на деле нужен ВЫНОС, доходящий до заявки, а такие редки. Поэтому "
+                + "расчёт — нижняя граница: при η = 0.25 геометрия обещает 1.05%, "
+                + "измерено 10.8%.\n\n");
 
         sb.append("### Пол по себестоимости: не продавать ниже цены входа (док. 116)\n\n");
         sb.append("Точечная правка, а не другой механизм. Отступ, скос и гейты работают "
