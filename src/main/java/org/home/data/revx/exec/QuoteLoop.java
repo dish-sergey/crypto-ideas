@@ -52,6 +52,10 @@ public final class QuoteLoop implements Runnable {
     private static final long ADOPT_GRACE_MS = 5_000L;
     /** Как часто сверяться с книгой площадки, даже когда всё выглядит хорошо. */
     private static final long RECONCILE_PERIOD_MS = 60_000L;
+    /** Сколько расхождение позиции должно продержаться, чтобы стать тревогой. */
+    private static final long MISMATCH_GRACE_MS = 30_000L;
+    /** И как часто повторять тревогу, если оно не уходит. */
+    private static final long MISMATCH_REPEAT_MS = 300_000L;
 
     /** Ключи долгоживущего состояния в журнале. */
     private static final String STATE_POSITION = "position";
@@ -117,6 +121,8 @@ public final class QuoteLoop implements Runnable {
     private final double positionSeed;
     /** Позиция, принятая за точку отсчёта P&L: с неё началась жизнь этого бота. */
     private volatile double seedPosition;
+    private volatile long mismatchSinceMs;
+    private volatile long mismatchWarnedMs;
 
     private final AtomicBoolean quoting = new AtomicBoolean(false);
     private volatile boolean alive = true;
@@ -787,20 +793,55 @@ public final class QuoteLoop implements Runnable {
                 quoteTotal = total;           // а это — сколько денег у нас есть
             }
         }
-        if (ownPosition && !Double.isNaN(baseTotal) && inventory > baseTotal + 1e-12) {
-            String message = ("РАСХОЖДЕНИЕ: своя позиция %s больше остатка аккаунта %s. "
-                    + "Либо потеряно исполнение, либо позицию тронули извне.")
-                    .formatted(fmt(inventory), fmt(baseTotal));
-            log.error(message);
-            journal.event("position_mismatch", message);
-            alert.accept(message);
-        }
+        checkPositionAgainstAccount(baseTotal);
         if (!startCaptured && inventory + quoteTotal > 0) {
             startInventory = inventory;
             startQuote = quoteTotal;
             startCaptured = true;
         }
         checkTradingPnl();
+    }
+
+    /**
+     * Своя позиция против остатка аккаунта — с выдержкой.
+     *
+     * ⚠️ Мгновенная проверка даёт ложные тревоги, и это гонка, а не поломка:
+     * аск исполняется → остаток на бирже падает СРАЗУ → мы сверяемся до того, как
+     * узнали о собственной сделке. 01.09.2026 бот B выдал четыре таких тревоги
+     * подряд, и каждая закрывалась через 4–7 секунд, когда исполнение находилось.
+     * Итог сошёлся до последнего знака: 8 сделок, нетто +0.000025, столько же на
+     * счету.
+     *
+     * Поэтому: заметили расхождение — сначала СВЕРЯЕМСЯ с книгой (сверка находит
+     * исчезнувшую заявку и записывает исполнение), и только если расхождение
+     * пережило выдержку, кричим. Тревога, которая срабатывает на штатной работе,
+     * маскирует настоящую.
+     */
+    private void checkPositionAgainstAccount(double baseTotal) {
+        if (!ownPosition || Double.isNaN(baseTotal)) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (inventory <= baseTotal + 1e-12) {
+            mismatchSinceMs = 0;          // сошлось — счётчик выдержки сбрасывается
+            return;
+        }
+        if (mismatchSinceMs == 0) {
+            mismatchSinceMs = now;
+            reconcile("расхождение позиции");   // может найти неучтённое исполнение
+            return;
+        }
+        if (now - mismatchSinceMs < MISMATCH_GRACE_MS
+                || now - mismatchWarnedMs < MISMATCH_REPEAT_MS) {
+            return;
+        }
+        mismatchWarnedMs = now;
+        String message = ("РАСХОЖДЕНИЕ: своя позиция %s больше остатка аккаунта %s уже "
+                + "%d с. Либо потеряно исполнение, либо позицию тронули извне.")
+                .formatted(fmt(inventory), fmt(baseTotal), (now - mismatchSinceMs) / 1000);
+        log.error(message);
+        journal.event("position_mismatch", message);
+        alert.accept(message);
     }
 
     /**

@@ -80,6 +80,7 @@ public class RevxConfig {
     private final boolean simStickyReplaceOnFill;
     private final double simStickySkewDelta;
     private final boolean simStickyResetQueue;
+    private final List<Double> simAnchorLeashLadder;
     private final List<Double> simWideningLadder;
     private final double simWideningMaxStep;
     private final List<Double> simCostFloorLadder;
@@ -183,6 +184,7 @@ public class RevxConfig {
             @Value("${revx.sim.sticky-replace-on-fill}") boolean simStickyReplaceOnFill,
             @Value("${revx.sim.sticky-skew-delta}") double simStickySkewDelta,
             @Value("${revx.sim.sticky-reset-queue}") boolean simStickyResetQueue,
+            @Value("${revx.sim.anchor-leash-ladder}") List<Double> simAnchorLeashLadder,
             @Value("${revx.sim.widening-ladder}") List<Double> simWideningLadder,
             @Value("${revx.sim.widening-max-step}") double simWideningMaxStep,
             @Value("${revx.sim.cost-floor-ladder}") List<Double> simCostFloorLadder,
@@ -283,6 +285,7 @@ public class RevxConfig {
         this.simStickyReplaceOnFill = simStickyReplaceOnFill;
         this.simStickySkewDelta = simStickySkewDelta;
         this.simStickyResetQueue = simStickyResetQueue;
+        this.simAnchorLeashLadder = simAnchorLeashLadder;
         this.simWideningLadder = simWideningLadder;
         this.simWideningMaxStep = simWideningMaxStep;
         this.simCostFloorLadder = simCostFloorLadder;
@@ -578,6 +581,10 @@ public class RevxConfig {
         return new org.home.data.revx.sim.Quoter.Sticky(simStickyEnabled, simStickyOuter,
                 simStickyInner, simStickyMaxAgeMs, simStickyReplaceOnFill,
                 simStickySkewDelta, simStickyResetQueue);
+    }
+
+    public double[] simAnchorLeashLadder() {
+        return simAnchorLeashLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     public double[] simWideningLadder() {

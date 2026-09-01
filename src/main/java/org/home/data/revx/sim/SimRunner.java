@@ -263,6 +263,21 @@ public class SimRunner {
                     new SimEngine(params, limits, cfg.simMakerFee(), policy).run(data.windows())));
         }
 
+        // Бид от ЦЕНЫ ВХОДА с поводком (док. 119). Отвечает на вопрос, который
+        // растущий шаг обошёл: заявка на 2% ниже справедливой не исполняется
+        // никогда, потому что для этого нужен ВЫНОС такой глубины, а не приход
+        // цены. Поводок задаёт всё семейство: равен отступу — прежняя привязка к
+        // рынку, бесконечен — чистая сетка.
+        List<RatioRung> leashLadder = new ArrayList<>();
+        for (double leash : cfg.simAnchorLeashLadder()) {
+            QuotePolicy floored = new CostFloorPolicy(new Quoter(base), 0.0, base.quoteStep());
+            QuotePolicy policy = new AnchoredBidPolicy(floored, base.offset(),
+                    cfg.simGridWidening(), base.offset(), leash, base.size(),
+                    base.inventoryCap(), base.quoteStep());
+            leashLadder.add(new RatioRung(leash,
+                    new SimEngine(base, limits, cfg.simMakerFee(), policy).run(data.windows())));
+        }
+
         // Растущий шаг покупок (док. 117). Отвечает на вопрос ЁМКОСТИ: сколько
         // процентов падения конструкция отрабатывает, прежде чем упрётся в потолок.
         // Ставится ВМЕСТЕ с полом по себестоимости — это и есть кандидат-конструкция
@@ -417,7 +432,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, targetFloored, wideStep, costFloor, gridMargin, gridWidening, gridLots,
+                cross, stopLadder, targetLadder, targetFloored, leashLadder, wideStep, costFloor, gridMargin, gridWidening, gridLots,
                 frozenCool, frozenAge, stickyOuter, stickyInner, queueControl);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
@@ -788,6 +803,7 @@ public class SimRunner {
                           List<RatioRung> shapeLadder, List<CrossCell> cross,
                           List<RatioRung> stopLadder, List<RatioRung> targetLadder,
                           List<RatioRung> targetFloored,
+                          List<RatioRung> leashLadder,
                           List<RatioRung> wideStep, List<RatioRung> costFloor,
                           List<GridRung> gridMargin, List<GridRung> gridWidening,
                           List<GridRung> gridLots,
@@ -1227,6 +1243,46 @@ public class SimRunner {
             appendTargetRow(sb, rung, base, false);
         }
         sb.append("\n");
+
+        sb.append("### Бид от цены входа с поводком (док. 119)\n\n");
+        sb.append("Обычный бид висит на `справедливая × (1 − шаг)` и пересчитывается "
+                + "каждый тик: он никогда не отстаёт, но и исполниться может только от "
+                + "ВЫНОСА такой глубины за один принт. По замеру ленты на 20 б.п. до нас "
+                + "доходит 1.5 сделки в сутки, на 30 — ноль. Поэтому растущий шаг не "
+                + "«покупает глубже», а перестаёт покупать.\n\n");
+        sb.append("Здесь бид привязан к цене последней покупки и ЖДЁТ, пока рынок придёт. "
+                + "Поводок — единственный параметр — задаёт всё семейство: равен отступу "
+                + "(10 б.п.) значит прежняя привязка к рынку, 9.99 значит чистая сетка.\n\n");
+        sb.append("| Поводок | Исполнений | Покупок / продаж | Захват, б.п. | Ср. инвентарь "
+                + "| Время с полным | **Ёмкость падения** | **Просадка** | **Total** "
+                + "| **Buy & hold** | **Альфа** | **При возврате** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : leashLadder) {
+            SimEngine.Result r = rung.result();
+            sb.append("| ").append(rung.ratio() >= 1 ? "∞ (сетка)"
+                            : round(rung.ratio() * 10_000, 1) + " б.п.")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(r.fills().stream()
+                            .filter(f -> f.side() == Side.BUY).count())
+                    .append(" / ").append(r.fills().stream()
+                            .filter(f -> f.side() == Side.SELL).count())
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(r.avgInventory(), 4))
+                    .append(" | ").append(round(100.0 * r.windowsAtCap()
+                            / Math.max(1, r.windows()), 1)).append("%")
+                    .append(" | **").append(capacity(r)).append("**")
+                    .append(" | **").append(round(r.maxDrawdown(), 1)).append("**")
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                    .append(" | **").append(round(r.pnl().total() - r.buyAndHoldPnl(), 1))
+                    .append("**")
+                    .append(" | **").append(round(r.pnlAtStart(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n**Что здесь читать.** Нижняя ступень обязана совпасть со строкой "
+                + "«пол по себестоимости» — это приёмка. Дальше вопрос один: покупает ли "
+                + "ждущая заявка БОЛЬШЕ на падении (колонка «покупок») и во что это "
+                + "обходится на росте, где она остаётся внизу и не исполняется вовсе.\n\n");
 
         sb.append("### Растущий шаг покупок: ёмкость падения (док. 117)\n\n");
         sb.append("Кандидат-конструкция второго бота: **пол по себестоимости на аске "
