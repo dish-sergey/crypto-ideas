@@ -60,13 +60,29 @@ public final class WideningBidPolicy implements QuotePolicy {
         if (inventory >= inventoryCap) {
             return new Quoter.Quotes(null, quotes.ask());
         }
-        return new Quoter.Quotes(round(fair * (1 - step(inventory))), quotes.ask());
+        // ⚠️ Расширение ДОБАВЛЯЕТСЯ к расстоянию внутренней политики, а не
+        // подменяет его. Первая версия ставила бид на `справедливая × (1 − шаг)` и
+        // тем самым выбрасывала вклад скоса — а вместе с ним и цель инвентаря:
+        // у живого бота B цель 0.3 отодвигала аск, но НЕ придвигала бид, то есть
+        // работала ровно половина механизма (найдено 01.09.2026 на живом).
+        //
+        // Теперь при пустом наборе бид в точности такой, каким его хочет
+        // котировщик — при цели 0.3 это 5.7 б.п. вместо 10, — а расширение
+        // включается только по мере накопления.
+        double innerDistance = (fair - quotes.bid()) / fair;
+        double distance = Math.min(maxStep, innerDistance + extraStep(inventory));
+        return new Quoter.Quotes(round(fair * (1 - distance)), quotes.ask());
     }
 
-    /** Расстояние до следующей покупки при текущем наборе. */
-    public double step(double inventory) {
+    /** Насколько ДАЛЬШЕ обычного отодвинута покупка при текущем наборе. */
+    public double extraStep(double inventory) {
         double held = lotSize > 0 ? Math.max(0, inventory) / lotSize : 0;
-        return Math.min(maxStep, baseStep * (1 + widening * held));
+        return baseStep * widening * held;
+    }
+
+    /** Полное расстояние до покупки, если внутренняя политика даёт ровно отступ. */
+    public double step(double inventory) {
+        return Math.min(maxStep, baseStep + extraStep(inventory));
     }
 
     /** Ёмкость падения по геометрии: сумма расстояний до всех N покупок. */

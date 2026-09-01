@@ -74,6 +74,7 @@ public final class ExecBot implements Runnable {
     @Override
     public void run() {
         registerCommands();
+        dropBacklog();
         send("Исполнитель запущен. Котирование ВЫКЛЮЧЕНО — включить: /start\n\n"
                 + ExecLimits.describe());
         while (alive) {
@@ -88,6 +89,45 @@ public final class ExecBot implements Runnable {
                 log.warn("опрос Telegram упал: {}", e.toString());
                 sleep(5_000);
             }
+        }
+    }
+
+    /**
+     * Выбросить накопившиеся сообщения, НЕ выполняя их.
+     *
+     * ⚠️ Telegram держит непрочитанные обновления в очереди и отдаёт их первым же
+     * {@code getUpdates}. Без этого команда, отправленная когда процесса не было,
+     * выполняется при следующем запуске — и 01.09.2026 именно так и вышло: бот B
+     * включил котирование через СЕКУНДУ после старта, подобрав {@code /start},
+     * посланный за восемь минут до его первого запуска.
+     *
+     * Это прямое нарушение правила 1 ({@link QuoteLoop}): «стартует остановленным,
+     * перезапуск после падения не должен сам возобновлять торговлю». Команда
+     * включить торговлю обязана быть НАМЕРЕНИЕМ ЧЕЛОВЕКА В ЭТОТ МОМЕНТ, а не
+     * эхом из прошлого — тем более что упавший бот перезапускается как раз тогда,
+     * когда в чате уже лежат встревоженные команды.
+     */
+    private void dropBacklog() {
+        try {
+            String body = call("getUpdates?timeout=0&offset=-1", null);
+            JsonNode result = JSON.readTree(body).path("result");
+            int dropped = 0;
+            for (JsonNode update : result) {
+                offset = Math.max(offset, update.path("update_id").asLong() + 1);
+                dropped++;
+            }
+            if (dropped > 0) {
+                // Один запрос отдаёт только хвост очереди; сдвинутый offset
+                // подтверждает приём всего, что было до него.
+                call("getUpdates?timeout=0&offset=" + offset, null);
+                log.warn("отброшено накопившихся сообщений Telegram: {} — команды из "
+                        + "прошлого не выполняются", dropped);
+                journal.event("telegram_backlog", "отброшено " + dropped);
+            }
+        } catch (Exception e) {
+            // Не смогли — тем более не выполняем: лучше пропустить команду, чем
+            // включить торговлю по чужому эху.
+            log.warn("не удалось очистить очередь Telegram: {}", e.toString());
         }
     }
 
