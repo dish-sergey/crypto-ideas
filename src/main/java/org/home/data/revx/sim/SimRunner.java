@@ -251,6 +251,17 @@ public class SimRunner {
             }
         }
 
+        // Пол по себестоимости (док. 116). Точечная правка нынешней конструкции:
+        // всё как в базовом прогоне, но аск не опускается ниже средней цены входа.
+        // Вмешательство происходит ТОЛЬКО там, где старое правило велело продать
+        // в минус, поэтому на растущем окне ступени обязаны почти совпасть с базой.
+        List<RatioRung> costFloor = new ArrayList<>();
+        for (double margin : cfg.simCostFloorLadder()) {
+            QuotePolicy floored = new CostFloorPolicy(new Quoter(base), margin, base.quoteStep());
+            costFloor.add(new RatioRung(margin,
+                    new SimEngine(base, limits, cfg.simMakerFee(), floored).run(data.windows())));
+        }
+
         // Сетка с якорем на себестоимости (док. 115). Это не настройка котировщика,
         // а ДРУГАЯ политика: аск привязан к цене покупки лота, а не к рынку.
         // Три лестницы разводят три разных вопроса: сколько просить сверх входа,
@@ -380,7 +391,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, gridMargin, gridWidening, gridLots,
+                cross, stopLadder, targetLadder, costFloor, gridMargin, gridWidening, gridLots,
                 frozenCool, frozenAge, stickyOuter, stickyInner, queueControl);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
@@ -715,6 +726,7 @@ public class SimRunner {
                           List<DriftRung> driftLadder, List<RatioRung> ratioLadder,
                           List<RatioRung> shapeLadder, List<CrossCell> cross,
                           List<RatioRung> stopLadder, List<RatioRung> targetLadder,
+                          List<RatioRung> costFloor,
                           List<GridRung> gridMargin, List<GridRung> gridWidening,
                           List<GridRung> gridLots,
                           List<RatioRung> frozenCool, List<RatioRung> frozenAge,
@@ -1162,6 +1174,56 @@ public class SimRunner {
                     .append(" |\n");
         }
         sb.append("\n");
+
+        sb.append("### Пол по себестоимости: не продавать ниже цены входа (док. 116)\n\n");
+        sb.append("Точечная правка, а не другой механизм. Отступ, скос и гейты работают "
+                + "как прежде; убирается ровно одно правило — то, по которому скос, целясь "
+                + "в нулевой инвентарь, велит разгружаться НИЖЕ цены покупки. Пока рынок "
+                + "выше себестоимости, поведение в точности прежнее.\n\n");
+        sb.append("Дефект, который это чинит, измерен в док. 115 §2: на падении "
+                + "котировщик теряет **−439 даже при полном возврате цены**, то есть "
+                + "убыток реализованный. Колонка «при возврате цены» и есть проверка: "
+                + "если правка работает, там должен исчезнуть минус.\n\n");
+        sb.append("| Маржа над входом | Исполнений | Покупок / продаж | Захват, б.п. "
+                + "| Ср. инвентарь | Время с полным | **Просадка** | **Total** | **Buy & hold** "
+                + "| **При возврате цены** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|\n");
+        sb.append("| **пола нет (база)** | ").append(baseResult.fills().size())
+                .append(" | ").append(baseResult.fills().stream()
+                        .filter(f -> f.side() == Side.BUY).count())
+                .append(" / ").append(baseResult.fills().stream()
+                        .filter(f -> f.side() == Side.SELL).count())
+                .append(" | ").append(round(captureBp(baseResult), 2))
+                .append(" | ").append(round(baseResult.avgInventory(), 4))
+                .append(" | ").append(round(100.0 * baseResult.windowsAtCap()
+                        / Math.max(1, baseResult.windows()), 1)).append("%")
+                .append(" | **").append(round(baseResult.maxDrawdown(), 1)).append("**")
+                .append(" | **").append(round(baseResult.pnl().total(), 1)).append("**")
+                .append(" | **").append(round(baseResult.buyAndHoldPnl(), 1)).append("**")
+                .append(" | **").append(round(baseResult.pnlAtStart(), 1)).append("**")
+                .append(" |\n");
+        for (RatioRung rung : costFloor) {
+            SimEngine.Result r = rung.result();
+            sb.append("| ").append(round(rung.ratio() * 10_000, 1)).append(" б.п.")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(r.fills().stream()
+                            .filter(f -> f.side() == Side.BUY).count())
+                    .append(" / ").append(r.fills().stream()
+                            .filter(f -> f.side() == Side.SELL).count())
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(r.avgInventory(), 4))
+                    .append(" | ").append(round(100.0 * r.windowsAtCap()
+                            / Math.max(1, r.windows()), 1)).append("%")
+                    .append(" | **").append(round(r.maxDrawdown(), 1)).append("**")
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                    .append(" | **").append(round(r.pnlAtStart(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n**Цена правки — «время с полным инвентарём».** Разгрузка на падении "
+                + "прекращается, инвентарь копится до потолка и стоит. Отложенный убыток "
+                + "остаётся отложенным: пол не делает падение прибыльным, он лишь "
+                + "перестаёт превращать его в реализованный убыток.\n\n");
 
         sb.append("### Сетка с якорем на себестоимости (док. 115)\n\n");
         sb.append("Другой механизм, а не настройка. У котировщика аск привязан к рынку "

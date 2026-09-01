@@ -80,6 +80,7 @@ public class RevxConfig {
     private final boolean simStickyReplaceOnFill;
     private final double simStickySkewDelta;
     private final boolean simStickyResetQueue;
+    private final List<Double> simCostFloorLadder;
     private final double simGridMargin;
     private final double simGridBaseStep;
     private final double simGridWidening;
@@ -180,6 +181,7 @@ public class RevxConfig {
             @Value("${revx.sim.sticky-replace-on-fill}") boolean simStickyReplaceOnFill,
             @Value("${revx.sim.sticky-skew-delta}") double simStickySkewDelta,
             @Value("${revx.sim.sticky-reset-queue}") boolean simStickyResetQueue,
+            @Value("${revx.sim.cost-floor-ladder}") List<Double> simCostFloorLadder,
             @Value("${revx.sim.grid-margin}") double simGridMargin,
             @Value("${revx.sim.grid-base-step}") double simGridBaseStep,
             @Value("${revx.sim.grid-widening}") double simGridWidening,
@@ -277,6 +279,7 @@ public class RevxConfig {
         this.simStickyReplaceOnFill = simStickyReplaceOnFill;
         this.simStickySkewDelta = simStickySkewDelta;
         this.simStickyResetQueue = simStickyResetQueue;
+        this.simCostFloorLadder = simCostFloorLadder;
         this.simGridMargin = simGridMargin;
         this.simGridBaseStep = simGridBaseStep;
         this.simGridWidening = simGridWidening;
@@ -569,6 +572,10 @@ public class RevxConfig {
         return new org.home.data.revx.sim.Quoter.Sticky(simStickyEnabled, simStickyOuter,
                 simStickyInner, simStickyMaxAgeMs, simStickyReplaceOnFill,
                 simStickySkewDelta, simStickyResetQueue);
+    }
+
+    public double[] simCostFloorLadder() {
+        return simCostFloorLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     public double simGridMargin() { return simGridMargin; }
