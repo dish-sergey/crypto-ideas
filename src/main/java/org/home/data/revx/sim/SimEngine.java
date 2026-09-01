@@ -47,6 +47,8 @@ public final class SimEngine {
             double fairFirst,
             double fairLast,
             TreeMap<Long, Double> fairSeries,
+            int frozenCycles,             // сколько раз замороженная пара выпускалась заново
+            long frozenHeldWindows,       // окон, в которые пара стояла нетронутой
             ExecutionModel.Stats execution) {
 
         /** Перевыставлений в сутки — сверяется с лимитом запросов (ТЗ §4.2, §5.4 п.6). */
@@ -182,6 +184,12 @@ public final class SimEngine {
         boolean askFilledLast = false;
         int stoppedWindows = 0;
         int erSamples = 0;
+        // Состояние замороженной пары: выставлена ли она и когда её можно трогать.
+        boolean frozenArmed = false;
+        long frozenRequoteAtMs = Long.MIN_VALUE;
+        long frozenPlacedMs = 0;
+        int frozenCycles = 0;
+        long frozenHeldWindows = 0;
 
         for (int wi = 0; wi < windows.size(); wi++) {
             Window window = windows.get(wi);
@@ -207,6 +215,9 @@ public final class SimEngine {
                     restingAsk = null;
                     requotes++;
                 }
+                // Гейт снял пару целиком — значит замораживать больше нечего, и
+                // после его открытия пара выставляется заново как с нуля.
+                frozenArmed = false;
                 paused++;
                 continue;
             }
@@ -287,7 +298,21 @@ public final class SimEngine {
             bidFilledLast = false;
             askFilledLast = false;
 
-            if (!bidSticks && quoter.shouldRequote(restingBid, target.bid())) {
+            // Замороженная пара: пока держим, заявки не трогаем ВООБЩЕ — ни ту, что
+            // уехала, ни ту, что исполнилась. Держим до истечения паузы после
+            // исполнения, а без исполнений — до предохранителя по возрасту (если он
+            // включён) либо бесконечно, и это часть проверяемого правила.
+            boolean frozenHold = false;
+            if (params.frozen().enabled() && frozenArmed) {
+                boolean aged = params.frozen().maxAgeMs() > 0
+                        && window.tsMs() - frozenPlacedMs >= params.frozen().maxAgeMs();
+                frozenHold = !aged && window.tsMs() < frozenRequoteAtMs;
+            }
+            if (frozenHold) {
+                frozenHeldWindows++;
+            }
+
+            if (!frozenHold && !bidSticks && quoter.shouldRequote(restingBid, target.bid())) {
                 execution.cancel(Side.BUY);
                 restingBid = target.bid();
                 if (restingBid != null) {
@@ -297,13 +322,13 @@ public final class SimEngine {
                     bidSkewAtPlace = skewNow;
                 }
                 requotes++;
-            } else if (bidSticks && restingBid != null && params.sticky().resetQueue()) {
+            } else if (!frozenHold && bidSticks && restingBid != null && params.sticky().resetQueue()) {
                 // Контроль M2: цена липкая, приоритет очереди сбрасывается.
                 execution.cancel(Side.BUY);
                 execution.place(Side.BUY, restingBid, params.sizeFor(Side.BUY, pnl.inventory()),
                         window.book(), window.tsMs());
             }
-            if (!askSticks && quoter.shouldRequote(restingAsk, target.ask())) {
+            if (!frozenHold && !askSticks && quoter.shouldRequote(restingAsk, target.ask())) {
                 execution.cancel(Side.SELL);
                 restingAsk = target.ask();
                 if (restingAsk != null) {
@@ -318,12 +343,22 @@ public final class SimEngine {
                     }
                 }
                 requotes++;
-            } else if (askSticks && restingAsk != null && params.sticky().resetQueue()) {
+            } else if (!frozenHold && askSticks && restingAsk != null && params.sticky().resetQueue()) {
                 double size = Math.min(params.sizeFor(Side.SELL, pnl.inventory()), pnl.inventory());
                 if (size > 0) {
                     execution.cancel(Side.SELL);
                     execution.place(Side.SELL, restingAsk, size, window.book(), window.tsMs());
                 }
+            }
+
+            // Пара выставлена заново — замораживаем её до следующего исполнения.
+            if (params.frozen().enabled() && !frozenHold) {
+                if (frozenArmed) {
+                    frozenCycles++;           // это был перевыпуск, а не первая выставка
+                }
+                frozenArmed = true;
+                frozenPlacedMs = window.tsMs();
+                frozenRequoteAtMs = Long.MAX_VALUE;
             }
 
             execution.observe();
@@ -344,6 +379,14 @@ public final class SimEngine {
                 filledQty += fill.qty();
             }
             if (!fills.isEmpty()) {
+                // Замороженная пара размораживается СОБЫТИЕМ, а не расстоянием:
+                // после первого исполнения ждём паузу и выставляем обе стороны
+                // заново. min, а не max — отсчёт идёт от ПЕРВОГО исполнения, иначе
+                // серия сделок подряд отодвигала бы перевыпуск бесконечно.
+                if (params.frozen().enabled()) {
+                    frozenRequoteAtMs = Math.min(frozenRequoteAtMs,
+                            window.tsMs() + params.frozen().coolOffMs());
+                }
                 // исполненную сторону надо будет выставить заново
                 for (Fill fill : fills) {
                     // Исполнение с любой стороны помечает обе: исполнившаяся
@@ -385,6 +428,7 @@ public final class SimEngine {
                 maxInventory, avgInventory, atCap, atZero,
                 gateOpenWindows, erSamples == 0 ? Double.NaN : erSum / erSamples,
                 stopHits, stoppedWindows, filledQty, marketQty, maxDrawdown,
-                fairFirst, fairLast, fairSeries, execution.stats());
+                fairFirst, fairLast, fairSeries, frozenCycles, frozenHeldWindows,
+                execution.stats());
     }
 }

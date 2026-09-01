@@ -122,7 +122,8 @@ public class SimRunner {
                 cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
                 cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
                 cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simStopDrawdownPct(),
-                Quoter.Sticky.OFF, cfg.simStopCoolOffMs(), cfg.simRequoteThreshold(), steps[1]);
+                Quoter.Sticky.OFF, Quoter.Frozen.OFF, cfg.simStopCoolOffMs(),
+                cfg.simRequoteThreshold(), steps[1]);
 
         List<Run> runs = new ArrayList<>();
         SimEngine.Result baseResult = new SimEngine(base, limits, cfg.simMakerFee()).run(data.windows());
@@ -245,6 +246,25 @@ public class SimRunner {
             }
         }
 
+        // Замороженная пара (док. 114). Заявки не двигаются ВООБЩЕ, пока одна не
+        // исполнится; после исполнения пауза, затем обе стороны выставляются заново
+        // и пара замерзает снова. Две лестницы разводят два разных вопроса:
+        // сколько ждать после исполнения и надо ли вообще спасать зависшую пару.
+        List<RatioRung> frozenCool = new ArrayList<>();
+        for (long cool : cfg.simFrozenCoolOffLadder()) {
+            Quoter.Params p = base.withFrozen(new Quoter.Frozen(true, cool,
+                    cfg.simFrozen().maxAgeMs()));
+            frozenCool.add(new RatioRung(cool,
+                    new SimEngine(p, limits, cfg.simMakerFee()).run(data.windows())));
+        }
+        List<RatioRung> frozenAge = new ArrayList<>();
+        for (long age : cfg.simFrozenMaxAgeLadder()) {
+            Quoter.Params p = base.withFrozen(new Quoter.Frozen(true,
+                    cfg.simFrozen().coolOffMs(), age));
+            frozenAge.add(new RatioRung(age,
+                    new SimEngine(p, limits, cfg.simMakerFee()).run(data.windows())));
+        }
+
         // Лестницы липкой котировки. Базовая точка — ВЫКЛЮЧЕННАЯ липкость, и это
         // приёмочное условие задания: она обязана дать в точности прежние числа.
         List<RatioRung> stickyOuter = new ArrayList<>();
@@ -335,12 +355,34 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, stickyOuter, stickyInner, queueControl);
+                cross, stopLadder, targetLadder, frozenCool, frozenAge, stickyOuter,
+                stickyInner, queueControl);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
                 round(baseResult.pnl().spreadCapture(), 4), round(baseResult.pnl().inventoryPnl(), 4),
                 baseResult.fills().size(), out);
+    }
+
+    /** Строка лестницы замороженной пары. Обе лестницы печатают одно и то же. */
+    private void appendFrozenRow(StringBuilder sb, RatioRung rung, SimDataReader.Dataset data) {
+        SimEngine.Result r = rung.result();
+        double edge = netEdgeBp(r, 60_000);
+        double buy = netEdgeBp(r, 60_000, Side.BUY);
+        double sell = netEdgeBp(r, 60_000, Side.SELL);
+        sb.append("| ").append(rung.ratio() == 0 ? "нет" : round(rung.ratio() / 1000.0, 0) + " с")
+                .append(" | ").append(r.frozenCycles())
+                .append(" | ").append(round(100.0 * r.frozenHeldWindows()
+                        / Math.max(1, r.windows()), 1)).append("%")
+                .append(" | ").append(r.fills().size())
+                .append(" | ").append(round(captureBp(r), 2))
+                .append(" | ").append(round(edge, 2))
+                .append(" | ").append(round(buy, 2)).append(" / ").append(round(sell, 2))
+                .append(" | **").append(round(edge * turnover(r) / 10_000, 1)).append("**")
+                .append(" | ").append(round(r.avgInventory(), 4))
+                .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                .append(" |\n");
     }
 
     /** Базовый отступ плюс лестница, по возрастанию и без дублей. */
@@ -598,6 +640,7 @@ public class SimRunner {
                           List<DriftRung> driftLadder, List<RatioRung> ratioLadder,
                           List<RatioRung> shapeLadder, List<CrossCell> cross,
                           List<RatioRung> stopLadder, List<RatioRung> targetLadder,
+                          List<RatioRung> frozenCool, List<RatioRung> frozenAge,
                           List<RatioRung> stickyOuter, List<RatioRung> stickyInner,
                           List<java.util.Map.Entry<String, SimEngine.Result>> queueControl) {
         StringBuilder sb = new StringBuilder();
@@ -1042,6 +1085,43 @@ public class SimRunner {
                     .append(" |\n");
         }
         sb.append("\n");
+
+        sb.append("### Замороженная пара: двигаем только ПОСЛЕ исполнения (док. 114)\n\n");
+        sb.append("Правило: выставили бид и аск и не трогаем их вовсе, пока одна "
+                + "сторона не исполнится. После исполнения — пауза, затем обе стороны "
+                + "выставляются заново по текущей справедливой цене и текущему "
+                + "инвентарю, и пара снова замерзает.\n\n");
+        sb.append("Отличие от липкой котировки: там решение принимается по "
+                + "РАССТОЯНИЮ и упирается в невыбираемые пороги (док. 110 §8), здесь — "
+                + "по СОБЫТИЮ, и порогов нет вовсе. Против правила работает то же, что "
+                + "убило M3: неподвижная заявка при уходе цены оказывается по невыгодную "
+                + "сторону справедливой, и исполняется первой именно она. Поэтому "
+                + "решающая колонка — **разрыв между покупками и продажами по краю**: "
+                + "если выживает всегда та сторона, от которой рынок ушёл, разрыв "
+                + "разъедется.\n\n");
+        sb.append("**Пауза после исполнения** (предохранитель по возрасту — из конфига)\n\n");
+        sb.append("| Пауза | Выпусков пары | Доля времени замороженной | Исполнений "
+                + "| Захват, б.п. | Чистый край | Край: покупки / продажи | **Край × оборот** "
+                + "| Ср. инвентарь | **Total** | **Buy & hold** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : frozenCool) {
+            appendFrozenRow(sb, rung, data);
+        }
+        sb.append("\n**Предохранитель по возрасту: спасать ли зависшую пару** "
+                + "(0 = правило в чистом виде)\n\n");
+        sb.append("| Возраст | Выпусков пары | Доля времени замороженной | Исполнений "
+                + "| Захват, б.п. | Чистый край | Край: покупки / продажи | **Край × оборот** "
+                + "| Ср. инвентарь | **Total** | **Buy & hold** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : frozenAge) {
+            appendFrozenRow(sb, rung, data);
+        }
+        sb.append("\n**Как читать.** «Выпусков пары» — сколько раз за окно правило "
+                + "сработало целиком; малое число означает, что пара зависла и торговли "
+                + "не было. «Доля времени замороженной» показывает то же с другой "
+                + "стороны. Сравнивать с базовым прогоном надо по **краю × оборот**: "
+                + "правило меняет и качество сделки, и их число, и `total` смешивает это "
+                + "с бетой.\n\n");
 
         sb.append("### Липкая котировка — задание Z8 (док. 109 §II)\n\n");
         sb.append("Гипотеза: часть измеренной пошлины создаётся **самим переставлением** "

@@ -27,6 +27,7 @@ public final class Quoter implements QuotePolicy {
             long erSampleMs,          // шаг прореживания ряда для ER
             double stopDrawdownPct,   // стоп по просадке, % от номинала потолка (0 = выкл.)
             Sticky sticky,            // липкая котировка (док. 109 §II)
+            Frozen frozen,            // замороженная пара: двигаем только после исполнения
             long stopCoolOffMs,       // сколько не набирать после срабатывания
             double requoteThreshold,  // порог перевыставления, доля цены
             double quoteStep) {       // шаг цены пары
@@ -35,13 +36,13 @@ public final class Quoter implements QuotePolicy {
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double requoteThreshold, double quoteStep) {
             this(offset, size, inventoryCap, skewK, 0.0, 0.0, 1.0, 0L, 0.0, 0.0, 0L, 0L,
-                    0.0, Sticky.OFF, 0L, requoteThreshold, quoteStep);
+                    0.0, Sticky.OFF, Frozen.OFF, 0L, requoteThreshold, quoteStep);
         }
 
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double skewTarget, double requoteThreshold, double quoteStep) {
             this(offset, size, inventoryCap, skewK, skewTarget, 0.0, 1.0, 0L, 0.0, 0.0, 0L, 0L,
-                    0.0, Sticky.OFF, 0L, requoteThreshold, quoteStep);
+                    0.0, Sticky.OFF, Frozen.OFF, 0L, requoteThreshold, quoteStep);
         }
 
         // Точечные изменения параметров живут ЗДЕСЬ, а не в лестницах стенда.
@@ -52,7 +53,7 @@ public final class Quoter implements QuotePolicy {
         public Params withOffset(double v) {
             return new Params(v, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         /** Потолок вместе с ПРОПОРЦИОНАЛЬНЫМ лотом — см. док. 97 §1. */
@@ -60,56 +61,62 @@ public final class Quoter implements QuotePolicy {
             double factor = inventoryCap > 0 ? v / inventoryCap : 1;
             return new Params(offset, size * factor, v, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withSkewK(double v) {
             return new Params(offset, size, inventoryCap, v, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withSkewTarget(double v) {
             return new Params(offset, size, inventoryCap, skewK, v, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withDriftBeta(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, v,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withBuyRatio(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     v, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withShapeEta(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, v, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         /** Стоп по просадке: порог в долях номинала потолка (док. 107 §5). */
         public Params withSticky(Sticky v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, stopDrawdownPct, v, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, v, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
+        }
+
+        public Params withFrozen(Frozen v) {
+            return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
+                    buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
+                    erSampleMs, stopDrawdownPct, sticky, v, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withStopDrawdownPct(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs,
-                    erSampleMs, v, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, v, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         public Params withDriftGateEr(double v) {
             return new Params(offset, size, inventoryCap, skewK, skewTarget, driftBeta,
                     buySizeRatio, driftWindowMs, sizeShapeEta, v, erWindowMs,
-                    erSampleMs, stopDrawdownPct, sticky, stopCoolOffMs, requoteThreshold, quoteStep);
+                    erSampleMs, stopDrawdownPct, sticky, frozen, stopCoolOffMs, requoteThreshold, quoteStep);
         }
 
         /**
@@ -183,6 +190,44 @@ public final class Quoter implements QuotePolicy {
         public Sticky withResetQueue(boolean v) {
             return new Sticky(enabled, outerMult, innerMult, maxAgeMs, replaceOnFill,
                     skewDelta, v);
+        }
+    }
+
+    /**
+     * Замороженная пара: выставили обе заявки и НЕ ДВИГАЕМ их вовсе, пока одна не
+     * исполнится. После исполнения — пауза, затем обе стороны выставляются заново
+     * по текущей справедливой цене и текущему инвентарю, и пара снова замерзает.
+     *
+     * Это не разновидность липкой котировки из {@link Sticky}: там решение о
+     * переставлении принимается по РАССТОЯНИЮ (уехала заявка далеко или, наоборот,
+     * сползла к справедливой цене), здесь — по СОБЫТИЮ. Пороги расстояния
+     * оказались невыбираемыми (док. 110 §8), событие порогов не имеет вовсе.
+     *
+     * Гипотеза, которую режим проверяет: если исполнения происходят часто, то
+     * заявка, стоящая на полном отступе и никогда не догоняющая цену, забирает
+     * весь отступ целиком — в отличие от переставляемой, которая платит пошлину
+     * на каждом движении.
+     *
+     * Против гипотезы работает то же, что убило M3: неподвижная заявка при уходе
+     * цены оказывается по НЕВЫГОДНУЮ сторону справедливой и исполняется первой
+     * именно там. Выживает всегда та сторона, от которой рынок ушёл.
+     *
+     *  coolOffMs   сколько ждать после исполнения, прежде чем выставлять пару заново
+     *  maxAgeMs    предохранитель: переставить пару, даже если ничего не исполнилось.
+     *              0 = выключен, то есть правило в чистом виде — без исполнения
+     *              заявки висят вечно
+     */
+    public record Frozen(boolean enabled, long coolOffMs, long maxAgeMs) {
+
+        /** Выключено: поведение в точности прежнее. */
+        public static final Frozen OFF = new Frozen(false, 0, 0);
+
+        public Frozen withCoolOff(long v) {
+            return new Frozen(true, v, maxAgeMs);
+        }
+
+        public Frozen withMaxAge(long v) {
+            return new Frozen(true, coolOffMs, v);
         }
     }
 

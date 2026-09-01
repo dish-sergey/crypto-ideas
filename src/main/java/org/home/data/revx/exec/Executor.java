@@ -86,7 +86,8 @@ public class Executor {
                 cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
                 cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
                 cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simStopDrawdownPct(),
-                Quoter.Sticky.OFF, cfg.simStopCoolOffMs(), cfg.simRequoteThreshold(), quoteStep());
+                Quoter.Sticky.OFF, Quoter.Frozen.OFF, cfg.simStopCoolOffMs(),
+                cfg.simRequoteThreshold(), quoteStep());
         QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs,
                 minNotional());
 

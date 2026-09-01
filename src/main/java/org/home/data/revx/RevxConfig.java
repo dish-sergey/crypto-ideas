@@ -80,6 +80,11 @@ public class RevxConfig {
     private final boolean simStickyReplaceOnFill;
     private final double simStickySkewDelta;
     private final boolean simStickyResetQueue;
+    private final boolean simFrozenEnabled;
+    private final long simFrozenCoolOffMs;
+    private final long simFrozenMaxAgeMs;
+    private final List<Long> simFrozenCoolOffLadder;
+    private final List<Long> simFrozenMaxAgeLadder;
     private final List<Double> simSkewTargetLadder;
     private final List<Double> simStickyOuterLadder;
     private final List<Double> simStickyInnerLadder;
@@ -168,6 +173,11 @@ public class RevxConfig {
             @Value("${revx.sim.sticky-replace-on-fill}") boolean simStickyReplaceOnFill,
             @Value("${revx.sim.sticky-skew-delta}") double simStickySkewDelta,
             @Value("${revx.sim.sticky-reset-queue}") boolean simStickyResetQueue,
+            @Value("${revx.sim.frozen-enabled}") boolean simFrozenEnabled,
+            @Value("${revx.sim.frozen-cool-off-ms}") long simFrozenCoolOffMs,
+            @Value("${revx.sim.frozen-max-age-ms}") long simFrozenMaxAgeMs,
+            @Value("${revx.sim.frozen-cool-off-ladder}") List<Long> simFrozenCoolOffLadder,
+            @Value("${revx.sim.frozen-max-age-ladder}") List<Long> simFrozenMaxAgeLadder,
             @Value("${revx.sim.skew-target-ladder}") List<Double> simSkewTargetLadder,
             @Value("${revx.sim.sticky-outer-ladder}") List<Double> simStickyOuterLadder,
             @Value("${revx.sim.sticky-inner-ladder}") List<Double> simStickyInnerLadder,
@@ -253,6 +263,11 @@ public class RevxConfig {
         this.simStickyReplaceOnFill = simStickyReplaceOnFill;
         this.simStickySkewDelta = simStickySkewDelta;
         this.simStickyResetQueue = simStickyResetQueue;
+        this.simFrozenEnabled = simFrozenEnabled;
+        this.simFrozenCoolOffMs = simFrozenCoolOffMs;
+        this.simFrozenMaxAgeMs = simFrozenMaxAgeMs;
+        this.simFrozenCoolOffLadder = simFrozenCoolOffLadder;
+        this.simFrozenMaxAgeLadder = simFrozenMaxAgeLadder;
         this.simSkewTargetLadder = simSkewTargetLadder;
         this.simStickyOuterLadder = simStickyOuterLadder;
         this.simStickyInnerLadder = simStickyInnerLadder;
@@ -533,6 +548,18 @@ public class RevxConfig {
         return new org.home.data.revx.sim.Quoter.Sticky(simStickyEnabled, simStickyOuter,
                 simStickyInner, simStickyMaxAgeMs, simStickyReplaceOnFill,
                 simStickySkewDelta, simStickyResetQueue);
+    }
+
+    public org.home.data.revx.sim.Quoter.Frozen simFrozen() {
+        return new org.home.data.revx.sim.Quoter.Frozen(simFrozenEnabled, simFrozenCoolOffMs, simFrozenMaxAgeMs);
+    }
+
+    public long[] simFrozenCoolOffLadder() {
+        return simFrozenCoolOffLadder.stream().mapToLong(Long::longValue).toArray();
+    }
+
+    public long[] simFrozenMaxAgeLadder() {
+        return simFrozenMaxAgeLadder.stream().mapToLong(Long::longValue).toArray();
     }
 
     public double[] simSkewTargetLadder() {
