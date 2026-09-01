@@ -80,6 +80,13 @@ public class RevxConfig {
     private final boolean simStickyReplaceOnFill;
     private final double simStickySkewDelta;
     private final boolean simStickyResetQueue;
+    private final double simGridMargin;
+    private final double simGridBaseStep;
+    private final double simGridWidening;
+    private final double simGridMaxStep;
+    private final List<Double> simGridMarginLadder;
+    private final List<Double> simGridWideningLadder;
+    private final List<Integer> simGridLotsLadder;
     private final boolean simFrozenEnabled;
     private final long simFrozenCoolOffMs;
     private final long simFrozenMaxAgeMs;
@@ -173,6 +180,13 @@ public class RevxConfig {
             @Value("${revx.sim.sticky-replace-on-fill}") boolean simStickyReplaceOnFill,
             @Value("${revx.sim.sticky-skew-delta}") double simStickySkewDelta,
             @Value("${revx.sim.sticky-reset-queue}") boolean simStickyResetQueue,
+            @Value("${revx.sim.grid-margin}") double simGridMargin,
+            @Value("${revx.sim.grid-base-step}") double simGridBaseStep,
+            @Value("${revx.sim.grid-widening}") double simGridWidening,
+            @Value("${revx.sim.grid-max-step}") double simGridMaxStep,
+            @Value("${revx.sim.grid-margin-ladder}") List<Double> simGridMarginLadder,
+            @Value("${revx.sim.grid-widening-ladder}") List<Double> simGridWideningLadder,
+            @Value("${revx.sim.grid-lots-ladder}") List<Integer> simGridLotsLadder,
             @Value("${revx.sim.frozen-enabled}") boolean simFrozenEnabled,
             @Value("${revx.sim.frozen-cool-off-ms}") long simFrozenCoolOffMs,
             @Value("${revx.sim.frozen-max-age-ms}") long simFrozenMaxAgeMs,
@@ -263,6 +277,13 @@ public class RevxConfig {
         this.simStickyReplaceOnFill = simStickyReplaceOnFill;
         this.simStickySkewDelta = simStickySkewDelta;
         this.simStickyResetQueue = simStickyResetQueue;
+        this.simGridMargin = simGridMargin;
+        this.simGridBaseStep = simGridBaseStep;
+        this.simGridWidening = simGridWidening;
+        this.simGridMaxStep = simGridMaxStep;
+        this.simGridMarginLadder = simGridMarginLadder;
+        this.simGridWideningLadder = simGridWideningLadder;
+        this.simGridLotsLadder = simGridLotsLadder;
         this.simFrozenEnabled = simFrozenEnabled;
         this.simFrozenCoolOffMs = simFrozenCoolOffMs;
         this.simFrozenMaxAgeMs = simFrozenMaxAgeMs;
@@ -548,6 +569,26 @@ public class RevxConfig {
         return new org.home.data.revx.sim.Quoter.Sticky(simStickyEnabled, simStickyOuter,
                 simStickyInner, simStickyMaxAgeMs, simStickyReplaceOnFill,
                 simStickySkewDelta, simStickyResetQueue);
+    }
+
+    public double simGridMargin() { return simGridMargin; }
+
+    public double simGridBaseStep() { return simGridBaseStep; }
+
+    public double simGridWidening() { return simGridWidening; }
+
+    public double simGridMaxStep() { return simGridMaxStep; }
+
+    public double[] simGridMarginLadder() {
+        return simGridMarginLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    public double[] simGridWideningLadder() {
+        return simGridWideningLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    public int[] simGridLotsLadder() {
+        return simGridLotsLadder.stream().mapToInt(Integer::intValue).toArray();
     }
 
     public org.home.data.revx.sim.Quoter.Frozen simFrozen() {

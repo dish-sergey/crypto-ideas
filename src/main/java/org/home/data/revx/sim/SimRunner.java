@@ -81,6 +81,11 @@ public class SimRunner {
     private record RatioRung(double ratio, SimEngine.Result result) {
     }
 
+    /** Ступень сетки: своя политика, поэтому нужен и сам котировщик — за книгой лотов. */
+    private record GridRung(double margin, double widening, int lots, double cap,
+                            GridQuoter quoter, SimEngine.Result result) {
+    }
+
     /** Клетка кросса: два механизма торможения набора одновременно. */
     private record CrossCell(double beta, double eta, SimEngine.Result result) {
     }
@@ -246,6 +251,26 @@ public class SimRunner {
             }
         }
 
+        // Сетка с якорем на себестоимости (док. 115). Это не настройка котировщика,
+        // а ДРУГАЯ политика: аск привязан к цене покупки лота, а не к рынку.
+        // Три лестницы разводят три разных вопроса: сколько просить сверх входа,
+        // как быстро тормозить набор и сколько капитала нужно, чтобы дожить.
+        List<GridRung> gridMargin = new ArrayList<>();
+        for (double margin : cfg.simGridMarginLadder()) {
+            gridMargin.add(gridRun(base, limits, data, margin, cfg.simGridWidening(),
+                    defaultGridLots(base)));
+        }
+        List<GridRung> gridWidening = new ArrayList<>();
+        for (double widening : cfg.simGridWideningLadder()) {
+            gridWidening.add(gridRun(base, limits, data, cfg.simGridMargin(), widening,
+                    defaultGridLots(base)));
+        }
+        List<GridRung> gridLots = new ArrayList<>();
+        for (int lots : cfg.simGridLotsLadder()) {
+            gridLots.add(gridRun(base, limits, data, cfg.simGridMargin(),
+                    cfg.simGridWidening(), lots));
+        }
+
         // Замороженная пара (док. 114). Заявки не двигаются ВООБЩЕ, пока одна не
         // исполнится; после исполнения пауза, затем обе стороны выставляются заново
         // и пара замерзает снова. Две лестницы разводят два разных вопроса:
@@ -355,13 +380,63 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, frozenCool, frozenAge, stickyOuter,
-                stickyInner, queueControl);
+                cross, stopLadder, targetLadder, gridMargin, gridWidening, gridLots,
+                frozenCool, frozenAge, stickyOuter, stickyInner, queueControl);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
                 round(baseResult.pnl().spreadCapture(), 4), round(baseResult.pnl().inventoryPnl(), 4),
                 baseResult.fills().size(), out);
+    }
+
+    /** Сколько лотов держит базовый потолок — точка отсчёта для лестницы капитала. */
+    private static int defaultGridLots(Quoter.Params base) {
+        return base.size() > 0 ? (int) Math.round(base.inventoryCap() / base.size()) : 5;
+    }
+
+    /**
+     * Один прогон сетки. Потолок задаётся в ЛОТАХ, а не в монетах: вопрос ступени —
+     * «на сколько докупок хватает капитала», и в лотах он читается прямо.
+     */
+    private GridRung gridRun(Quoter.Params base, ExecutionModel.Limits limits,
+                             SimDataReader.Dataset data, double margin, double widening,
+                             int lots) {
+        double cap = base.size() * lots;
+        GridQuoter grid = new GridQuoter(base.size(), margin, cfg.simGridBaseStep(),
+                widening, cfg.simGridMaxStep(), cap, base.quoteStep());
+        // Потолок передаётся и в Params: по нему движок считает «время с полным
+        // инвентарём» и размер стопа, и разойтись эти два числа не должны.
+        Quoter.Params params = base.withCap(cap).withOffset(cfg.simGridBaseStep());
+        SimEngine.Result result = new SimEngine(params, limits, cfg.simMakerFee(), grid)
+                .run(data.windows());
+        return new GridRung(margin, widening, lots, cap, grid, result);
+    }
+
+    private static void appendGridHeader(StringBuilder sb, String first) {
+        sb.append("| ").append(first).append(" | Исполнений | Покупок / продаж "
+                + "| Захват, б.п. | Ср. инвентарь | Время с полным | **Просадка** "
+                + "| Открытых лотов на конце | **Total** | **Buy & hold** "
+                + "| **При возврате цены** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
+    }
+
+    private static void appendGridRow(StringBuilder sb, String label, GridRung rung) {
+        SimEngine.Result r = rung.result();
+        long buys = r.fills().stream().filter(f -> f.side() == Side.BUY).count();
+        long sells = r.fills().size() - buys;
+        sb.append("| ").append(label)
+                .append(" | ").append(r.fills().size())
+                .append(" | ").append(buys).append(" / ").append(sells)
+                .append(" | ").append(round(captureBp(r), 2))
+                .append(" | ").append(round(r.avgInventory(), 4))
+                .append(" | ").append(round(100.0 * r.windowsAtCap()
+                        / Math.max(1, r.windows()), 1)).append("%")
+                .append(" | **").append(round(r.maxDrawdown(), 1)).append("**")
+                .append(" | ").append(rung.quoter().openLots())
+                .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
+                .append(" | **").append(round(r.pnlAtStart(), 1)).append("**")
+                .append(" |\n");
     }
 
     /** Строка лестницы замороженной пары. Обе лестницы печатают одно и то же. */
@@ -640,6 +715,8 @@ public class SimRunner {
                           List<DriftRung> driftLadder, List<RatioRung> ratioLadder,
                           List<RatioRung> shapeLadder, List<CrossCell> cross,
                           List<RatioRung> stopLadder, List<RatioRung> targetLadder,
+                          List<GridRung> gridMargin, List<GridRung> gridWidening,
+                          List<GridRung> gridLots,
                           List<RatioRung> frozenCool, List<RatioRung> frozenAge,
                           List<RatioRung> stickyOuter, List<RatioRung> stickyInner,
                           List<java.util.Map.Entry<String, SimEngine.Result>> queueControl) {
@@ -1085,6 +1162,57 @@ public class SimRunner {
                     .append(" |\n");
         }
         sb.append("\n");
+
+        sb.append("### Сетка с якорем на себестоимости (док. 115)\n\n");
+        sb.append("Другой механизм, а не настройка. У котировщика аск привязан к рынку "
+                + "(`справедливая × (1 + отступ − скос)`), и при уходе цены вниз скос "
+                + "велит разгружаться — то есть продавать в убыток. Здесь аск привязан к "
+                + "ЦЕНЕ ПОКУПКИ лота (`вход × (1 + маржа)`): продаём только дороже, чем "
+                + "купили, а падение переживаем накоплением. Бид ставится на "
+                + "`справедливая × (1 − шаг)`, где шаг растёт с числом набранных лотов.\n\n");
+        sb.append("**Решающая колонка — «при возврате цены».** Обычный `total` оценивает "
+                + "инвентарь по цене на КОНЦЕ окна, а окно падения кончается на дне: там "
+                + "любая накопительная стратегия выглядит плохо, и разность с `buy & hold` "
+                + "меряет не эдж, а разницу позиций. Колонка «при возврате» отвечает на "
+                + "другой вопрос: сколько останется, если цена вернётся к началу окна. "
+                + "Контроль `buy & hold` в этой точке тождественно равен нулю, поэтому "
+                + "число само по себе и есть альфа сценария возврата.\n\n");
+        sb.append("**И решающая строка — падение.** Правило «продавать только выше входа» "
+                + "делает каждую закрытую сделку прибыльной по построению; убыток целиком "
+                + "уходит в незакрытый инвентарь. Смотреть надо на просадку и на то, "
+                + "сколько лотов осталось открытыми.\n\n");
+
+        sb.append("**Опорная точка — обычный котировщик**\n\n");
+        sb.append("| | Исполнений | Ср. инвентарь | Просадка | **Total** | **Buy & hold** "
+                + "| **При возврате цены** |\n|---|---|---|---|---|---|---|\n");
+        sb.append("| котировщик, отступ ").append(round(base.offset() * 10_000, 1))
+                .append(" б.п. | ").append(baseResult.fills().size())
+                .append(" | ").append(round(baseResult.avgInventory(), 4))
+                .append(" | ").append(round(baseResult.maxDrawdown(), 1))
+                .append(" | **").append(round(baseResult.pnl().total(), 1)).append("**")
+                .append(" | **").append(round(baseResult.buyAndHoldPnl(), 1)).append("**")
+                .append(" | **").append(round(baseResult.pnlAtStart(), 1)).append("**")
+                .append(" |\n\n");
+
+        sb.append("**Лестница маржи: сколько просить сверх цены входа**\n\n");
+        appendGridHeader(sb, "Маржа");
+        for (GridRung rung : gridMargin) {
+            appendGridRow(sb, round(rung.margin() * 10_000, 1) + " б.п.", rung);
+        }
+        sb.append("\n**Лестница торможения набора: во сколько раз шаг растёт на лот**\n\n");
+        appendGridHeader(sb, "η");
+        for (GridRung rung : gridWidening) {
+            appendGridRow(sb, String.valueOf(round(rung.widening(), 2)), rung);
+        }
+        sb.append("\n**Лестница капитала: на сколько докупок хватает потолка**\n\n");
+        appendGridHeader(sb, "Лотов");
+        for (GridRung rung : gridLots) {
+            appendGridRow(sb, rung.lots() + " (потолок " + round(rung.cap(), 3) + ")", rung);
+        }
+        sb.append("\n**Как читать.** «Открытых лотов на конце» — сколько покупок так и не "
+                + "нашли выхода; это и есть перенесённый в будущее убыток. «Время с полным "
+                + "инвентарём» показывает, где сетка упёрлась в капитал и перестала быть "
+                + "стратегией вовсе.\n\n");
 
         sb.append("### Замороженная пара: двигаем только ПОСЛЕ исполнения (док. 114)\n\n");
         sb.append("Правило: выставили бид и аск и не трогаем их вовсе, пока одна "

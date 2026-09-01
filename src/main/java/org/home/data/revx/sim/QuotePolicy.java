@@ -19,6 +19,14 @@ public interface QuotePolicy {
      */
     Quoter.Quotes quotes(double fair, double inventory, double drift);
 
+    /**
+     * Исполнение состоялось. Политике это нужно, только если её цены зависят от
+     * СОБСТВЕННОЙ истории сделок, а не от одного рынка — как у { GridQuoter},
+     * где аск привязан к цене входа. Остальным политикам знать об этом незачем.
+     */
+    default void onFill(Fill fill) {
+    }
+
     /** Без дрейфа — историческое поведение. */
     default Quoter.Quotes quotes(double fair, double inventory) {
         return quotes(fair, inventory, 0);

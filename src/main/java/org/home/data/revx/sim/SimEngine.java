@@ -47,6 +47,7 @@ public final class SimEngine {
             double fairFirst,
             double fairLast,
             TreeMap<Long, Double> fairSeries,
+            double pnlAtStart,            // P&L, если бы цена вернулась к началу окна (b&h там = 0)
             int frozenCycles,             // сколько раз замороженная пара выпускалась заново
             long frozenHeldWindows,       // окон, в которые пара стояла нетронутой
             ExecutionModel.Stats execution) {
@@ -377,6 +378,9 @@ public final class SimEngine {
                 pnl.add(fill);
                 allFills.add(fill);
                 filledQty += fill.qty();
+                // Политике, чьи цены зависят от собственных сделок, факт исполнения
+                // нужен раньше, чем следующий вызов quotes.
+                policy.onFill(fill);
             }
             if (!fills.isEmpty()) {
                 // Замороженная пара размораживается СОБЫТИЕМ, а не расстоянием:
@@ -428,7 +432,7 @@ public final class SimEngine {
                 maxInventory, avgInventory, atCap, atZero,
                 gateOpenWindows, erSamples == 0 ? Double.NaN : erSum / erSamples,
                 stopHits, stoppedWindows, filledQty, marketQty, maxDrawdown,
-                fairFirst, fairLast, fairSeries, frozenCycles, frozenHeldWindows,
-                execution.stats());
+                fairFirst, fairLast, fairSeries, pnl.markAtStart(fairFirst),
+                frozenCycles, frozenHeldWindows, execution.stats());
     }
 }
