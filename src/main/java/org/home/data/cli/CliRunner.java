@@ -220,6 +220,14 @@ public class CliRunner implements ApplicationRunner {
                                 ? Double.valueOf(firstOr(args, "offset", "0")) : null,
                         firstOr(args, "out", "reports/revx_exec.md"));
             }
+            if (args.containsOption("revx-perp-basis")) {
+                revx.getObject().perpBasis(
+                        List.of(firstOr(args, "symbols", "BTC/USDC,ETH/USDC,SOL/USDC").split(",")),
+                        Integer.parseInt(firstOr(args, "hours", "96")),
+                        java.time.Instant.parse(firstOr(args, "to",
+                                java.time.Instant.now().toString())).toEpochMilli(),
+                        firstOr(args, "out", "reports/revx_perp_basis.md"));
+            }
             if (args.containsOption("revx-screen")) {
                 revx.getObject().screen(
                         Integer.parseInt(firstOr(args, "hours", "96")),
