@@ -1147,12 +1147,14 @@ public class SimRunner {
         }
         ArrivalLaw.Fit fitFills = ArrivalLaw.fit(byFills);
         ArrivalLaw.Fit fitTurnover = ArrivalLaw.fit(byTurnover);
-        sb.append("| Подгонка | κ | 1/κ, б.п. | R² | Держится |\n|---|---|---|---|---|\n");
-        sb.append("| по числу исполнений | ").append(round(fitFills.kappa(), 1))
+        sb.append("| Подгонка | **A** | κ | 1/κ, б.п. | R² | Держится |\n|---|---|---|---|---|---|\n");
+        sb.append("| по числу исполнений | ").append(round(fitFills.a(), 1))
+                .append(" | ").append(round(fitFills.kappa(), 1))
                 .append(" | ").append(round(10_000 / Math.max(1e-9, fitFills.kappa()), 2))
                 .append(" | ").append(round(fitFills.rSquared(), 3))
                 .append(" | ").append(fitFills.holds() ? "да" : "**нет**").append(" |\n");
-        sb.append("| **по обороту** | ").append(round(fitTurnover.kappa(), 1))
+        sb.append("| **по обороту** | ").append(round(fitTurnover.a(), 1))
+                .append(" | ").append(round(fitTurnover.kappa(), 1))
                 .append(" | **").append(round(10_000 / Math.max(1e-9, fitTurnover.kappa()), 2))
                 .append("** | ").append(round(fitTurnover.rSquared(), 3))
                 .append(" | ").append(fitTurnover.holds() ? "да" : "**нет**").append(" |\n\n");
@@ -1175,6 +1177,23 @@ public class SimRunner {
         sb.append("| **формула `δ* = c + 1/κ`** | **")
                 .append(round(fitTurnover.optimalOffset(costFraction) * 10_000, 2)).append("** |\n");
         sb.append("| наш рабочий `d` | ").append(round(base.offset() * 10_000, 2)).append(" |\n\n");
+        // Скорость дохода в собственном оптимуме — величина, по которой пары
+        // сравниваются между собой (док. 132 §2). Здесь `A` и `κ` НАШИ, а не
+        // ленточные, поэтому смещения «лента завышает приходы на расстоянии»
+        // (док. 134 §9) в ней нет.
+        double revenueRate = fitTurnover.kappa() > 0
+                ? fitTurnover.a() * Math.exp(-fitTurnover.kappa() * costFraction)
+                        / (Math.E * fitTurnover.kappa())
+                : Double.NaN;
+        sb.append("| **Скорость дохода в оптимуме** `A·e^{−κc}/(e·κ)` | **")
+                .append(Double.isNaN(revenueRate) ? "—" : round(revenueRate, 2))
+                .append("** |\n\n");
+        sb.append("Последняя строка — то, по чему пары сравниваются между собой "
+                + "(док. 132 §2, док. 134 §9). Здесь `A` и `κ` измерены НАШИМИ "
+                + "исполнениями, а не лентой, поэтому смещения «лента завышает приходы на "
+                + "расстоянии, и тем сильнее, чем шире пара» в ней нет. Число сопоставимо "
+                + "между прогонами, сделанными на ОДНОМ окне и ОДНОМ номинале лота: `A` "
+                + "выражен в обороте за окно, а не в час.\n\n");
         sb.append("Замкнутая формула — независимая проверка настройки с другой стороны: "
                 + "два измеренных параметра вместо перебора по трём окнам. Без "
                 + "слагаемого `c`, которого в моделях нет вовсе, формула дала бы "
@@ -1375,6 +1394,23 @@ public class SimRunner {
                 .append(cfg.simHedgeRoundDown() ? "**вниз** (нетто-шорта не возникает)"
                         : "**к ближайшему** (возможен нетто-шорт до половины шага)")
                 .append(".\n\n");
+        // Настоящий критерий работоспособности — не ступени на ПОТОЛОК, а
+        // средний инвентарь в ступенях (док. 134 §8). Хедж срабатывает, когда
+        // позиция пересекает границу шага; если она в среднем меньше шага,
+        // пересекать нечего, и хедж не «грубоват», а просто не совершается.
+        double meanSteps = hedgeStep > 0 ? baseResult.avgInventory() / hedgeStep : Double.NaN;
+        sb.append("**Работает ли хедж вообще** (док. 134 §8): критерий — не ступени на "
+                + "потолок, а **средний инвентарь в ступенях**, потому что хедж "
+                + "срабатывает только при пересечении границы шага. Здесь средний "
+                + "инвентарь ").append(trimNum(round(baseResult.avgInventory(), 8)))
+                .append(" = **").append(round(meanSteps, 2))
+                .append(" шага контракта**")
+                .append(meanSteps < 1 ? " — это МЕНЬШЕ одного шага, то есть хеджировать "
+                        + "нечего почти всё время"
+                        : meanSteps < 3 ? " — на грани: хедж срабатывает редко"
+                        : " — хеджу есть что ловить")
+                .append(". Потолок в этой оценке не участвует: инвентарь до него не "
+                        + "доходит, а платим мы за то, что несём в среднем.\n\n");
         sb.append("**Контроль здесь другой.** Захеджированная конструкция рыночно "
                 + "нейтральна, поэтому сравнивать её с `buy & hold` бессмысленно — "
                 + "сравнивать надо с **нулём**: весь результат обязан приходить из захвата "
