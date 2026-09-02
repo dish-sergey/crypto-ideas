@@ -112,6 +112,7 @@ public class RevxConfig {
     private final long simRandomSeed;
     private final int simRandomSeeds;
     private final int simControlAnchorWindows;
+    private final List<Integer> simControlAnchorLadder;
     private final List<Double> simFeeLadder;
     private final List<Double> simOffsetLadder;
     private final List<Double> simSkewLadder;
@@ -223,6 +224,7 @@ public class RevxConfig {
             @Value("${revx.sim.random-seed}") long simRandomSeed,
             @Value("${revx.sim.random-seeds}") int simRandomSeeds,
             @Value("${revx.sim.control-anchor-windows}") int simControlAnchorWindows,
+            @Value("${revx.sim.control-anchor-ladder}") List<Integer> simControlAnchorLadder,
             @Value("${revx.sim.fee-ladder}") List<Double> simFeeLadder,
             @Value("${revx.sim.offset-ladder}") List<Double> simOffsetLadder,
             @Value("${revx.sim.skew-ladder}") List<Double> simSkewLadder,
@@ -331,6 +333,7 @@ public class RevxConfig {
         this.simRandomSeed = simRandomSeed;
         this.simRandomSeeds = simRandomSeeds;
         this.simControlAnchorWindows = simControlAnchorWindows;
+        this.simControlAnchorLadder = simControlAnchorLadder;
         this.simFeeLadder = simFeeLadder;
         this.simOffsetLadder = simOffsetLadder;
         this.simSkewLadder = simSkewLadder;
@@ -752,6 +755,15 @@ public class RevxConfig {
      */
     public int simControlAnchorWindows() {
         return simControlAnchorWindows;
+    }
+
+    /**
+     * Лестница глубины якоря. Нужна, чтобы отличить «слежение за ценой» от
+     * «свежести котировки»: если счёт контроля идёт по {@code d − 2.86·√(t/5)},
+     * он меряет устаревание и только его (док. 132 §1).
+     */
+    public int[] simControlAnchorLadder() {
+        return simControlAnchorLadder.stream().mapToInt(Integer::intValue).toArray();
     }
 
     public double[] simFeeLadder() {

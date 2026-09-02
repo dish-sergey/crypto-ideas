@@ -432,6 +432,29 @@ public class SimRunner {
         runs.add(new Run("контроль: случайный якорь, те же расстояния", anchorResult,
                 cfg.simMakerFee(), base.offset(), base.inventoryCap()));
 
+        // Лестница ГЛУБИНЫ ЯКОРЯ (док. 132 §1). Возражение: контроль со
+        // случайным якорем меряет не «слежение», а устаревание, цена которого
+        // уже известна из лестницы задержки — 2.86·√(t/5) б.п. Проверяется это
+        // одним прогоном: если счёт контроля идёт по формуле, вопрос закрыт.
+        List<RatioRung> anchorDepth = new ArrayList<>();
+        for (int windows : cfg.simControlAnchorLadder()) {
+            SimEngine.Result r = new SimEngine(base, limits, cfg.simMakerFee(),
+                    QuotePolicy.staleAnchor(base, cfg.simRandomSeed(), windows)).run(data.windows());
+            anchorDepth.add(new RatioRung(windows, r));
+        }
+
+        // Контроли C3 и C4 (док. 132 §1): оба на ТЕКУЩЕЙ справедливой цене,
+        // то есть без устаревания вовсе. Только они отвечают на исходный вопрос
+        // док. 127 §9 — добавляют ли что-то скос и корзинная справедливая цена.
+        SimEngine.Result noSkewResult = new SimEngine(base, limits, cfg.simMakerFee(),
+                QuotePolicy.noSkew(base)).run(data.windows());
+        runs.add(new Run("контроль C3: без скоса, цена текущая", noSkewResult,
+                cfg.simMakerFee(), base.offset(), base.inventoryCap()));
+        SimEngine.Result ownBookResult = new SimEngine(base, limits, cfg.simMakerFee(),
+                QuotePolicy.ownBookMid(base)).run(data.windows());
+        runs.add(new Run("контроль C4: от середины своей книги, без скоса", ownBookResult,
+                cfg.simMakerFee(), base.offset(), base.inventoryCap()));
+
         // Лестница отступа с контролем на КАЖДОЙ ступени (док. 75 §5). Раньше и
         // buy & hold, и случайные считались только при базовом d, а вердикт «kill-критерий
         // сработал» переносился на всю конструкцию. Между тем d двигает и число
@@ -462,7 +485,8 @@ public class SimRunner {
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
                 cross, stopLadder, targetLadder, targetFloored, hedgeLadder, leashLadder, wideStep, costFloor, gridMargin, gridWidening, gridLots,
-                frozenCool, frozenAge, stickyOuter, stickyInner, queueControl);
+                frozenCool, frozenAge, stickyOuter, stickyInner, queueControl,
+                anchorDepth, noSkewResult, ownBookResult);
         write(out, markdown);
         log.info("{}: {} прогонов, базовый total={} (спред {} + инвентарь {}), исполнений {} → {}",
                 symbol, runs.size(), round(baseResult.pnl().total(), 4),
@@ -855,7 +879,9 @@ public class SimRunner {
                           List<GridRung> gridLots,
                           List<RatioRung> frozenCool, List<RatioRung> frozenAge,
                           List<RatioRung> stickyOuter, List<RatioRung> stickyInner,
-                          List<java.util.Map.Entry<String, SimEngine.Result>> queueControl) {
+                          List<java.util.Map.Entry<String, SimEngine.Result>> queueControl,
+                          List<RatioRung> anchorDepth, SimEngine.Result noSkewResult,
+                          SimEngine.Result ownBookResult) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Симуляция маркет-мейкинга: ").append(symbol).append("\n\n");
         sb.append("Прогоны ТЗ §4.7, отчёт §5.3. Код `").append(registry.gitHash())
@@ -1026,6 +1052,9 @@ public class SimRunner {
                 + "оптимизировать надо расстояние и стоимость нейтральности, а не логику "
                 + "скоса и слежения. Проигрыш только первому — артефакт лестницы отступа, "
                 + "и он ничего не говорит о конструкции.\n\n");
+
+        renderAnchorDepth(sb, anchorDepth, base, data);
+        renderFairControls(sb, base, baseResult, noSkewResult, ownBookResult);
 
         sb.append("### Диагностика модели исполнения по ступеням (ТЗ §0)\n\n");
         sb.append("Лестница монотонна, значит первое подозрение — на допущения об "
@@ -2275,6 +2304,123 @@ public class SimRunner {
         }
         double factor = Math.pow(10, digits);
         return Math.round(v * factor) / factor;
+    }
+
+    /**
+     * Лестница глубины якоря: устаревание это или слежение (док. 132 §1).
+     *
+     * Возражение к контролю со случайным якорем звучит так: «не следить за
+     * ценой» и «стоять с устаревшей котировкой» — одно и то же, а цена
+     * устаревания уже измерена лестницей задержки, {@code 2.86·√(t/5)} б.п.
+     * Значит счёт контроля обязан идти по формуле, и никакого нового знания в
+     * нём нет.
+     *
+     * Проверка требует правильных единиц: захват здесь считается **в базисных
+     * пунктах оборота**, а не в валюте, иначе сравнивать с формулой нечего.
+     */
+    private void renderAnchorDepth(StringBuilder sb, List<RatioRung> ladder,
+                                   Quoter.Params base, SimDataReader.Dataset data) {
+        if (ladder.isEmpty()) {
+            return;
+        }
+        double stepSec = data.windowPeriodSec();
+        sb.append("### Глубина якоря: это устаревание или слежение? (док. 132 §1)\n\n");
+        sb.append("Возражение к предыдущему контролю: «не следить за ценой» и «стоять с "
+                + "устаревшей котировкой» — одно и то же, а цена устаревания уже измерена "
+                + "лестницей задержки. Если счёт контроля идёт по `d − 2.86·√(t/5)`, то "
+                + "новый контроль меряет свежесть, а не выбор цен, и вопрос док. 127 §9 "
+                + "им не закрыт.\n\n");
+        sb.append("Средний возраст якоря — половина глубины: центр выбирается равномерно "
+                + "среди последних N окон. Захват здесь **в б.п. оборота**, иначе с "
+                + "формулой сравнивать нечего.\n\n");
+        sb.append("| Глубина, окон | Средний возраст, с | Захват, б.п. оборота "
+                + "| Предсказание `d − 2.86·√(t/5)` | Разница | Исполнений |\n");
+        sb.append("|---|---|---|---|---|---|\n");
+        for (RatioRung rung : ladder) {
+            SimEngine.Result r = rung.result();
+            double ageSec = rung.ratio() * stepSec / 2;
+            double predicted = base.offset() * 10_000 - 2.86 * Math.sqrt(ageSec / 5.0);
+            double actual = captureBp(r);
+            sb.append("| ").append((int) rung.ratio())
+                    .append(" | ").append(round(ageSec, 1))
+                    .append(" | ").append(round(actual, 2))
+                    .append(" | ").append(round(predicted, 2))
+                    .append(" | ").append(round(actual - predicted, 2))
+                    .append(" | ").append(r.fills().size())
+                    .append(" |\n");
+        }
+        sb.append("\n**Как читать.** Если «разница» мала по всей лестнице, контроль меряет "
+                + "устаревание и только его, а его преимущество над стратегией — "
+                + "переизмерение лестницы задержки, а не проверка выбора цен.\n\n");
+        sb.append("Систематически ОТРИЦАТЕЛЬНАЯ разница, растущая с возрастом, означает "
+                + "большее: устаревшую котировку не просто сносит ценой, её ещё и выбирают "
+                + "— число исполнений растёт вместе с глубиной якоря, потому что "
+                + "промахнувшаяся цена оказывается привлекательной для той стороны, "
+                + "которой она выгодна. Формула `2.86·√(t/5)` тогда занижает цену "
+                + "несвежести на длинных возрастах.\n\n");
+    }
+
+    /**
+     * Контроли C3 и C4 (док. 132 §1) — единственные, что отвечают на исходный
+     * вопрос дока 127 §9. Оба стоят на ТЕКУЩЕЙ справедливой цене, поэтому
+     * устареванием их разница со стратегией объясниться не может.
+     */
+    private void renderFairControls(StringBuilder sb, Quoter.Params base,
+                                    SimEngine.Result strategy, SimEngine.Result noSkew,
+                                    SimEngine.Result ownBook) {
+        sb.append("### Контроли C3 и C4: что даёт скос и что даёт корзина (док. 132 §1)\n\n");
+        sb.append("Оба контроля котируют на текущей справедливой цене и на том же "
+                + "отступе, поэтому свежесть у всех троих одинаковая, и разница — "
+                + "не устаревание.\n\n");
+        sb.append("- **C3** выключает скос: котирует `справедливая ± d` симметрично. "
+                + "Изолирует вклад скоса — единственного «умного» элемента, про который "
+                + "доки 111 и 118 уже говорили, что он регулятор беты, а не источник края.\n");
+        sb.append("- **C4** выключает и скос, и саму корзину: котирует от **середины "
+                + "стакана своей пары**. Изолирует вклад справедливой цены из 23 пар с "
+                + "implied-курсом USDC — самой дорогой части системы, которую ни разу не "
+                + "сравнивали с тривиальной альтернативой.\n\n");
+        sb.append("| Прогон | Захват, б.п. оборота | Захват, валюта | Исполнений "
+                + "| Оборот | Ср. инвентарь | `total` |\n");
+        sb.append("|---|---|---|---|---|---|---|\n");
+        record Line(String label, SimEngine.Result r) {
+        }
+        for (Line line : List.of(new Line("стратегия", strategy),
+                new Line("**C3: без скоса**", noSkew),
+                new Line("**C4: от своей книги**", ownBook))) {
+            SimEngine.Result r = line.r();
+            sb.append("| ").append(line.label())
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(r.pnl().spreadCapture(), 1))
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(turnover(r), 0))
+                    .append(" | ").append(round(r.avgInventory(), 5))
+                    .append(" | ").append(round(r.pnl().total(), 1))
+                    .append(" |\n");
+        }
+        double strategyBp = captureBp(strategy);
+        double noSkewBp = captureBp(noSkew);
+        double ownBookBp = captureBp(ownBook);
+        sb.append("\n**Разложение, которое читается только из этой таблицы.** Сравнивать "
+                + "надо захват НА ЕДИНИЦУ ОБОРОТА: `total` у контролей выше просто "
+                + "потому, что они несут больше инвентаря, а это бета, а не край.\n\n");
+        sb.append("| Что изолируем | Разность | Вывод |\n|---|---|---|\n");
+        sb.append("| **Вклад скоса** (стратегия − C3) | ")
+                .append(round(strategyBp - noSkewBp, 2)).append(" б.п. | ")
+                .append(strategyBp - noSkewBp > 0.5 ? "скос приносит край"
+                        : strategyBp - noSkewBp < -0.5
+                        ? "скос края НЕ приносит, а стоит — он регулятор беты (доки 111, 118)"
+                        : "скос по краю нейтрален")
+                .append(" |\n");
+        sb.append("| **Вклад корзины** (C3 − C4) | ")
+                .append(round(noSkewBp - ownBookBp, 2)).append(" б.п. | ")
+                .append(noSkewBp - ownBookBp > 0.5
+                        ? "справедливая цена из 23 пар окупается: середина своего стакана хуже"
+                        : "корзина не окупается, тривиальная альтернатива не хуже")
+                .append(" |\n\n");
+        sb.append("И отдельная колонка, мимо которой пройти нельзя: **средний инвентарь**. "
+                + "У C4 он в разы больше — котируя от середины собственного стакана, "
+                + "конструкция едет вместе с ним и накапливает позицию. Это цена, "
+                + "которой нет в захвате, но которая целиком видна в `total` и в риске.\n\n");
     }
 
     /** Шаги бывают мельче 1e-8: без %f они печатаются нулём. */

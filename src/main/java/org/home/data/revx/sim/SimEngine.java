@@ -323,6 +323,9 @@ public final class SimEngine {
             }
 
             execution.refresh(window.book());
+            // Книгу видит только контроль C4 (котирует от середины своей пары);
+            // остальным политикам этот вызов ничего не делает.
+            policy.onWindow(window.book());
             Quoter.Quotes target = decisionWindow
                     ? policy.quotes(window.fair(), pnl.inventory(), driftNow)
                     : new Quoter.Quotes(restingBid, restingAsk);

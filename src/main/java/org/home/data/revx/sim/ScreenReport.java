@@ -147,6 +147,49 @@ public class ScreenReport {
             return byNotional == null || !(byNotional.kappa() > 0) ? Double.NaN
                     : costBp() + 10_000 / byNotional.kappa();
         }
+
+        /**
+         * Скорость дохода в собственном оптимуме пары — величина, по которой
+         * пары и надо ранжировать (док. 132 §2).
+         *
+         * Ширина книги сама по себе не платит: платит `край × число исполнений`,
+         * а число исполнений идёт за потоком. Ранжирование по одному полуспреду
+         * ставит на первое место пару с самой тонкой лентой во вселенной.
+         *
+         * Из `λ(δ) = A·e^{−κδ}` скорость дохода равна `λ(δ)·(δ − c)`, и в точке
+         * `δ* = c + 1/κ` она равна замкнуто:
+         *
+         * <pre>A · e^{−κc} · e^{−1} / κ</pre>
+         *
+         * ⚠️ `A` здесь — интенсивность ЛЕНТЫ, а не наша: принт, прошедший мимо,
+         * в наши исполнения не превращается. Поэтому величина годится для
+         * СРАВНЕНИЯ пар (смещение общее), но не как прогноз дохода.
+         */
+        double revenueRate() {
+            if (byNotional == null || !(byNotional.kappa() > 0) || !(byNotional.a() > 0)) {
+                return Double.NaN;
+            }
+            double kappa = byNotional.kappa();
+            return byNotional.a() * Math.exp(-kappa * costBp() / 10_000) / (Math.E * kappa);
+        }
+
+        /**
+         * Средняя непокрытая бета при округлении хеджа вниз, доля потолка.
+         *
+         * Остаток лежит в [0, шаг), средний — половина шага, то есть
+         * {@code 1 / (2·ступеней)} от потолка. **Это и есть критерий годности
+         * пары к хеджу** (док. 132 §3): круглое «≥ 20 ступеней» было
+         * иллюстрацией масштаба, а не порогом, и по нему зря забраковали SOL.
+         */
+        /** Держится ли закон прихода на ОБЕИХ подгонках — приёмка всех чисел §4. */
+        boolean lawHolds() {
+            return byPrints != null && byPrints.holds() && byNotional != null && byNotional.holds();
+        }
+
+        double residualBetaShare(double lotNotional, int lotsPerCap) {
+            double steps = stepsPerCap(lotNotional, lotsPerCap);
+            return Double.isNaN(steps) || steps <= 0 ? Double.NaN : 1 / (2 * steps);
+        }
     }
 
     public void run(int hours, long toMs, String out) {
@@ -168,7 +211,18 @@ public class ScreenReport {
                 rows.add(row);
             }
         }
-        rows.sort(Comparator.comparingDouble((Row r) -> -r.halfSpreadBp()));
+        // Сортировка по СКОРОСТИ ДОХОДА, а не по ширине книги (док. 132 §2):
+        // ширина без потока не платит.
+        //
+        // Но сначала — по тому, устанавливается ли закон прихода вообще. У пары,
+        // где подгонка не держится, скорость дохода считается по κ, которому
+        // верить нельзя: у BCH κ = 3 даёт «оптимальный отступ» в тысячи б.п. и
+        // фиктивно высокую скорость. Такие строки обязаны стоять НИЖЕ, иначе
+        // ранжирование возглавит шум.
+        rows.sort(Comparator.comparing((Row r) -> !r.lawHolds())
+                .thenComparing(Comparator.comparingDouble(
+                        (Row r) -> Double.isNaN(r.revenueRate()) ? Double.NEGATIVE_INFINITY
+                                : r.revenueRate()).reversed()));
         write(out, render(rows, hours, fromMs, toMs));
         log.info("скрининг: {} пар, отчёт → {}", rows.size(), out);
     }
@@ -365,53 +419,79 @@ public class ScreenReport {
         sb.append("| Потолок инвентаря | ").append(LOTS_PER_CAP).append(" лотов = $")
                 .append(round(LOT_NOTIONAL * LOTS_PER_CAP, 1)).append(" |\n\n");
 
-        sb.append("## 1. Книга и поток\n\n");
-        sb.append("Полуспред — медиана `(ask₁ − bid₁) / 2 / mid`. Это верхняя оценка того, "
-                + "как далеко можно стоять, не уходя из книги; край на исполнение растёт "
-                + "вместе с ней (док. 125 §6). Поток — противовес: край бесполезен без "
-                + "исполнений, и он же ограничивает ёмкость сверху (док. 127 §13).\n\n");
-        sb.append("| Пара | Цена | **Полуспред, б.п.** | σ за период, б.п. | Сделок/сут "
-                + "| **Оборот ленты, $/сут** | Медианная сделка, $ | Снимков |\n");
-        sb.append("|---|---|---|---|---|---|---|---|\n");
+        sb.append("## 1. Книга и поток: ранжирование по скорости дохода\n\n");
+        sb.append("⚠️ **Ранжировать по полуспреду нельзя** (док. 132 §2). Ширина сама по "
+                + "себе не платит: платит `край на исполнение × число исполнений`, а число "
+                + "исполнений идёт за потоком, и эти два множителя у площадки "
+                + "антикоррелированы. Сортировка по одной ширине ставит первой пару с "
+                + "самой тонкой лентой во вселенной.\n\n");
+        sb.append("Правильная величина считается замкнуто из закона прихода (§4): в точке "
+                + "`δ* = c + 1/κ` скорость дохода равна `A·e^{−κc}/(e·κ)`. Таблица "
+                + "отсортирована по ней; колонка «ширина × поток» оставлена как грубая "
+                + "проверка того же порядка на глаз.\n\n");
+        sb.append("| Пара | Цена | Полуспред, б.п. | σ за период, б.п. | Сделок/сут "
+                + "| Оборот ленты, $/сут | **Ширина × поток, млн** | **`A·e^{−κc}/(e·κ)`** "
+                + "| Закон держится |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|\n");
         double days = hours / 24.0;
         for (Row r : rows) {
+            boolean solid = r.lawHolds();
             sb.append("| ").append(r.symbol())
                     .append(" | ").append(trim(r.price()))
-                    .append(" | **").append(round(r.halfSpreadBp(), 1)).append("**")
+                    .append(" | ").append(round(r.halfSpreadBp(), 1))
                     .append(" | ").append(round(r.sigmaBp(), 2))
                     .append(" | ").append(round(r.trades() / days, 0))
                     .append(" | ").append(round(r.notional() / days, 0))
-                    .append(" | ").append(round(r.medianTradeNotional(), 1))
-                    .append(" | ").append(r.snapshots())
+                    .append(" | **").append(round(r.halfSpreadBp() * r.notional() / days / 1e6, 2))
+                    .append("**")
+                    .append(" | **").append(sig(r.revenueRate())).append("**")
+                    .append(" | ").append(solid ? "да" : "нет")
                     .append(" |\n");
         }
+        sb.append("\n**Оговорка к последней колонке.** `A` — интенсивность ЛЕНТЫ, а не "
+                + "наша: принт, прошедший мимо нашей цены, в исполнение не превращается. "
+                + "Величина годится для сравнения пар между собой (смещение общее), но не "
+                + "как прогноз дохода. Там, где закон прихода не держится (§4), её нет "
+                + "смысла читать вовсе.\n");
 
-        sb.append("\n## 2. Разрешение хеджа: чем ограничен живой масштаб\n\n");
+        sb.append("\n## 2. Разрешение хеджа: сколько беты остаётся непокрытой\n\n");
         sb.append("Хедж — единственный механизм, который убирает проблему падения, а не "
-                + "переносит её (док. 127 §8). Но он квантован шагом контракта, и когда "
-                + "шаг сравним с потолком инвентаря, хеджировать нечего: у живого бота "
-                + "на BTC весь потолок — две с половиной ступени. **Порог годности — два "
-                + "десятка ступеней**, ниже него проверять на живом нечего.\n\n");
-        sb.append("| Пара | Перп | Шаг контракта | Наш лот | **Шаг в наших лотах** "
-                + "| **Ступеней на потолок** | Годен живьём |\n");
-        sb.append("|---|---|---|---|---|---|---|\n");
+                + "переносит её (док. 127 §8). Но он квантован шагом контракта.\n\n");
+        sb.append("**Критерий годности — не круглое число ступеней, а остаточная бета** "
+                + "(док. 132 §3). При округлении вниз непокрытый остаток лежит в "
+                + "`[0, шаг)`, средний — половина шага, то есть `1/(2·ступеней)` от "
+                + "потолка. Прежний порог «≥ 20 ступеней» был иллюстрацией масштаба, и по "
+                + "нему зря забраковали SOL при 19.2.\n\n");
+        sb.append("| Пара | Перп | Шаг контракта | Наш лот | Шаг в наших лотах "
+                + "| Ступеней на потолок | **Ср. непокрытая бета** | **Хедж снимает** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|\n");
         for (Row r : rows) {
             double steps = r.stepsPerCap(LOT_NOTIONAL, LOTS_PER_CAP);
+            double residual = r.residualBetaShare(LOT_NOTIONAL, LOTS_PER_CAP);
             sb.append("| ").append(r.symbol())
                     .append(" | ").append(r.perp() == null ? "**нет**" : r.perp().symbol())
                     .append(" | ").append(r.perp() == null ? "—" : trim(r.perp().step()))
                     .append(" | ").append(trim(round(r.lot(LOT_NOTIONAL), 9)))
                     .append(" | ").append(Double.isNaN(r.stepInLots(LOT_NOTIONAL)) ? "—"
                             : round(r.stepInLots(LOT_NOTIONAL), 2))
-                    .append(" | **").append(Double.isNaN(steps) ? "—" : round(steps, 1)).append("**")
-                    .append(" | ").append(Double.isNaN(steps) ? "—" : steps >= 20 ? "**да**" : "нет")
+                    .append(" | ").append(Double.isNaN(steps) ? "—" : round(steps, 1))
+                    .append(" | **").append(Double.isNaN(residual) ? "—"
+                            : round(100 * residual, 1) + "%").append("**")
+                    .append(" | **").append(Double.isNaN(residual) ? "—"
+                            : round(100 * (1 - residual), 1) + "%").append("**")
                     .append(" |\n");
         }
-        sb.append("\nКолонка «ступеней на потолок» считается при потолке ")
-                .append(LOTS_PER_CAP).append(" лотов, то есть при том же номинале, на "
-                        + "котором стоит живой бот. Чтобы пара стала годной, номинал надо "
-                        + "поднимать пропорционально: пара с одной ступенью требует "
-                        + "двадцатикратного увеличения.\n\n");
+        sb.append("\n⚠️ **И у этого критерия есть более жёсткий вариант, который надо "
+                + "держать рядом.** Знаменатель здесь — ПОТОЛОК, а несём мы средний "
+                + "инвентарь, и он бывает много меньше потолка: на окне вне выборки у BTC "
+                + "средний инвентарь около 4% потолка. Если шаг контракта крупнее типичной "
+                + "позиции, хедж не «грубоват» — он не совершается вовсе: живой BTC при "
+                + "округлении вниз сделал **ноль** хеджирующих сделок за 96 часов "
+                + "(док. 129 §4). Правильная проверка — **шаг против среднего инвентаря**, "
+                + "а не против потолка, и она требует прогона симулятора по паре.\n\n");
+        sb.append("Всё считается при потолке ").append(LOTS_PER_CAP)
+                .append(" лотов, то есть на номинале живого бота. Остаточная бета обратно "
+                        + "пропорциональна номиналу: удвоение потолка вдвое её уменьшает.\n\n");
 
         sb.append("## 3. Фондирование: платим или получаем\n\n");
         sb.append("Шорт ПОЛУЧАЕТ фондирование при положительной ставке. У BTC это "
@@ -491,21 +571,31 @@ public class ScreenReport {
                 + "свойство пары, а не площадки.\n\n");
 
         sb.append("## 5. Что из этого следует\n\n");
-        List<Row> hedgeable = rows.stream()
-                .filter(r -> r.stepsPerCap(LOT_NOTIONAL, LOTS_PER_CAP) >= 20).toList();
+        List<Row> solid = rows.stream()
+                .filter(r -> r.byPrints() != null && r.byPrints().holds()
+                        && r.byNotional() != null && r.byNotional().holds()).toList();
         sb.append("- Пар с перпом на Kraken: **")
                 .append(rows.stream().filter(r -> r.perp() != null).count())
                 .append("** из ").append(rows.size()).append(".\n");
-        sb.append("- Пар, на которых хедж проверяем при нынешнем номинале (≥20 ступеней "
-                        + "контракта на потолок): **").append(hedgeable.size()).append("**")
-                .append(hedgeable.isEmpty() ? "" : " — " + hedgeable.stream()
+        sb.append("- Пар, где закон прихода устанавливается на обеих подгонках и "
+                        + "ранжирование осмысленно: **").append(solid.size()).append("**")
+                .append(solid.isEmpty() ? "" : " — " + solid.stream()
                         .map(Row::symbol).reduce((a, b) -> a + ", " + b).orElse(""))
                 .append(".\n");
-        sb.append("- Пара с самым широким спредом: **")
-                .append(rows.isEmpty() ? "—" : rows.get(0).symbol())
-                .append("**, самый тонкий поток и самая широкая книга обычно совпадают — "
-                        + "это и есть конфликт §13: то, что делает пару прибыльнее, "
-                        + "ограничивает её масштаб.\n\n");
+        sb.append("- Лучшая пара по скорости дохода: **")
+                .append(solid.isEmpty() ? "—" : solid.get(0).symbol())
+                .append("**. Пара с самой широкой книгой — **")
+                .append(rows.stream().max(Comparator.comparingDouble(Row::halfSpreadBp))
+                        .map(Row::symbol).orElse("—"))
+                .append("**, и это разные пары: ширина и поток антикоррелированы, а "
+                        + "платят они вместе.\n");
+        sb.append("- Самая дешёвая нейтральность (наименьшая остаточная бета): **")
+                .append(rows.stream()
+                        .filter(r -> !Double.isNaN(r.residualBetaShare(LOT_NOTIONAL, LOTS_PER_CAP)))
+                        .min(Comparator.comparingDouble(
+                                r -> r.residualBetaShare(LOT_NOTIONAL, LOTS_PER_CAP)))
+                        .map(Row::symbol).orElse("—"))
+                .append("**.\n\n");
         sb.append("Скрининг НЕ измеряет доходность: он отбирает кандидатов, которых потом "
                 + "гоняют симулятором. Пара, прошедшая по спреду, но провалившая "
                 + "разрешение хеджа, к живой проверке не годится ни при какой "
@@ -549,6 +639,18 @@ public class ScreenReport {
         }
         double factor = Math.pow(10, digits);
         return Math.round(v * factor) / factor;
+    }
+
+    /**
+     * Три значащие цифры. Скорость дохода различается между парами на порядки,
+     * и округление до фиксированного знака превращает половину таблицы в нули.
+     */
+    private static String sig(double v) {
+        if (Double.isNaN(v)) {
+            return "—";
+        }
+        return new java.math.BigDecimal(v).round(new java.math.MathContext(3))
+                .stripTrailingZeros().toPlainString();
     }
 
     private static String trim(double v) {
