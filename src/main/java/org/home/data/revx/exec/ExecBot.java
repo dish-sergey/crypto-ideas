@@ -76,7 +76,7 @@ public final class ExecBot implements Runnable {
         registerCommands();
         dropBacklog();
         send("Исполнитель запущен. Котирование ВЫКЛЮЧЕНО — включить: /start\n\n"
-                + ExecLimits.describe());
+                + ExecLimits.describe(loop.botId()));
         while (alive) {
             try {
                 String body = call("getUpdates?timeout=25&offset=" + offset, null);
@@ -153,7 +153,7 @@ public final class ExecBot implements Runnable {
             }
             case "/status" -> send(status());
             case "/stats" -> send(stats());
-            case "/limits" -> send(ExecLimits.describe());
+            case "/limits" -> send(ExecLimits.describe(loop.botId()));
             case "/help" -> send(help());
             default -> { }                // неизвестная команда — без ответа
         }
@@ -184,7 +184,7 @@ public final class ExecBot implements Runnable {
                 Замен: %d
                 Инвентарь: %.8f
                 Записей в журнале: %d""".formatted(
-                s.fills(), s.placements(), ExecLimits.MAX_PLACEMENTS_PER_DAY,
+                s.fills(), s.placements(), ExecLimits.maxPlacementsPerDay(loop.botId()),
                 s.replaces(), s.inventory(), journal.countRequests());
     }
 

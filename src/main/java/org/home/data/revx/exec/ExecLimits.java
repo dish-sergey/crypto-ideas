@@ -44,11 +44,38 @@ public final class ExecLimits {
     public static final double MAX_TOTAL_EXPOSURE_USDC = 30.0;
 
     /**
-     * Постановок в сутки. У площадки 1000 (`POST /orders`), и это единственный
-     * жёсткий ресурс: перевыставление идёт через `PUT` без суточного потолка.
-     * 800 оставляет запас на повторы и на ручные проверки.
+     * Постановок в сутки, ПО БОТАМ. У площадки 1000 (`POST /orders`) на весь
+     * аккаунт, и это единственный жёсткий ресурс: перевыставление идёт через
+     * `PUT` без суточного потолка.
+     *
+     * Делить поровну неправильно, потому что боты расходуют бюджет неодинаково.
+     * Замер за 02.09.2026: у A 48 исполнений за 6.6 ч (каждое исполнение
+     * съедает заявку и требует новой постановки), у B шесть, у C семь. Поэтому
+     * A получает вдвое больше — он и есть контроль, на котором копится
+     * статистика, — а B и C по 200. Сумма 800 из 1000 оставляет двести на
+     * повторы и ручные проверки.
+     *
+     * Карта в КОДЕ, а не в конфиге, по той же причине, что и остальные пределы
+     * этого класса: поднять число можно только пересборкой и выкаткой.
      */
-    public static final int MAX_PLACEMENTS_PER_DAY = 800 / BOTS_SHARING_ACCOUNT;
+    private static final java.util.Map<String, Integer> PLACEMENTS_BY_BOT =
+            java.util.Map.of("a", 400, "b", 200, "c", 200);
+
+    /**
+     * Сколько постановок в сутки положено этому боту.
+     *
+     * ⚠️ Незнакомая метка получает САМУЮ МАЛУЮ долю из карты, а не среднюю.
+     * Иначе опечатка в {@code --revx.exec.bot-id} молча выдавала бы боту бюджет
+     * БОЛЬШЕ настроенного, и суммарный расход по аккаунту вышел бы за потолок
+     * площадки — ровно тот класс тихой ошибки, ради которого пределы и живут в
+     * коде.
+     */
+    public static int maxPlacementsPerDay(String botId) {
+        String key = botId == null || botId.isBlank()
+                ? "" : botId.trim().substring(0, 1).toLowerCase(java.util.Locale.ROOT);
+        return PLACEMENTS_BY_BOT.getOrDefault(key,
+                PLACEMENTS_BY_BOT.values().stream().min(Integer::compareTo).orElse(100));
+    }
 
     /**
      * Предохранитель от зацикливания: если за минуту потребовалось больше
@@ -90,7 +117,7 @@ public final class ExecLimits {
         return totalUsdc <= MAX_TOTAL_EXPOSURE_USDC;
     }
 
-    public static String describe() {
+    public static String describe(String botId) {
         return """
                 Жёсткие пределы (в коде, менять только пересборкой):
                   заявка не больше       %.2f USDC
@@ -100,7 +127,7 @@ public final class ExecLimits {
                   комиссия не больше     %.2f USDC — иначе стоп
                   торговый убыток        %.2f USDC — иначе стоп (против buy and hold)""".formatted(
                 MAX_ORDER_NOTIONAL_USDC, MAX_TOTAL_EXPOSURE_USDC,
-                MAX_PLACEMENTS_PER_DAY, MAX_REPLACES_PER_MINUTE,
+                maxPlacementsPerDay(botId), MAX_REPLACES_PER_MINUTE,
                 MAX_FEE_USDC, MAX_TRADING_LOSS_USDC);
     }
 }

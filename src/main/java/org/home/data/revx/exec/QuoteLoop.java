@@ -135,6 +135,13 @@ public final class QuoteLoop implements Runnable {
     private volatile double quoteBalance;
     private volatile double quoteTotal;
     private volatile double lastFair;
+    /**
+     * Последняя справедливая цена, которой гейт ДОВЕРЯЛ. От неё считается отвод
+     * заявок: текущей цене в момент закрытия гейта доверия нет по определению.
+     */
+    private volatile double lastTrustedFair;
+    /** Относительное расстояние отвода; ≤ 0 — отвод выключен, работает отмена. */
+    private final double parkDistance;
     private final java.util.ArrayDeque<long[]> fairHistory = new java.util.ArrayDeque<>();
     private final org.home.data.revx.sim.EfficiencyRatio efficiency;
     private volatile String pausedReason = "не запущен";
@@ -156,7 +163,8 @@ public final class QuoteLoop implements Runnable {
     public QuoteLoop(TradeClient client, StandReader stand, ExecJournal journal,
                      Quoter.Params params, String symbol, long periodMs, double minNotional,
                      BotTag tag, org.home.data.revx.sim.QuotePolicy policy,
-                     boolean ownPosition, double positionSeed, double baseStep) {
+                     boolean ownPosition, double positionSeed, double baseStep,
+                     double parkDistance) {
         this.client = client;
         this.stand = stand;
         this.journal = journal;
@@ -174,6 +182,7 @@ public final class QuoteLoop implements Runnable {
         this.ownPosition = ownPosition;
         this.positionSeed = positionSeed;
         this.dust = baseStep > 0 ? baseStep / 2 : 0;
+        this.parkDistance = parkDistance;
     }
 
     /**
@@ -227,6 +236,11 @@ public final class QuoteLoop implements Runnable {
         reconcile("выключение процесса");
     }
 
+    /** Метка бота: суточный лимит постановок у каждого свой (см. {@link ExecLimits}). */
+    public String botId() {
+        return tag.id();
+    }
+
     public Stats stats() {
         return new Stats(placements, replaces, cancels, fills, inventory, lastFair,
                 quoting.get() ? "котирует" : "остановлен", pausedReason);
@@ -275,19 +289,20 @@ public final class QuoteLoop implements Runnable {
             return;
         }
         if (!fair.quotable() || !(fair.price() > 0)) {
-            // Гейт ТЗ §4.1: опора сломана — снимаем всё, а не ждём.
+            // Гейт ТЗ §4.1: опора сломана — уводим котировки из зоны исполнения.
             pausedReason = fair.pausedReason() == null ? "курс ненадёжен" : fair.pausedReason();
             journal.quote(fair.price(), null, null, inventory, false, pausedReason);
-            cancelAll(pausedReason);
+            standAside(pausedReason);
             return;
         }
         long staleMs = System.currentTimeMillis() - fair.asOfMs();
         if (staleMs > 15_000) {
             pausedReason = "данные стенда устарели на " + staleMs / 1000 + " с";
-            cancelAll(pausedReason);
+            standAside(pausedReason);
             return;
         }
         pausedReason = null;
+        lastTrustedFair = fair.price();
 
         // Страховка от тренда включается только в трендовом режиме (док. 105 §5).
         // При выключенном гейте (порог 0) поведение прежнее.
@@ -450,9 +465,9 @@ public final class QuoteLoop implements Runnable {
     }
 
     private void place(Side side, Resting resting, double price, double size) {
-        if (placements >= ExecLimits.MAX_PLACEMENTS_PER_DAY) {
+        if (placements >= ExecLimits.maxPlacementsPerDay(tag.id())) {
             log.error("исчерпан суточный лимит постановок ({}) — останавливаю котирование",
-                    ExecLimits.MAX_PLACEMENTS_PER_DAY);
+                    ExecLimits.maxPlacementsPerDay(tag.id()));
             journal.event("limit_blocked", "постановки за сутки");
             stopQuoting();
             return;
@@ -774,6 +789,59 @@ public final class QuoteLoop implements Runnable {
     private void cancelAll(String why) {
         cancel(Side.BUY, bid, why);
         cancel(Side.SELL, ask, why);
+    }
+
+    /**
+     * Уйти из зоны исполнения на время закрытого гейта — **не отменяя заявку**.
+     *
+     * Зачем. Единственный жёсткий ресурс площадки — `POST /orders`: 1000 в сутки
+     * на ВЕСЬ аккаунт. Отмена стоит дёшево сама по себе, но каждая отмена обязана
+     * когда-нибудь оплатиться новой постановкой. Замер 02.09.2026: у бота A из
+     * 169 суточных постановок 57 (**34%**) — возвраты после закрытия гейта, у
+     * бота B 92 из 153 (**60%**). То есть больше половины бюджета B уходит не на
+     * торговлю, а на повторный вход.
+     *
+     * Замена (`PUT`) суточного потолка не имеет. Поэтому вместо «снять и потом
+     * поставить заново» заявка уводится далеко от рынка и возвращается обычным
+     * перевыставлением: две замены вместо отмены и постановки, ноль расхода
+     * дефицитного ресурса.
+     *
+     * ⚠️ **Чем это НЕ бесплатно.** Отведённая заявка остаётся в книге и может
+     * исполниться, если рынок дойдёт до неё. Дойдёт он ровно в тех эпизодах,
+     * ради которых гейт и закрывается: 22.08.2026 марка перпа двадцать минут
+     * стояла на 2.35% от спота, а спред опоры доходил до 8% (док. 138 §5).
+     * То есть отведённая заявка — это опцион, который мы бесплатно выписали
+     * рынку, и исполняется он только в худшие минуты. Поэтому:
+     * <ul>
+     *   <li>расстояние отвода настраивается и по умолчанию ВЫКЛЮЧЕНО
+     *       ({@code revx.exec.park-distance} ≤ 0 — прежнее поведение, отмена);</li>
+     *   <li>отвод считается от ПОСЛЕДНЕЙ ДОВЕРЕННОЙ цены, а не от текущей:
+     *       текущей мы как раз и не доверяем, на том гейт и сработал;</li>
+     *   <li>если доверенной цены ещё не было, заявка снимается по-старому.</li>
+     * </ul>
+     *
+     * Отвод применяется ТОЛЬКО к закрытому гейту. Отмена «нечем котировать эту
+     * сторону» остаётся отменой: там проблема в деньгах, а отведённая заявка
+     * держит их в резерве и отнимает у соседнего бота — у B за сутки 197 отказов
+     * по средствам, добавлять к ним нечего.
+     */
+    private void standAside(String why) {
+        if (parkDistance <= 0 || !(lastTrustedFair > 0)) {
+            cancelAll(why);
+            return;
+        }
+        parkSide(Side.BUY, bid, lastTrustedFair * (1 - parkDistance), why);
+        parkSide(Side.SELL, ask, lastTrustedFair * (1 + parkDistance), why);
+    }
+
+    private void parkSide(Side side, Resting resting, double price, String why) {
+        if (resting.venueId == null) {
+            return;                       // отводить нечего
+        }
+        if (quoter.shouldRequote(resting.price, price)) {
+            replace(side, resting, price, resting.size);
+            journal.event("park", side + " отведена на " + fmt(price) + " (" + why + ")");
+        }
     }
 
     /**

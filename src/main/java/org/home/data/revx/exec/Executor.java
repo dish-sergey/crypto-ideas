@@ -64,6 +64,7 @@ public class Executor {
     private final boolean ownPosition;
     private final double positionSeed;
     private final double baseStep;
+    private final double parkDistance;
     private final Panic panic;
 
     public Executor(RevxConfig cfg,
@@ -84,6 +85,7 @@ public class Executor {
                     @Value("${revx.exec.own-position}") boolean ownPosition,
                     @Value("${revx.exec.position-seed}") double positionSeed,
                     @Value("${revx.exec.base-step}") double baseStep,
+                    @Value("${revx.exec.park-distance}") double parkDistance,
                     Panic panic) {
         this.cfg = cfg;
         this.standDbPath = standDbPath;
@@ -103,6 +105,7 @@ public class Executor {
         this.ownPosition = ownPosition;
         this.positionSeed = positionSeed;
         this.baseStep = baseStep;
+        this.parkDistance = parkDistance;
         this.panic = panic;
     }
 
@@ -130,7 +133,7 @@ public class Executor {
                 cfg.simRequoteThreshold(), quoteStep());
         QuotePolicy policy = buildPolicy(params);
         QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs,
-                minNotional(), tag, policy, ownPosition, positionSeed, baseStep);
+                minNotional(), tag, policy, ownPosition, positionSeed, baseStep, parkDistance);
 
         log.warn("""
 
@@ -140,7 +143,7 @@ public class Executor {
                 котирование ВЫКЛЮЧЕНО до команды /start
                 {}""", symbol, size, symbol.substring(0, symbol.indexOf('/')), periodMs,
                 offset * 10_000, cfg.simOffset() * 10_000, cfg.simSkewK() * 100,
-                ExecLimits.describe());
+                ExecLimits.describe(tag.id()));
         if (offset != cfg.simOffset()) {
             // Расхождение намеренное, но молчать о нём нельзя: иначе через месяц
             // живое сравнят с базовым прогоном и не поймут, почему не сходится.
