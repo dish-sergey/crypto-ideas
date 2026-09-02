@@ -16,6 +16,7 @@ import org.springframework.stereotype.Component;
 public class TheoryCommands {
 
     private final S5EventImporter s5Importer;
+    private final org.home.data.theory.s5.S5PremiumBench s5Premium;
     private final AllocBench allocBench;
     private final org.home.data.theory.kelly.KellyBench kellyBench;
     private final org.home.data.theory.ou.OuBench ouBench;
@@ -23,13 +24,15 @@ public class TheoryCommands {
     private final org.home.data.theory.ou.PerpMinuteImporter perpImporter;
     private final org.home.data.theory.ou.BasisVerify basisVerify;
 
-    public TheoryCommands(S5EventImporter s5Importer, AllocBench allocBench,
+    public TheoryCommands(S5EventImporter s5Importer, org.home.data.theory.s5.S5PremiumBench s5Premium,
+                          AllocBench allocBench,
                           org.home.data.theory.kelly.KellyBench kellyBench,
                           org.home.data.theory.ou.OuBench ouBench,
                           org.home.data.theory.band.BandBench bandBench,
                           org.home.data.theory.ou.PerpMinuteImporter perpImporter,
                           org.home.data.theory.ou.BasisVerify basisVerify) {
         this.s5Importer = s5Importer;
+        this.s5Premium = s5Premium;
         this.allocBench = allocBench;
         this.kellyBench = kellyBench;
         this.ouBench = ouBench;
@@ -42,6 +45,7 @@ public class TheoryCommands {
     public void run(String target, String out) {
         switch (target) {
             case "s5-import" -> s5Importer.run();
+            case "s5-premium" -> s5Premium.run(out);
             case "alloc" -> allocBench.run(out);
             case "kelly" -> kellyBench.run(out);
             case "ou" -> ouBench.run(out);
@@ -51,7 +55,7 @@ public class TheoryCommands {
             case "basis-stress" -> perpImporter.runStress(java.util.List.of("BTCUSDT"), 20, "2024-01-01");
             case "basis-history" -> perpImporter.runContinuous(java.util.List.of("BTCUSDT"), "2025-08-01");
             default -> throw new IllegalArgumentException(
-                    "Неизвестный стенд: " + target + " (s5-import | basis-import | basis-stress | basis-history | alloc | kelly | ou | band | verify)");
+                    "Неизвестный стенд: " + target + " (s5-import | s5-premium | basis-import | basis-stress | basis-history | alloc | kelly | ou | band | verify)");
         }
     }
 }

@@ -91,6 +91,66 @@ class UnlockFeedTest {
         assertTrue(up.get(0).pctLabel().startsWith("36.0% (team 32.0 + eco 4.0"), up.get(0).pctLabel());
     }
 
+    /**
+     * Регрессия док. 130: порог применяется ПОСЛЕ слияния. Два транша по 2% в один день дают событие 4% и
+     * обязаны пройти порог 3%; одиночный транш 2% — не обязан. До правки первый случай отбрасывался целиком
+     * (живой промах: ZRO 19.09.2026, 1.68% + 2.06%, оба insiders).
+     */
+    @Test void thresholdAppliesAfterMergeNotPerTranche() throws Exception {
+        long today = 20000, unlockDay = today + 5, ts = unlockDay * 86400;
+        String twoSmall = """
+            {"metadata":{"token":"coingecko:aptos","events":[
+               {"unlockType":"cliff","timestamp":%d,"noOfTokens":[20],"category":"","description":"cliff from Team on X"},
+               {"unlockType":"cliff","timestamp":%d,"noOfTokens":[20],"category":"","description":"cliff from Core Contributors on X"}
+            ]},"documentedData":{"data":[{"label":"All","data":[{"timestamp":%d,"unlocked":1000}]}]}}
+            """.formatted(ts, ts, ts);
+        List<UnlockEvent> up = feed(fake(Map.of("aptos", twoSmall))).upcoming(today);
+        assertEquals(1, up.size(), "2% + 2% = 4% за день — событие проходит порог 3%");
+        assertEquals(0.04, up.get(0).pctCirculating(), 1e-9);
+
+        // контроль: одиночный транш 2% порога не проходит
+        var single = fake(Map.of("aptos", emission("aptos", ts, "20", "cliff from Team on X", 1000)));
+        assertTrue(feed(single).upcoming(today).isEmpty(), "одиночный транш 2% отсекается");
+    }
+
+    /** Транши разных дней не сливаются, даже если каждый по отдельности ниже порога. */
+    @Test void doesNotMergeAcrossDays() throws Exception {
+        long today = 20000;
+        String twoDays = """
+            {"metadata":{"token":"coingecko:aptos","events":[
+               {"unlockType":"cliff","timestamp":%d,"noOfTokens":[20],"category":"","description":"cliff from Team on X"},
+               {"unlockType":"cliff","timestamp":%d,"noOfTokens":[20],"category":"","description":"cliff from Team on X"}
+            ]},"documentedData":{"data":[{"label":"All","data":[{"timestamp":%d,"unlocked":1000}]}]}}
+            """.formatted((today + 5) * 86400, (today + 6) * 86400, (today + 5) * 86400);
+        assertTrue(feed(fake(Map.of("aptos", twoDays))).upcoming(today).isEmpty(),
+                "2% в один день и 2% в другой — два разных события, оба ниже порога");
+    }
+
+    /** Линейные события — это смена скорости [было, стало], а не объём: в разлоки они не попадают. */
+    @Test void ignoresLinearRateChanges() throws Exception {
+        long today = 20000, ts = (today + 5) * 86400;
+        String linear = """
+            {"metadata":{"token":"coingecko:aptos","events":[
+               {"unlockType":"linear","timestamp":%d,"noOfTokens":[0,900],"category":"","description":"Linear from Team on X","rateDurationDays":30}
+            ]},"documentedData":{"data":[{"label":"All","data":[{"timestamp":%d,"unlocked":1000}]}]}}
+            """.formatted(ts, ts);
+        assertTrue(feed(fake(Map.of("aptos", linear))).upcoming(today).isEmpty(),
+                "linear не событие S5: 900 — новая скорость, а не разлочённый объём");
+    }
+
+    /** timestamp в корпусе бывает строкой (наблюдалось у Curve) — разбор обязан это переживать. */
+    @Test void acceptsStringTimestamps() throws Exception {
+        long today = 20000, unlockDay = today + 5, ts = unlockDay * 86400;
+        String stringTs = """
+            {"metadata":{"token":"coingecko:aptos","events":[
+               {"unlockType":"cliff","timestamp":"%d","noOfTokens":[60],"category":"","description":"cliff from Investors on X"}
+            ]},"documentedData":{"data":[{"label":"All","data":[{"timestamp":"%d","unlocked":1000}]}]}}
+            """.formatted(ts, ts);
+        List<UnlockEvent> up = feed(fake(Map.of("aptos", stringTs))).upcoming(today);
+        assertEquals(1, up.size(), "строковый timestamp разобран");
+        assertEquals(unlockDay, up.get(0).unlockDay());
+    }
+
     @Test void oneBadProtocolDoesNotBreakFeed() throws Exception {
         long today = 20000;
         var src = fake(Map.of(

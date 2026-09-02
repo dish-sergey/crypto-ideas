@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.home.data.theory.Jlog;
 import org.home.data.theory.TheoryDb;
+import org.home.data.trade.UnlockSchedule;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -27,7 +28,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.TreeMap;
 import java.util.TreeSet;
 
 /**
@@ -103,11 +103,7 @@ public class S5EventImporter {
                         skippedNoPerp++;
                         continue;
                     }
-                    TreeMap<Long, Double> circ = circulating(e);
-                    if (circ.isEmpty()) {
-                        continue;
-                    }
-                    collectEvents(e, base, circ, events, bases);
+                    collectEvents(e, base, events, bases);
                 } catch (IOException ex) {
                     Jlog.warn(log, "s5.cache.skip",
                             Map.of("file", f.getFileName().toString(), "err", ex.toString()));
@@ -144,42 +140,15 @@ public class S5EventImporter {
                 "funding", db.queryLong("SELECT count(*) FROM s5_funding_daily")));
     }
 
-    /** Циркулирующее предложение по датам: сумма всех веток документированных данных. */
-    private static TreeMap<Long, Double> circulating(JsonNode e) {
-        TreeMap<Long, Double> circ = new TreeMap<>();
-        for (JsonNode chart : e.path("documentedData").path("data")) {
-            for (JsonNode p : chart.path("data")) {
-                circ.merge(p.path("timestamp").asLong(), p.path("unlocked").asDouble(0), Double::sum);
-            }
-        }
-        return circ;
-    }
-
-    private void collectEvents(JsonNode e, String base, TreeMap<Long, Double> circ,
-                               List<Raw> events, Set<String> bases) {
-        JsonNode evs = e.path("metadata").path("events");
-        if (evs.isMissingNode() || !evs.isArray()) {
-            evs = e.path("events");
-        }
-        for (JsonNode ev : evs) {
-            if (!"cliff".equals(ev.path("unlockType").asText())) {
-                continue;
-            }
-            JsonNode tokens = ev.path("noOfTokens");
-            if (!tokens.isArray() || tokens.isEmpty()) {
-                continue;
-            }
-            double amount = tokens.get(0).asDouble(0);
-            long ts = ev.path("timestamp").asLong();
-            Long floor = circ.floorKey(ts);
-            if (amount <= 0 || floor == null || circ.get(floor) <= 0) {
-                continue;
-            }
-            double pct = Math.min(amount / circ.get(floor), 1.0);
-            if (pct < minPct) {
-                continue;
-            }
-            events.add(new Raw(base, day(ts * 1000L), pct, amount));
+    /**
+     * События одного протокола через общий разбор {@link UnlockSchedule} (док. 130 §6): транши одного дня
+     * сливаются, и только потом применяется {@code minPct}. Раньше здесь была своя копия разбора, которая
+     * резала по порогу каждый транш, а дубликаты по {@code (base, unlock_day)} гасились уже в SQLite через
+     * {@code INSERT OR REPLACE} — в базу попадала доля СЛУЧАЙНОГО транша, а не всего дня.
+     */
+    private void collectEvents(JsonNode e, String base, List<Raw> events, Set<String> bases) {
+        for (UnlockSchedule.Unlock u : UnlockSchedule.parse(e, base, minPct)) {
+            events.add(new Raw(base, day(u.day() * 86400_000L), u.pct(), u.tokens()));
             bases.add(base);
         }
     }
