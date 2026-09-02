@@ -17,6 +17,7 @@ public class TheoryCommands {
 
     private final S5EventImporter s5Importer;
     private final org.home.data.theory.s5.S5PremiumBench s5Premium;
+    private final org.home.data.theory.s5.S5FundingBench s5Funding;
     private final AllocBench allocBench;
     private final org.home.data.theory.kelly.KellyBench kellyBench;
     private final org.home.data.theory.ou.OuBench ouBench;
@@ -25,6 +26,7 @@ public class TheoryCommands {
     private final org.home.data.theory.ou.BasisVerify basisVerify;
 
     public TheoryCommands(S5EventImporter s5Importer, org.home.data.theory.s5.S5PremiumBench s5Premium,
+                          org.home.data.theory.s5.S5FundingBench s5Funding,
                           AllocBench allocBench,
                           org.home.data.theory.kelly.KellyBench kellyBench,
                           org.home.data.theory.ou.OuBench ouBench,
@@ -33,6 +35,7 @@ public class TheoryCommands {
                           org.home.data.theory.ou.BasisVerify basisVerify) {
         this.s5Importer = s5Importer;
         this.s5Premium = s5Premium;
+        this.s5Funding = s5Funding;
         this.allocBench = allocBench;
         this.kellyBench = kellyBench;
         this.ouBench = ouBench;
@@ -46,6 +49,7 @@ public class TheoryCommands {
         switch (target) {
             case "s5-import" -> s5Importer.run();
             case "s5-premium" -> s5Premium.run(out);
+            case "s5-funding" -> s5Funding.run(out);
             case "alloc" -> allocBench.run(out);
             case "kelly" -> kellyBench.run(out);
             case "ou" -> ouBench.run(out);

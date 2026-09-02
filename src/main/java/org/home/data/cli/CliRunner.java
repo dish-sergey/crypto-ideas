@@ -60,6 +60,7 @@ public class CliRunner implements ApplicationRunner {
     private final FundingCollector funding;
     private final OnchainCollector onchain;
     private final OiArchiveImporter oiArchive;
+    private final org.home.data.collectors.KrakenFundingBackfill krakenFundingBackfill;
     private final RegimeDetector detector;
     private final RegimeDetectorV2 detectorV2;
     private final RegimeDetectorV3 detectorV3;
@@ -86,6 +87,7 @@ public class CliRunner implements ApplicationRunner {
     public CliRunner(ConfigurableApplicationContext context, CliMode mode,
                      List<Collector> collectors, OhlcvCollector ohlcv, FundingCollector funding,
                      OnchainCollector onchain, OiArchiveImporter oiArchive,
+                     org.home.data.collectors.KrakenFundingBackfill krakenFundingBackfill,
                      RegimeDetector detector, RegimeDetectorV2 detectorV2, RegimeDetectorV3 detectorV3,
                      RegimeDetectorV5 detectorV5,
                      RegimeReport report, AllocationProxy allocationProxy, Bench bench, S1Backtest s1Backtest,
@@ -107,6 +109,7 @@ public class CliRunner implements ApplicationRunner {
         this.funding = funding;
         this.onchain = onchain;
         this.oiArchive = oiArchive;
+        this.krakenFundingBackfill = krakenFundingBackfill;
         this.detector = detector;
         this.detectorV2 = detectorV2;
         this.detectorV3 = detectorV3;
@@ -354,13 +357,14 @@ public class CliRunner implements ApplicationRunner {
                 List<String> list = symbolsArg != null ? List.of(symbolsArg.split(",")) : defaultSymbols;
                 oiArchive.backfill(list, firstOr(args, "from", "2021-01-01"));
             }
+            case "kraken-funding" -> krakenFundingBackfill.run();
             case "regime" -> detector.backfill(firstOr(args, "from", "2020-01-01"));
             case "regime-v2" -> detectorV2.backfill(firstOr(args, "from", "2020-01-01"));
             case "regime-v3" -> detectorV3.backfill(firstOr(args, "from", "2020-01-01"));
             case "regime-v5" -> detectorV5.backfill(firstOr(args, "from", "2020-01-01"));
             default -> throw new IllegalArgumentException(
                     "Неизвестная цель backfill: " + target
-                            + " (ohlcv | funding-okx | onchain | oi-archive | regime | regime-v2 | regime-v3 | regime-v5)");
+                            + " (ohlcv | funding-okx | onchain | oi-archive | kraken-funding | regime | regime-v2 | regime-v3 | regime-v5)");
         }
     }
 
