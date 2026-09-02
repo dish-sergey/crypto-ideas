@@ -39,7 +39,8 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-ex
   --revx.exec.skew-target=0.3 \
   --revx.exec.cost-floor-margin=-1 \
   --revx.exec.anchor-leash=-1 \
-  --revx.exec.own-position=true
+  --revx.exec.own-position=true \
+  --revx.exec.park-distance=0.10
 
 # Аварийная остановка при выключении сервиса: заявки на бирже переживают наш
 # процесс, и оставлять их там нельзя. Хук в приложении снимает их сам, но если

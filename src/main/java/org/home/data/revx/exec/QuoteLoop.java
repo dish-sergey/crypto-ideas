@@ -838,10 +838,22 @@ public final class QuoteLoop implements Runnable {
         if (resting.venueId == null) {
             return;                       // отводить нечего
         }
-        if (quoter.shouldRequote(resting.price, price)) {
-            replace(side, resting, price, resting.size);
-            journal.event("park", side + " отведена на " + fmt(price) + " (" + why + ")");
+        if (!quoter.shouldRequote(resting.price, price)) {
+            return;                       // уже отведена
         }
+        int failuresBefore = resting.failures;
+        replace(side, resting, price, resting.size);
+        if (resting.failures > failuresBefore) {
+            // Площадка отказала — возможно, цена в 10% от рынка ей не нравится.
+            // Оставить заявку там, где она есть, нельзя: гейт закрыт именно
+            // потому, что цена подозрительная, и заявка стоит в зоне исполнения.
+            // Отвод — оптимизация расхода постановок, а не повод ослабить гейт,
+            // поэтому при неудаче возвращаемся к прежнему поведению.
+            log.warn("отвод {} не прошёл — снимаю заявку по-старому", side);
+            cancel(side, resting, why + " (отвод отклонён)");
+            return;
+        }
+        journal.event("park", side + " отведена на " + fmt(price) + " (" + why + ")");
     }
 
     /**
