@@ -164,6 +164,29 @@ public class S5PremiumBench {
         md.append("\n## Честный бенчмарк: шорт тех же монет без разлока (порог 3%)\n\n");
         md.append(benchmark(base3, px, ctl));
 
+        md.append("\n## Устойчивость к именам (док. 134 §4)\n\n");
+        md.append("Единственный разрез, где эффект крупный и частый, — **вне Kraken в 2025-26** ")
+                .append("(+4.10% при 208 событиях). На нём и стоит вопрос о доступе к Binance. ")
+                .append("Но средняя по двум сотням событий ничего не говорит о том, из скольких ")
+                .append("источников она собрана: если её несут четыре имени, то это не «премия ")
+                .append("разлока», а четыре истории одного года.\n\n");
+        md.append("Метрика везде — **разность к рынку в те же дни**, та же, на которой стоит ")
+                .append("вывод честного бенчмарка. Считать устойчивость по неочищенной ")
+                .append("доходности значило бы мерить устойчивость режима, а не эффекта.\n\n");
+        List<Trade> usableAll = base3.stream()
+                .filter(x -> peerCount(ctl.peer(), entryDay(x)) >= 20).toList();
+        md.append(nameRobustness("Вне Kraken, 2025-26 — разрез, на котором принимается решение",
+                usableAll.stream().filter(x -> !x.onKraken()
+                        && x.day().compareTo("2025-01-01") >= 0).toList(), ctl.peer()));
+        md.append(nameRobustness("Kraken, 2025-26 — торгуемая вселенная, для сравнения",
+                usableAll.stream().filter(x -> x.onKraken()
+                        && x.day().compareTo("2025-01-01") >= 0).toList(), ctl.peer()));
+        md.append("**Как читать.** Если после удаления одного имени `t` падает ниже двух — ")
+                .append("эффект держится на нём, и решение принимать нельзя. Если винзоризация ")
+                .append("5/95 срезает эффект вдвое и больше — он живёт в хвосте, а не в среднем ")
+                .append("событии, и торговать его придётся редкими крупными ставками. Доля ")
+                .append("топ-имён в суммарной разности показывает то же самое одним числом.\n\n");
+
         md.append("\n## Листинг или тонкий стакан? (порог 3%)\n\n");
         md.append(liquidity(base3, px, ctl));
 
@@ -277,6 +300,126 @@ public class S5PremiumBench {
                 .append("`t` проверяет разность против нуля, `p` — против плацебо (доля прогонов, где ")
                 .append("случайные даты дали не хуже фактических). Правильный вопрос — второй: ")
                 .append("«отличается ли дата разлока от любой другой даты».\n");
+        return sb.toString();
+    }
+
+    /**
+     * Устойчивость к именам: не несут ли эффект несколько монет (док. 134 §4).
+     *
+     * Зачем это отдельная проверка. Средняя по 178 событиям ничего не говорит о
+     * том, из скольких источников она собрана. Если убрать четыре имени и эффект
+     * исчезает, то «премия разлока вне Kraken» — на самом деле «четыре истории
+     * 2025 года», и решение о доступе к Binance принимается не на том основании.
+     *
+     * Три независимых среза:
+     * <ul>
+     *   <li><b>leave-one-out по имени</b> — выбрасываем ВСЕ события монеты и
+     *       смотрим, что осталось. Именно по имени, а не по сделке: события одной
+     *       монеты не независимы;</li>
+     *   <li><b>винзоризация</b> 5/95 — обрезаем хвосты значений, не удаляя
+     *       наблюдений. Отвечает на «эффект в среднем или в хвосте»;</li>
+     *   <li><b>концентрация</b> — какая доля суммарного эффекта приходится на
+     *       топ-1, топ-3, топ-5 имён.</li>
+     * </ul>
+     *
+     * Метрика везде одна и та же — разность к рынку в те же дни, то есть та, на
+     * которой стоит вывод §5а. Считать устойчивость по неочищенной доходности
+     * значило бы мерить устойчивость режима, а не эффекта.
+     */
+    private String nameRobustness(String label, List<Trade> t, Map<String, double[]> peer) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("### ").append(label).append("\n\n");
+        if (t.size() < 20) {
+            return sb.append("Событий ").append(t.size()).append(" — мало для разбора.\n\n").toString();
+        }
+        // Разность к рынку по каждому событию и группировка по имени.
+        Map<String, List<Double>> byName = new java.util.TreeMap<>();
+        double[] adj = new double[t.size()];
+        for (int i = 0; i < t.size(); i++) {
+            Trade x = t.get(i);
+            adj[i] = x.shortRet() - peerMean(peer, entryDay(x));
+            byName.computeIfAbsent(x.base(), k -> new ArrayList<>()).add(adj[i]);
+        }
+        double mean = Arrays.stream(adj).average().orElse(0);
+        double se = sd(adj, mean) / Math.sqrt(adj.length);
+        double t0 = se > 0 ? mean / se : 0;
+
+        sb.append("| Величина | Событий | Имён | Разность к рынку | t |\n|---|---|---|---|---|\n");
+        sb.append(String.format(Locale.ROOT, "| **как есть** | %d | %d | **%+.2f%%** | **%.2f** |%n",
+                t.size(), byName.size(), mean * 100, t0));
+
+        // Винзоризация: хвосты обрезаются, наблюдения остаются.
+        double[] sorted = adj.clone();
+        Arrays.sort(sorted);
+        double lo = sorted[(int) Math.floor(0.05 * (sorted.length - 1))];
+        double hi = sorted[(int) Math.ceil(0.95 * (sorted.length - 1))];
+        double[] win = Arrays.stream(adj).map(v -> Math.min(hi, Math.max(lo, v))).toArray();
+        double wMean = Arrays.stream(win).average().orElse(0);
+        double wSe = sd(win, wMean) / Math.sqrt(win.length);
+        sb.append(String.format(Locale.ROOT, "| винзоризация 5/95 | %d | %d | %+.2f%% | %.2f |%n",
+                win.length, byName.size(), wMean * 100, wSe > 0 ? wMean / wSe : 0));
+        sb.append(String.format(Locale.ROOT, "| медиана события | %d | %d | %+.2f%% | — |%n%n",
+                adj.length, byName.size(), median(adj) * 100));
+
+        // Вклад каждого имени в СУММУ: сколько эффекта уйдёт вместе с ним.
+        record Name(String base, int n, double sum, double mean) {
+        }
+        List<Name> names = byName.entrySet().stream()
+                .map(e -> new Name(e.getKey(), e.getValue().size(),
+                        e.getValue().stream().mapToDouble(Double::doubleValue).sum(),
+                        e.getValue().stream().mapToDouble(Double::doubleValue).average().orElse(0)))
+                .sorted(Comparator.comparingDouble(Name::sum).reversed())
+                .toList();
+        double total = Arrays.stream(adj).sum();
+
+        sb.append("**Leave-one-out: что остаётся без каждого из десяти сильнейших имён**\n\n");
+        sb.append("| Убрано имя | Его событий | Его средняя | Осталось событий "
+                + "| Разность к рынку | t |\n|---|---|---|---|---|---|\n");
+        for (Name n : names.stream().limit(10).toList()) {
+            double[] rest = new double[t.size() - n.n()];
+            int k = 0;
+            for (int i = 0; i < t.size(); i++) {
+                if (!t.get(i).base().equals(n.base())) {
+                    rest[k++] = adj[i];
+                }
+            }
+            double rMean = Arrays.stream(rest).average().orElse(0);
+            double rSe = sd(rest, rMean) / Math.sqrt(rest.length);
+            sb.append(String.format(Locale.ROOT, "| %s | %d | %+.2f%% | %d | %+.2f%% | %.2f |%n",
+                    n.base(), n.n(), n.mean() * 100, rest.length, rMean * 100,
+                    rSe > 0 ? rMean / rSe : 0));
+        }
+
+        // Концентрация: сколько эффекта в нескольких именах.
+        sb.append("\n**Концентрация эффекта**\n\n| Топ имён | Доля суммарной разности |\n|---|---|\n");
+        for (int top : new int[]{1, 3, 5}) {
+            double s = names.stream().limit(top).mapToDouble(Name::sum).sum();
+            sb.append(String.format(Locale.ROOT, "| %d из %d | %.0f%% |%n",
+                    top, names.size(), total != 0 ? 100 * s / total : Double.NaN));
+        }
+
+        // И прямой ответ на вопрос док. 134 §4: убрать НЕСКОЛЬКО сильнейших имён
+        // сразу. Поодиночке эффект может пережить каждое, а вместе — нет.
+        sb.append("\n**Убрать топ-k имён сразу**\n\n| Убрано | Имена | Осталось событий "
+                + "| Разность к рынку | t |\n|---|---|---|---|---|\n");
+        for (int k : new int[]{2, 3, 4, 5}) {
+            Set<String> drop = names.stream().limit(k).map(Name::base)
+                    .collect(java.util.stream.Collectors.toSet());
+            double[] rest = new double[t.size()];
+            int m = 0;
+            for (int i = 0; i < t.size(); i++) {
+                if (!drop.contains(t.get(i).base())) {
+                    rest[m++] = adj[i];
+                }
+            }
+            double[] r = Arrays.copyOf(rest, m);
+            double rMean = m == 0 ? Double.NaN : Arrays.stream(r).average().orElse(0);
+            double rSe = m < 2 ? Double.NaN : sd(r, rMean) / Math.sqrt(m);
+            sb.append(String.format(Locale.ROOT, "| %d | %s | %d | %+.2f%% | %.2f |%n",
+                    k, String.join(", ", names.stream().limit(k).map(Name::base).toList()),
+                    m, rMean * 100, rSe > 0 ? rMean / rSe : Double.NaN));
+        }
+        sb.append("\n");
         return sb.toString();
     }
 
