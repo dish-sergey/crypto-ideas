@@ -159,6 +159,9 @@ public class S5PremiumBench {
         md.append("Только Kraken: ").append(blockBootstrap(
                 base3.stream().filter(Trade::onKraken).toList(), 2000));
 
+        md.append("\n## Честный бенчмарк: шорт тех же монет без разлока (порог 3%)\n\n");
+        md.append(benchmark(base3, px, kraken));
+
         md.append("\n## Разложение: сколько из дохода — эффект разлока, а сколько снос\n\n");
         md.append("Доходность шорта = безусловный снос монеты за те же 5 дней + премия события. ")
                 .append("Первое слагаемое — бета (шортим падающие альты), второе — то, за что S5 существует.\n\n");
@@ -188,6 +191,153 @@ public class S5PremiumBench {
                 .append("порог случайно. Смотреть надо на согласованность разрезов, а не на лучший.\n");
 
         write(outDir, md.toString());
+    }
+
+    /**
+     * Честный бенчмарк (док. 131 §7 п.2): шорт тех же монет БЕЗ привязки к разлоку.
+     *
+     * <p>Два контроля, потому что «безусловный снос по всей истории монеты» снимает только один из двух
+     * конфаундеров. Второй — время: события кучкуются, и если они пришлись на падающий рынок, шорт был бы
+     * прибылен и без разлока.
+     * <ul>
+     *   <li><b>Рыночный контроль</b>: те же календарные дни, но другие монеты — среднее по всем базам, у
+     *       которых в это окно СВОЕГО разлока нет. Разность «событие − рынок» и есть доход, очищенный от
+     *       режима.</li>
+     *   <li><b>Плацебо по времени</b>: та же монета, случайные окна без разлока рядом. Перестановочный тест
+     *       даёт распределение того же показателя при случайных датах — с ним и сравнивается факт.</li>
+     * </ul>
+     */
+    private String benchmark(List<Trade> t, Map<String, TreeMap<String, Double>> px, Set<String> kraken) {
+        Map<String, java.util.Set<Long>> unlocks = new HashMap<>();
+        db.query("SELECT base, unlock_day FROM s5_event", rs -> {
+            unlocks.computeIfAbsent(rs.getString(1), k -> new HashSet<>())
+                    .add(LocalDate.parse(rs.getString(2)).toEpochDay());
+            return null;
+        });
+
+        Map<String, double[]> peer = new HashMap<>();                 // день -> {сумма, счёт}
+        Map<String, List<String>> placeboDays = new HashMap<>();      // база -> дни без разлока рядом
+        for (Map.Entry<String, TreeMap<String, Double>> e : px.entrySet()) {
+            java.util.Set<Long> un = unlocks.getOrDefault(e.getKey(), java.util.Set.of());
+            for (Map.Entry<String, Double> p : e.getValue().entrySet()) {
+                String d = p.getKey();
+                Double exit = e.getValue().get(LocalDate.parse(d).plusDays(lead).toString());
+                if (exit == null || p.getValue() <= 0) {
+                    continue;
+                }
+                long d0 = LocalDate.parse(d).toEpochDay();
+                if (!hasUnlock(un, d0, d0 + lead)) {                  // в контроль — только чистые окна
+                    double ret = (p.getValue() - exit) / p.getValue();
+                    peer.computeIfAbsent(d, k -> new double[2])[0] += ret;
+                    peer.get(d)[1]++;
+                    if (!hasUnlock(un, d0 - lead, d0 + 2L * lead)) {  // плацебо — с запасом вокруг окна
+                        placeboDays.computeIfAbsent(e.getKey(), k -> new ArrayList<>()).add(d);
+                    }
+                }
+            }
+        }
+
+        List<Trade> usable = t.stream()
+                .filter(x -> peerCount(peer, entryDay(x)) >= 20 && placeboDays.containsKey(x.base()))
+                .toList();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Рыночный контроль: среднее по монетам без своего разлока в те же дни ")
+                .append("(минимум 20 монет в контроле). Плацебо: та же монета, случайные окна, ")
+                .append("вокруг которых разлоков нет.\n\n");
+        sb.append("| Разрез | Событий | Шорт события | Шорт рынка в те же дни | Разность | Плацебо | t | p |\n")
+                .append("|---|---|---|---|---|---|---|---|\n");
+        sb.append(benchRow("всё", usable, peer, px, placeboDays));
+        sb.append(benchRow("есть на Kraken", usable.stream().filter(Trade::onKraken).toList(),
+                peer, px, placeboDays));
+        sb.append(benchRow("Kraken, 2025-26", usable.stream()
+                .filter(x -> x.onKraken() && x.day().compareTo("2025-01-01") >= 0).toList(),
+                peer, px, placeboDays));
+        sb.append(benchRow("нет на Kraken", usable.stream().filter(x -> !x.onKraken()).toList(),
+                peer, px, placeboDays));
+        sb.append("\n`Разность` = шорт события минус рынок в те же дни: доход, очищенный от режима.\n")
+                .append("`Плацебо` — та же величина на случайных окнах без разлока, среднее по 2000 прогонам: ")
+                .append("это уровень, который даёт шорт этих же монет БЕЗ разлока.\n")
+                .append("`t` проверяет разность против нуля, `p` — против плацебо (доля прогонов, где ")
+                .append("случайные даты дали не хуже фактических). Правильный вопрос — второй: ")
+                .append("«отличается ли дата разлока от любой другой даты».\n");
+        return sb.toString();
+    }
+
+    private String benchRow(String label, List<Trade> t, Map<String, double[]> peer,
+                            Map<String, TreeMap<String, Double>> px, Map<String, List<String>> placebo) {
+        if (t.size() < 20) {
+            return "| " + label + " | " + t.size() + " | — | — | — | — | — | — |\n";
+        }
+        double[] adj = new double[t.size()];
+        double sEv = 0;
+        double sMk = 0;
+        for (int i = 0; i < t.size(); i++) {
+            Trade x = t.get(i);
+            double mk = peerMean(peer, entryDay(x));
+            adj[i] = x.shortRet() - mk;
+            sEv += x.shortRet();
+            sMk += mk;
+        }
+        double mean = Arrays.stream(adj).average().orElse(0);
+        double se = sd(adj, mean) / Math.sqrt(adj.length);
+
+        java.util.Random rnd = new java.util.Random(20260902L);
+        int iters = 2000;
+        int notWorse = 0;
+        double placeboSum = 0;
+        for (int it = 0; it < iters; it++) {
+            double sum = 0;
+            int n = 0;
+            for (Trade x : t) {
+                List<String> days = placebo.get(x.base());
+                if (days == null || days.isEmpty()) {
+                    continue;
+                }
+                String d = days.get(rnd.nextInt(days.size()));
+                TreeMap<String, Double> p = px.get(x.base());
+                Double entry = p.get(d);
+                Double exit = p.get(LocalDate.parse(d).plusDays(lead).toString());
+                if (entry == null || exit == null || entry <= 0) {
+                    continue;
+                }
+                sum += (entry - exit) / entry - peerMean(peer, d);
+                n++;
+            }
+            if (n > 0) {
+                placeboSum += sum / n;
+                if (sum / n >= mean) {
+                    notWorse++;
+                }
+            }
+        }
+        return String.format(Locale.ROOT,
+                "| %s | %d | %+.2f%% | %+.2f%% | %+.2f%% | %+.2f%% | %.2f | %.3f |%n",
+                label, t.size(), sEv / t.size() * 100, sMk / t.size() * 100, mean * 100,
+                placeboSum / iters * 100, se > 0 ? mean / se : 0, (double) notWorse / iters);
+    }
+
+    private String entryDay(Trade x) {
+        return LocalDate.parse(x.day()).minusDays(lead).toString();
+    }
+
+    private static boolean hasUnlock(java.util.Set<Long> days, long from, long to) {
+        for (long d = from; d <= to; d++) {
+            if (days.contains(d)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static double peerMean(Map<String, double[]> peer, String day) {
+        double[] a = peer.get(day);
+        return a == null || a[1] == 0 ? 0 : a[0] / a[1];
+    }
+
+    private static double peerCount(Map<String, double[]> peer, String day) {
+        double[] a = peer.get(day);
+        return a == null ? 0 : a[1];
     }
 
     /** Разложение доходности шорта на безусловный снос монеты и премию события. */
