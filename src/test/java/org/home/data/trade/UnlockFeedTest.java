@@ -158,4 +158,42 @@ class UnlockFeedTest {
                 "broken", "{ not json"));
         assertEquals(1, feed(src).upcoming(today).size(), "битый протокол пропущен, фид жив");
     }
+
+    /**
+     * Тикер, на который претендуют два проекта, не берётся ВООБЩЕ (док. 130
+     * §III п.7). Реальный случай: у `velodrome-finance` тикер VELO, на Kraken
+     * есть PF_VELOUSD — но это Velo Labs, другая монета, и её расписание
+     * разлоков к Velodrome отношения не имеет.
+     */
+    @Test void refusesTickerClaimedByTwoProjects() throws Exception {
+        long today = 20000;
+        long unlock = (today + 5) * 86400;
+        Map<String, String> gecko = Map.of(
+                "aptos", "APT",
+                "velodrome-finance", "VELO",
+                "velo", "VELO");                    // два проекта, один тикер
+        UnlockFeed feed = new UnlockFeed(
+                fake(Map.of("velodrome-finance", emission("velodrome-finance", unlock, "50", "investors", 1000))),
+                gecko, Set.of("APT", "VELO"));
+
+        assertTrue(feed.ambiguousTickers().contains("VELO"),
+                "конфликт обязан быть виден в списке исключённых");
+        assertEquals(0, feed.upcoming(today).size(),
+                "чужое расписание не должно доехать до бота");
+    }
+
+    /** Однозначный тикер конфликтом не считается — иначе фид опустеет. */
+    @Test void unambiguousTickerSurvives() {
+        UnlockFeed feed = feed(fake(Map.of()));
+        assertTrue(feed.ambiguousTickers().isEmpty(),
+                "в обычной карте конфликтов нет: " + feed.ambiguousTickers());
+    }
+
+    /** Коллизии среди монет, которыми мы не торгуем, в предупреждение не попадают. */
+    @Test void collisionOutsideKrakenIsNotReported() {
+        UnlockFeed feed = new UnlockFeed(fake(Map.of()),
+                Map.of("a", "APT", "x", "FOO", "y", "FOO"), Set.of("APT"));
+        assertTrue(feed.ambiguousTickers().isEmpty(),
+                "FOO не торгуется — шуметь про него незачем");
+    }
 }

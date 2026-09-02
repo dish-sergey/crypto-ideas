@@ -23,9 +23,53 @@ public class UnlockFeed implements EventFeed {
     private final EmissionSource src;
     private final Map<String, String> geckoToTicker;  // gecko_id -> TICKER (upper)
     private final Set<String> krakenBases;            // базы с торгуемым перпом на Kraken (XBT->BTC)
+    /**
+     * Тикеры, на которые претендует БОЛЬШЕ ОДНОГО проекта CoinGecko.
+     *
+     * ⚠️ Отображение {@code gecko_id → тикер} не проверяет тождества монеты, и
+     * это структурная подмена (док. 130 §III п.7): у `velodrome-finance` тикер
+     * `VELO`, на Kraken есть `PF_VELOUSD` — но это Velo Labs, другая монета.
+     * Любой протокол, чей тикер совпал с чужим перпом, отдал бы боту ЧУЖОЕ
+     * расписание разлоков, и бот открыл бы позицию по событию, которого у этой
+     * монеты нет.
+     *
+     * Разрешать такое угадыванием (по капитализации, по возрасту) нельзя:
+     * ошибка тут стоит реальной сделки. Поэтому конфликтный тикер **исключается
+     * целиком**, а его список печатается при старте — это отказ, а не тихий
+     * пропуск.
+     */
+    private final Set<String> ambiguous;
 
     public UnlockFeed(EmissionSource src, Map<String, String> geckoToTicker, Set<String> krakenBases) {
         this.src = src; this.geckoToTicker = geckoToTicker; this.krakenBases = krakenBases;
+        this.ambiguous = ambiguousTickers(geckoToTicker, krakenBases);
+    }
+
+    /**
+     * Тикеры торгуемых перпов, на которые претендует больше одного gecko_id.
+     *
+     * Считается только по базам Kraken: коллизии среди монет, которыми мы не
+     * торгуем, вреда не приносят, а в предупреждении были бы шумом.
+     */
+    static Set<String> ambiguousTickers(Map<String, String> geckoToTicker, Set<String> krakenBases) {
+        Map<String, Integer> claims = new java.util.HashMap<>();
+        for (String t : geckoToTicker.values()) {
+            if (krakenBases.contains(t)) {
+                claims.merge(t, 1, Integer::sum);
+            }
+        }
+        Set<String> out = new java.util.TreeSet<>();
+        claims.forEach((t, n) -> {
+            if (n > 1) {
+                out.add(t);
+            }
+        });
+        return out;
+    }
+
+    /** Исключённые из-за неоднозначности тикеры — для печати при старте. */
+    public Set<String> ambiguousTickers() {
+        return ambiguous;
     }
 
     /** Все клифф-разлоки ≥{@link #MIN_PCT} на Kraken-инструментах с датой > todayEpochDay (будущие). */
@@ -56,6 +100,9 @@ public class UnlockFeed implements EventFeed {
     void collect(JsonNode e, long todayEpochDay, List<UnlockEvent> out) {
         String ticker = ticker(e, geckoToTicker);
         if (ticker.isEmpty() || !krakenBases.contains(ticker)) return;
+        // Тикер, на который претендует несколько проектов, не берём ВООБЩЕ:
+        // расписание могло приехать от чужой монеты (док. 130 §III п.7).
+        if (ambiguous.contains(ticker)) return;
         for (UnlockSchedule.Unlock u : UnlockSchedule.parse(e, ticker, MIN_PCT)) {
             if (u.day() <= todayEpochDay) continue;                 // только будущие
             out.add(new UnlockEvent(u.base(), UnlockSchedule.krakenSymbol(u.base()), u.day(),
