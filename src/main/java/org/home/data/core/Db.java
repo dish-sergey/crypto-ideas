@@ -77,6 +77,26 @@ public class Db {
         }
     }
 
+    /**
+     * Применить схему к ЧУЖОМУ соединению — например к сборочной базе, которую
+     * создаёт зеркало ({@link org.home.data.revx.sim.MirrorBuilder}).
+     *
+     * Вынесено сюда, а не скопировано на месте, ровно из-за ловушки ниже:
+     * наивное разбиение по ';' даёт фрагмент без оператора, и sqlite-jdbc
+     * отвечает на него невнятным «The prepared statement has been finalized».
+     * Один раз на этом уже потеряли время.
+     */
+    public static void applySchema(Connection connection, String schema) throws SQLException {
+        try (Statement st = connection.createStatement()) {
+            for (String sql : stripLineComments(schema).split(";")) {
+                String trimmed = sql.trim();
+                if (!trimmed.isEmpty()) {
+                    st.execute(trimmed);
+                }
+            }
+        }
+    }
+
     /** Убирает построчные '--' комментарии. Строковых литералов с '--' в схемах нет. */
     private static String stripLineComments(String schema) {
         StringBuilder sb = new StringBuilder(schema.length());

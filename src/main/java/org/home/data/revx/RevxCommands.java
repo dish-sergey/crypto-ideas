@@ -27,6 +27,7 @@ public class RevxCommands {
     private final org.home.data.revx.sim.SimRunner simRunner;
     private final org.home.data.revx.sim.ScreenReport screenReport;
     private final org.home.data.revx.sim.PerpBasisReport perpBasisReport;
+    private final org.home.data.revx.sim.MirrorBuilder mirrorBuilder;
     private final RevxConfig cfg;
 
     public RevxCommands(PairsCatalog catalog, RateLimitProbe probe, RevxCollectorDaemon daemon,
@@ -34,7 +35,8 @@ public class RevxCommands {
                         org.home.data.revx.sim.FlowReport flowReport,
                         org.home.data.revx.sim.SimRunner simRunner,
                         org.home.data.revx.sim.ScreenReport screenReport,
-                        org.home.data.revx.sim.PerpBasisReport perpBasisReport, RevxConfig cfg) {
+                        org.home.data.revx.sim.PerpBasisReport perpBasisReport,
+                        org.home.data.revx.sim.MirrorBuilder mirrorBuilder, RevxConfig cfg) {
         this.catalog = catalog;
         this.probe = probe;
         this.daemon = daemon;
@@ -43,6 +45,7 @@ public class RevxCommands {
         this.simRunner = simRunner;
         this.screenReport = screenReport;
         this.perpBasisReport = perpBasisReport;
+        this.mirrorBuilder = mirrorBuilder;
         this.cfg = cfg;
     }
 
@@ -99,6 +102,11 @@ public class RevxCommands {
     /** --revx-perp-basis: базис перпа Kraken против спота — цена нейтральности (док. 127 §12). */
     public void perpBasis(java.util.List<String> symbols, int hours, long toMs, String out) {
         perpBasisReport.run(symbols, hours, toMs, out);
+    }
+
+    /** --revx-mirror: зеркальное падение из окна роста, согласованно по всей корзине (док. 125 §3). */
+    public void mirror(int hours, long toMs, String out) {
+        mirrorBuilder.run(toMs - hours * 3600_000L, toMs, out);
     }
 
     /** --revx-screen: вся вселенная разом — спред, поток, разрешение хеджа, δ* (док. 127 §15 п.2, 6). */
