@@ -1,0 +1,55 @@
+[Unit]
+Description=Revolut X micro-live BOT C (REAL orders) — тот же профиль, что у A, но отступ 14 б.п.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx-exec-c
+EnvironmentFile=/etc/revx-exec-c.env
+
+# Профиль C — БЛИЗНЕЦ БОТА A С ДРУГИМ ОТСТУПОМ (док. 132 §5).
+#
+# Зачем третий бот. Интенсивность прихода λ(δ) = A·e^{−κδ} и всё, что из неё
+# следует — рабочая точка δ* = c + 1/κ и ранжирование пар, — держатся на κ,
+# который живьём НЕ МЕРИЛСЯ НИ РАЗУ: он берётся из симулятора. А измерить κ
+# можно только по разным отступам: два бота на одном отступе дают одну точку,
+# и подгонка невозможна.
+#
+# Поэтому C отличается от A ровно одним числом — отступом. Всё остальное
+# совпадает: цель инвентаря 0.3, пол и поводок выключены. Тогда отношение частот
+# исполнения A и C даёт κ прямо:
+#
+#   κ = ln(λ_A / λ_C) / (d_C − d_A)
+#
+# и вместе с живой пошлиной c (док. 129 §8) закрывает вопрос о рабочей точке,
+# которая по расчёту должна стоять около 12, а не 10.
+#
+# Разведение по механизмам при этом никуда не девается: оно живёт в паре A ↔ B.
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-exec-c/app.jar --revx-exec \
+  --revx.exec.bot-id=c \
+  --revx.exec.journal=state/exec-c.db \
+  --revx.exec.offset=0.0014 \
+  --revx.exec.skew-target=0.3 \
+  --revx.exec.cost-floor-margin=-1 \
+  --revx.exec.anchor-leash=-1 \
+  --revx.exec.own-position=true \
+  --revx.exec.position-seed=0
+
+# Добивает ТОЛЬКО свои заявки: panic-all по умолчанию false, иначе остановка
+# бота C снимала бы живые заявки A и B.
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-c/app.jar --revx-panic --revx.exec.bot-id=c --revx.exec.journal=state/exec-c.db || true'
+
+# Нормальная остановка через SIGTERM даёт код 143. Без этой строки systemd
+# показывает «failed» после каждого штатного stop, и настоящую аварию в этом
+# шуме уже не заметить.
+SuccessExitStatus=143
+
+# Намеренно НЕТ автоперезапуска: перезапуск после падения не должен сам
+# возобновлять торговлю. Котирование в любом случае стартует выключенным.
+Restart=no
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
