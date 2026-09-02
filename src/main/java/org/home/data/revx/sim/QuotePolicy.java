@@ -62,4 +62,51 @@ public interface QuotePolicy {
             return new Quoter.Quotes(bid, ask);
         };
     }
+
+    /**
+     * Второй контроль: **случайные цены на ТЕХ ЖЕ расстояниях**.
+     *
+     * Зачем он нужен отдельно (док. 127 §9). У {@link #random} случайно не только
+     * положение центра, но и само расстояние — оно равномерно на (0, 2d]. Между
+     * тем `край × оборот` по расстоянию не плоский, у него есть вершина (док. 113
+     * §4), поэтому смесь расстояний вокруг d — это не нейтральная перестановка, а
+     * ДРУГАЯ точка лестницы отступа. Проигрыш такому контролю смешан с лестницей
+     * и сам по себе не значит ничего.
+     *
+     * Здесь отличие ровно одно: расстояние ±d и скос — как у стратегии, а центр
+     * берётся не из текущей справедливой цены, а из СЛУЧАЙНОЙ недавней. То есть
+     * контроль отвечает на единственный вопрос: **помогает ли слежение за
+     * справедливой ценой** или достаточно стоять в книге на правильном удалении
+     * от чего угодно похожего на цену.
+     *
+     * @param lagWindows сколько последних окон составляют «недавнее»; центр
+     *                   выбирается равномерно среди них, включая текущее
+     */
+    static QuotePolicy staleAnchor(Quoter.Params params, long seed, int lagWindows) {
+        RandomGenerator rng = RandomGeneratorFactory.of("L64X128MixRandom").create(seed);
+        double[] ring = new double[Math.max(1, lagWindows)];
+        int[] seen = {0};
+        return (fair, inventory, drift) -> {
+            if (!(fair > 0)) {
+                return new Quoter.Quotes(null, null);
+            }
+            ring[seen[0] % ring.length] = fair;
+            seen[0]++;
+            // Пока кольцо не заполнено, случайный индекс берётся только из
+            // заполненной части: нули в хвосте дали бы центр в нуле.
+            int have = Math.min(seen[0], ring.length);
+            double anchor = ring[rng.nextInt(have)];
+
+            double shift = params.skewK() * Quoter.skew(params, inventory, drift);
+            Double bid = null;
+            Double ask = null;
+            if (inventory < params.inventoryCap()) {
+                bid = anchor * (1 - params.offset() - shift);
+            }
+            if (inventory > 0) {
+                ask = anchor * (1 + params.offset() - shift);
+            }
+            return new Quoter.Quotes(bid, ask);
+        };
+    }
 }

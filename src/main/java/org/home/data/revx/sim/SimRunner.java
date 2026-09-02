@@ -59,8 +59,14 @@ public class SimRunner {
                        double cap) {
     }
 
-    /** Ступень лестницы отступа: сама стратегия и её нулевое распределение. */
-    private record Rung(double offset, SimEngine.Result result, Null nulls) {
+    /**
+     * Ступень лестницы отступа: сама стратегия и ДВА её нулевых распределения.
+     *
+     * Второе появилось по док. 127 §9: у первого контроля случайно и расстояние
+     * тоже, поэтому проигрыш ему смешан с лестницей отступа. Их надо читать
+     * рядом, а не вместо друг друга.
+     */
+    private record Rung(double offset, SimEngine.Result result, Null nulls, Null anchorNulls) {
     }
 
     /** Ступень лестницы скоса. Нулевое распределение тут не нужно: скос — не выбор цен. */
@@ -268,7 +274,9 @@ public class SimRunner {
         // проверялось, лишь переносило убыток во времени.
         List<RatioRung> hedgeLadder = new ArrayList<>();
         for (long ms : cfg.simHedgeRebalanceLadder()) {
-            Quoter.Params p = base.withHedge(cfg.simHedge().withRebalance(ms));
+            // Шаг контракта — ПО ПАРЕ: у каждого перпа он свой, и BTC-шаг,
+            // подставленный SOL, делает хедж в тысячи раз тоньше настоящего.
+            Quoter.Params p = base.withHedge(cfg.simHedge(symbol).withRebalance(ms));
             hedgeLadder.add(new RatioRung(ms,
                     new SimEngine(p, limits, cfg.simMakerFee()).run(data.windows())));
         }
@@ -415,6 +423,15 @@ public class SimRunner {
         runs.add(new Run("контроль: случайные котировки", randomResult, cfg.simMakerFee(),
                 base.offset(), base.inventoryCap()));
 
+        // Второй контроль (док. 127 §9): расстояние ±d и скос — как у стратегии,
+        // случаен только ЦЕНТР. Отвечает на «помогает ли слежение за справедливой
+        // ценой», не смешивая ответ с лестницей отступа.
+        SimEngine.Result anchorResult = new SimEngine(base, limits, cfg.simMakerFee(),
+                QuotePolicy.staleAnchor(base, cfg.simRandomSeed(), cfg.simControlAnchorWindows()))
+                .run(data.windows());
+        runs.add(new Run("контроль: случайный якорь, те же расстояния", anchorResult,
+                cfg.simMakerFee(), base.offset(), base.inventoryCap()));
+
         // Лестница отступа с контролем на КАЖДОЙ ступени (док. 75 §5). Раньше и
         // buy & hold, и случайные считались только при базовом d, а вердикт «kill-критерий
         // сработал» переносился на всю конструкцию. Между тем d двигает и число
@@ -424,7 +441,9 @@ public class SimRunner {
             Quoter.Params params = withOffset(base, offset);
             SimEngine.Result result = offset == base.offset() ? baseResult
                     : new SimEngine(params, limits, cfg.simMakerFee()).run(data.windows());
-            ladder.add(new Rung(offset, result, nullDistribution(params, limits, data, result)));
+            ladder.add(new Rung(offset, result,
+                    nullDistribution(params, limits, data, result),
+                    anchorNullDistribution(params, limits, data, result)));
         }
 
         for (Run run : runs) {
@@ -591,12 +610,29 @@ public class SimRunner {
 
     private Null nullDistribution(Quoter.Params params, ExecutionModel.Limits limits,
                                   SimDataReader.Dataset data, SimEngine.Result strategy) {
+        return nullDistribution(params, limits, data, strategy,
+                seed -> QuotePolicy.random(params, seed));
+    }
+
+    /**
+     * Нулевое распределение того же вида, но с центром из случайной недавней
+     * справедливой цены: расстояние и скос как у стратегии (док. 127 §9).
+     */
+    private Null anchorNullDistribution(Quoter.Params params, ExecutionModel.Limits limits,
+                                        SimDataReader.Dataset data, SimEngine.Result strategy) {
+        return nullDistribution(params, limits, data, strategy,
+                seed -> QuotePolicy.staleAnchor(params, seed, cfg.simControlAnchorWindows()));
+    }
+
+    private Null nullDistribution(Quoter.Params params, ExecutionModel.Limits limits,
+                                  SimDataReader.Dataset data, SimEngine.Result strategy,
+                                  java.util.function.LongFunction<QuotePolicy> control) {
         int seeds = Math.max(1, cfg.simRandomSeeds());
         double[] captures = new double[seeds];
         double[] totals = new double[seeds];
         for (int i = 0; i < seeds; i++) {
             SimEngine.Result result = new SimEngine(params, limits, cfg.simMakerFee(),
-                    QuotePolicy.random(params, cfg.simRandomSeed() + i)).run(data.windows());
+                    control.apply(cfg.simRandomSeed() + i)).run(data.windows());
             captures[i] = result.pnl().spreadCapture();
             totals[i] = result.pnl().total();
         }
@@ -955,6 +991,42 @@ public class SimRunner {
                 + "его с бетой, и именно поэтому вердикт по `total` на одном seed'е "
                 + "(док. 74) оказался неустойчивым.\n\n");
 
+        sb.append("### Второй контроль: случайный якорь на ТЕХ ЖЕ расстояниях (док. 127 §9)\n\n");
+        sb.append("Первый контроль рандомизирует не только положение центра, но и само "
+                + "расстояние — оно равномерно на (0, 2d]. Между тем `край × оборот` по "
+                + "расстоянию не плоский, у него есть вершина, поэтому смесь расстояний "
+                + "вокруг d — это не нейтральная перестановка, а ДРУГАЯ точка лестницы "
+                + "отступа. Проигрыш такому контролю смешан с лестницей и сам по себе не "
+                + "значит ничего.\n\n");
+        sb.append("Здесь отличие ровно одно: расстояние ±d и скос как у стратегии, а центр "
+                + "берётся из случайной справедливой цены за последние ")
+                .append(cfg.simControlAnchorWindows())
+                .append(" окон. Вопрос, на который отвечает таблица: **помогает ли слежение "
+                        + "за справедливой ценой** или довольно стоять на правильном "
+                        + "удалении от чего угодно похожего на цену.\n\n");
+        sb.append("| Отступ | Захват стратегии | Контроль: среднее | σ | 5-й … 95-й процентиль "
+                + "| Стратегия выше по захвату | (σ) | Стратегия выше по `total` |\n");
+        sb.append("|---|---|---|---|---|---|---|---|\n");
+        for (Rung rung : ladder) {
+            Null n = rung.anchorNulls();
+            double capture = rung.result().pnl().spreadCapture();
+            double z = n.captureSd() > 0 ? (capture - n.captureMean()) / n.captureSd() : Double.NaN;
+            sb.append("| ").append(round(rung.offset() * 100, 3)).append("%")
+                    .append(" | ").append(round(capture, 1))
+                    .append(" | ").append(round(n.captureMean(), 1))
+                    .append(" | ").append(round(n.captureSd(), 1))
+                    .append(" | ").append(round(n.captureP05(), 1)).append(" … ")
+                    .append(round(n.captureP95(), 1))
+                    .append(" | ").append(round(n.capturePercentile(), 0)).append("%")
+                    .append(" | ").append(round(z, 1)).append("σ")
+                    .append(" | ").append(round(n.totalPercentile(), 0)).append("% |\n");
+        }
+        sb.append("\n**Как читать вместе с предыдущей таблицей.** Проигрыш ОБОИМ контролям "
+                + "означает, что мы продаём ликвидность, а не выбираем цены, и "
+                + "оптимизировать надо расстояние и стоимость нейтральности, а не логику "
+                + "скоса и слежения. Проигрыш только первому — артефакт лестницы отступа, "
+                + "и он ничего не говорит о конструкции.\n\n");
+
         sb.append("### Диагностика модели исполнения по ступеням (ТЗ §0)\n\n");
         sb.append("Лестница монотонна, значит первое подозрение — на допущения об "
                 + "очереди. Заявка, улучшающая книгу, встаёт одна на новом уровне и "
@@ -1255,11 +1327,25 @@ public class SimRunner {
         sb.append("\n");
 
         sb.append("### Хедж шортом на перпе: лестница периода (док. 122)\n\n");
-        sb.append("Против спотового инвентаря держим шорт PF_XBTUSD на Kraken, доводя "
+        double hedgeStep = cfg.simHedgeStep(symbol);
+        sb.append("Против спотового инвентаря держим шорт на перпе Kraken, доводя "
                 + "его до `−инвентарь` раз в период. Схема «купили — сразу шорт» на наших "
-                + "размерах невозможна: минимальный шаг количества там 0.0001 BTC, а лот "
-                + "живого бота 0.0000125 — единица хеджа **в восемь раз крупнее сделки**. "
+                + "размерах невозможна: шаг контракта крупнее нашей сделки. "
                 + "Хеджируется нетто-позиция, и период — главный размен.\n\n");
+        sb.append("**Разрешение хеджа на этом прогоне** (док. 127 §8.4): шаг контракта ")
+                .append(trimNum(hedgeStep)).append(", лот ").append(trimNum(base.size()))
+                .append(", потолок инвентаря ").append(trimNum(base.inventoryCap()))
+                .append(" — то есть **")
+                .append(hedgeStep > 0 ? String.valueOf(round(base.inventoryCap() / hedgeStep, 1)) : "∞")
+                .append(" ступеней контракта на весь потолок**")
+                .append(hedgeStep > 0 && base.inventoryCap() / hedgeStep < 20
+                        ? ". Ниже двух десятков ступеней хедж не грубоват, а НЕВОЗМОЖЕН: "
+                        + "округление сравнимо с самой позицией."
+                        : ".")
+                .append(" Округление целевого шорта — ")
+                .append(cfg.simHedgeRoundDown() ? "**вниз** (нетто-шорта не возникает)"
+                        : "**к ближайшему** (возможен нетто-шорт до половины шага)")
+                .append(".\n\n");
         sb.append("**Контроль здесь другой.** Захеджированная конструкция рыночно "
                 + "нейтральна, поэтому сравнивать её с `buy & hold` бессмысленно — "
                 + "сравнивать надо с **нулём**: весь результат обязан приходить из захвата "
@@ -1269,8 +1355,8 @@ public class SimRunner {
                 + "`kraken_funding` за 20.08–01.09.2026. Ставка положительна, значит шорт "
                 + "её ПОЛУЧАЕТ: это попутный ветер, а не издержка.\n\n");
         sb.append("| Период | Сделок на перпе | Комиссии | Фондирование | Переоценка шорта "
-                + "| Остаточная позиция | Спот `total` | **С хеджем** |\n");
-        sb.append("|---|---|---|---|---|---|---|---|\n");
+                + "| Остаточная позиция | Нетто-шорт: мин / доля окон | Спот `total` | **С хеджем** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|\n");
         for (RatioRung rung : hedgeLadder) {
             SimEngine.Result r = rung.result();
             long ms = (long) rung.ratio();
@@ -1282,6 +1368,8 @@ public class SimRunner {
                     .append(" | ").append(round(r.hedgeFunding(), 1))
                     .append(" | ").append(round(r.hedgePnl(), 1))
                     .append(" | ").append(round(r.hedgeResidual(), 5))
+                    .append(" | ").append(round(r.hedgeNetMin(), 5))
+                    .append(" / ").append(round(100 * r.hedgeShortWindows(), 1)).append("%")
                     .append(" | ").append(round(r.pnl().total(), 1))
                     .append(" | **").append(round(r.hedgedTotal(), 1)).append("**")
                     .append(" |\n");
@@ -1290,6 +1378,17 @@ public class SimRunner {
                 + "инвентаря: она равна нулю только при хедже каждое окно и растёт с "
                 + "периодом. Именно она и есть то, за что мы платим, экономя на комиссии. "
                 + "Разность между `спот total` и `с хеджем` — цена нейтральности.\n\n");
+        sb.append("Колонка **нетто-шорта** — приёмка правки док. 127 §8.4, и читать её надо "
+                + "по первой строке. При округлении вниз шорт не превышает инвентарь **в "
+                + "момент ребалансировки**, поэтому на ступени «каждое окно» нетто-шорта "
+                + "нет вовсе. С ростом периода он появляется, но уже по другой причине: "
+                + "инвентарь между ребалансировками уменьшается (мы продаём), а шорт стоит "
+                + "на старом уровне. Это плата за редкость слежения, а не скрытый дефект "
+                + "округления, и она входит в ту же остаточную ногу.\n\n");
+        sb.append("Разница принципиальна. Округление к ближайшему создаёт обратную позицию "
+                + "СРАЗУ, в момент установки, и её величина не зависит от того, как часто "
+                + "мы ребалансируем: на живом масштабе BTC это до 20% потолка. Дрейф между "
+                + "ребалансировками, наоборот, лечится периодом.\n\n");
 
         sb.append("### Бид от цены входа с поводком (док. 119)\n\n");
         sb.append("Обычный бид висит на `справедливая × (1 − шаг)` и пересчитывается "
@@ -2176,5 +2275,10 @@ public class SimRunner {
         }
         double factor = Math.pow(10, digits);
         return Math.round(v * factor) / factor;
+    }
+
+    /** Шаги бывают мельче 1e-8: без %f они печатаются нулём. */
+    private static String trimNum(double v) {
+        return java.math.BigDecimal.valueOf(v).stripTrailingZeros().toPlainString();
     }
 }

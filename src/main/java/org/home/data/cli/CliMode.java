@@ -31,7 +31,7 @@ public class CliMode {
             "collect", "backfill", "report", "theory",
             "s5-dry-run", "s5-kraken-check", "s5-demo", "s5-live",
             "revx-pairs", "revx-probe-limits", "revx-collect", "revx-basis",
-            "revx-sim", "revx-flow",
+            "revx-sim", "revx-flow", "revx-screen", "revx-exec-report",
             "revx-trade-check", "revx-order-probe", "revx-panic", "revx-exec", "revx-regimes");
 
     /**
@@ -44,7 +44,8 @@ public class CliMode {
      */
     private static final Set<String> PARAMS = Set.of(
             "symbol", "symbols", "hours", "from", "to", "interval",
-            "out", "table", "bucket-seconds", "days", "edge", "up", "down", "flat");
+            "out", "table", "bucket-seconds", "days", "edge", "up", "down", "flat",
+            "journal", "offset");
 
     private final boolean scheduleMode;
     private final Set<String> unknownOptions;

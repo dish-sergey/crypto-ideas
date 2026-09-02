@@ -5,6 +5,7 @@ import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * Конфигурация стенда. ТЗ §2: все параметры стратегии и издержек — только из
@@ -82,6 +83,8 @@ public class RevxConfig {
     private final boolean simStickyResetQueue;
     private final List<Long> simHedgeRebalanceLadder;
     private final double simHedgeStep;
+    private final Map<String, Double> simHedgeSteps;
+    private final boolean simHedgeRoundDown;
     private final double simHedgeFee;
     private final double simHedgeFundingPerHour;
     private final List<Double> simAnchorLeashLadder;
@@ -108,6 +111,7 @@ public class RevxConfig {
     private final double simPessimisticFee;
     private final long simRandomSeed;
     private final int simRandomSeeds;
+    private final int simControlAnchorWindows;
     private final List<Double> simFeeLadder;
     private final List<Double> simOffsetLadder;
     private final List<Double> simSkewLadder;
@@ -190,6 +194,8 @@ public class RevxConfig {
             @Value("${revx.sim.sticky-reset-queue}") boolean simStickyResetQueue,
             @Value("${revx.sim.hedge-rebalance-ladder}") List<Long> simHedgeRebalanceLadder,
             @Value("${revx.sim.hedge-step}") double simHedgeStep,
+            @Value("${revx.sim.hedge-steps}") String simHedgeSteps,
+            @Value("${revx.sim.hedge-round-down}") boolean simHedgeRoundDown,
             @Value("${revx.sim.hedge-fee}") double simHedgeFee,
             @Value("${revx.sim.hedge-funding-per-hour}") double simHedgeFundingPerHour,
             @Value("${revx.sim.anchor-leash-ladder}") List<Double> simAnchorLeashLadder,
@@ -216,6 +222,7 @@ public class RevxConfig {
             @Value("${revx.sim.pessimistic-fee}") double simPessimisticFee,
             @Value("${revx.sim.random-seed}") long simRandomSeed,
             @Value("${revx.sim.random-seeds}") int simRandomSeeds,
+            @Value("${revx.sim.control-anchor-windows}") int simControlAnchorWindows,
             @Value("${revx.sim.fee-ladder}") List<Double> simFeeLadder,
             @Value("${revx.sim.offset-ladder}") List<Double> simOffsetLadder,
             @Value("${revx.sim.skew-ladder}") List<Double> simSkewLadder,
@@ -295,6 +302,8 @@ public class RevxConfig {
         this.simStickyResetQueue = simStickyResetQueue;
         this.simHedgeRebalanceLadder = simHedgeRebalanceLadder;
         this.simHedgeStep = simHedgeStep;
+        this.simHedgeSteps = parseSteps(simHedgeSteps);
+        this.simHedgeRoundDown = simHedgeRoundDown;
         this.simHedgeFee = simHedgeFee;
         this.simHedgeFundingPerHour = simHedgeFundingPerHour;
         this.simAnchorLeashLadder = simAnchorLeashLadder;
@@ -321,6 +330,7 @@ public class RevxConfig {
         this.simPessimisticFee = simPessimisticFee;
         this.simRandomSeed = simRandomSeed;
         this.simRandomSeeds = simRandomSeeds;
+        this.simControlAnchorWindows = simControlAnchorWindows;
         this.simFeeLadder = simFeeLadder;
         this.simOffsetLadder = simOffsetLadder;
         this.simSkewLadder = simSkewLadder;
@@ -599,9 +609,57 @@ public class RevxConfig {
         return simHedgeRebalanceLadder.stream().mapToLong(Long::longValue).toArray();
     }
 
+    /**
+     * Хедж БЕЗ привязки к паре — только для мест, где символ неизвестен.
+     * Везде, где он известен, брать {@link #simHedge(String)}.
+     */
     public org.home.data.revx.sim.Quoter.Hedge simHedge() {
         return new org.home.data.revx.sim.Quoter.Hedge(true, 0, simHedgeStep, simHedgeFee,
-                simHedgeFundingPerHour);
+                simHedgeFundingPerHour, simHedgeRoundDown);
+    }
+
+    /**
+     * Хедж для КОНКРЕТНОЙ пары.
+     *
+     * ⚠️ Шаг контракта у каждого перпа свой, и подставлять BTC-шаг остальным
+     * нельзя. Прогоны ETH и SOL из док. 125 §6 шли с общим {@code hedge-step}
+     * = 0.0001, то есть с разрешением хеджа в тысячи раз тоньше настоящего:
+     * остаточная нога там выходила 0.00188 SOL при реальном шаге контракта
+     * порядка 0.1. Числа «SOL 200.0 против BTC 30.0» посчитаны при этом
+     * допущении и без него не проверены.
+     */
+    public org.home.data.revx.sim.Quoter.Hedge simHedge(String symbol) {
+        return simHedge().withStep(simHedgeStep(symbol));
+    }
+
+    /** Шаг контракта перпа для пары; при отсутствии в карте — общий. */
+    public double simHedgeStep(String symbol) {
+        if (symbol == null) {
+            return simHedgeStep;
+        }
+        String base = symbol.contains("/") ? symbol.substring(0, symbol.indexOf('/'))
+                : symbol.contains("-") ? symbol.substring(0, symbol.indexOf('-')) : symbol;
+        Double v = simHedgeSteps.get(base.toUpperCase(java.util.Locale.ROOT));
+        return v == null ? simHedgeStep : v;
+    }
+
+    public boolean simHedgeRoundDown() {
+        return simHedgeRoundDown;
+    }
+
+    /** Формат «BTC:0.0001,ETH:0.01,SOL:0.1»; пустая строка = карты нет. */
+    private static Map<String, Double> parseSteps(String raw) {
+        Map<String, Double> map = new java.util.LinkedHashMap<>();
+        if (raw == null || raw.isBlank()) {
+            return map;
+        }
+        for (String part : raw.split(",")) {
+            String[] kv = part.split(":");
+            if (kv.length == 2 && !kv[0].isBlank() && !kv[1].isBlank()) {
+                map.put(kv[0].trim().toUpperCase(java.util.Locale.ROOT), Double.parseDouble(kv[1].trim()));
+            }
+        }
+        return map;
     }
 
     public double[] simAnchorLeashLadder() {
@@ -686,6 +744,14 @@ public class RevxConfig {
      */
     public int simRandomSeeds() {
         return simRandomSeeds;
+    }
+
+    /**
+     * Глубина «недавнего» для второго контроля — того, у которого расстояние
+     * ±d такое же, как у стратегии, а случаен только центр (док. 127 §9).
+     */
+    public int simControlAnchorWindows() {
+        return simControlAnchorWindows;
     }
 
     public double[] simFeeLadder() {

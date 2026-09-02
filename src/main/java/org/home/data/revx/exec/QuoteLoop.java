@@ -156,7 +156,7 @@ public final class QuoteLoop implements Runnable {
     public QuoteLoop(TradeClient client, StandReader stand, ExecJournal journal,
                      Quoter.Params params, String symbol, long periodMs, double minNotional,
                      BotTag tag, org.home.data.revx.sim.QuotePolicy policy,
-                     boolean ownPosition, double positionSeed) {
+                     boolean ownPosition, double positionSeed, double baseStep) {
         this.client = client;
         this.stand = stand;
         this.journal = journal;
@@ -173,7 +173,24 @@ public final class QuoteLoop implements Runnable {
         this.policy = policy != null ? policy : this.quoter;
         this.ownPosition = ownPosition;
         this.positionSeed = positionSeed;
+        this.dust = baseStep > 0 ? baseStep / 2 : 0;
     }
+
+    /**
+     * Ниже этого остатка позиция считается нулевой.
+     *
+     * Площадка квантует количество шагом {@code base_step}, поэтому остаток
+     * мельче половины шага не может соответствовать никакому реальному
+     * количеству — это накопленная ошибка сложения. У бота B так висело
+     * 3.4e−21 BTC (док. 126 §9 п.5): продать его нельзя (номинал на двадцать
+     * порядков ниже минимума заявки), а ненулевым он числился, и каждый тик
+     * котировал аск, который тут же отбраковывался как «нечем котировать».
+     *
+     * Обнуление безопасно в обе стороны: расхождение с остатком аккаунта
+     * проверяется условием «своя позиция не больше общей», и занижение его не
+     * ломает.
+     */
+    private final double dust;
 
     public void startQuoting() {
         if (quoting.compareAndSet(false, true)) {
@@ -859,7 +876,9 @@ public final class QuoteLoop implements Runnable {
         Double saved = journal.getState(STATE_POSITION);
         Double savedCash = journal.getState(STATE_CASH);
         if (saved != null) {
-            inventory = saved;
+            // Пыль, накопленная предыдущей версией бота, переживает перезапуск в
+            // журнале — снимаем её здесь же, иначе правка не подействует.
+            inventory = Math.abs(saved) < dust ? 0 : saved;
             ownCash = savedCash == null ? 0 : savedCash;
             Double savedSeed = journal.getState(STATE_SEED);
             seedPosition = savedSeed == null ? 0 : savedSeed;
@@ -898,6 +917,10 @@ public final class QuoteLoop implements Runnable {
             return;
         }
         inventory += side.sign() * qty;
+        if (Math.abs(inventory) < dust) {
+            // Пыль ниже половины шага количества — не позиция, а ошибка сложения.
+            inventory = 0;
+        }
         ownCash -= side.sign() * qty * price;
         journal.putState(STATE_POSITION, inventory);
         journal.putState(STATE_CASH, ownCash);

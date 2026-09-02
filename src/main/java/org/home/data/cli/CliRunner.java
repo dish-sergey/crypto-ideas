@@ -79,6 +79,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.Panic> panic;
     private final ObjectProvider<org.home.data.revx.sim.RegimeFrequencyReport> regimeReport;
     private final ObjectProvider<org.home.data.revx.exec.Executor> executor;
+    private final ObjectProvider<org.home.data.revx.exec.ExecReport> execReport;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
 
@@ -96,6 +97,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.Panic> panic,
                      ObjectProvider<org.home.data.revx.sim.RegimeFrequencyReport> regimeReport,
                      ObjectProvider<org.home.data.revx.exec.Executor> executor,
+                     ObjectProvider<org.home.data.revx.exec.ExecReport> execReport,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols) {
         this.context = context;
@@ -121,6 +123,7 @@ public class CliRunner implements ApplicationRunner {
         this.panic = panic;
         this.regimeReport = regimeReport;
         this.executor = executor;
+        this.execReport = execReport;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
     }
@@ -206,6 +209,23 @@ public class CliRunner implements ApplicationRunner {
                         java.time.Instant.parse(firstOr(args, "to",
                                 java.time.Instant.now().toString())).toEpochMilli(),
                         firstOr(args, "out", "reports/revx_flow.md"));
+            }
+            if (args.containsOption("revx-exec-report")) {
+                execReport.getObject().run(
+                        firstOr(args, "journal", "state/exec.db"),
+                        Integer.parseInt(firstOr(args, "hours", "0")),   // 0 = весь журнал
+                        java.time.Instant.parse(firstOr(args, "to",
+                                java.time.Instant.now().toString())).toEpochMilli(),
+                        args.containsOption("offset")
+                                ? Double.valueOf(firstOr(args, "offset", "0")) : null,
+                        firstOr(args, "out", "reports/revx_exec.md"));
+            }
+            if (args.containsOption("revx-screen")) {
+                revx.getObject().screen(
+                        Integer.parseInt(firstOr(args, "hours", "96")),
+                        java.time.Instant.parse(firstOr(args, "to",
+                                java.time.Instant.now().toString())).toEpochMilli(),
+                        firstOr(args, "out", "reports/revx_screen.md"));
             }
             if (args.containsOption("revx-regimes")) {
                 regimeReport.getObject().run(

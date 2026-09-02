@@ -63,6 +63,7 @@ public class Executor {
     private final double anchorWidening;
     private final boolean ownPosition;
     private final double positionSeed;
+    private final double baseStep;
     private final Panic panic;
 
     public Executor(RevxConfig cfg,
@@ -82,6 +83,7 @@ public class Executor {
                     @Value("${revx.exec.anchor-widening}") double anchorWidening,
                     @Value("${revx.exec.own-position}") boolean ownPosition,
                     @Value("${revx.exec.position-seed}") double positionSeed,
+                    @Value("${revx.exec.base-step}") double baseStep,
                     Panic panic) {
         this.cfg = cfg;
         this.standDbPath = standDbPath;
@@ -100,6 +102,7 @@ public class Executor {
         this.anchorWidening = anchorWidening;
         this.ownPosition = ownPosition;
         this.positionSeed = positionSeed;
+        this.baseStep = baseStep;
         this.panic = panic;
     }
 
@@ -127,7 +130,7 @@ public class Executor {
                 cfg.simRequoteThreshold(), quoteStep());
         QuotePolicy policy = buildPolicy(params);
         QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs,
-                minNotional(), tag, policy, ownPosition, positionSeed);
+                minNotional(), tag, policy, ownPosition, positionSeed, baseStep);
 
         log.warn("""
 

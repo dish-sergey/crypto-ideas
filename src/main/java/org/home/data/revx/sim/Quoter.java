@@ -257,15 +257,50 @@ public final class Quoter implements QuotePolicy {
      *       положительной ставке шорт её ПОЛУЧАЕТ. Измерено по нашей же
      *       {@code kraken_funding}: 11.5 ppm/ч = 10.1% годовых за 20.08–01.09.2026,
      *       то есть это попутный ветер, а не издержка.</li>
+     *   <li>{@code roundDown} — округлять целевой шорт ВНИЗ, а не к ближайшему.</li>
      * </ul>
+     *
+     * ⚠️ **Округление к ближайшему создаёт скрытый нетто-шорт** (док. 127 §8.4).
+     * Когда шаг контракта сравним с потолком инвентаря, «ближайшее» половину
+     * времени БОЛЬШЕ самого инвентаря: на живом масштабе BTC весь потолок — 2.5
+     * шага контракта, и переокруглённый шорт даёт до половины шага, то есть
+     * 4 лота или 20% потолка В ОБРАТНУЮ СТОРОНУ. Конструкция, задуманная
+     * нейтральной, оказывается направленной, а знак направления зависит от того,
+     * где случайно стоял инвентарь. Поэтому по умолчанию округляем ВНИЗ: хедж
+     * недохеджирует, но никогда не переворачивает позицию, и остаточная нога
+     * читается как «сколько инвентаря не покрыто», а не как «в какую сторону мы
+     * сегодня смотрим».
      */
     public record Hedge(boolean enabled, long rebalanceMs, double step,
-                        double feeRate, double fundingPerHour) {
+                        double feeRate, double fundingPerHour, boolean roundDown) {
 
-        public static final Hedge OFF = new Hedge(false, 0, 0, 0, 0);
+        public static final Hedge OFF = new Hedge(false, 0, 0, 0, 0, true);
 
         public Hedge withRebalance(long ms) {
-            return new Hedge(true, ms, step, feeRate, fundingPerHour);
+            return new Hedge(true, ms, step, feeRate, fundingPerHour, roundDown);
+        }
+
+        public Hedge withStep(double v) {
+            return new Hedge(enabled, rebalanceMs, v, feeRate, fundingPerHour, roundDown);
+        }
+
+        public Hedge withRoundDown(boolean v) {
+            return new Hedge(enabled, rebalanceMs, step, feeRate, fundingPerHour, v);
+        }
+
+        /**
+         * Целевой шорт против инвентаря {@code inv}: отрицательное число, ноль
+         * означает «хеджировать нечем — инвентаря меньше одного шага контракта».
+         */
+        public double target(double inv) {
+            if (step <= 0) {
+                return -inv;
+            }
+            double lots = inv / step;
+            double rounded = roundDown
+                    ? Math.signum(lots) * Math.floor(Math.abs(lots))
+                    : Math.round(lots);
+            return -rounded * step;
         }
     }
 

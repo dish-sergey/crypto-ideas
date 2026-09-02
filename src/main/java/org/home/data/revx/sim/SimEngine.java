@@ -53,6 +53,9 @@ public final class SimEngine {
             double hedgeCost,             // комиссии перпа
             double hedgeFunding,          // фондирование: шорт его ПОЛУЧАЕТ при положительной ставке
             double hedgeResidual,         // средняя непокрытая позиция, базовой валюты
+            double hedgeNetMin,           // самая ОТРИЦАТЕЛЬНАЯ нетто-позиция (инвентарь + шорт)
+            double hedgeNetMax,           // и самая положительная — вместе это ширина остатка
+            double hedgeShortWindows,     // доля окон, в которые нетто-позиция была шортом
             int hedgeTrades,              // сколько раз пришлось доводить шорт
             int frozenCycles,             // сколько раз замороженная пара выпускалась заново
             long frozenHeldWindows,       // окон, в которые пара стояла нетронутой
@@ -201,6 +204,10 @@ public final class SimEngine {
         double hedgeCost = 0;
         double hedgeFunding = 0;
         double hedgeResidualSum = 0;
+        double hedgeNetMin = 0;
+        double hedgeNetMax = 0;
+        int hedgeShortWindows = 0;
+        int hedgeSamples = 0;
         int hedgeTrades = 0;
         double prevFair = 0;
         long prevTsMs = 0;
@@ -463,9 +470,10 @@ public final class SimEngine {
                     hedgeFunding += -hedgeQty * window.fair() * h.fundingPerHour() * hours;
                 }
                 if (window.tsMs() - lastHedgeMs >= h.rebalanceMs()) {
-                    double want = h.step() > 0
-                            ? -Math.round(pnl.inventory() / h.step()) * h.step()
-                            : -pnl.inventory();
+                    // Округление живёт в Hedge.target: «к ближайшему» умеет
+                    // перевернуть позицию в шорт (док. 127 §8.4), и решение об
+                    // этом — свойство хеджа, а не цикла.
+                    double want = h.target(pnl.inventory());
                     if (Math.abs(want - hedgeQty) > 1e-12) {
                         hedgeCost += Math.abs(want - hedgeQty) * window.fair() * h.feeRate();
                         hedgeTrades++;
@@ -473,7 +481,16 @@ public final class SimEngine {
                     }
                     lastHedgeMs = window.tsMs();
                 }
-                hedgeResidualSum += Math.abs(pnl.inventory() + hedgeQty);
+                // Остаток СО ЗНАКОМ: модуль скрывает ровно то, ради чего мерили —
+                // ушла ли нетто-позиция в минус.
+                double net = pnl.inventory() + hedgeQty;
+                hedgeResidualSum += Math.abs(net);
+                hedgeNetMin = Math.min(hedgeNetMin, net);
+                hedgeNetMax = Math.max(hedgeNetMax, net);
+                hedgeSamples++;
+                if (net < -1e-12) {
+                    hedgeShortWindows++;
+                }
             }
             prevFair = window.fair();
             prevTsMs = window.tsMs();
@@ -508,7 +525,9 @@ public final class SimEngine {
                 stopHits, stoppedWindows, filledQty, marketQty, maxDrawdown,
                 fairFirst, fairLast, fairSeries, pnl.markAtStart(fairFirst), capAtDropPct,
                 hedgePnl, hedgeCost, hedgeFunding,
-                inventorySamples == 0 ? 0 : hedgeResidualSum / inventorySamples, hedgeTrades,
+                hedgeSamples == 0 ? 0 : hedgeResidualSum / hedgeSamples,
+                hedgeNetMin, hedgeNetMax,
+                hedgeSamples == 0 ? 0 : (double) hedgeShortWindows / hedgeSamples, hedgeTrades,
                 frozenCycles, frozenHeldWindows, execution.stats());
     }
 }

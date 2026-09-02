@@ -34,6 +34,8 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun --args='--theory=ou --out=reports/theory'      # ТЗ 67: калибровка и допуск OU (предтест блока B)
 ./gradlew bootRun --args='--theory=band --out=reports/theory'    # ТЗ 68: полоса бездействия и граница разорения
 ./gradlew bootRun --args='--theory=verify --out=reports/theory'  # ТЗ 72: доверификация базиса без прореживания + сверка констант S5
+./gradlew bootRun --args='--revx-screen --hours=96 --to=2026-09-01T09:00:00Z --revx.db-path=data/revx-oos.db'  # скрининг всех 23 пар: спред, поток, разрешение хеджа, δ*
+./gradlew bootRun --args='--revx-exec-report --journal=data/exec/ea.db --out=reports/revx_exec_a.md'           # живой журнал: разложение + пошлина через markout
 ```
 
 Дашборд режима: `--report=regime-dash` рендерит `index.html` (меню с карточками версий:
@@ -166,6 +168,16 @@ Telegram getUpdates, иначе 409). На micro — сервис `s5-live` (с�
   порядке** (324 снимка из 324), `asks[0]` это худший аск: наивное чтение завышает
   спред в полтора раза. Лента сделок отдаёт поле `side`. Публичные endpoint — без
   ключа, `region=EEA` доступен и с локальной машины.
+- **Шаг контракта перпа Kraken у каждой пары свой** (`contractValueTradePrecision`
+  из `instruments`), и он решает, возможен ли хедж вообще. При потолке инвентаря
+  в $20 (живой бот) в него укладывается 2.6 ступени у BTC, 8.1 у ETH, **19.2 у
+  SOL** — то есть на живом масштабе хедж не грубоват, а невозможен ни на одной из
+  трёх пар. Прогоны ETH/SOL из док. 125 шли с BTC-шагом 0.0001 на все пары, то
+  есть с разрешением на два порядка тоньше настоящего. Карта шагов —
+  `revx.sim.hedge-steps`, снимается командой `--revx-screen`.
+- **Целевой шорт округляется ВНИЗ** (`revx.sim.hedge-round-down=true`).
+  Округление «к ближайшему» на грубом шаге переворачивает позицию: измерено на
+  живом масштабе BTC — нетто-шорт 5e−5 BTC = 20% потолка в обратную сторону.
 - **Kraken Futures** — публичный API без geo-блока и ключа. Funding здесь
   **ЧАСОВОЙ** (не 8ч), берётся через `historicalfundingrates` **API v4** (v3 →
   404), ~12 мес в одном ответе. Ставки Kraken невзаимозаменяемы с OKX/Binance
@@ -185,6 +197,10 @@ Telegram getUpdates, иначе 409). На micro — сервис `s5-live` (с�
   реконнект раз в 6ч для новых листингов); пер-биржевой ping, daemon-потоки
 - `scheduling/CollectorScheduler` — расписание (док. 09 §5)
 - `cli/CliRunner` — one-shot команды; `cli/CliMode` — переключатель режимов
+- `revx/sim/ScreenReport` — `--revx-screen`: вся вселенная разом (спред, поток,
+  разрешение хеджа по instruments Kraken, фондирование, `δ*` по ленте)
+- `revx/exec/ExecReport` — `--revx-exec-report`: разложение живого журнала и
+  пошлина `c = отступ − захват − markout`
 
 ## Что дальше (по док. 09)
 
