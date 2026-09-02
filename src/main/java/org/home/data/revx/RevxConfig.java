@@ -85,6 +85,8 @@ public class RevxConfig {
     private final double simHedgeStep;
     private final Map<String, Double> simHedgeSteps;
     private final boolean simHedgeRoundDown;
+    private final boolean simHedgeEnabled;
+    private final long simHedgeRebalanceMs;
     private final double simHedgeFee;
     private final double simHedgeFundingPerHour;
     private final List<Double> simAnchorLeashLadder;
@@ -197,6 +199,8 @@ public class RevxConfig {
             @Value("${revx.sim.hedge-step}") double simHedgeStep,
             @Value("${revx.sim.hedge-steps}") String simHedgeSteps,
             @Value("${revx.sim.hedge-round-down}") boolean simHedgeRoundDown,
+            @Value("${revx.sim.hedge-enabled}") boolean simHedgeEnabled,
+            @Value("${revx.sim.hedge-rebalance-ms}") long simHedgeRebalanceMs,
             @Value("${revx.sim.hedge-fee}") double simHedgeFee,
             @Value("${revx.sim.hedge-funding-per-hour}") double simHedgeFundingPerHour,
             @Value("${revx.sim.anchor-leash-ladder}") List<Double> simAnchorLeashLadder,
@@ -306,6 +310,8 @@ public class RevxConfig {
         this.simHedgeStep = simHedgeStep;
         this.simHedgeSteps = parseSteps(simHedgeSteps);
         this.simHedgeRoundDown = simHedgeRoundDown;
+        this.simHedgeEnabled = simHedgeEnabled;
+        this.simHedgeRebalanceMs = simHedgeRebalanceMs;
         this.simHedgeFee = simHedgeFee;
         this.simHedgeFundingPerHour = simHedgeFundingPerHour;
         this.simAnchorLeashLadder = simAnchorLeashLadder;
@@ -648,6 +654,19 @@ public class RevxConfig {
 
     public boolean simHedgeRoundDown() {
         return simHedgeRoundDown;
+    }
+
+    /**
+     * Захеджирована ли БАЗОВАЯ конфигурация замеров (док. 127 §15 п.7). При
+     * включении хедж наследуют все лестницы, и их `total` перестаёт быть на 99%
+     * переоценкой позиции.
+     */
+    public boolean simHedgeEnabled() {
+        return simHedgeEnabled;
+    }
+
+    public long simHedgeRebalanceMs() {
+        return simHedgeRebalanceMs;
     }
 
     /** Формат «BTC:0.0001,ETH:0.01,SOL:0.1»; пустая строка = карты нет. */

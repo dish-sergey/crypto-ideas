@@ -129,11 +129,19 @@ public class SimRunner {
 
         double[] steps = pairSteps(symbol);
         ExecutionModel.Limits limits = new ExecutionModel.Limits(steps[0], 1e-9);
+        // Хедж в БАЗОВЫХ параметрах (док. 127 §15 п.7): включённый здесь, он
+        // наследуется всеми лестницами, потому что каждая строится из base.
+        // Без этого лестницы продолжают меряться величиной, которая на падающем
+        // окне на 99% состоит из переоценки позиции (док. 127 §3).
+        this.hedged = cfg.simHedgeEnabled();
+        Quoter.Hedge hedge = hedged
+                ? cfg.simHedge(symbol).withRebalance(cfg.simHedgeRebalanceMs())
+                : Quoter.Hedge.OFF;
         Quoter.Params base = new Quoter.Params(cfg.simOffset(), cfg.simSize(), cfg.simInventoryCap(),
                 cfg.simSkewK(), cfg.simSkewTarget(), cfg.simDriftBeta(), cfg.simBuySizeRatio(),
                 cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
                 cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simStopDrawdownPct(),
-                Quoter.Sticky.OFF, Quoter.Frozen.OFF, Quoter.Hedge.OFF, cfg.simStopCoolOffMs(),
+                Quoter.Sticky.OFF, Quoter.Frozen.OFF, hedge, cfg.simStopCoolOffMs(),
                 cfg.simRequoteThreshold(), steps[1]);
 
         List<Run> runs = new ArrayList<>();
@@ -524,7 +532,7 @@ public class SimRunner {
         sb.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     }
 
-    private static void appendTargetRow(StringBuilder sb, RatioRung rung,
+    private void appendTargetRow(StringBuilder sb, RatioRung rung,
                                         Quoter.Params base, boolean markBase) {
         SimEngine.Result r = rung.result();
         double edge = netEdgeBp(r, 60_000);
@@ -540,9 +548,9 @@ public class SimRunner {
                 .append(" | ").append(round(100.0 * r.windowsAtCap()
                         / Math.max(1, r.windows()), 1)).append("%")
                 .append(" | ").append(round(r.maxDrawdown(), 1))
-                .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                .append(" | **").append(round(outcome(r), 1)).append("**")
                 .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
-                .append(" | **").append(round(r.pnl().total() - r.buyAndHoldPnl(), 1)).append("**")
+                .append(" | **").append(round(alpha(r), 1)).append("**")
                 .append(" | **").append(round(r.pnlAtStart(), 1)).append("**")
                 .append(" |\n");
     }
@@ -560,7 +568,7 @@ public class SimRunner {
         sb.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
     }
 
-    private static void appendGridRow(StringBuilder sb, String label, GridRung rung) {
+    private void appendGridRow(StringBuilder sb, String label, GridRung rung) {
         SimEngine.Result r = rung.result();
         long buys = r.fills().stream().filter(f -> f.side() == Side.BUY).count();
         long sells = r.fills().size() - buys;
@@ -573,7 +581,7 @@ public class SimRunner {
                         / Math.max(1, r.windows()), 1)).append("%")
                 .append(" | **").append(round(r.maxDrawdown(), 1)).append("**")
                 .append(" | ").append(rung.quoter().openLots())
-                .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                .append(" | **").append(round(outcome(r), 1)).append("**")
                 .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                 .append(" | **").append(round(r.pnlAtStart(), 1)).append("**")
                 .append(" |\n");
@@ -595,7 +603,7 @@ public class SimRunner {
                 .append(" | ").append(round(buy, 2)).append(" / ").append(round(sell, 2))
                 .append(" | **").append(round(edge * turnover(r) / 10_000, 1)).append("**")
                 .append(" | ").append(round(r.avgInventory(), 4))
-                .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                .append(" | **").append(round(outcome(r), 1)).append("**")
                 .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                 .append(" |\n");
     }
@@ -889,6 +897,24 @@ public class SimRunner {
                 .append("`. Все прогоны записаны в `revx_run`.\n\n");
         sb.append("> **Читать с презумпцией ошибки.** ТЗ §0: если результат красив, ")
                 .append("первая гипотеза — дефект модели исполнения, а не работающая стратегия.\n\n");
+        if (hedged) {
+            sb.append("> ⚠️ **БАЗА ЗАХЕДЖИРОВАНА** (док. 127 §15 п.7). Каждая лестница "
+                    + "несёт шорт на перпе, доводимый до `−инвентарь` раз в ")
+                    .append(humanMs(cfg.simHedgeRebalanceMs()))
+                    .append(", шаг контракта ").append(trimNum(cfg.simHedgeStep(symbol)))
+                    .append(". Колонка **Total во всех лестницах — это результат С "
+                            + "ХЕДЖЕМ**, то есть спот плюс переоценка шорта, минус комиссии "
+                            + "перпа, плюс фондирование.\n>\n");
+            sb.append("> Зачем: незахеджированный `total` на падающем окне на 99% состоит "
+                    + "из переоценки средней позиции (док. 127 §3) — он меряет размер "
+                    + "инвентаря, а не котирование, и по этой колонке подряд закрыли шесть "
+                    + "параметров (док. 127 §4). У нейтральной конструкции беты нет, "
+                    + "поэтому `total`, альфа и «при возврате» схлопываются в одну "
+                    + "величину, и сравнивать её надо **с нулём**, а не с buy & hold.\n>\n");
+            sb.append("> Колонки **Buy & hold** и **При возврате цены** в захеджированных "
+                    + "прогонах смысла не имеют и оставлены только для сверки с прежними "
+                    + "отчётами.\n\n");
+        }
 
         sb.append("## Данные\n\n");
         sb.append("| Показатель | Значение |\n|---|---|\n");
@@ -965,7 +991,7 @@ public class SimRunner {
                     // исполняешься, дольше сидишь в позиции.
                     .append(" | ").append(round(100.0 * r.windowsAtCap()
                             / Math.max(1, r.windows()), 1)).append("%")
-                    .append(" | ").append(round(r.pnl().total(), 1))
+                    .append(" | ").append(round(outcome(r), 1))
                     .append(" | ").append(round(r.buyAndHoldPnl(), 1))
                     .append(" | ").append(round(rung.nulls().capturePercentile(), 0)).append("%")
                     .append(" |\n");
@@ -1291,7 +1317,7 @@ public class SimRunner {
                     .append(" | ").append(round(r.avgInventory(), 4))
                     .append(" | ").append(round(100.0 * r.windowsAtCap()
                             / Math.max(1, r.windows()), 1)).append("%")
-                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(outcome(r), 1)).append("**")
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                     .append(" |\n");
         }
@@ -1311,7 +1337,7 @@ public class SimRunner {
                     .append(" | ").append(round(r.avgInventory(), 4))
                     .append(" | ").append(round(100.0 * r.windowsAtCap()
                             / Math.max(1, r.windows()), 1)).append("%")
-                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(outcome(r), 1)).append("**")
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                     .append(" |\n");
         }
@@ -1331,7 +1357,7 @@ public class SimRunner {
                     .append(" | ").append(round(r.avgInventory(), 4))
                     .append(" | ").append(round(100.0 * r.windowsAtCap()
                             / Math.max(1, r.windows()), 1)).append("%")
-                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(outcome(r), 1)).append("**")
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                     .append(" |\n");
         }
@@ -1435,7 +1461,7 @@ public class SimRunner {
                     .append(" | ").append(round(r.hedgeResidual(), 5))
                     .append(" | ").append(round(r.hedgeNetMin(), 5))
                     .append(" / ").append(round(100 * r.hedgeShortWindows(), 1)).append("%")
-                    .append(" | ").append(round(r.pnl().total(), 1))
+                    .append(" | ").append(round(outcome(r), 1))
                     .append(" | **").append(round(r.hedgedTotal(), 1)).append("**")
                     .append(" |\n");
         }
@@ -1483,9 +1509,9 @@ public class SimRunner {
                             / Math.max(1, r.windows()), 1)).append("%")
                     .append(" | **").append(capacity(r)).append("**")
                     .append(" | **").append(round(r.maxDrawdown(), 1)).append("**")
-                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(outcome(r), 1)).append("**")
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
-                    .append(" | **").append(round(r.pnl().total() - r.buyAndHoldPnl(), 1))
+                    .append(" | **").append(round(alpha(r), 1))
                     .append("**")
                     .append(" | **").append(round(r.pnlAtStart(), 1)).append("**")
                     .append(" |\n");
@@ -1525,7 +1551,7 @@ public class SimRunner {
                     .append(" | ").append(round(100.0 * r.windowsAtCap()
                             / Math.max(1, r.windows()), 1)).append("%")
                     .append(" | **").append(round(r.maxDrawdown(), 1)).append("**")
-                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(outcome(r), 1)).append("**")
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                     .append(" | **").append(round(r.pnlAtStart(), 1)).append("**")
                     .append(" |\n");
@@ -1570,7 +1596,7 @@ public class SimRunner {
                         / Math.max(1, baseResult.windows()), 1)).append("%")
                 .append(" | **").append(capacity(baseResult)).append("**")
                 .append(" | **").append(round(baseResult.maxDrawdown(), 1)).append("**")
-                .append(" | **").append(round(baseResult.pnl().total(), 1)).append("**")
+                .append(" | **").append(round(outcome(baseResult), 1)).append("**")
                 .append(" | **").append(round(baseResult.buyAndHoldPnl(), 1)).append("**")
                 .append(" | **").append(round(baseResult.pnlAtStart(), 1)).append("**")
                 .append(" |\n");
@@ -1588,7 +1614,7 @@ public class SimRunner {
                             / Math.max(1, r.windows()), 1)).append("%")
                     .append(" | **").append(capacity(r)).append("**")
                     .append(" | **").append(round(r.maxDrawdown(), 1)).append("**")
-                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(outcome(r), 1)).append("**")
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                     .append(" | **").append(round(r.pnlAtStart(), 1)).append("**")
                     .append(" |\n");
@@ -1624,7 +1650,7 @@ public class SimRunner {
                 .append(" б.п. | ").append(baseResult.fills().size())
                 .append(" | ").append(round(baseResult.avgInventory(), 4))
                 .append(" | ").append(round(baseResult.maxDrawdown(), 1))
-                .append(" | **").append(round(baseResult.pnl().total(), 1)).append("**")
+                .append(" | **").append(round(outcome(baseResult), 1)).append("**")
                 .append(" | **").append(round(baseResult.buyAndHoldPnl(), 1)).append("**")
                 .append(" | **").append(round(baseResult.pnlAtStart(), 1)).append("**")
                 .append(" |\n\n");
@@ -1704,7 +1730,7 @@ public class SimRunner {
                     .append(" | ").append(round(captureBp(r), 2))
                     .append(" | ").append(round(netEdgeBp(r, 60_000), 2))
                     .append(" | ").append(round(r.avgInventory(), 4))
-                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(outcome(r), 1)).append("**")
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                     .append(" |\n");
         }
@@ -1720,7 +1746,7 @@ public class SimRunner {
                     .append(" | ").append(round(captureBp(r), 2))
                     .append(" | ").append(round(netEdgeBp(r, 60_000), 2))
                     .append(" | ").append(round(r.avgInventory(), 4))
-                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(outcome(r), 1)).append("**")
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                     .append(" |\n");
         }
@@ -1732,7 +1758,7 @@ public class SimRunner {
             sb.append("| ").append(entry.getKey())
                     .append(" | ").append(r.fills().size())
                     .append(" | ").append(round(netEdgeBp(r, 60_000), 2))
-                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(outcome(r), 1)).append("**")
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                     .append(" |\n");
         }
@@ -1815,7 +1841,7 @@ public class SimRunner {
                     .append(" | ").append(r.fills().size())
                     .append(" | ").append(round(r.avgInventory(), 4))
                     .append(" | ").append(round(r.maxDrawdown(), 1))
-                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | **").append(round(outcome(r), 1)).append("**")
                     .append(" | **").append(round(r.buyAndHoldPnl(), 1)).append("**")
                     .append(" |\n");
         }
@@ -1850,7 +1876,7 @@ public class SimRunner {
                     sb.append(" — |");
                     continue;
                 }
-                double alpha = cell.result().pnl().total() - cell.result().buyAndHoldPnl();
+                double alpha = alpha(cell.result());
                 sb.append(" ").append(round(alpha, 1))
                         .append(" <br><sub>").append(cell.result().fills().size())
                         .append(" филлов, инв ").append(round(cell.result().avgInventory(), 3))
@@ -1893,7 +1919,7 @@ public class SimRunner {
                     .append(" | ").append(round(turnover(r), 0))
                     .append(" | ").append(round(edge * turnover(r) / 10_000, 1))
                     .append(" | ").append(Math.round(r.requotesPerDay(data.spanMs())))
-                    .append(" | ").append(round(r.pnl().total(), 1))
+                    .append(" | ").append(round(outcome(r), 1))
                     .append(" |\n");
         }
         sb.append("\nПобочно эта таблица отвечает и на вопрос лимита запросов: реже "
@@ -1984,7 +2010,7 @@ public class SimRunner {
                             / Math.max(1, r.windows()), 1)).append("%**")
                     .append(" | **").append(round(100.0 * r.windowsAtZero()
                             / Math.max(1, r.windows()), 1)).append("%**")
-                    .append(" | ").append(round(r.pnl().total(), 1))
+                    .append(" | ").append(round(outcome(r), 1))
                     .append(" |\n");
         }
         sb.append("\nЕсли разрыв между сторонами схлопывается при уменьшении скоса, "
@@ -2334,6 +2360,37 @@ public class SimRunner {
         }
     }
 
+    /**
+     * Захеджирована ли база замеров (док. 127 §15 п.7). Ставится один раз на
+     * прогон: хедж либо включён у базовых параметров, и тогда его наследуют все
+     * лестницы, либо выключен.
+     */
+    private boolean hedged;
+
+    /**
+     * Итог ступени лестницы: у захеджированной базы это результат С ХЕДЖЕМ.
+     *
+     * Смысл подмены — в док. 127 §3–4. Незахеджированный `total` на падающем
+     * окне на 99% состоит из переоценки средней позиции, то есть меряет размер
+     * инвентаря, а не котирование. Поэтому шесть параметров подряд были закрыты
+     * по колонке, которая шумит по построению. У захеджированной конструкции
+     * беты нет, и `total`, альфа и «при возврате» схлопываются в одну величину.
+     */
+    private double outcome(SimEngine.Result r) {
+        return hedged ? r.hedgedTotal() : r.pnl().total();
+    }
+
+    /**
+     * Альфа над buy & hold — и она же {@link #outcome} у захеджированной базы.
+     *
+     * Это не упрощение, а тождество: контроль buy & hold отвечает на вопрос «не
+     * был ли результат просто движением рынка», а у нейтральной конструкции
+     * движение рынка уже вычтено хеджем. Сравнивать её надо с нулём.
+     */
+    private double alpha(SimEngine.Result r) {
+        return hedged ? r.hedgedTotal() : r.pnl().total() - r.buyAndHoldPnl();
+    }
+
     private static double round(double v, int digits) {
         if (Double.isNaN(v)) {
             return Double.NaN;
@@ -2430,7 +2487,7 @@ public class SimRunner {
                     .append(" | ").append(r.fills().size())
                     .append(" | ").append(round(turnover(r), 0))
                     .append(" | ").append(round(r.avgInventory(), 5))
-                    .append(" | ").append(round(r.pnl().total(), 1))
+                    .append(" | ").append(round(outcome(r), 1))
                     .append(" |\n");
         }
         double strategyBp = captureBp(strategy);
