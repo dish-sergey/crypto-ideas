@@ -88,8 +88,17 @@ Telegram getUpdates, иначе 409). На micro — сервис `s5-live` (с�
   получает RST_STREAM, а с collector/браузерным UA запрос молча висит до
   таймаута (Akamai). Оба обхода зашиты в `ApiClient` (глобальный HTTP/1.1 +
   пер-хостовый UA); не менять UA для fred.stlouisfed.org.
-- **DefiLlama `api.llama.fi/emissions` стал платным** (HTTP 402) — бесплатных
-  разлоков для S5 нет; альтернативы: CryptoRank (страницы), Tokenomist ($).
+- **DefiLlama `api.llama.fi/emissions` стал платным** (HTTP 402), **но корпус
+  разлоков бесплатен через CDN их же фронтенда** (проверено 02.09.2026, см. `s5/`):
+  `https://defillama-datasets.llama.fi/emissionsProtocolsList` (372 протокола) и
+  `https://defillama-datasets.llama.fi/emissions/{slug}` — без ключа и лимитов,
+  с форвардными событиями до 2032. Покрывает 113 из 274 перпов Kraken. Грабли:
+  `gecko_id` бывает мусорным (маппить по `metadata.token` = `coingecko:<id>`);
+  `timestamp` иногда строка; у `unlockType:"linear"` в `noOfTokens` лежит смена
+  скорости `[было, стало]`, а не объём; часть адаптеров пишет линейный вестинг
+  ежедневными микро-`cliff` (Celestia — 0.02% циркуляции в день), поэтому событие
+  S5 отбирается по размеру, а не по типу. Платные альтернативы для оставшихся 35
+  монет: CryptoRank `/v2/currencies/{id}/vesting` (Pro), Tokenomist, DropsTab.
 - **Bulk-архив `data.binance.vision` (листинг через S3 API)**: `metrics`
   (с OI) — daily с 2020-09-01; `fundingRate` — monthly с 2020-01;
   `bookDepth` — daily с 2023-01-01; **`liquidationSnapshot` удалён совсем**
