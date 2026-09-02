@@ -196,6 +196,7 @@ public class S5EventImporter {
     private void importPrices(String base) {
         long start = LocalDate.parse(from).atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli();
         List<Object[]> rows = new ArrayList<>();
+        List<Object[]> liq = new ArrayList<>();
         long now = System.currentTimeMillis();
         for (int page = 0; page < 6; page++) {
             JsonNode kl = get("https://fapi.binance.com/fapi/v1/klines?symbol=" + base
@@ -208,6 +209,8 @@ public class S5EventImporter {
                 long openTime = c.get(0).asLong();
                 rows.add(new Object[]{base, day(openTime), c.get(1).asDouble(), c.get(2).asDouble(),
                         c.get(3).asDouble(), c.get(4).asDouble(), now});
+                // klines: [7] — оборот в котируемой валюте, [8] — число сделок (док. 131 §7 п.4)
+                liq.add(new Object[]{base, day(openTime), c.get(7).asDouble(0), c.get(8).asLong(0), now});
                 last = openTime;
             }
             if (kl.size() < 1500) {
@@ -217,6 +220,8 @@ public class S5EventImporter {
         }
         db.batch("INSERT OR REPLACE INTO s5_price(base, day, open, high, low, close, imported_ms) "
                 + "VALUES(?,?,?,?,?,?,?)", rows);
+        db.batch("INSERT OR REPLACE INTO s5_liquidity(base, day, quote_volume, trades, imported_ms) "
+                + "VALUES(?,?,?,?,?)", liq);
     }
 
     private void importFunding(String base) {

@@ -88,3 +88,15 @@ CREATE TABLE IF NOT EXISTS spot_1m (
     imported_ms INTEGER NOT NULL,
     PRIMARY KEY (symbol, close_time)
 );
+
+-- Дневной долларовый оборот перпа Binance по активам событий S5 (док. 131 §7 п.4).
+-- Отдельной таблицей, а не колонкой в s5_price: у схемы нет миграций, а ALTER TABLE
+-- на повторном запуске падал бы дублем колонки.
+CREATE TABLE IF NOT EXISTS s5_liquidity (
+    base          TEXT    NOT NULL,
+    day           TEXT    NOT NULL,
+    quote_volume  REAL    NOT NULL,          -- оборот в USDT за сутки
+    trades        INTEGER,                   -- число сделок за сутки
+    imported_ms   INTEGER NOT NULL,
+    PRIMARY KEY (base, day)
+);

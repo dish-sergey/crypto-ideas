@@ -159,8 +159,13 @@ public class S5PremiumBench {
         md.append("Только Kraken: ").append(blockBootstrap(
                 base3.stream().filter(Trade::onKraken).toList(), 2000));
 
+        Controls ctl = controls(px);
+
         md.append("\n## Честный бенчмарк: шорт тех же монет без разлока (порог 3%)\n\n");
-        md.append(benchmark(base3, px, kraken));
+        md.append(benchmark(base3, px, ctl));
+
+        md.append("\n## Листинг или тонкий стакан? (порог 3%)\n\n");
+        md.append(liquidity(base3, px, ctl));
 
         md.append("\n## Разложение: сколько из дохода — эффект разлока, а сколько снос\n\n");
         md.append("Доходность шорта = безусловный снос монеты за те же 5 дней + премия события. ")
@@ -207,7 +212,11 @@ public class S5PremiumBench {
      *       даёт распределение того же показателя при случайных датах — с ним и сравнивается факт.</li>
      * </ul>
      */
-    private String benchmark(List<Trade> t, Map<String, TreeMap<String, Double>> px, Set<String> kraken) {
+    private record Controls(Map<String, double[]> peer, Map<String, List<String>> placebo) {
+    }
+
+    /** Контроли считаются один раз: рыночный по дням и список «чистых» окон по каждой монете. */
+    private Controls controls(Map<String, TreeMap<String, Double>> px) {
         Map<String, java.util.Set<Long>> unlocks = new HashMap<>();
         db.query("SELECT base, unlock_day FROM s5_event", rs -> {
             unlocks.computeIfAbsent(rs.getString(1), k -> new HashSet<>())
@@ -237,6 +246,13 @@ public class S5PremiumBench {
             }
         }
 
+        return new Controls(peer, placeboDays);
+    }
+
+    /** Таблица бенчмарка: событие против рынка в те же дни и против случайных дат. */
+    private String benchmark(List<Trade> t, Map<String, TreeMap<String, Double>> px, Controls c) {
+        Map<String, double[]> peer = c.peer();
+        Map<String, List<String>> placeboDays = c.placebo();
         List<Trade> usable = t.stream()
                 .filter(x -> peerCount(peer, entryDay(x)) >= 20 && placeboDays.containsKey(x.base()))
                 .toList();
@@ -315,6 +331,122 @@ public class S5PremiumBench {
                 "| %s | %d | %+.2f%% | %+.2f%% | %+.2f%% | %+.2f%% | %.2f | %.3f |%n",
                 label, t.size(), sEv / t.size() * 100, sMk / t.size() * 100, mean * 100,
                 placeboSum / iters * 100, se > 0 ? mean / se : 0, (double) notWorse / iters);
+    }
+
+    /**
+     * Разведение двух объяснений (док. 131 §7 п.4). Разрез «есть перп на Kraken» — про листинг, а гипотеза
+     * S5 — про тонкий стакан. Здесь событиям приписывается ликвидность на момент входа (медианный дневной
+     * оборот перпа за 30 дней до), они бьются на квинтили, и внутри КАЖДОГО квинтиля сравниваются
+     * Kraken и не-Kraken. Если разница исчезает внутри квинтилей — дело в ликвидности, а листинг был
+     * просто её меткой.
+     */
+    private String liquidity(List<Trade> t, Map<String, TreeMap<String, Double>> px, Controls c) {
+        Map<String, TreeMap<String, Double>> vol = new HashMap<>();
+        db.query("SELECT base, day, quote_volume FROM s5_liquidity ORDER BY base, day", rs -> {
+            vol.computeIfAbsent(rs.getString(1), k -> new TreeMap<>()).put(rs.getString(2), rs.getDouble(3));
+            return null;
+        });
+        if (vol.isEmpty()) {
+            return "Таблица `s5_liquidity` пуста — нужен повторный `--theory=s5-import`.\n";
+        }
+
+        record WithVol(Trade t, double vol) {
+        }
+        List<WithVol> wv = new ArrayList<>();
+        for (Trade x : t) {
+            double v = medianVolume(vol.get(x.base()), entryDay(x));
+            if (v > 0 && peerCount(c.peer(), entryDay(x)) >= 20 && c.placebo().containsKey(x.base())) {
+                wv.add(new WithVol(x, v));
+            }
+        }
+        if (wv.size() < 100) {
+            return "Событий с известным оборотом мало (" + wv.size() + ") — разрез не считается.\n";
+        }
+        wv.sort(java.util.Comparator.comparingDouble(WithVol::vol));
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Ликвидность события — медианный дневной оборот перпа Binance за 30 дней до входа ")
+                .append("(величина на момент входа, не задним числом). Квинтили по ней:\n\n");
+        sb.append("| Квинтиль оборота | Событий | Медианный оборот | Доля на Kraken | Разность к рынку | Плацебо | p |\n")
+                .append("|---|---|---|---|---|---|---|\n");
+        int q = wv.size() / 5;
+        for (int i = 0; i < 5; i++) {
+            List<WithVol> part = wv.subList(i * q, i == 4 ? wv.size() : (i + 1) * q);
+            List<Trade> tr = part.stream().map(WithVol::t).toList();
+            double medVol = part.get(part.size() / 2).vol();
+            long onK = tr.stream().filter(Trade::onKraken).count();
+            // benchRow: | label | n | шорт | рынок | разность | плацебо | t | p |
+            String[] f = benchRow("q", tr, c.peer(), px, c.placebo()).split("\\|");
+            sb.append(String.format(Locale.ROOT, "| Q%d %s | %d | $%.1f млн | %.0f%% | %s | %s | %s |%n",
+                    i + 1, i == 0 ? "(тонкие)" : i == 4 ? "(толстые)" : "", tr.size(), medVol / 1e6,
+                    100.0 * onK / tr.size(), f[5].trim(), f[6].trim(), f[8].trim()));
+        }
+
+        sb.append("\n### Кто несёт эффект вне Kraken\n\n");
+        sb.append("Вся вселенная датасета — перпы Binance USDT, поэтому «нет на Kraken» означает ")
+                .append("«есть на Binance, нет на Kraken». Монеты с наибольшим числом таких событий:\n\n");
+        sb.append("| Монета | Событий | Разность к рынку | Медианный оборот |\n|---|---|---|---|\n");
+        Map<String, List<WithVol>> byBase = new LinkedHashMap<>();
+        for (WithVol x : wv) {
+            if (!x.t().onKraken()) {
+                byBase.computeIfAbsent(x.t().base(), k -> new ArrayList<>()).add(x);
+            }
+        }
+        byBase.entrySet().stream()
+                .sorted((a, b) -> Integer.compare(b.getValue().size(), a.getValue().size()))
+                .limit(10)
+                .forEach(e -> {
+                    List<Trade> tr = e.getValue().stream().map(WithVol::t).toList();
+                    double mv = e.getValue().stream().mapToDouble(WithVol::vol).sorted()
+                            .skip(e.getValue().size() / 2).findFirst().orElse(0);
+                    double[] v = tr.stream()
+                            .mapToDouble(x -> x.shortRet() - peerMean(c.peer(), entryDay(x))).toArray();
+                    sb.append(String.format(Locale.ROOT, "| %s | %d | %+.2f%% | $%.1f млн |%n",
+                            e.getKey(), tr.size(), Arrays.stream(v).average().orElse(0) * 100, mv / 1e6));
+                });
+
+        sb.append("\n### Kraken против не-Kraken ВНУТРИ квинтилей\n\n");
+        sb.append("| Квинтиль | Kraken n | Kraken разность | не-Kraken n | не-Kraken разность |\n")
+                .append("|---|---|---|---|---|\n");
+        for (int i = 0; i < 5; i++) {
+            List<WithVol> part = wv.subList(i * q, i == 4 ? wv.size() : (i + 1) * q);
+            List<Trade> k = part.stream().map(WithVol::t).filter(Trade::onKraken).toList();
+            List<Trade> nk = part.stream().map(WithVol::t).filter(x -> !x.onKraken()).toList();
+            sb.append(String.format(Locale.ROOT, "| Q%d | %d | %s | %d | %s |%n", i + 1,
+                    k.size(), diffOnly(k, c.peer()), nk.size(), diffOnly(nk, c.peer())));
+        }
+        return sb.toString();
+    }
+
+    /** Только «разность к рынку» без перестановки — для компактных клеток кросс-таблицы. */
+    private String diffOnly(List<Trade> t, Map<String, double[]> peer) {
+        if (t.size() < 15) {
+            return "—";
+        }
+        double[] v = t.stream().mapToDouble(x -> x.shortRet() - peerMean(peer, entryDay(x))).toArray();
+        double mean = Arrays.stream(v).average().orElse(0);
+        double se = sd(v, mean) / Math.sqrt(v.length);
+        return String.format(Locale.ROOT, "%+.2f%% (t=%.2f)", mean * 100, se > 0 ? mean / se : 0);
+    }
+
+    /** Медианный дневной оборот за 30 дней до дня входа; 0, если данных нет. */
+    private static double medianVolume(TreeMap<String, Double> v, String entryDay) {
+        if (v == null) {
+            return 0;
+        }
+        LocalDate d = LocalDate.parse(entryDay);
+        List<Double> vals = new ArrayList<>();
+        for (int i = 1; i <= 30; i++) {
+            Double x = v.get(d.minusDays(i).toString());
+            if (x != null && x > 0) {
+                vals.add(x);
+            }
+        }
+        if (vals.size() < 10) {
+            return 0;
+        }
+        java.util.Collections.sort(vals);
+        return vals.get(vals.size() / 2);
     }
 
     private String entryDay(Trade x) {
