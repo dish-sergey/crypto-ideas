@@ -99,6 +99,7 @@ public class RevxConfig {
     private final double simUnloadTarget;
     private final List<Double> simUnloadStallLadder;
     private final double simUnloadStallMargin;
+    private final int simWindowSeconds;
     private final double simGridMargin;
     private final double simGridBaseStep;
     private final double simGridWidening;
@@ -220,6 +221,7 @@ public class RevxConfig {
             @Value("${revx.sim.unload-target}") double simUnloadTarget,
             @Value("${revx.sim.unload-stall-ladder}") List<Double> simUnloadStallLadder,
             @Value("${revx.sim.unload-stall-margin}") double simUnloadStallMargin,
+            @Value("${revx.sim.window-seconds}") int simWindowSeconds,
             @Value("${revx.sim.grid-margin}") double simGridMargin,
             @Value("${revx.sim.grid-base-step}") double simGridBaseStep,
             @Value("${revx.sim.grid-widening}") double simGridWidening,
@@ -338,6 +340,7 @@ public class RevxConfig {
         this.simUnloadTarget = simUnloadTarget;
         this.simUnloadStallLadder = simUnloadStallLadder;
         this.simUnloadStallMargin = simUnloadStallMargin;
+        this.simWindowSeconds = simWindowSeconds;
         this.simGridMargin = simGridMargin;
         this.simGridBaseStep = simGridBaseStep;
         this.simGridWidening = simGridWidening;
@@ -751,6 +754,22 @@ public class RevxConfig {
     /** Лестница застоя: сколько окон без продажи включает разгрузку. */
     public double[] simUnloadStallLadder() {
         return simUnloadStallLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    /**
+     * Размер окна симуляции, с — СВОЙ ключ, не период опроса коллектора.
+     *
+     * Разводит два разных решения, которые до док. 151 сидели на одном ключе:
+     * период опроса площадки (деплой, меняется под бюджет запросов) и период
+     * котирования, который мы моделируем (методика, определяет сравнимость с
+     * прошлыми доками). Правка первого молча сдвигала второе.
+     *
+     * ⚠️ Значение обязано соответствовать РЕАЛЬНОЙ плотности данных торгуемой
+     * пары в окне. Поставить 1 с там, где собиралось раз в 5, значит получить
+     * четыре пустых окна из пяти.
+     */
+    public int simWindowSeconds() {
+        return simWindowSeconds;
     }
 
     /** Минимальная прибыль над входом при разгрузке по застою. */

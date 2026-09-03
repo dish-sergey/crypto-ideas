@@ -59,6 +59,9 @@ public final class SimEngine {
             double hedgeShortWindows,     // доля окон, в которые нетто-позиция была шортом
             int hedgeTrades,              // сколько раз пришлось доводить шорт
             int hedgeSkipped,             // ребалансировок пропущено предохранителем по дислокации
+            double hedgeNeutralisation,   // q·ΔS — часть переоценки, гасящая ногу инвентаря
+            double hedgeBasisDrift,       // q·(Δперп − ΔS) — дрейф базиса, ошибка слежения
+            double uncoveredNotional,     // средний непокрытый остаток округления, $
             double basisMeanAbsBp,        // средний |базис| перп−спот за окно, б.п.
             double basisMaxAbsBp,         // и самый широкий разъезд
             int frozenCycles,             // сколько раз замороженная пара выпускалась заново
@@ -236,6 +239,9 @@ public final class SimEngine {
         double basisSum = 0;
         double basisMaxAbs = 0;
         double prevPerp = 0;
+        double hedgeNeutralisation = 0;
+        double hedgeBasisDrift = 0;
+        double uncoveredSum = 0;
         double prevFair = 0;
         long prevTsMs = 0;
         double fairFirst = 0;
@@ -502,6 +508,31 @@ public final class SimEngine {
                     // Переоценка шорта идёт по ПЕРПУ: это цена ноги, которой мы
                     // владеем. По споту она бы не сходилась ровно на базис.
                     hedgePnl += hedgeQty * (perp - prevPerp);
+
+                    // ПОСТРОЧНАЯ РАСКЛАДКА (док. 150 §2, пункт 1 очереди).
+                    //
+                    // Одно число «переоценка шорта» трижды поменялось на порядок
+                    // между доками, и причину было не восстановить. Разложение
+                    // делает слагаемые видимыми по отдельности:
+                    //
+                    //   q·ΔS                        нейтрализация рынка —
+                    //                               ровно то, что гасит ногу инвентаря;
+                    //   q·(Δперп_в_USDC − ΔS)       ДРЕЙФ БАЗИСА, ошибка слежения
+                    //                               хеджа; не гасит ничего;
+                    //
+                    // Сумма тождественно равна hedgePnl, поэтому раскладка не
+                    // может «не сойтись» — она именно раскладка, а не вторая
+                    // оценка того же.
+                    //
+                    // Уровень базиса сам по себе ничего не стоит: шорт
+                    // открывается и закрывается при одном и том же смещении.
+                    // Стоит ИЗМЕНЕНИЕ уровня, и оно здесь во второй строке.
+                    if (prevFair > 0) {
+                        double dSpot = window.fair() - prevFair;
+                        hedgeNeutralisation += hedgeQty * dSpot;
+                        hedgeBasisDrift += hedgeQty * ((perp - prevPerp) - dSpot);
+                    }
+
                     double hours = Math.max(0, window.tsMs() - prevTsMs) / 3_600_000.0;
                     // Шорт ПОЛУЧАЕТ фондирование при положительной ставке: знак
                     // hedgeQty отрицателен, поэтому минус перед произведением.
@@ -531,6 +562,11 @@ public final class SimEngine {
                         lastHedgeMs = window.tsMs();
                     }
                 }
+                // Непокрытый ОСТАТОК ОКРУГЛЕНИЯ: инвентарь минус то, что реально
+                // захеджировано. Это направленная позиция, которой хедж не
+                // закрыл, и в раскладке она обязана стоять отдельной строкой —
+                // иначе её цена молча смешивается с дрейфом базиса.
+                uncoveredSum += Math.abs(pnl.inventory() + hedgeQty) * window.fair();
                 basisSum += Math.abs(basisBp);
                 basisMaxAbs = Math.max(basisMaxAbs, Math.abs(basisBp));
                 prevPerp = perp;
@@ -581,7 +617,9 @@ public final class SimEngine {
                 hedgeSamples == 0 ? 0 : hedgeResidualSum / hedgeSamples,
                 hedgeNetMin, hedgeNetMax,
                 hedgeSamples == 0 ? 0 : (double) hedgeShortWindows / hedgeSamples, hedgeTrades,
-                hedgeSkipped, hedgeSamples == 0 ? 0 : basisSum / hedgeSamples, basisMaxAbs,
+                hedgeSkipped, hedgeNeutralisation, hedgeBasisDrift,
+                hedgeSamples == 0 ? 0 : uncoveredSum / hedgeSamples,
+                hedgeSamples == 0 ? 0 : basisSum / hedgeSamples, basisMaxAbs,
                 frozenCycles, frozenHeldWindows, execution.stats());
     }
 }

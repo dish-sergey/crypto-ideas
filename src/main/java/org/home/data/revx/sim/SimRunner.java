@@ -191,7 +191,14 @@ public class SimRunner {
      */
     public void run(String symbol, int hours, long toMs, String out) {
         long fromMs = toMs - hours * 3600_000L;
-        long bucketMs = cfg.authBookPeriodSeconds() * 1000L;
+        // Окно симуляции — СВОЙ ключ, а не период опроса коллектора.
+        //
+        // Раньше здесь стоял authBookPeriodSeconds, и это была скрытая сцепка двух
+        // разных решений: как часто мы ОПРАШИВАЕМ площадку (деплой) и какой период
+        // котирования МОДЕЛИРУЕМ (методика). Правка периода хвоста вселенной с 5 на
+        // 6 с (док. 151 §4) молча сдвинула окно симуляции и изменила все числа:
+        // базовый total BTC 51.44 → 47.01 без единой правки в логике.
+        long bucketMs = cfg.simWindowSeconds() * 1000L;
 
         SimDataReader.Dataset data = reader.read(symbol, fromMs, toMs, bucketMs);
         if (data.windows().size() < 100) {
@@ -2931,6 +2938,52 @@ public class SimRunner {
                             : String.valueOf(round(r.hedgedTotal() - ref.result().hedgedTotal(), 2)))
                     .append(" |\n");
         }
+        // Построчная раскладка ноги перпа (док. 150 §2, пункт 1 очереди).
+        //
+        // Одно число «переоценка шорта» трижды поменялось на порядок между
+        // доками 127, 146 и 149, и причину было не восстановить постфактум.
+        // Слагаемые складываются в hedgedTotal тождественно, поэтому таблица —
+        // раскладка, а не вторая оценка: строка «сходимость» обязана быть нулём.
+        sb.append("\n#### Построчная раскладка ноги перпа (док. 150 §2)\n\n");
+        sb.append("Число «переоценка шорта» между док. 127, 146 и 149 менялось на "
+                + "порядок трижды, и каждый раз по своей причине — шаг контракта, "
+                + "номинал, единица марок. Постфактум причину восстановить было нельзя, "
+                + "потому что всё схлопнуто в одно число. Здесь слагаемые видны "
+                + "по отдельности.\n\n");
+        sb.append("| Строка | $ за окно | Что это |\n|---|---|---|\n");
+        for (DislocationRung rung : ladder) {
+            if (rung.thresholdBp() != 0) {
+                continue;                 // раскладка одна — для опорной строки
+            }
+            SimEngine.Result r = rung.result();
+            sb.append("| спот `total` | ").append(round(r.pnl().total(), 2))
+                    .append(" | захват спреда плюс нога инвентаря |\n");
+            sb.append("| **нейтрализация** `q·ΔS` | **").append(round(r.hedgeNeutralisation(), 2))
+                    .append("** | ровно то, ради чего хедж и вводится: гасит ногу инвентаря |\n");
+            sb.append("| **дрейф базиса** `q·(Δперп−ΔS)` | **")
+                    .append(round(r.hedgeBasisDrift(), 2))
+                    .append("** | ошибка слежения — не гасит ничего и есть чистая цена |\n");
+            sb.append("| комиссии перпа | ").append(round(-r.hedgeCost(), 2))
+                    .append(" | ").append(r.hedgeTrades()).append(" сделок |\n");
+            sb.append("| фондирование | ").append(round(r.hedgeFunding(), 2))
+                    .append(" | шорт получает при положительной ставке |\n");
+            sb.append("| **итого с хеджем** | **").append(round(r.hedgedTotal(), 2))
+                    .append("** | |\n");
+            double sum = r.pnl().total() + r.hedgeNeutralisation() + r.hedgeBasisDrift()
+                    - r.hedgeCost() + r.hedgeFunding();
+            sb.append("| *сходимость* | *").append(round(sum - r.hedgedTotal(), 6))
+                    .append("* | *обязана быть нулём: это раскладка, а не вторая оценка* |\n\n");
+            sb.append("Средний непокрытый остаток округления: **$")
+                    .append(round(r.uncoveredNotional(), 2))
+                    .append("** — направленная позиция, которую хедж не закрыл. Её цена "
+                            + "сидит в ноге инвентаря спота, а не в строках выше.\n\n");
+            sb.append("**Как читать.** Нейтрализация обязана быть примерно противоположна "
+                    + "инвентарной ноге спота (").append(round(r.pnl().inventoryPnl(), 2))
+                    .append(") — если нет, хедж не делает того, что обещает. А цена "
+                            + "нейтральности — это НЕ вся переоценка шорта, а только строка "
+                            + "«дрейф базиса» плюс комиссии минус фондирование.\n\n");
+        }
+
         sb.append("\n| Базис на окне | б.п. |\n|---|---|\n");
         sb.append("| средний `|базис|` | ").append(round(ref.result().basisMeanAbsBp(), 2))
                 .append(" |\n");
