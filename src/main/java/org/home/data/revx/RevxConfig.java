@@ -95,6 +95,10 @@ public class RevxConfig {
     private final List<Double> simWideningLadder;
     private final double simWideningMaxStep;
     private final List<Double> simCostFloorLadder;
+    private final List<Double> simUnloadLadder;
+    private final double simUnloadTarget;
+    private final List<Double> simUnloadStallLadder;
+    private final double simUnloadStallMargin;
     private final double simGridMargin;
     private final double simGridBaseStep;
     private final double simGridWidening;
@@ -212,6 +216,10 @@ public class RevxConfig {
             @Value("${revx.sim.widening-ladder}") List<Double> simWideningLadder,
             @Value("${revx.sim.widening-max-step}") double simWideningMaxStep,
             @Value("${revx.sim.cost-floor-ladder}") List<Double> simCostFloorLadder,
+            @Value("${revx.sim.unload-ladder}") List<Double> simUnloadLadder,
+            @Value("${revx.sim.unload-target}") double simUnloadTarget,
+            @Value("${revx.sim.unload-stall-ladder}") List<Double> simUnloadStallLadder,
+            @Value("${revx.sim.unload-stall-margin}") double simUnloadStallMargin,
             @Value("${revx.sim.grid-margin}") double simGridMargin,
             @Value("${revx.sim.grid-base-step}") double simGridBaseStep,
             @Value("${revx.sim.grid-widening}") double simGridWidening,
@@ -326,6 +334,10 @@ public class RevxConfig {
         this.simWideningLadder = simWideningLadder;
         this.simWideningMaxStep = simWideningMaxStep;
         this.simCostFloorLadder = simCostFloorLadder;
+        this.simUnloadLadder = simUnloadLadder;
+        this.simUnloadTarget = simUnloadTarget;
+        this.simUnloadStallLadder = simUnloadStallLadder;
+        this.simUnloadStallMargin = simUnloadStallMargin;
         this.simGridMargin = simGridMargin;
         this.simGridBaseStep = simGridBaseStep;
         this.simGridWidening = simGridWidening;
@@ -724,6 +736,31 @@ public class RevxConfig {
 
     public double[] simCostFloorLadder() {
         return simCostFloorLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    /**
+     * Лестница разгрузки по себестоимости (док. 150) — зеркало пола.
+     *
+     * Отрицательная ступень означает «правило выключено» и служит опорной
+     * строкой: без неё вклад самой разгрузки не отделить от вклада прогона.
+     */
+    public double[] simUnloadLadder() {
+        return simUnloadLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    /** Лестница застоя: сколько окон без продажи включает разгрузку. */
+    public double[] simUnloadStallLadder() {
+        return simUnloadStallLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    /** Минимальная прибыль над входом при разгрузке по застою. */
+    public double simUnloadStallMargin() {
+        return simUnloadStallMargin;
+    }
+
+    /** С какой доли потолка разгрузка включается; ниже цели правило молчит. */
+    public double simUnloadTarget() {
+        return simUnloadTarget;
     }
 
     public double simGridMargin() { return simGridMargin; }

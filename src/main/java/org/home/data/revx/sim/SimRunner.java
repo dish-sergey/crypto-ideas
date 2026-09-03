@@ -480,6 +480,41 @@ public class SimRunner {
                     new SimEngine(base, limits, cfg.simMakerFee(), floored).run(data.windows())));
         }
 
+        // Разгрузка по себестоимости (док. 150) — ЗЕРКАЛО пола: набрав сверх цели,
+        // продаём при первой прибыли, не дожидаясь полного отступа. Идея с живого
+        // бота: рост встал, инвентарь 64% потолка, а вход был на 0.33% ниже рынка —
+        // то есть продать в плюс было можно, но аск ждал ещё десять б.п.
+        //
+        // Это СТАВКА НА РАЗВОРОТ, и читать её надо так: на растущем окне механизм
+        // обязан проигрывать (продали дёшево), на падающем выигрывать. Одно окно
+        // ничего не решает, нужны оба.
+        List<RatioRung> unload = new ArrayList<>();
+        for (double margin : cfg.simUnloadLadder()) {
+            QuotePolicy p = margin < 0 ? new Quoter(base)
+                    : new UnloadPolicy(new Quoter(base), cfg.simUnloadTarget(),
+                            base.inventoryCap(), margin, base.quoteStep());
+            unload.add(new RatioRung(margin,
+                    new SimEngine(base, limits, cfg.simMakerFee(), p).run(data.windows())));
+        }
+
+        // Разгрузка ПРИ ЗАСТОЕ (док. 150 §3). Отличие от предыдущей лестницы одно
+        // и решающее: цена привязана к КНИГЕ, а не к нашему входу. Правило ставит
+        // аск первым в книге (лучший аск − тик) и только когда продаж давно не
+        // было; себестоимость работает нижней границей, а не целью.
+        //
+        // Ступень — сколько окон без продажи считается застоем. Окно здесь равно
+        // периоду опроса данных, поэтому ступени переводятся в минуты по
+        // фактическому шагу, а не по конфигу (та же ловушка, что в док. 94).
+        List<RatioRung> stallUnload = new ArrayList<>();
+        for (double windows : cfg.simUnloadStallLadder()) {
+            QuotePolicy p = windows < 0 ? new Quoter(base)
+                    : new StallUnloadPolicy(new Quoter(base), cfg.simUnloadTarget(),
+                            base.inventoryCap(), (int) windows, cfg.simUnloadStallMargin(),
+                            base.quoteStep());
+            stallUnload.add(new RatioRung(windows,
+                    new SimEngine(base, limits, cfg.simMakerFee(), p).run(data.windows())));
+        }
+
         // Сетка с якорем на себестоимости (док. 115). Это не настройка котировщика,
         // а ДРУГАЯ политика: аск привязан к цене покупки лота, а не к рынку.
         // Три лестницы разводят три разных вопроса: сколько просить сверх входа,
@@ -643,7 +678,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, targetFloored, hedgeLadder, hedgeBandLadder, leashLadder, lotLadder, dislocation, wideStep, costFloor, gridMargin, gridWidening, gridLots,
+                cross, stopLadder, targetLadder, targetFloored, hedgeLadder, hedgeBandLadder, leashLadder, lotLadder, dislocation, wideStep, costFloor, unload, stallUnload, gridMargin, gridWidening, gridLots,
                 frozenCool, frozenAge, stickyOuter, stickyInner, queueControl,
                 anchorDepth, noSkewResult, ownBookResult);
         write(out, markdown);
@@ -1048,6 +1083,7 @@ public class SimRunner {
                           List<LotRung> lotLadder,
                           List<DislocationRung> dislocation,
                           List<RatioRung> wideStep, List<RatioRung> costFloor,
+                          List<RatioRung> unload, List<RatioRung> stallUnload,
                           List<GridRung> gridMargin, List<GridRung> gridWidening,
                           List<GridRung> gridLots,
                           List<RatioRung> frozenCool, List<RatioRung> frozenAge,
@@ -1818,6 +1854,8 @@ public class SimRunner {
                 + "остаётся отложенным: пол не делает падение прибыльным, он лишь "
                 + "перестаёт превращать его в реализованный убыток.\n\n");
 
+        renderUnload(sb, unload, baseResult, base);
+        renderStallUnload(sb, stallUnload, data);
         sb.append("### Сетка с якорем на себестоимости (док. 115)\n\n");
         sb.append("Другой механизм, а не настройка. У котировщика аск привязан к рынку "
                 + "(`справедливая × (1 + отступ − скос)`), и при уходе цены вниз скос "
@@ -2912,6 +2950,115 @@ public class SimRunner {
         sb.append("⚠️ **Одно окно ничего не решает.** Дислокаций за год штуки (док. 138 §3: "
                 + "три за год), и на окне, где их не случилось, предохранитель обязан быть "
                 + "ровно нулевым — это приёмка, а не результат.\n\n");
+    }
+
+    /**
+     * Разгрузка по себестоимости (док. 150) — зеркало пола по себестоимости.
+     *
+     * Читается ТОЛЬКО вместе со вторым окном: механизм по построению
+     * зарабатывает на развороте и теряет на продолжении роста, поэтому одна
+     * таблица показывает не качество правила, а направление окна.
+     */
+    private void renderUnload(StringBuilder sb, List<RatioRung> ladder,
+                              SimEngine.Result baseResult, Quoter.Params base) {
+        if (ladder.isEmpty()) {
+            return;
+        }
+        sb.append("### Разгрузка по себестоимости: продавать при первой прибыли (док. 150)\n\n");
+        sb.append("Наблюдение с живого бота 03.09.2026: рост встал, три бота за два часа "
+                + "набрали с 16% до 64% потолка, продажи прекратились — а инвентарь был "
+                + "**в прибыли**: средняя цена входа 80 810 против рынка 81 078, то есть "
+                + "+0.33%. Обычный аск стоял на `fair·(1+d)` и ждал ещё десять б.п., "
+                + "которых рынок не давал.\n\n");
+        sb.append("Правило: пока инвентарь выше цели (**")
+                .append(round(cfg.simUnloadTarget() * 100, 0))
+                .append("%** потолка), аск разрешается опустить до `себестоимость·(1+ε)`. "
+                        + "Это ЗЕРКАЛО пола по себестоимости: то же число, но потолком для "
+                        + "аска, и инвентарь оно сбрасывает, а не копит.\n\n");
+        sb.append("⚠️ **Это ставка на разворот.** Механизм зарабатывает ровно тогда, когда "
+                + "после остановки цена идёт вниз. На растущем окне он ОБЯЗАН проигрывать — "
+                + "мы продали дёшево и смотрим, как рынок уходит. Поэтому строка «правило "
+                + "выключено» здесь опорная, а вывод делается только по двум окнам сразу.\n\n");
+        sb.append("| Маржа над входом | Исполнений | Покупок / продаж | Захват, б.п. "
+                + "| Ср. инвентарь | Время с полным | **Total** | **Buy & hold** "
+                + "| **При возврате цены** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : ladder) {
+            SimEngine.Result r = rung.result();
+            long buys = r.fills().stream().filter(f -> f.side() == Side.BUY).count();
+            sb.append("| ").append(rung.ratio() < 0 ? "**правило выключено**"
+                            : round(rung.ratio() * 10_000, 1) + " б.п.")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(buys).append(" / ").append(r.fills().size() - buys)
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(r.avgInventory(), 5))
+                    .append(" | ").append(round(100.0 * r.windowsAtCap()
+                            / Math.max(1, r.windows()), 1)).append("%")
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | ").append(round(r.buyAndHoldPnl(), 1))
+                    .append(" | ").append(round(r.pnlAtStart(), 1))
+                    .append(" |\n");
+        }
+        sb.append("\n**Как читать.** Решающая колонка — **«при возврате цены»**: она "
+                + "оценивает инвентарь по цене НАЧАЛА окна, и контроль `buy & hold` в ней "
+                + "тождественно ноль. Если разгрузка полезна, она обязана выигрывать именно "
+                + "там — то есть в сценарии, ради которого и вводится.\n\n");
+    }
+
+    /**
+     * Разгрузка при застое (док. 150 §3) — исправленная версия предыдущей.
+     *
+     * Отличие одно и решающее: цена привязана к КНИГЕ, а не к нашему входу.
+     * Предыдущая опускала аск до себестоимости и отдавала весь спред; эта
+     * отдаёт тик и позицию в очереди.
+     */
+    private void renderStallUnload(StringBuilder sb, List<RatioRung> ladder,
+                                   SimDataReader.Dataset data) {
+        if (ladder.isEmpty()) {
+            return;
+        }
+        double sec = data.windowPeriodSec();
+        sb.append("### Разгрузка при застое: встать первым в книге (док. 150 §3)\n\n");
+        sb.append("Предыдущая лестница опускала аск до `себестоимость·(1+ε)` и потому "
+                + "проиграла на обоих окнах: захват падал с 10.9 до 1.1 б.п. Ошибка была в "
+                + "привязке — цена бралась от НАШЕГО входа, а на растущем окне вход отстаёт "
+                + "от книги на всю величину роста.\n\n");
+        sb.append("Здесь цена привязана к книге: аск опускается ровно до **лучший аск − "
+                + "тик**, то есть отдаётся один тик и позиция в очереди, а не спред целиком. "
+                + "Три условия обязательны все сразу: инвентарь выше цели (**")
+                .append(round(cfg.simUnloadTarget() * 100, 0))
+                .append("%** потолка), продаж не было дольше порога, и цена всё ещё выше "
+                        + "себестоимости на **")
+                .append(round(cfg.simUnloadStallMargin() * 10_000, 1))
+                .append(" б.п.**\n\n");
+        sb.append("| Порог застоя | Исполнений | Покупок / продаж | Захват, б.п. "
+                + "| Чистый край 60 с | Ср. инвентарь | **Total** | **Buy & hold** "
+                + "| **При возврате цены** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : ladder) {
+            SimEngine.Result r = rung.result();
+            long buys = r.fills().stream().filter(f -> f.side() == Side.BUY).count();
+            sb.append("| ").append(rung.ratio() < 0 ? "**правило выключено**"
+                            : String.format(java.util.Locale.ROOT, "%.0f окон (%.0f мин)",
+                                    rung.ratio(), rung.ratio() * sec / 60))
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(buys).append(" / ").append(r.fills().size() - buys)
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(netEdgeBp(r, 60_000), 2))
+                    .append(" | ").append(round(r.avgInventory(), 5))
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | ").append(round(r.buyAndHoldPnl(), 1))
+                    .append(" | ").append(round(r.pnlAtStart(), 1))
+                    .append(" |\n");
+        }
+        sb.append("\n**Что смотреть.** Не число исполнений: встать первым — значит забрать "
+                + "поток раньше, и оно вырастет обязательно. Смотреть надо на **чистый край "
+                + "60 с**: у лучшей цены выше неблагоприятный отбор, и если правило что-то "
+                + "даёт, край обязан выжить.\n\n");
+        sb.append("⚠️ **Порог застоя нельзя делать маленьким.** При коротком пороге правило "
+                + "срабатывает почти всегда, пока инвентарь высок, и превращается в "
+                + "«котировать у́же» — то есть в лестницу отступа, давно измеренную. Смысл "
+                + "именно в редком срабатывании.\n\n");
     }
 
     /** Шаги бывают мельче 1e-8: без %f они печатаются нулём. */
