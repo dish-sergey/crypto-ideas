@@ -310,11 +310,59 @@ public final class QuoteLoop implements Runnable {
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
         journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null);
-        syncSide(Side.BUY, bid, target.bid(), fair.price());
-        syncSide(Side.SELL, ask, target.ask(), fair.price());
+        syncSide(Side.BUY, bid, noCross(Side.BUY, target.bid(), fair), fair.price());
+        syncSide(Side.SELL, ask, noCross(Side.SELL, target.ask(), fair), fair.price());
     }
 
     /** Приводит одну сторону к целевой цене: поставить, переставить или снять. */
+    /**
+     * Предохранитель от пересечения книги (найден 03.09.2026).
+     *
+     * <b>Что случилось.</b> Справедливая цена считается по корзине из 23 пар и
+     * на быстром движении обгоняет книгу самой площадки. Бид, посчитанный как
+     * {@code fair·(1−d)}, оказывается на уровне текущего аска или выше, и
+     * площадка отвергает заявку с {@code post_only_immediate_match}. Заявка при
+     * этом ПОГИБАЕТ: следующая замена бьёт по мёртвому id, получает 422, бот
+     * сверяется с книгой, не находит её и ставит новую через `POST` — то есть
+     * тратит единственный жёсткий ресурс площадки.
+     *
+     * <b>Сколько это стоило.</b> Из 217 заявок с отказом замены за 8 часов
+     * **139 (64%) были именно `post_only_immediate_match`**, ещё 72 (33%) успели
+     * исполниться — эти постановки законны. Расход постановок на исполнение
+     * вырос с 1.04 до 3.9.
+     *
+     * <b>Почему зажим, а не отказ от котировки.</b> Пересечение означает, что
+     * наша цена лучше рынка, — то есть мы готовы стоять на месте, где нас сразу
+     * заберут. Отойти на тик внутрь книги дешевле, чем не стоять вовсе: заявка
+     * остаётся мейкерской, край при этом только растёт.
+     *
+     * ⚠️ Верх стакана берётся из снимка стенда, а он сам отстаёт на период
+     * опроса. Зажим поэтому не гарантия, а сокращение частоты: он убирает случаи,
+     * где пересечение видно уже по имеющимся данным, и не видит тех, где книга
+     * ушла после снимка.
+     */
+    private Double noCross(Side side, Double targetPrice, StandReader.Fair fair) {
+        if (targetPrice == null) {
+            return null;
+        }
+        double step = Math.max(params.quoteStep(), 1e-9);
+        if (side == Side.BUY && fair.bookAsk() > 0 && targetPrice >= fair.bookAsk()) {
+            double clamped = fair.bookAsk() - step;
+            journal.event("no_cross", String.format(java.util.Locale.ROOT,
+                    "BUY %.2f пересекал аск %.2f — зажат до %.2f",
+                    targetPrice, fair.bookAsk(), clamped));
+            return clamped > 0 ? clamped : null;
+        }
+        if (side == Side.SELL && fair.bookBid() > 0 && targetPrice <= fair.bookBid()) {
+            double clamped = fair.bookBid() + step;
+            journal.event("no_cross", String.format(java.util.Locale.ROOT,
+                    "SELL %.2f пересекал бид %.2f — зажат до %.2f",
+                    targetPrice, fair.bookBid(), clamped));
+            return clamped;
+        }
+        return targetPrice;
+    }
+
     private void syncSide(Side side, Resting resting, Double targetPrice, double fair) {
         if (targetPrice == null) {
             if (resting.venueId != null) {

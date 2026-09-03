@@ -64,8 +64,24 @@ public final class StandReader implements AutoCloseable {
             """;
 
     /** Справедливая цена пары и всё, что нужно, чтобы решить — котировать ли. */
+    /**
+     *  bookBid лучший БИД книги торгуемой пары (USDC-нога), 0 = неизвестен
+     *  bookAsk лучший АСК той же книги, 0 = неизвестен
+     *
+     * Верх стакана нужен не для цены, а для ПРЕДОХРАНИТЕЛЯ: наша справедливая
+     * цена считается по корзине из 23 пар и на быстром движении обгоняет книгу
+     * самой площадки. Тогда бид, посчитанный как `fair·(1−d)`, оказывается выше
+     * текущего аска, и площадка отвергает заявку с `post_only_immediate_match`.
+     * Измерено 03.09.2026: **139 из 217 отказов замены за 8 часов — именно эта
+     * причина**, и каждый такой отказ стоит постановки из суточной тысячи.
+     */
     public record Fair(double price, boolean quotable, String pausedReason,
-                       long asOfMs, int pairsUsed) {
+                       long asOfMs, int pairsUsed, double bookBid, double bookAsk) {
+
+        public Fair(double price, boolean quotable, String pausedReason,
+                    long asOfMs, int pairsUsed) {
+            this(price, quotable, pausedReason, asOfMs, pairsUsed, 0, 0);
+        }
     }
 
     private final Connection connection;
@@ -96,6 +112,7 @@ public final class StandReader implements AutoCloseable {
     public Fair latest(String base, long lookbackMs) {
         long since = System.currentTimeMillis() - lookbackMs;
         List<PairQuote> quotes = new ArrayList<>();
+        java.util.Map<String, Leg> ownBook = new java.util.HashMap<>();
         long asOf = 0;
         for (String pairBase : universe()) {
             // Ноги сопоставляются ПО snap_id, а не «последняя с последней».
@@ -125,6 +142,7 @@ public final class StandReader implements AutoCloseable {
             if (skew > maxSkewMs) {
                 continue;
             }
+            ownBook.put(pairBase, usdc);
             quotes.add(new PairQuote(pairBase, usdc.mid(), usd.mid(),
                     usdc.spread(), usd.spread(), memecoins.contains(pairBase),
                     Math.max(usdc.recvMs, usd.recvMs)));
@@ -139,8 +157,10 @@ public final class StandReader implements AutoCloseable {
         if (state == null) {
             return new Fair(0, false, "пары " + base + " нет в последнем срезе", asOf, quotes.size());
         }
+        Leg own = ownBook.get(base);
         return new Fair(state.fairUsdc(), state.quotable(), state.pausedReason(),
-                asOf, quotes.size());
+                asOf, quotes.size(),
+                own == null ? 0 : own.bid(), own == null ? 0 : own.ask());
     }
 
     /** Одна нога последнего снимка символа. */
