@@ -47,8 +47,11 @@ public class SimRunner {
     private final RunRegistry registry;
     private final RevxConfig cfg;
     private final RevxDb db;
+    private final PerpMarkSource marks;
 
-    public SimRunner(SimDataReader reader, RunRegistry registry, RevxConfig cfg, RevxDb db) {
+    public SimRunner(SimDataReader reader, RunRegistry registry, RevxConfig cfg, RevxDb db,
+                     PerpMarkSource marks) {
+        this.marks = marks;
         this.reader = reader;
         this.registry = registry;
         this.cfg = cfg;
@@ -85,6 +88,14 @@ public class SimRunner {
     }
 
     private record RatioRung(double ratio, SimEngine.Result result) {
+    }
+
+    /**
+     * Ступень предохранителя по дислокации. Порог 0 = предохранитель выключен,
+     * но базис всё равно НАСТОЯЩИЙ — это опорная строка, отделяющая вклад ряда
+     * марок от вклада самого правила.
+     */
+    private record DislocationRung(double thresholdBp, SimEngine.Result result) {
     }
 
     /**
@@ -348,6 +359,35 @@ public class SimRunner {
                     new SimEngine(p, limits, cfg.simMakerFee()).run(data.windows())));
         }
 
+        // Хедж на НАСТОЯЩЕМ ряде базиса плюс предохранитель по дислокации —
+        // обе колонки одного прогона (док. 142 §8).
+        //
+        // До сих пор шорт переоценивался по споту, то есть базис молчаливо
+        // считался нулевым. Здесь нога хеджа маркуется по перпу, а вторая
+        // колонка добавляет правило «|базис| шире порога — ребалансировку
+        // пропустить». Обоснование в док. 138 §3: базис возвратный, разброс не
+        // растёт с горизонтом, поэтому ожидание почти бесплатно.
+        List<DislocationRung> dislocation = new ArrayList<>();
+        java.util.NavigableMap<Long, Double> perpMark = java.util.Collections.emptyNavigableMap();
+        if (cfg.simHedge(symbol).enabled() && cfg.simDislocationLadder().length > 0) {
+            String hedgeBase = symbol.substring(0, Math.max(0, symbol.indexOf('/')));
+            perpMark = marks.marks(PerpMarkSource.perpFor(hedgeBase), data.fromMs(), data.toMs());
+            if (perpMark.isEmpty()) {
+                log.warn("{}: марок перпа нет — хедж на реальном базисе не считается", symbol);
+            } else {
+                Quoter.Hedge h0 = cfg.simHedge(symbol).withRebalance(cfg.simHedgeRebalanceMs());
+                // Опорная строка: тот же ряд марок, предохранитель ВЫКЛЮЧЕН.
+                // Без неё нельзя отделить вклад настоящего базиса от вклада
+                // самого правила — а это два разных утверждения.
+                for (double bp : cfg.simDislocationLadder()) {
+                    Quoter.Params p = base.withHedge(h0.withDislocation(bp));
+                    dislocation.add(new DislocationRung(bp,
+                            new SimEngine(p, limits, cfg.simMakerFee())
+                                    .run(data.windows(), perpMark)));
+                }
+            }
+        }
+
         // Лестница размера лота (док. 142 §7) — измерение ЁМКОСТИ и проверка,
         // переносится ли ранжирование пар из док. 135 §3 на торговый размер.
         //
@@ -582,7 +622,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, targetFloored, hedgeLadder, hedgeBandLadder, leashLadder, lotLadder, wideStep, costFloor, gridMargin, gridWidening, gridLots,
+                cross, stopLadder, targetLadder, targetFloored, hedgeLadder, hedgeBandLadder, leashLadder, lotLadder, dislocation, wideStep, costFloor, gridMargin, gridWidening, gridLots,
                 frozenCool, frozenAge, stickyOuter, stickyInner, queueControl,
                 anchorDepth, noSkewResult, ownBookResult);
         write(out, markdown);
@@ -985,6 +1025,7 @@ public class SimRunner {
                           List<RatioRung> hedgeLadder, List<RatioRung> hedgeBandLadder,
                           List<RatioRung> leashLadder,
                           List<LotRung> lotLadder,
+                          List<DislocationRung> dislocation,
                           List<RatioRung> wideStep, List<RatioRung> costFloor,
                           List<GridRung> gridMargin, List<GridRung> gridWidening,
                           List<GridRung> gridLots,
@@ -1586,6 +1627,7 @@ public class SimRunner {
 
         renderHedgeBand(sb, hedgeBandLadder, base);
         renderLotLadder(sb, lotLadder, base, symbol);
+        renderDislocation(sb, dislocation, baseResult);
 
         sb.append("### Бид от цены входа с поводком (док. 119)\n\n");
         sb.append("Обычный бид висит на `справедливая × (1 − шаг)` и пересчитывается "
@@ -2759,6 +2801,69 @@ public class SimRunner {
         sb.append("⚠️ **`δ*` тоже едет с размером**, и это второй ответ: ранжирование пар "
                 + "из док. 135 §3 сделано на лоте $1, и переносить его на торговый размер "
                 + "нельзя без этой таблицы.\n\n");
+    }
+
+    /**
+     * Хедж на настоящем базисе плюс предохранитель по дислокации (док. 142 §8).
+     *
+     * Две колонки одного прогона, и порядок чтения важен: сперва строка «порог 0»
+     * против прежнего хеджа по споту — это цена того, что базис вообще
+     * существует; потом ступени порога — это цена самого правила.
+     */
+    private void renderDislocation(StringBuilder sb, List<DislocationRung> ladder,
+                                   SimEngine.Result spotMarked) {
+        if (ladder.isEmpty()) {
+            return;
+        }
+        sb.append("### Хедж на НАСТОЯЩЕМ базисе и предохранитель по дислокации (док. 142 §8)\n\n");
+        sb.append("До сих пор шорт переоценивался по СПОТУ, то есть базис перп−спот молча "
+                + "считался тождественно нулевым. Вся проблема дислокации ровно в том, что он "
+                + "не ноль: 22.08.2026 марка двадцать минут стояла на 2.35% от спота "
+                + "(док. 138 §5). Здесь нога хеджа маркуется по перпу, комиссия и "
+                + "фондирование берутся с его же цены.\n\n");
+        sb.append("Предохранитель: **при `|базис|` шире порога ребалансировка пропускается, "
+                + "позиция не трогается.** Обоснование в док. 138 §3 — базис возвратный, "
+                + "разброс не растёт с горизонтом, поэтому ожидание почти бесплатно: эпизод "
+                + "рассасывается, и мы ничего не зафиксировали. Платим только непокрытой "
+                + "позицией на время эпизода. Это та единственная форма, что сработала в "
+                + "док. 108: **ноль цены вне срабатывания**.\n\n");
+        DislocationRung ref = ladder.get(0);
+        sb.append("| Порог, б.п. | Сделок на перпе | Пропущено | Комиссии | Переоценка шорта "
+                + "| Фондирование | **С хеджем** | Δ к порогу 0 |\n");
+        sb.append("|---|---|---|---|---|---|---|---|\n");
+        for (DislocationRung rung : ladder) {
+            SimEngine.Result r = rung.result();
+            sb.append("| ").append(rung.thresholdBp() == 0
+                            ? "0 (нет правила)" : trimNum(rung.thresholdBp()))
+                    .append(" | ").append(r.hedgeTrades())
+                    .append(" | ").append(r.hedgeSkipped())
+                    .append(" | ").append(round(r.hedgeCost(), 2))
+                    .append(" | ").append(round(r.hedgePnl(), 2))
+                    .append(" | ").append(round(r.hedgeFunding(), 3))
+                    .append(" | **").append(round(r.hedgedTotal(), 2)).append("**")
+                    .append(" | ").append(rung.thresholdBp() == 0 ? "—"
+                            : String.valueOf(round(r.hedgedTotal() - ref.result().hedgedTotal(), 2)))
+                    .append(" |\n");
+        }
+        sb.append("\n| Базис на окне | б.п. |\n|---|---|\n");
+        sb.append("| средний `|базис|` | ").append(round(ref.result().basisMeanAbsBp(), 2))
+                .append(" |\n");
+        sb.append("| самый широкий разъезд | **").append(round(ref.result().basisMaxAbsBp(), 1))
+                .append("** |\n\n");
+        double costOfBasis = ref.result().hedgedTotal() - spotMarked.hedgedTotal();
+        sb.append("**Цена того, что базис существует:** строка «порог 0» против прежнего счёта "
+                + "по споту — **").append(round(costOfBasis, 2))
+                .append("**. Это не эффект правила, а поправка, которой в прежних числах "
+                        + "не было вовсе; все выводы про хедж из док. 122, 125 и 135 сделаны "
+                        + "без неё.\n\n");
+        sb.append("**Как читать ступени.** Порог должен быть заметно шире обычного базиса, "
+                + "иначе правило срабатывает постоянно и превращается в «хеджировать реже», а "
+                + "это уже лестница периода, а не предохранитель. Если колонка «пропущено» "
+                + "растёт, а результат не улучшается — эпизоды на этом окне не те, ради "
+                + "которых правило вводилось.\n\n");
+        sb.append("⚠️ **Одно окно ничего не решает.** Дислокаций за год штуки (док. 138 §3: "
+                + "три за год), и на окне, где их не случилось, предохранитель обязан быть "
+                + "ровно нулевым — это приёмка, а не результат.\n\n");
     }
 
     /** Шаги бывают мельче 1e-8: без %f они печатаются нулём. */

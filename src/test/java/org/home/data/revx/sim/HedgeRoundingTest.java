@@ -21,7 +21,7 @@ class HedgeRoundingTest {
     private static final double CAP = 0.00025;
 
     private static Quoter.Hedge hedge(boolean roundDown) {
-        return new Quoter.Hedge(true, 0, STEP, 0.0005, 0, roundDown, 0);
+        return Quoter.Hedge.OFF.withRebalance(0).withStep(STEP).withFee(0.0005).withRoundDown(roundDown);
     }
 
     @Test
@@ -75,9 +75,27 @@ class HedgeRoundingTest {
     }
 
     @Test
+    void dislocationThresholdIsOffByDefaultAndSettable() {
+        // Приёмка формы «ноль цены вне срабатывания» (док. 108): по умолчанию
+        // предохранителя нет вовсе, и включение его не трогает ничего другого.
+        Quoter.Hedge plain = hedge(true);
+        assertEquals(0.0, plain.dislocationBp(), 1e-12, "по умолчанию предохранитель выключен");
+
+        Quoter.Hedge guarded = plain.withDislocation(50);
+        assertEquals(50.0, guarded.dislocationBp(), 1e-12);
+        // Целевой шорт от предохранителя не зависит: правило решает, ДЕЛАТЬ ли
+        // ребалансировку, а не какой она должна быть.
+        assertEquals(plain.target(0.00021), guarded.target(0.00021), 1e-15);
+        assertEquals(plain.step(), guarded.step(), 1e-15);
+        assertEquals(plain.feeRate(), guarded.feeRate(), 1e-15);
+        assertEquals(plain.roundDown(), guarded.roundDown());
+        assertEquals(plain.deadband(), guarded.deadband(), 1e-15);
+    }
+
+    @Test
     void zeroStepMeansContinuousHedge() {
         // Шаг не задан — модель непрерывного хеджа, остаток тождественно нулевой.
-        Quoter.Hedge continuous = new Quoter.Hedge(true, 0, 0, 0, 0, true, 0);
+        Quoter.Hedge continuous = Quoter.Hedge.OFF.withRebalance(0).withStep(0);
         assertEquals(-0.000123, continuous.target(0.000123), 1e-15);
     }
 }

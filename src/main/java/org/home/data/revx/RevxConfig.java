@@ -88,6 +88,7 @@ public class RevxConfig {
     private final boolean simHedgeEnabled;
     private final long simHedgeRebalanceMs;
     private final List<Double> simHedgeBandLadder;
+    private final List<Double> simDislocationLadder;
     private final double simHedgeFee;
     private final double simHedgeFundingPerHour;
     private final List<Double> simAnchorLeashLadder;
@@ -204,6 +205,7 @@ public class RevxConfig {
             @Value("${revx.sim.hedge-enabled}") boolean simHedgeEnabled,
             @Value("${revx.sim.hedge-rebalance-ms}") long simHedgeRebalanceMs,
             @Value("${revx.sim.hedge-band-ladder}") List<Double> simHedgeBandLadder,
+            @Value("${revx.sim.dislocation-ladder}") List<Double> simDislocationLadder,
             @Value("${revx.sim.hedge-fee}") double simHedgeFee,
             @Value("${revx.sim.hedge-funding-per-hour}") double simHedgeFundingPerHour,
             @Value("${revx.sim.anchor-leash-ladder}") List<Double> simAnchorLeashLadder,
@@ -317,6 +319,7 @@ public class RevxConfig {
         this.simHedgeEnabled = simHedgeEnabled;
         this.simHedgeRebalanceMs = simHedgeRebalanceMs;
         this.simHedgeBandLadder = simHedgeBandLadder;
+        this.simDislocationLadder = simDislocationLadder;
         this.simHedgeFee = simHedgeFee;
         this.simHedgeFundingPerHour = simHedgeFundingPerHour;
         this.simAnchorLeashLadder = simAnchorLeashLadder;
@@ -630,7 +633,7 @@ public class RevxConfig {
      */
     public org.home.data.revx.sim.Quoter.Hedge simHedge() {
         return new org.home.data.revx.sim.Quoter.Hedge(true, 0, simHedgeStep, simHedgeFee,
-                simHedgeFundingPerHour, simHedgeRoundDown, 0);
+                simHedgeFundingPerHour, simHedgeRoundDown, 0, 0);
     }
 
     /**
@@ -681,6 +684,17 @@ public class RevxConfig {
      */
     public double[] simHedgeBandLadder() {
         return simHedgeBandLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    /**
+     * Лестница порога предохранителя по дислокации, б.п. базиса перп−спот.
+     *
+     * Первая ступень — 0, и это не «выключено ради полноты», а ОПОРНАЯ строка:
+     * базис в ней настоящий, а правила нет. Без неё вклад ряда марок и вклад
+     * самого правила складываются в одно число и не разделяются.
+     */
+    public double[] simDislocationLadder() {
+        return simDislocationLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     /** Формат «BTC:0.0001,ETH:0.01,SOL:0.1»; пустая строка = карты нет. */

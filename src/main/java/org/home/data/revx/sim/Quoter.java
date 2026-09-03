@@ -273,20 +273,26 @@ public final class Quoter implements QuotePolicy {
      */
     public record Hedge(boolean enabled, long rebalanceMs, double step,
                         double feeRate, double fundingPerHour, boolean roundDown,
-                        double deadband) {
+                        double deadband, double dislocationBp) {
 
-        public static final Hedge OFF = new Hedge(false, 0, 0, 0, 0, true, 0);
+        public static final Hedge OFF = new Hedge(false, 0, 0, 0, 0, true, 0, 0);
 
         public Hedge withRebalance(long ms) {
-            return new Hedge(true, ms, step, feeRate, fundingPerHour, roundDown, deadband);
+            return new Hedge(true, ms, step, feeRate, fundingPerHour, roundDown, deadband, dislocationBp);
+        }
+
+        /** Комиссия перпа за оборот, доля. */
+        public Hedge withFee(double v) {
+            return new Hedge(enabled, rebalanceMs, step, v, fundingPerHour, roundDown,
+                    deadband, dislocationBp);
         }
 
         public Hedge withStep(double v) {
-            return new Hedge(enabled, rebalanceMs, v, feeRate, fundingPerHour, roundDown, deadband);
+            return new Hedge(enabled, rebalanceMs, v, feeRate, fundingPerHour, roundDown, deadband, dislocationBp);
         }
 
         public Hedge withRoundDown(boolean v) {
-            return new Hedge(enabled, rebalanceMs, step, feeRate, fundingPerHour, v, deadband);
+            return new Hedge(enabled, rebalanceMs, step, feeRate, fundingPerHour, v, deadband, dislocationBp);
         }
 
         /**
@@ -297,7 +303,24 @@ public final class Quoter implements QuotePolicy {
          * про то, какую долю лимита мы выбрали.
          */
         public Hedge withDeadband(double v) {
-            return new Hedge(enabled, rebalanceMs, step, feeRate, fundingPerHour, roundDown, v);
+            return new Hedge(enabled, rebalanceMs, step, feeRate, fundingPerHour, roundDown, v, dislocationBp);
+        }
+
+        /**
+         * Предохранитель по дислокации: при |базис| шире порога (б.п.)
+         * ребалансировка пропускается, позиция не трогается. 0 = выключен.
+         *
+         * Обоснование — возвратность базиса (док. 138 §3): разброс не растёт с
+         * горизонтом, поэтому ожидание почти бесплатно, эпизод рассасывается, и
+         * мы ничего не зафиксировали. Убыток в дислокации приносит не сам
+         * разъезд, а МИНУТНАЯ РЕБАЛАНСИРОВКА внутри него (док. 138 §7).
+         *
+         * Форма выбрана та единственная, что сработала в док. 108: **ноль цены
+         * вне срабатывания**. Пока базис в норме, предохранителя как будто нет.
+         */
+        public Hedge withDislocation(double bp) {
+            return new Hedge(enabled, rebalanceMs, step, feeRate, fundingPerHour, roundDown,
+                    deadband, bp);
         }
 
         /**

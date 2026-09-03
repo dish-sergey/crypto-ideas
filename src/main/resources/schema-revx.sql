@@ -119,3 +119,16 @@ CREATE TABLE IF NOT EXISTS revx_probe (
     verdict   TEXT,                             -- 'clean' | 'throttled' | 'sustained'
     PRIMARY KEY (run_ms, level_rps, attempt)
 );
+
+-- Марк-цена перпа Kraken по минутам (док. 142 §8).
+--
+-- Кэш, а не источник: ряд приходит с их charts API, но прогон симулятора обязан
+-- быть воспроизводимым и не зависеть от сети (ТЗ §7). Первый прогон наполняет,
+-- последующие читают. Ключ — перп и минута, поэтому повторная загрузка того же
+-- окна ничего не дублирует (принцип 2 из CLAUDE.md).
+CREATE TABLE IF NOT EXISTS revx_perp_mark (
+    perp   TEXT    NOT NULL,                    -- символ Kraken, например PF_XBTUSD
+    ts_ms  INTEGER NOT NULL,                    -- начало минуты
+    mark   REAL    NOT NULL,
+    PRIMARY KEY (perp, ts_ms)
+);

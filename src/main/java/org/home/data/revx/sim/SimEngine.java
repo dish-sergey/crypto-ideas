@@ -2,6 +2,7 @@ package org.home.data.revx.sim;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.TreeMap;
 
 /**
@@ -57,6 +58,9 @@ public final class SimEngine {
             double hedgeNetMax,           // и самая положительная — вместе это ширина остатка
             double hedgeShortWindows,     // доля окон, в которые нетто-позиция была шортом
             int hedgeTrades,              // сколько раз пришлось доводить шорт
+            int hedgeSkipped,             // ребалансировок пропущено предохранителем по дислокации
+            double basisMeanAbsBp,        // средний |базис| перп−спот за окно, б.п.
+            double basisMaxAbsBp,         // и самый широкий разъезд
             int frozenCycles,             // сколько раз замороженная пара выпускалась заново
             long frozenHeldWindows,       // окон, в которые пара стояла нетронутой
             ExecutionModel.Stats execution) {
@@ -172,6 +176,25 @@ public final class SimEngine {
     }
 
     public Result run(List<Window> windows) {
+        return run(windows, java.util.Collections.emptyNavigableMap());
+    }
+
+    /**
+     * Прогон с НАСТОЯЩИМ рядом марок перпа (док. 142 §8, док. 138 §7).
+     *
+     * Без ряда шорт переоценивается по споту, то есть базис молча считается
+     * тождественно нулевым — а вся проблема дислокации ровно в том, что он не
+     * ноль. С рядом переоценка идёт по перпу, комиссия и фондирование берутся с
+     * его же цены, и появляется величина, которой раньше не было: сам базис.
+     *
+     * Он же включает предохранитель {@code Hedge.dislocationBp}: при разъезде
+     * шире порога ребалансировка пропускается. Обоснование в док. 138 §3 —
+     * базис возвратный, разброс не растёт с горизонтом, поэтому ожидание почти
+     * бесплатно; платим только непокрытой позицией на время эпизода.
+     *
+     * @param perpMark марки перпа по времени; пустая карта = прежнее поведение
+     */
+    public Result run(List<Window> windows, java.util.NavigableMap<Long, Double> perpMark) {
         ExecutionModel execution = new ExecutionModel(limits);
         PnlBook pnl = new PnlBook(makerFeeRate);
         TreeMap<Long, Double> fairSeries = new TreeMap<>();
@@ -209,6 +232,10 @@ public final class SimEngine {
         int hedgeShortWindows = 0;
         int hedgeSamples = 0;
         int hedgeTrades = 0;
+        int hedgeSkipped = 0;
+        double basisSum = 0;
+        double basisMaxAbs = 0;
+        double prevPerp = 0;
         double prevFair = 0;
         long prevTsMs = 0;
         double fairFirst = 0;
@@ -464,26 +491,49 @@ public final class SimEngine {
             // это размен: реже значит дешевле по комиссии и грязнее по риску.
             if (params.hedge().enabled()) {
                 Quoter.Hedge h = params.hedge();
-                if (prevFair > 0 && hedgeQty != 0) {
-                    // Переоценка шорта и фондирование за прошедшее время.
-                    hedgePnl += hedgeQty * (window.fair() - prevFair);
+                // Цена НОГИ ХЕДЖА. При наличии ряда — марка перпа, иначе спот
+                // (прежнее поведение, базис тождественно нулевой).
+                Map.Entry<Long, Double> markAt = perpMark.floorEntry(window.tsMs());
+                double perp = markAt != null && markAt.getValue() > 0
+                        ? markAt.getValue() : window.fair();
+                double basisBp = window.fair() > 0
+                        ? (perp - window.fair()) / window.fair() * 10_000 : 0;
+                if (prevPerp > 0 && hedgeQty != 0) {
+                    // Переоценка шорта идёт по ПЕРПУ: это цена ноги, которой мы
+                    // владеем. По споту она бы не сходилась ровно на базис.
+                    hedgePnl += hedgeQty * (perp - prevPerp);
                     double hours = Math.max(0, window.tsMs() - prevTsMs) / 3_600_000.0;
                     // Шорт ПОЛУЧАЕТ фондирование при положительной ставке: знак
                     // hedgeQty отрицателен, поэтому минус перед произведением.
-                    hedgeFunding += -hedgeQty * window.fair() * h.fundingPerHour() * hours;
+                    hedgeFunding += -hedgeQty * perp * h.fundingPerHour() * hours;
                 }
                 if (window.tsMs() - lastHedgeMs >= h.rebalanceMs()) {
-                    // Округление живёт в Hedge.target: «к ближайшему» умеет
-                    // перевернуть позицию в шорт (док. 127 §8.4), и решение об
-                    // этом — свойство хеджа, а не цикла.
-                    double want = h.target(pnl.inventory());
-                    if (Math.abs(want - hedgeQty) > 1e-12) {
-                        hedgeCost += Math.abs(want - hedgeQty) * window.fair() * h.feeRate();
-                        hedgeTrades++;
-                        hedgeQty = want;
+                    // Предохранитель по дислокации (док. 142 §8). Внутри эпизода
+                    // ребалансировка ФИКСИРУЕТ разъезд, который сам по себе
+                    // возвратный: док. 138 §7 показал, что убыток приносит не
+                    // дислокация, а минутная торговля внутри неё. Пропуск стоит
+                    // непокрытой позиции на время эпизода — двадцать минут на
+                    // среднем инвентаре, — и ноль вне срабатывания.
+                    boolean dislocated = h.dislocationBp() > 0
+                            && Math.abs(basisBp) > h.dislocationBp();
+                    if (dislocated) {
+                        hedgeSkipped++;
+                    } else {
+                        // Округление живёт в Hedge.target: «к ближайшему» умеет
+                        // перевернуть позицию в шорт (док. 127 §8.4), и решение об
+                        // этом — свойство хеджа, а не цикла.
+                        double want = h.target(pnl.inventory());
+                        if (Math.abs(want - hedgeQty) > 1e-12) {
+                            hedgeCost += Math.abs(want - hedgeQty) * perp * h.feeRate();
+                            hedgeTrades++;
+                            hedgeQty = want;
+                        }
+                        lastHedgeMs = window.tsMs();
                     }
-                    lastHedgeMs = window.tsMs();
                 }
+                basisSum += Math.abs(basisBp);
+                basisMaxAbs = Math.max(basisMaxAbs, Math.abs(basisBp));
+                prevPerp = perp;
                 // Остаток СО ЗНАКОМ: модуль скрывает ровно то, ради чего мерили —
                 // ушла ли нетто-позиция в минус.
                 double net = pnl.inventory() + hedgeQty;
@@ -531,6 +581,7 @@ public final class SimEngine {
                 hedgeSamples == 0 ? 0 : hedgeResidualSum / hedgeSamples,
                 hedgeNetMin, hedgeNetMax,
                 hedgeSamples == 0 ? 0 : (double) hedgeShortWindows / hedgeSamples, hedgeTrades,
+                hedgeSkipped, hedgeSamples == 0 ? 0 : basisSum / hedgeSamples, basisMaxAbs,
                 frozenCycles, frozenHeldWindows, execution.stats());
     }
 }
