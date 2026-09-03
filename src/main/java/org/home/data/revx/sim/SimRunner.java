@@ -87,6 +87,51 @@ public class SimRunner {
     private record RatioRung(double ratio, SimEngine.Result result) {
     }
 
+    /**
+     * Ступень размера лота: своя подгонка закона прихода, потому что вопрос
+     * ёмкости именно в том, как `κ` и `A` меняются с размером (док. 142 §7).
+     *
+     * @param notional   номинал лота, $
+     * @param size       он же в базовой валюте
+     * @param fit        подгонка ПО ОБОРОТУ на лестнице отступа при этом размере
+     * @param costBp     пошлина `c` на этом размере (устаревание + отбор)
+     * @param atBase     прогон на базовом отступе — для инвентаря и исполнений
+     */
+    private record LotRung(double notional, double size, ArrivalLaw.Fit fit,
+                           double costBp, SimEngine.Result atBase) {
+
+        double optimalOffsetBp() {
+            return fit.holds() ? costBp + 10_000 / fit.kappa() : Double.NaN;
+        }
+
+        /**
+         * Скорость дохода в собственном оптимуме, $ прибыли за окно.
+         *
+         * ⚠️ Считается ТОЛЬКО при установившемся законе. Иначе формула делит на
+         * `κ`, которому верить нельзя: у SUI κ округляется до нуля (2 исполнения
+         * за 96 часов), и та же формула выдаёт «оптимальный отступ» в 362 000
+         * б.п. и скорость дохода 482 — число, которое возглавило бы любое
+         * ранжирование. Пустая клетка честнее подставного лидера.
+         */
+        double revenue() {
+            if (!fit.holds() || !(fit.a() > 0)) {
+                return Double.NaN;
+            }
+            return fit.a() * Math.exp(-fit.kappa() * costBp / 10_000) / (Math.E * fit.kappa());
+        }
+
+        /**
+         * Доход на доллар лота — это и есть кривая ёмкости.
+         *
+         * Пока конструкция масштабируется линейно, отношение постоянно: вдвое
+         * больший лот приносит вдвое больше. Падение отношения означает, что
+         * поток кончился раньше нашего аппетита, и вот эта точка и есть ёмкость.
+         */
+        double revenuePerDollar() {
+            return notional > 0 ? revenue() / notional : Double.NaN;
+        }
+    }
+
     /** Ступень сетки: своя политика, поэтому нужен и сам котировщик — за книгой лотов. */
     private record GridRung(double margin, double widening, int lots, double cap,
                             GridQuoter quoter, SimEngine.Result result) {
@@ -303,6 +348,37 @@ public class SimRunner {
                     new SimEngine(p, limits, cfg.simMakerFee()).run(data.windows())));
         }
 
+        // Лестница размера лота (док. 142 §7) — измерение ЁМКОСТИ и проверка,
+        // переносится ли ранжирование пар из док. 135 §3 на торговый размер.
+        //
+        // Лот и потолок растут вместе (withCap масштабирует и то и другое), так
+        // что число лотов на потолок сохраняется: меряется масштаб конструкции,
+        // а не отдельно взятая заявка. Внутри каждой ступени гоняется ВСЯ
+        // лестница отступа — иначе κ на этом размере взять неоткуда, а вопрос
+        // как раз в том, как κ меняется с размером.
+        List<LotRung> lotLadder = new ArrayList<>();
+        double medianFair = medianFair(data);
+        double staleBpForLots = 2.86 * Math.sqrt(data.windowPeriodSec() / 5.0);
+        for (double notional : cfg.simLotNotionalLadder()) {
+            double wantSize = medianFair > 0 ? notional / medianFair : base.size();
+            Quoter.Params scaled = base.withCap(
+                    base.inventoryCap() * (wantSize / Math.max(1e-12, base.size())));
+            List<ArrivalLaw.Rung> byTurnover = new ArrayList<>();
+            for (double offset : cfg.simOffsetLadder()) {
+                SimEngine.Result r = new SimEngine(scaled.withOffset(offset), limits,
+                        cfg.simMakerFee()).run(data.windows());
+                byTurnover.add(new ArrivalLaw.Rung(offset, turnover(r)));
+            }
+            SimEngine.Result atBase = new SimEngine(scaled, limits, cfg.simMakerFee())
+                    .run(data.windows());
+            // Пошлина пересчитывается на КАЖДОМ размере: неблагоприятный отбор от
+            // размера зависит — крупная заявка стоит в очереди дольше и чаще
+            // достаётся тому, кто знает больше.
+            double adverse = Math.max(0, captureBp(atBase) - netEdgeBp(atBase, 60_000));
+            lotLadder.add(new LotRung(notional, scaled.size(),
+                    ArrivalLaw.fit(byTurnover), staleBpForLots + adverse, atBase));
+        }
+
         // Бид от ЦЕНЫ ВХОДА с поводком (док. 119). Отвечает на вопрос, который
         // растущий шаг обошёл: заявка на 2% ниже справедливой не исполняется
         // никогда, потому что для этого нужен ВЫНОС такой глубины, а не приход
@@ -506,7 +582,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, targetFloored, hedgeLadder, hedgeBandLadder, leashLadder, wideStep, costFloor, gridMargin, gridWidening, gridLots,
+                cross, stopLadder, targetLadder, targetFloored, hedgeLadder, hedgeBandLadder, leashLadder, lotLadder, wideStep, costFloor, gridMargin, gridWidening, gridLots,
                 frozenCool, frozenAge, stickyOuter, stickyInner, queueControl,
                 anchorDepth, noSkewResult, ownBookResult);
         write(out, markdown);
@@ -718,6 +794,17 @@ public class SimRunner {
         return round(ms / 3_600_000, 1) + " ч";
     }
 
+    /**
+     * Медианная справедливая цена окна — курс для пересчёта номинала лота в
+     * базовую валюту. Медиана, а не среднее: на трендовом окне среднее уводит
+     * размер лота в сторону конца окна.
+     */
+    private static double medianFair(SimDataReader.Dataset data) {
+        double[] fair = data.windows().stream()
+                .mapToDouble(SimEngine.Window::fair).filter(v -> v > 0).sorted().toArray();
+        return fair.length == 0 ? Double.NaN : fair[fair.length / 2];
+    }
+
     private static double turnover(SimEngine.Result result) {
         return result.fills().stream().mapToDouble(Fill::notional).sum();
     }
@@ -897,6 +984,7 @@ public class SimRunner {
                           List<RatioRung> targetFloored,
                           List<RatioRung> hedgeLadder, List<RatioRung> hedgeBandLadder,
                           List<RatioRung> leashLadder,
+                          List<LotRung> lotLadder,
                           List<RatioRung> wideStep, List<RatioRung> costFloor,
                           List<GridRung> gridMargin, List<GridRung> gridWidening,
                           List<GridRung> gridLots,
@@ -1497,6 +1585,7 @@ public class SimRunner {
                 + "ребалансировками, наоборот, лечится периодом.\n\n");
 
         renderHedgeBand(sb, hedgeBandLadder, base);
+        renderLotLadder(sb, lotLadder, base, symbol);
 
         sb.append("### Бид от цены входа с поводком (док. 119)\n\n");
         sb.append("Обычный бид висит на `справедливая × (1 − шаг)` и пересчитывается "
@@ -2408,6 +2497,11 @@ public class SimRunner {
         return hedged ? r.hedgedTotal() : r.pnl().total() - r.buyAndHoldPnl();
     }
 
+    /** Клетка таблицы: неустановившийся закон печатается прочерком, а не `NaN`. */
+    private static String cell(double v, int digits) {
+        return Double.isNaN(v) ? "—" : String.valueOf(round(v, digits));
+    }
+
     private static double round(double v, int digits) {
         if (Double.isNaN(v)) {
             return Double.NaN;
@@ -2587,6 +2681,84 @@ public class SimRunner {
                 + "комиссий. И то и другое верно ТОЛЬКО для этого окна: под полосой лежит "
                 + "направленная позиция, и её знак решает направление рынка, а не "
                 + "конструкция.\n\n");
+    }
+
+    /**
+     * Лестница размера лота — ёмкость и переносимость ранжирования (док. 142 §7).
+     *
+     * Ключевая колонка — НЕ доход, а доход на доллар лота. Доход растёт с
+     * размером почти всегда, и по нему одному ёмкости не видно; постоянное
+     * отношение означает линейное масштабирование, падающее — что поток
+     * кончился раньше нашего аппетита.
+     */
+    private void renderLotLadder(StringBuilder sb, List<LotRung> ladder,
+                                 Quoter.Params base, String symbol) {
+        if (ladder.isEmpty()) {
+            return;
+        }
+        sb.append("### Ёмкость: лестница размера лота (док. 142 §7)\n\n");
+        sb.append("Вопрос «сколько номинала конструкция может нести» (док. 127 §13) не "
+                + "требует отдельного измерения: кривая скорости дохода против размера "
+                + "лота отвечает на него прямо. Лот и потолок растут вместе, число лотов "
+                + "на потолок сохраняется — масштабируется вся конструкция.\n\n");
+        sb.append("Внутри каждой ступени прогоняется ВСЯ лестница отступа: `κ` на этом "
+                + "размере иначе взять неоткуда, а вопрос ровно в том, как `κ` "
+                + "меняется с размером.\n\n");
+        sb.append("| Лот, $ | Лот, ").append(symbol, 0, Math.max(0, symbol.indexOf('/')))
+                .append(" | `A` | `κ` | R² | Держится | `c`, б.п. | **`δ*`, б.п.** "
+                        + "| Исполнений | Ср. инвентарь, лотов | **Скорость дохода** "
+                        + "| **На доллар лота** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+        for (LotRung rung : ladder) {
+            SimEngine.Result r = rung.atBase();
+            double invLots = rung.size() > 0 ? r.avgInventory() / rung.size() : Double.NaN;
+            sb.append("| ").append(trimNum(rung.notional()))
+                    .append(" | ").append(trimNum(round(rung.size(), 9)))
+                    .append(" | ").append(round(rung.fit().a(), 1))
+                    .append(" | ").append(round(rung.fit().kappa(), 0))
+                    .append(" | ").append(round(rung.fit().rSquared(), 3))
+                    .append(" | ").append(rung.fit().holds() ? "да" : "**нет**")
+                    .append(" | ").append(round(rung.costBp(), 2))
+                    .append(" | **").append(cell(rung.optimalOffsetBp(), 2)).append("**")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(round(invLots, 2))
+                    .append(" | **").append(cell(rung.revenue(), 3)).append("**")
+                    .append(" | **").append(cell(rung.revenuePerDollar(), 4)).append("**")
+                    .append(" |\n");
+        }
+        List<LotRung> usable = ladder.stream().filter(r -> r.fit().holds()).toList();
+        if (usable.size() >= 2) {
+            LotRung first = usable.get(0);
+            LotRung last = usable.get(usable.size() - 1);
+            double decay = first.revenuePerDollar() > 0
+                    ? last.revenuePerDollar() / first.revenuePerDollar() : Double.NaN;
+            sb.append("\n**Насыщение:** доход на доллар лота идёт с ")
+                    .append(round(first.revenuePerDollar(), 4)).append(" при $")
+                    .append(trimNum(first.notional())).append(" до ")
+                    .append(round(last.revenuePerDollar(), 4)).append(" при $")
+                    .append(trimNum(last.notional())).append(", то есть в ")
+                    .append(round(decay > 0 ? 1 / decay : Double.NaN, 2))
+                    .append(" раза при росте лота в ")
+                    .append(round(last.notional() / Math.max(1e-12, first.notional()), 0))
+                    .append(" раз. Ровно постоянное отношение означало бы, что ёмкость в "
+                            + "этом диапазоне ещё не достигнута.\n\n");
+        } else {
+            sb.append("\n**Насыщение не считается:** закон прихода держится меньше чем на "
+                    + "двух ступенях, сравнивать нечего.\n\n");
+        }
+        sb.append("⚠️ **Строки, где закон не держится, оставлены пустыми, а не посчитаны.** "
+                + "Формула делит на `κ`, и при двух исполнениях за окно она выдаёт "
+                + "«оптимальный отступ» в сотни тысяч б.п. и скорость дохода, которая "
+                + "возглавит любое ранжирование. Пустая клетка честнее подставного лидера. "
+                + "По той же причине рядом стоит колонка исполнений: `R²` может держаться "
+                + "и на полутора десятках сделок, а это не выборка.\n\n");
+        sb.append("⚠️ **Это верхняя граница ёмкости.** Модель проигрывает исторические "
+                + "сделки против гипотетической котировки и не знает, что при заметной "
+                + "доле рынка поток стал бы другим. Настоящая ёмкость ниже, и насколько — "
+                + "по историческим данным не измерить в принципе.\n\n");
+        sb.append("⚠️ **`δ*` тоже едет с размером**, и это второй ответ: ранжирование пар "
+                + "из док. 135 §3 сделано на лоте $1, и переносить его на торговый размер "
+                + "нельзя без этой таблицы.\n\n");
     }
 
     /** Шаги бывают мельче 1e-8: без %f они печатаются нулём. */

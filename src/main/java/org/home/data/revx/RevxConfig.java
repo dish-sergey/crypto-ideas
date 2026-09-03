@@ -120,6 +120,7 @@ public class RevxConfig {
     private final List<Double> simOffsetLadder;
     private final List<Double> simSkewLadder;
     private final List<Double> simCapLadder;
+    private final List<Double> simLotNotionalLadder;
     private final List<Double> simDriftBetaLadder;
     private final List<Double> simBuyRatioLadder;
     private final List<Double> simShapeLadder;
@@ -235,6 +236,7 @@ public class RevxConfig {
             @Value("${revx.sim.offset-ladder}") List<Double> simOffsetLadder,
             @Value("${revx.sim.skew-ladder}") List<Double> simSkewLadder,
             @Value("${revx.sim.cap-ladder}") List<Double> simCapLadder,
+            @Value("${revx.sim.lot-notional-ladder}") List<Double> simLotNotionalLadder,
             @Value("${revx.sim.drift-beta-ladder}") List<Double> simDriftBetaLadder,
             @Value("${revx.sim.buy-ratio-ladder}") List<Double> simBuyRatioLadder,
             @Value("${revx.sim.shape-ladder}") List<Double> simShapeLadder,
@@ -347,6 +349,7 @@ public class RevxConfig {
         this.simOffsetLadder = simOffsetLadder;
         this.simSkewLadder = simSkewLadder;
         this.simCapLadder = simCapLadder;
+        this.simLotNotionalLadder = simLotNotionalLadder;
         this.simDriftBetaLadder = simDriftBetaLadder;
         this.simBuyRatioLadder = simBuyRatioLadder;
         this.simShapeLadder = simShapeLadder;
@@ -826,6 +829,23 @@ public class RevxConfig {
      */
     public double[] simCapLadder() {
         return simCapLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    /**
+     * Лестница НОМИНАЛА ЛОТА в долларах — прямое измерение ёмкости (док. 142 §7).
+     *
+     * Отличается от {@link #simCapLadder()} тем, ЧТО меняется. Лестница потолка
+     * спрашивает «сколько позиции мы готовы нести при том же лоте»; эта — «во
+     * сколько раз крупнее мы можем торговать целиком». Лот и потолок растут
+     * вместе, число лотов на потолок сохраняется, поэтому масштабируется вся
+     * конструкция, а не одна заявка.
+     *
+     * Смысл в том, что кривая «скорость дохода против размера» и есть ответ на
+     * вопрос об ёмкости (док. 127 §13): там, где она перестаёт расти, ёмкость и
+     * кончается. Отдельного измерения для этого не нужно.
+     */
+    public double[] simLotNotionalLadder() {
+        return simLotNotionalLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     public double[] simDriftBetaLadder() {
