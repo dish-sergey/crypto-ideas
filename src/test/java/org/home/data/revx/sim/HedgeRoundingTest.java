@@ -21,7 +21,7 @@ class HedgeRoundingTest {
     private static final double CAP = 0.00025;
 
     private static Quoter.Hedge hedge(boolean roundDown) {
-        return new Quoter.Hedge(true, 0, STEP, 0.0005, 0, roundDown);
+        return new Quoter.Hedge(true, 0, STEP, 0.0005, 0, roundDown, 0);
     }
 
     @Test
@@ -59,9 +59,25 @@ class HedgeRoundingTest {
     }
 
     @Test
+    void deadbandLeavesInventoryBelowItUnhedged() {
+        // Полоса 0.0001 = один шаг контракта: всё, что ниже, не хеджируется вовсе,
+        // и под ней остаётся направленный лонг ровно на её величину.
+        Quoter.Hedge banded = hedge(true).withDeadband(0.0001);
+        assertEquals(0.0, banded.target(0.00009), 1e-12, "под полосой шорта нет");
+        assertEquals(-0.0001, banded.target(0.00021), 1e-12, "хеджируется только избыток");
+        // Непокрытым остаётся полоса ПЛЮС остаток округления вниз: при инвентаре
+        // 0.00025 избыток 0.00015 = полтора шага, хеджируется один.
+        double inv = 0.00025;
+        assertEquals(0.00015, inv + banded.target(inv), 1e-12,
+                "полоса 0.0001 плюс полшага округления");
+        assertTrue(inv + banded.target(inv) >= 0.0001,
+                "непокрытая часть не может быть меньше самой полосы");
+    }
+
+    @Test
     void zeroStepMeansContinuousHedge() {
         // Шаг не задан — модель непрерывного хеджа, остаток тождественно нулевой.
-        Quoter.Hedge continuous = new Quoter.Hedge(true, 0, 0, 0, 0, true);
+        Quoter.Hedge continuous = new Quoter.Hedge(true, 0, 0, 0, 0, true, 0);
         assertEquals(-0.000123, continuous.target(0.000123), 1e-15);
     }
 }

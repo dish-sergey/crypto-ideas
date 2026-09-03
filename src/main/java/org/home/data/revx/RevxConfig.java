@@ -87,6 +87,7 @@ public class RevxConfig {
     private final boolean simHedgeRoundDown;
     private final boolean simHedgeEnabled;
     private final long simHedgeRebalanceMs;
+    private final List<Double> simHedgeBandLadder;
     private final double simHedgeFee;
     private final double simHedgeFundingPerHour;
     private final List<Double> simAnchorLeashLadder;
@@ -201,6 +202,7 @@ public class RevxConfig {
             @Value("${revx.sim.hedge-round-down}") boolean simHedgeRoundDown,
             @Value("${revx.sim.hedge-enabled}") boolean simHedgeEnabled,
             @Value("${revx.sim.hedge-rebalance-ms}") long simHedgeRebalanceMs,
+            @Value("${revx.sim.hedge-band-ladder}") List<Double> simHedgeBandLadder,
             @Value("${revx.sim.hedge-fee}") double simHedgeFee,
             @Value("${revx.sim.hedge-funding-per-hour}") double simHedgeFundingPerHour,
             @Value("${revx.sim.anchor-leash-ladder}") List<Double> simAnchorLeashLadder,
@@ -312,6 +314,7 @@ public class RevxConfig {
         this.simHedgeRoundDown = simHedgeRoundDown;
         this.simHedgeEnabled = simHedgeEnabled;
         this.simHedgeRebalanceMs = simHedgeRebalanceMs;
+        this.simHedgeBandLadder = simHedgeBandLadder;
         this.simHedgeFee = simHedgeFee;
         this.simHedgeFundingPerHour = simHedgeFundingPerHour;
         this.simAnchorLeashLadder = simAnchorLeashLadder;
@@ -624,7 +627,7 @@ public class RevxConfig {
      */
     public org.home.data.revx.sim.Quoter.Hedge simHedge() {
         return new org.home.data.revx.sim.Quoter.Hedge(true, 0, simHedgeStep, simHedgeFee,
-                simHedgeFundingPerHour, simHedgeRoundDown);
+                simHedgeFundingPerHour, simHedgeRoundDown, 0);
     }
 
     /**
@@ -667,6 +670,14 @@ public class RevxConfig {
 
     public long simHedgeRebalanceMs() {
         return simHedgeRebalanceMs;
+    }
+
+    /**
+     * Лестница полосы бездействия хеджа: доля потолка, ниже которой инвентарь
+     * не хеджируется вовсе. Ноль — нынешнее поведение.
+     */
+    public double[] simHedgeBandLadder() {
+        return simHedgeBandLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     /** Формат «BTC:0.0001,ETH:0.01,SOL:0.1»; пустая строка = карты нет. */

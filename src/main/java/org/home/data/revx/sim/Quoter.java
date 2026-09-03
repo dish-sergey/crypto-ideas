@@ -272,34 +272,58 @@ public final class Quoter implements QuotePolicy {
      * сегодня смотрим».
      */
     public record Hedge(boolean enabled, long rebalanceMs, double step,
-                        double feeRate, double fundingPerHour, boolean roundDown) {
+                        double feeRate, double fundingPerHour, boolean roundDown,
+                        double deadband) {
 
-        public static final Hedge OFF = new Hedge(false, 0, 0, 0, 0, true);
+        public static final Hedge OFF = new Hedge(false, 0, 0, 0, 0, true, 0);
 
         public Hedge withRebalance(long ms) {
-            return new Hedge(true, ms, step, feeRate, fundingPerHour, roundDown);
+            return new Hedge(true, ms, step, feeRate, fundingPerHour, roundDown, deadband);
         }
 
         public Hedge withStep(double v) {
-            return new Hedge(enabled, rebalanceMs, v, feeRate, fundingPerHour, roundDown);
+            return new Hedge(enabled, rebalanceMs, v, feeRate, fundingPerHour, roundDown, deadband);
         }
 
         public Hedge withRoundDown(boolean v) {
-            return new Hedge(enabled, rebalanceMs, step, feeRate, fundingPerHour, v);
+            return new Hedge(enabled, rebalanceMs, step, feeRate, fundingPerHour, v, deadband);
+        }
+
+        /**
+         * Полоса бездействия: инвентарь ниже неё не хеджируется вовсе.
+         *
+         * Задаётся в АБСОЛЮТНОЙ величине инвентаря (не в долях потолка), потому
+         * что решает вопрос «есть ли что хеджировать», а он про количество, а не
+         * про то, какую долю лимита мы выбрали.
+         */
+        public Hedge withDeadband(double v) {
+            return new Hedge(enabled, rebalanceMs, step, feeRate, fundingPerHour, roundDown, v);
         }
 
         /**
          * Целевой шорт против инвентаря {@code inv}: отрицательное число, ноль
-         * означает «хеджировать нечем — инвентаря меньше одного шага контракта».
+         * означает «хеджировать нечего».
+         *
+         * <b>Полоса бездействия.</b> Хеджируется только ИЗБЫТОК инвентаря над
+         * {@code deadband}. Смысл: маркет-мейкер по построению всё время держит
+         * какую-то позицию, и платить за нейтральность на каждом лоте — значит
+         * платить за то, что и так вернётся в оборот. Опасна не позиция как
+         * таковая, а её накопление сверх ожидаемого: на затяжном падении бот
+         * покупает и не может продать, и вот эта надстройка и есть бета,
+         * ради которой хедж вводился.
+         *
+         * ⚠️ Полоса не бесплатна: под ней остаётся НЕХЕДЖИРОВАННЫЙ лонг ровно на
+         * {@code deadband}. Это сознательная направленная позиция, а не
+         * нейтральность, и сравнивать её с нулём уже нельзя.
          */
         public double target(double inv) {
+            double excess = Math.max(0, inv - Math.max(0, deadband));
             if (step <= 0) {
-                return -inv;
+                return -excess;
             }
-            double lots = inv / step;
             double rounded = roundDown
-                    ? Math.signum(lots) * Math.floor(Math.abs(lots))
-                    : Math.round(lots);
+                    ? Math.floor(excess / step)
+                    : Math.round(excess / step);
             return -rounded * step;
         }
     }

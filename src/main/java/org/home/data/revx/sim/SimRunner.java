@@ -289,6 +289,20 @@ public class SimRunner {
                     new SimEngine(p, limits, cfg.simMakerFee()).run(data.windows())));
         }
 
+        // Полоса бездействия хеджа: с какого инвентаря вообще начинать шортить.
+        // Вопрос ставится так: маркет-мейкер всё время держит какую-то позицию,
+        // и платить за нейтральность на каждом лоте — платить за то, что и так
+        // вернётся в оборот. Опасно накопление СВЕРХ ожидаемого. Ступень — доля
+        // потолка, ноль означает нынешнее поведение (хеджировать всё).
+        List<RatioRung> hedgeBandLadder = new ArrayList<>();
+        for (double share : cfg.simHedgeBandLadder()) {
+            Quoter.Params p = base.withHedge(cfg.simHedge(symbol)
+                    .withRebalance(cfg.simHedgeRebalanceMs())
+                    .withDeadband(share * base.inventoryCap()));
+            hedgeBandLadder.add(new RatioRung(share,
+                    new SimEngine(p, limits, cfg.simMakerFee()).run(data.windows())));
+        }
+
         // Бид от ЦЕНЫ ВХОДА с поводком (док. 119). Отвечает на вопрос, который
         // растущий шаг обошёл: заявка на 2% ниже справедливой не исполняется
         // никогда, потому что для этого нужен ВЫНОС такой глубины, а не приход
@@ -492,7 +506,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, targetFloored, hedgeLadder, leashLadder, wideStep, costFloor, gridMargin, gridWidening, gridLots,
+                cross, stopLadder, targetLadder, targetFloored, hedgeLadder, hedgeBandLadder, leashLadder, wideStep, costFloor, gridMargin, gridWidening, gridLots,
                 frozenCool, frozenAge, stickyOuter, stickyInner, queueControl,
                 anchorDepth, noSkewResult, ownBookResult);
         write(out, markdown);
@@ -881,7 +895,8 @@ public class SimRunner {
                           List<RatioRung> shapeLadder, List<CrossCell> cross,
                           List<RatioRung> stopLadder, List<RatioRung> targetLadder,
                           List<RatioRung> targetFloored,
-                          List<RatioRung> hedgeLadder, List<RatioRung> leashLadder,
+                          List<RatioRung> hedgeLadder, List<RatioRung> hedgeBandLadder,
+                          List<RatioRung> leashLadder,
                           List<RatioRung> wideStep, List<RatioRung> costFloor,
                           List<GridRung> gridMargin, List<GridRung> gridWidening,
                           List<GridRung> gridLots,
@@ -1480,6 +1495,8 @@ public class SimRunner {
                 + "СРАЗУ, в момент установки, и её величина не зависит от того, как часто "
                 + "мы ребалансируем: на живом масштабе BTC это до 20% потолка. Дрейф между "
                 + "ребалансировками, наоборот, лечится периодом.\n\n");
+
+        renderHedgeBand(sb, hedgeBandLadder, base);
 
         sb.append("### Бид от цены входа с поводком (док. 119)\n\n");
         sb.append("Обычный бид висит на `справедливая × (1 − шаг)` и пересчитывается "
@@ -2514,6 +2531,62 @@ public class SimRunner {
                 + "У C4 он в разы больше — котируя от середины собственного стакана, "
                 + "конструкция едет вместе с ним и накапливает позицию. Это цена, "
                 + "которой нет в захвате, но которая целиком видна в `total` и в риске.\n\n");
+    }
+
+    /**
+     * С какого инвентаря начинать шортить: лестница полосы бездействия.
+     *
+     * Нынешний хедж доводит шорт до −инвентаря ВСЕГДА, с первого лота. Вопрос,
+     * который этим не задан: маркет-мейкер по построению всё время держит
+     * какую-то позицию, и она возвращается в оборот сама — стоит ли платить
+     * комиссию перпа за нейтральность на ней. Опасно другое: накопление сверх
+     * ожидаемого, когда на затяжном падении бот покупает и не может продать.
+     *
+     * Полоса отвечает на это прямо: хеджировать только избыток над ней.
+     * ⚠️ Но она не бесплатна — под полосой остаётся НЕхеджированный лонг ровно
+     * на её величину, то есть сознательная направленная позиция. Поэтому в
+     * таблице рядом стоят и результат, и остаточная бета: сравнивать полосу с
+     * нулевой ступенью можно только глядя на обе колонки.
+     */
+    private void renderHedgeBand(StringBuilder sb, List<RatioRung> ladder, Quoter.Params base) {
+        if (ladder.isEmpty()) {
+            return;
+        }
+        sb.append("### С какого инвентаря начинать шортить: полоса бездействия\n\n");
+        sb.append("Хедж доводит шорт до `−инвентарь` с первого же лота. Но маркет-мейкер "
+                + "всё время держит какую-то позицию, и она возвращается в оборот сама — "
+                + "платить за нейтральность на ней значит платить за то, что и так "
+                + "уйдёт. Опасно накопление СВЕРХ ожидаемого: на затяжном падении бот "
+                + "покупает и не может продать. Полоса бездействия хеджирует только "
+                + "избыток над ней.\n\n");
+        sb.append("⚠️ **Полоса не бесплатна.** Под ней остаётся нехеджированный лонг ровно "
+                + "на её величину — сознательная направленная позиция, а не нейтральность. "
+                + "Поэтому рядом с результатом стоит остаточная бета, и читать надо обе "
+                + "колонки сразу.\n\n");
+        sb.append("| Полоса, доля потолка | В инвентаре | Сделок на перпе | Комиссии "
+                + "| **Нехеджированный лонг (ср.)** | Спот `total` | **С хеджем** |\n");
+        sb.append("|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : ladder) {
+            SimEngine.Result r = rung.result();
+            double band = rung.ratio() * base.inventoryCap();
+            // Средняя непокрытая позиция: инвентарь минус то, что реально захеджировано.
+            double uncovered = Math.min(r.avgInventory(), band);
+            sb.append("| ").append(round(rung.ratio() * 100, 0)).append("%")
+                    .append(rung.ratio() == 0 ? " (как сейчас)" : "")
+                    .append(" | ").append(trimNum(round(band, 8)))
+                    .append(" | ").append(r.hedgeTrades())
+                    .append(" | ").append(round(r.hedgeCost(), 1))
+                    .append(" | **").append(round(uncovered, 5)).append("**")
+                    .append(" | ").append(round(r.pnl().total(), 1))
+                    .append(" | **").append(round(r.hedgedTotal(), 1)).append("**")
+                    .append(" |\n");
+        }
+        sb.append("\n**Как читать.** Ступень 0% — нынешнее поведение. Если результат с "
+                + "ростом полосы улучшается, значит комиссия перпа на мелком инвентаре не "
+                + "окупается; если ухудшается — бета под полосой дороже сэкономленных "
+                + "комиссий. И то и другое верно ТОЛЬКО для этого окна: под полосой лежит "
+                + "направленная позиция, и её знак решает направление рынка, а не "
+                + "конструкция.\n\n");
     }
 
     /** Шаги бывают мельче 1e-8: без %f они печатаются нулём. */
