@@ -49,7 +49,10 @@ public class S5DryRun {
         TelegramNotifier notifier = new TelegramNotifier(tx, tg.chatId());
 
         Map<String, Double> marks = krakenMarks();                 // реальные PF_*USD марки
-        UnlockFeed feed = new UnlockFeed(new DefiLlamaEmissionSource(), geckoToTicker(), basesFrom(marks));
+        UnlockFeed feed = new UnlockFeed(new DefiLlamaEmissionSource(), geckoToTicker(), basesFrom(marks),
+                org.home.data.trade.S5Live.canonicalByTicker(
+                        url -> { try { return getJson(url); } catch (Exception e) { return null; } }));
+        feed.warnAmbiguous(log);
 
         MockExchange ex = new MockExchange(1000);
         marks.forEach(ex::tick);                                    // сид цен реальными марками Kraken

@@ -56,7 +56,11 @@ public class S5Live {
         KrakenFuturesExchange ex = new KrakenFuturesExchange(api);
         KrakenFundingSource funding = new KrakenFundingSource(api);
 
-        UnlockFeed feed = new UnlockFeed(new DefiLlamaEmissionSource(), geckoToTicker(), krakenBases());
+        Map<String, String> gecko = geckoToTicker();
+        Set<String> bases = krakenBases();
+        UnlockFeed feed = new UnlockFeed(new DefiLlamaEmissionSource(), gecko, bases,
+                canonicalByTicker(gecko, bases));
+        feed.warnAmbiguous(log);
 
         ApprovalGate gate = new ApprovalGate();
         TradeJournal j = new TradeJournal();
@@ -137,6 +141,167 @@ public class S5Live {
             m.put(n.path("id").asText(), n.path("symbol").asText().toUpperCase());
         log.info("CoinGecko coins: {}", m.size());
         return m;
+    }
+
+    /**
+     * Тикер → главная по капитализации монета с этим тикером.
+     *
+     * Нужно, чтобы отличить наш протокол от однофамильца: перп на Kraken
+     * торгуется на ГЛАВНУЮ монету с тикером, а не на любую (док. 130 §III п.7).
+     *
+     * Это первый проход — верхушка рейтинга. Её НЕ хватает: OPN (Opinion) имеет
+     * ранг 1185 и сюда не попадает, а именно его S5 и торговал. Спорные тикеры,
+     * оставшиеся без ответа, добираются точечным поиском — см.
+     * {@link #searchCanonical}.
+     *
+     * Страницы идут по 250. Первым в карту попадает старший по капитализации:
+     * страницы отсортированы по убыванию, и {@code putIfAbsent} сохраняет
+     * именно его.
+     *
+     * ⚠️ Глубина рейтинга — не украшение, а рабочий параметр. На первой тысяче
+     * неразрешёнными остались 17 тикеров, и среди них **OPN**, который S5
+     * фактически торговал 24.08.2026. Монета вне первой тысячи по
+     * капитализации — обычное дело для свежего листинга, а именно свежие и дают
+     * разлоки. Две тысячи закрывают вселенную; тикеры, не разрешённые и на этой
+     * глубине, честно теряются и попадают в предупреждение при старте.
+     *
+     * Между страницами пауза: у бесплатного CoinGecko лимит порядка десятков
+     * запросов в минуту, и восемь подряд без паузы ловят 429.
+     */
+    static Map<String, String> canonicalByTicker(java.util.function.Function<String, JsonNode> fetch) {
+        Map<String, String> out = new HashMap<>();
+        for (int page = 1; page <= 8; page++) {
+            if (page > 1) {
+                try {
+                    Thread.sleep(1500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            JsonNode arr = fetch.apply("https://api.coingecko.com/api/v3/coins/markets"
+                    + "?vs_currency=usd&order=market_cap_desc&per_page=250&page=" + page);
+            if (arr == null || !arr.isArray() || arr.isEmpty()) {
+                break;
+            }
+            for (JsonNode n : arr) {
+                String symbol = n.path("symbol").asText("").toUpperCase();
+                String id = n.path("id").asText("");
+                if (!symbol.isEmpty() && !id.isEmpty()) {
+                    out.putIfAbsent(symbol, id);
+                }
+            }
+        }
+        return out;
+    }
+
+    private Map<String, String> canonicalByTicker(Map<String, String> geckoToTicker,
+                                                  Set<String> krakenBases) {
+        java.util.function.Function<String, JsonNode> fetch = url -> {
+            try {
+                return getJson(url);
+            } catch (Exception e) {
+                log.warn("CoinGecko: {}", e.toString());
+                return null;
+            }
+        };
+        Map<String, String> m = canonicalByTicker(fetch);
+        log.info("главных монет по тикеру из рейтинга: {}", m.size());
+
+        // Добор тем, кого рейтинг не достал. Глубокая пагинация тут не работает:
+        // бесплатный CoinGecko отдаёт 429 уже на пятой странице подряд, и цикл
+        // обрывается на первой тысяче. А монета вне первой тысячи — обычное дело
+        // для свежего листинга, и именно свежие дают разлоки: OPN (Opinion) имеет
+        // ранг 1185 и на 02.09.2026 был единственным, что S5 вообще торговал.
+        //
+        // Поэтому спорные тикеры добираются ТОЧЕЧНО: один маленький запрос
+        // /search на тикер, и только на те, где спор есть. Их полтора десятка,
+        // а не две тысячи.
+        Set<String> contested = UnlockFeed.contested(geckoToTicker, krakenBases);
+        int recovered = 0;
+        Set<String> unchecked = new java.util.TreeSet<>();
+        for (String ticker : contested) {
+            if (m.containsKey(ticker)) {
+                continue;
+            }
+            JsonNode found = throttled("https://api.coingecko.com/api/v3/search?query=" + ticker);
+            if (found == null) {
+                // ⚠️ Запрос НЕ ПРОШЁЛ — это не то же самое, что «монета спорная».
+                // Смешивать их нельзя: первое временно и лечится повтором, второе
+                // постоянно. Слив их вместе, мы бы вычёркивали монету из торгуемой
+                // вселенной из-за одного 429 и не знали бы об этом.
+                unchecked.add(ticker);
+                continue;
+            }
+            String id = pickCanonical(found, ticker);
+            if (id != null) {
+                m.put(ticker, id);
+                recovered++;
+            }
+        }
+        log.info("спорных тикеров {}, добрано поиском {}", contested.size(), recovered);
+        if (!unchecked.isEmpty()) {
+            log.warn("НЕ ПРОВЕРЕНЫ из-за отказов CoinGecko: {} — это НЕ двусмысленность, "
+                    + "а недоступность справочника; на следующем старте попробуем снова",
+                    unchecked);
+        }
+        return m;
+    }
+
+    /**
+     * Главная монета с этим тикером по {@code /search}: ответ содержит
+     * {@code market_cap_rank}, и меньший ранг означает старшую монету.
+     * Кандидаты без ранга не рассматриваются — это ровно те однофамильцы,
+     * от которых мы и защищаемся.
+     */
+    /**
+     * Запрос с паузой и одним повтором.
+     *
+     * У бесплатного CoinGecko лимит порядка десятка запросов в минуту. Первая
+     * версия слала поиск по спорным тикерам подряд — семь в секунду — и получала
+     * 429 на большинстве; из-за этого COOKIE, GOAT, LAYER, MIRA, PIXEL и SPELL
+     * выпали из вселенной, хотя двусмысленными не были.
+     */
+    private JsonNode throttled(String url) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                Thread.sleep(attempt == 0 ? 2_500 : 15_000);
+                return getJson(url);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            } catch (Exception e) {
+                if (attempt == 1) {
+                    log.warn("CoinGecko после повтора: {}", e.toString());
+                }
+            }
+        }
+        return null;
+    }
+
+    static String searchCanonical(java.util.function.Function<String, JsonNode> fetch, String ticker) {
+        JsonNode root = fetch.apply("https://api.coingecko.com/api/v3/search?query=" + ticker);
+        return root == null ? null : pickCanonical(root, ticker);
+    }
+
+    /** Из ответа {@code /search} — монета с наименьшим рангом капитализации. */
+    static String pickCanonical(JsonNode root, String ticker) {
+        String best = null;
+        long bestRank = Long.MAX_VALUE;
+        for (JsonNode n : root.path("coins")) {
+            if (!ticker.equalsIgnoreCase(n.path("symbol").asText(""))) {
+                continue;
+            }
+            JsonNode rank = n.path("market_cap_rank");
+            if (rank.isNull() || !rank.isNumber()) {
+                continue;
+            }
+            if (rank.asLong() < bestRank) {
+                bestRank = rank.asLong();
+                best = n.path("id").asText(null);
+            }
+        }
+        return best;
     }
 
     /** Базы-тикеры торгуемых PF_<BASE>USD перпов Kraken (XBT->BTC). */

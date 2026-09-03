@@ -28,8 +28,9 @@ class UnlockFeedTest {
     }
 
     private UnlockFeed feed(EmissionSource src) {
+        // Тикеры уникальны, поэтому карта главных монет не нужна: конфликтов нет.
         return new UnlockFeed(src, Map.of("aptos", "APT", "arbitrum", "ARB", "bitcoin", "BTC"),
-                Set.of("APT", "BTC")); // ARB намеренно НЕ на Kraken
+                Set.of("APT", "BTC"), Map.of()); // ARB намеренно НЕ на Kraken
     }
 
     private static EmissionSource fake(Map<String, String> slugToJson) {
@@ -159,41 +160,70 @@ class UnlockFeedTest {
         assertEquals(1, feed(src).upcoming(today).size(), "битый протокол пропущен, фид жив");
     }
 
-    /**
-     * Тикер, на который претендуют два проекта, не берётся ВООБЩЕ (док. 130
-     * §III п.7). Реальный случай: у `velodrome-finance` тикер VELO, на Kraken
-     * есть PF_VELOUSD — но это Velo Labs, другая монета, и её расписание
-     * разлоков к Velodrome отношения не имеет.
-     */
-    @Test void refusesTickerClaimedByTwoProjects() throws Exception {
-        long today = 20000;
-        long unlock = (today + 5) * 86400;
-        Map<String, String> gecko = Map.of(
-                "aptos", "APT",
-                "velodrome-finance", "VELO",
-                "velo", "VELO");                    // два проекта, один тикер
-        UnlockFeed feed = new UnlockFeed(
-                fake(Map.of("velodrome-finance", emission("velodrome-finance", unlock, "50", "investors", 1000))),
-                gecko, Set.of("APT", "VELO"));
+    private static final long UNLOCK = (20000L + 5) * 86400;
 
-        assertTrue(feed.ambiguousTickers().contains("VELO"),
-                "конфликт обязан быть виден в списке исключённых");
-        assertEquals(0, feed.upcoming(today).size(),
-                "чужое расписание не должно доехать до бота");
+    /** Два проекта на тикер VELO: Velodrome и Velo Labs (реальный случай, док. 130 §III п.7). */
+    private static final Map<String, String> VELO_COLLISION =
+            Map.of("aptos", "APT", "velodrome-finance", "VELO", "velo", "VELO");
+
+    /**
+     * Чужое расписание не доезжает: перп на Kraken торгуется на ГЛАВНУЮ монету
+     * с тикером, и если наш протокол ей не является, событие не берётся.
+     */
+    @Test void refusesScheduleFromTheWrongProject() throws Exception {
+        UnlockFeed feed = new UnlockFeed(
+                fake(Map.of("velodrome-finance",
+                        emission("velodrome-finance", UNLOCK, "50", "investors", 1000))),
+                VELO_COLLISION, Set.of("APT", "VELO"),
+                Map.of("VELO", "velo"));            // главная VELO — Velo Labs
+        assertEquals(0, feed.upcoming(20000).size(),
+                "расписание Velodrome не должно попасть на перп Velo Labs");
+        assertTrue(feed.unresolvedTickers().isEmpty(), "конфликт разрешён, терять нечего");
     }
 
-    /** Однозначный тикер конфликтом не считается — иначе фид опустеет. */
-    @Test void unambiguousTickerSurvives() {
-        UnlockFeed feed = feed(fake(Map.of()));
-        assertTrue(feed.ambiguousTickers().isEmpty(),
-                "в обычной карте конфликтов нет: " + feed.ambiguousTickers());
+    /** А расписание ГЛАВНОЙ монеты берётся, хотя тикер и спорный. */
+    @Test void acceptsScheduleFromTheCanonicalProject() throws Exception {
+        UnlockFeed feed = new UnlockFeed(
+                fake(Map.of("velo", emission("velo", UNLOCK, "50", "investors", 1000))),
+                VELO_COLLISION, Set.of("APT", "VELO"),
+                Map.of("VELO", "velo"));
+        assertEquals(1, feed.upcoming(20000).size(),
+                "главная монета обязана проходить: иначе стратегия молча выключается");
+    }
+
+    /**
+     * ⚠️ Главная проверка этого файла. Отсекать по признаку «на тикер претендует
+     * больше одного проекта» НЕЛЬЗЯ: в списке CoinGecko 19 499 монет, и у почти
+     * каждого крупного тикера есть однофамильцы. Такая проверка 02.09.2026
+     * выбросила 118 тикеров, включая BTC, ETH, SOL и ADA, — то есть тихо
+     * выключила стратегию целиком.
+     */
+    @Test void namesakesDoNotDisableTheUniverse() throws Exception {
+        Map<String, String> gecko = Map.of(
+                "aptos", "APT", "fake-aptos", "APT", "scam-aptos", "APT");
+        UnlockFeed feed = new UnlockFeed(
+                fake(Map.of("aptos", emission("aptos", UNLOCK, "50", "investors", 1000))),
+                gecko, Set.of("APT"), Map.of("APT", "aptos"));
+        assertEquals(1, feed.upcoming(20000).size(),
+                "однофамильцы не должны выключать главную монету");
+    }
+
+    /** Несколько претендентов и ни одного известного главного — честный отказ. */
+    @Test void refusesWhenConflictCannotBeResolved() throws Exception {
+        UnlockFeed feed = new UnlockFeed(
+                fake(Map.of("velodrome-finance",
+                        emission("velodrome-finance", UNLOCK, "50", "investors", 1000))),
+                VELO_COLLISION, Set.of("APT", "VELO"), Map.of());
+        assertEquals(0, feed.upcoming(20000).size(), "неразрешимый конфликт — не берём");
+        assertTrue(feed.unresolvedTickers().contains("VELO"),
+                "и он обязан быть виден в списке потерянных");
     }
 
     /** Коллизии среди монет, которыми мы не торгуем, в предупреждение не попадают. */
     @Test void collisionOutsideKrakenIsNotReported() {
         UnlockFeed feed = new UnlockFeed(fake(Map.of()),
-                Map.of("a", "APT", "x", "FOO", "y", "FOO"), Set.of("APT"));
-        assertTrue(feed.ambiguousTickers().isEmpty(),
+                Map.of("a", "APT", "x", "FOO", "y", "FOO"), Set.of("APT"), Map.of());
+        assertTrue(feed.unresolvedTickers().isEmpty(),
                 "FOO не торгуется — шуметь про него незачем");
     }
 }
