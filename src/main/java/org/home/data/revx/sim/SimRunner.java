@@ -141,6 +141,24 @@ public class SimRunner {
         double revenuePerDollar() {
             return notional > 0 ? revenue() / notional : Double.NaN;
         }
+
+        /**
+         * Доход на доллар СРЕДНЕГО ИНВЕНТАРЯ — ранжирование по риску (док. 148 §3).
+         *
+         * Лот мы выбираем свободно, а платим за инвентарь: он определяет и
+         * капитал, и цену хеджа, и базисный хвост. Ранжирование по доходу на
+         * доллар лота систематически льстит парам, которые копят позицию, —
+         * ровно та же ошибка «один множитель из двух», что была с полуспредом
+         * без потока (док. 129 §2).
+         *
+         * ⚠️ Величина не заменяет предыдущую, а стоит рядом: по доходу на КАПИТАЛ
+         * первой может быть одна пара, по доходу на РИСК — другая, и это разные
+         * вопросы, а не спор.
+         */
+        double revenuePerInventoryDollar(double price) {
+            double inventoryUsd = atBase.avgInventory() * price;
+            return inventoryUsd > 0 ? revenue() / inventoryUsd : Double.NaN;
+        }
     }
 
     /** Ступень сетки: своя политика, поэтому нужен и сам котировщик — за книгой лотов. */
@@ -371,7 +389,10 @@ public class SimRunner {
         java.util.NavigableMap<Long, Double> perpMark = java.util.Collections.emptyNavigableMap();
         if (cfg.simHedge(symbol).enabled() && cfg.simDislocationLadder().length > 0) {
             String hedgeBase = symbol.substring(0, Math.max(0, symbol.indexOf('/')));
-            perpMark = marks.marks(PerpMarkSource.perpFor(hedgeBase), data.fromMs(), data.toMs());
+            // В USDC, а не в USD: иначе базис включает отклонение стейблкойна,
+            // которое на порядок крупнее самого базиса перпа (док. 149 §2).
+            perpMark = marks.marksInQuote(PerpMarkSource.perpFor(hedgeBase), hedgeBase,
+                    data.fromMs(), data.toMs());
             if (perpMark.isEmpty()) {
                 log.warn("{}: марок перпа нет — хедж на реальном базисе не считается", symbol);
             } else {
@@ -1419,25 +1440,40 @@ public class SimRunner {
                 .append(round(persistence.slope(), 4)).append(" |\n");
         sb.append("| **IC (корреляция прошлого с будущим)** | **")
                 .append(round(persistence.correlation(), 4)).append("** |\n");
+        sb.append("| **Независимых наблюдений** | **")
+                .append(round(persistence.effectivePoints(), 0)).append("** |\n");
+        sb.append("| **Значимость IC** | **").append(round(persistence.tStat(), 2))
+                .append("σ** |\n");
         sb.append("| R² | ").append(round(persistence.rSquared(), 4)).append(" |\n");
         sb.append("| Теоретический `β` = наклон / `k` | ")
                 .append(round(persistence.betaFor(base.skewK()), 0)).append(" |\n");
         sb.append("| Наш геометрический `β` | ")
                 .append(round(Quoter.betaFromGeometry(base.offset()), 0)).append(" |\n");
-        // ЗНАК обязан стоять в вердикте. predictive() смотрит на МОДУЛЬ
-        // корреляции, и при отрицательном наклоне строка «есть направленное
-        // содержание» читается как подтверждение нашего β — тогда как измерение
-        // говорит ровно обратное: дрейф на этом окне ОТКАТЫВАЕТСЯ, и скос с
-        // положительным β давит в противоположную сторону.
+        // Вердикт стоит на ЗНАЧИМОСТИ, а не на модуле корреляции. Прежняя версия
+        // объявляла «направленное содержание» при |IC| ≥ 0.05, то есть на оценке
+        // в две трети сигмы, и при отрицательном наклоне это читалось как
+        // подтверждение нашего положительного β (док. 148 §5).
+        //
+        // Знак называется ТОЛЬКО когда он значим. Иначе утверждение «дрейф
+        // откатывается» — такое же переусердствование, как и «дрейф продолжается».
         boolean inverted = persistence.predictive() && persistence.slope() < 0
                 && base.driftBeta() >= 0;
         sb.append("| **Вердикт** | ").append(!persistence.predictive()
-                        ? "**предсказуемости нет — дрейф-скос работает как ПРАВИЛО РИСКА, не как альфа**"
+                        ? "**направление дрейфа НЕОТЛИЧИМО ОТ НУЛЯ** — дрейф-скос работает "
+                          + "как ПРАВИЛО РИСКА, не как альфа"
                         : inverted
-                        ? "**направленное содержание есть, но ЗНАК ОБРАТНЫЙ**: дрейф "
+                        ? "**направленное содержание есть, и ЗНАК ОБРАТНЫЙ**: дрейф "
                           + "откатывается, и скос с положительным `β` давит не в ту сторону"
                         : "в дрейфе есть направленное содержание")
                 .append(" |\n\n");
+        sb.append("⚠️ **Значимость считается по НЕЗАВИСИМЫМ наблюдениям, а не по числу "
+                + "точек.** Точки берутся с шагом порядка минуты при горизонте в часы, "
+                + "поэтому соседние перекрываются десятками крат. По сырому числу точек "
+                + "тот же IC выглядел бы в `√overlap` раз значимее — разница между "
+                + "«сильный эффект» и «ничего» (док. 148 §5).\n\n");
+        sb.append("⚠️ **Вывод о вреде `β` держится на лестнице P&L, а не на IC.** "
+                + "Лестница ниже монотонна и от этой оценки не зависит; здесь решается "
+                + "только вопрос о ПРИРОДЕ (альфа или правило риска), а не о величине.\n\n");
         sb.append("Это ответ о ПРИРОДЕ результата, а не о его величине. Если будущее "
                 + "из прошлого дрейфа не предсказывается, дрейф-скос законен, но "
                 + "описывать его надо как управление риском, и переносить на другие "
@@ -1636,7 +1672,7 @@ public class SimRunner {
                 + "ребалансировками, наоборот, лечится периодом.\n\n");
 
         renderHedgeBand(sb, hedgeBandLadder, base);
-        renderLotLadder(sb, lotLadder, base, symbol);
+        renderLotLadder(sb, lotLadder, base, symbol, medianFair(data));
         renderDislocation(sb, dislocation, baseResult);
 
         sb.append("### Бид от цены входа с поводком (док. 119)\n\n");
@@ -2744,7 +2780,7 @@ public class SimRunner {
      * кончился раньше нашего аппетита.
      */
     private void renderLotLadder(StringBuilder sb, List<LotRung> ladder,
-                                 Quoter.Params base, String symbol) {
+                                 Quoter.Params base, String symbol, double price) {
         if (ladder.isEmpty()) {
             return;
         }
@@ -2759,8 +2795,8 @@ public class SimRunner {
         sb.append("| Лот, $ | Лот, ").append(symbol, 0, Math.max(0, symbol.indexOf('/')))
                 .append(" | `A` | `κ` | R² | Держится | `c`, б.п. | **`δ*`, б.п.** "
                         + "| Исполнений | Ср. инвентарь, лотов | **Скорость дохода** "
-                        + "| **На доллар лота** |\n");
-        sb.append("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+                        + "| **На доллар лота** | **На доллар инвентаря** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
         for (LotRung rung : ladder) {
             SimEngine.Result r = rung.atBase();
             double invLots = rung.size() > 0 ? r.avgInventory() / rung.size() : Double.NaN;
@@ -2776,6 +2812,8 @@ public class SimRunner {
                     .append(" | ").append(round(invLots, 2))
                     .append(" | **").append(cell(rung.revenue(), 3)).append("**")
                     .append(" | **").append(cell(rung.revenuePerDollar(), 4)).append("**")
+                    .append(" | **").append(cell(rung.revenuePerInventoryDollar(price), 4))
+                    .append("**")
                     .append(" |\n");
         }
         List<LotRung> usable = ladder.stream().filter(r -> r.fit().holds()).toList();

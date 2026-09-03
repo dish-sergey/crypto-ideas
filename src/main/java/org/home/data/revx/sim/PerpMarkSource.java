@@ -121,6 +121,84 @@ public class PerpMarkSource {
     }
 
     /**
+     * Марки перпа, ПЕРЕСЧИТАННЫЕ В USDC.
+     *
+     * <b>Зачем это отдельный метод.</b> Перп Kraken котируется в USD, а
+     * справедливая цена симулятора — {@code fairUsdc}, в USDC. Сравнение их
+     * напрямую даёт не базис перпа, а базис ПЛЮС отклонение стейблкойна, и
+     * второе слагаемое крупнее первого на порядок: на окне 28.08–01.09 базис
+     * BTC к USD-ноге был 0.61 ± 1.0 б.п., а к USDC-ноге — −5.34 ± 5.59.
+     *
+     * Из-за этого предохранитель по дислокации в док. 146 §4 срабатывал 188 раз
+     * там, где базис перпа не превышал порога НИ РАЗУ: он ловил USDC/USD, а не
+     * разъезд перпа. Величина реальная, но это другой риск и другое обоснование:
+     * возвратность из док. 138 §3 доказана для базиса перпа, а не для
+     * стейблкойна.
+     *
+     * Курс берётся поминутно из книги стенда как {@code mid(BASE/USDC) /
+     * mid(BASE/USD)} — то есть из тех же данных, на которых считается
+     * справедливая цена. Минуты, где какой-то из ног нет, выпадают: подставлять
+     * туда единицу значит молча объявить USDC равным доллару ровно тогда, когда
+     * это меньше всего известно.
+     */
+    public NavigableMap<Long, Double> marksInQuote(String perp, String base,
+                                                   long fromMs, long toMs) {
+        NavigableMap<Long, Double> usd = marks(perp, fromMs, toMs);
+        TreeMap<Long, Double> rate = usdcPerUsd(base, fromMs, toMs);
+        if (rate.isEmpty()) {
+            log.warn("{}: курса USDC/USD нет — марки остаются в USD, базис включит стейблкойн",
+                    base);
+            return usd;
+        }
+        TreeMap<Long, Double> out = new TreeMap<>();
+        for (Map.Entry<Long, Double> e : usd.entrySet()) {
+            Map.Entry<Long, Double> r = rate.floorEntry(e.getKey());
+            if (r != null && r.getValue() > 0) {
+                out.put(e.getKey(), e.getValue() * r.getValue());
+            }
+        }
+        log.info("марки {} пересчитаны в USDC: {} минут из {} (курс по {} минутам)",
+                perp, out.size(), usd.size(), rate.size());
+        return out;
+    }
+
+    /** Поминутный курс USDC за доллар: отношение середин USDC- и USD-ноги пары. */
+    private TreeMap<Long, Double> usdcPerUsd(String base, long fromMs, long toMs) {
+        TreeMap<Long, Double> usdc = midByMinute(base + "/USDC", "usdc", fromMs, toMs);
+        TreeMap<Long, Double> usd = midByMinute(base + "/USD", "usd", fromMs, toMs);
+        TreeMap<Long, Double> out = new TreeMap<>();
+        for (Map.Entry<Long, Double> e : usdc.entrySet()) {
+            Double u = usd.get(e.getKey());
+            if (u != null && u > 0) {
+                out.put(e.getKey(), e.getValue() / u);
+            }
+        }
+        return out;
+    }
+
+    /** Последняя середина книги внутри минуты; сломанные снимки отбрасываются. */
+    private TreeMap<Long, Double> midByMinute(String symbol, String leg, long fromMs, long toMs) {
+        TreeMap<Long, Double> out = new TreeMap<>();
+        db.query("SELECT t_recv_ms, flags, bp1, ap1 FROM revx_book WHERE symbol = ? AND leg = ? "
+                + "AND t_recv_ms BETWEEN ? AND ? ORDER BY t_recv_ms", rs -> {
+            int flags = rs.getInt("flags");
+            if (org.home.data.revx.BookFlags.has(flags, org.home.data.revx.BookFlags.CROSSED)
+                    || org.home.data.revx.BookFlags.has(flags,
+                            org.home.data.revx.BookFlags.EMPTY_SIDE)) {
+                return null;
+            }
+            double bp = rs.getDouble("bp1");
+            double ap = rs.getDouble("ap1");
+            if (!(bp > 0) || !(ap > 0)) {
+                return null;
+            }
+            out.put(rs.getLong("t_recv_ms") / 60_000L * 60_000L, (bp + ap) / 2);
+            return null;
+        }, symbol, leg, fromMs, toMs);
+        return out;
+    }
+
+    /**
      * Базис в б.п. по общим минутам — для отчёта, не для прогона.
      *
      * Считается только там, где есть ОБЕ цены: подставлять последнюю известную

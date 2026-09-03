@@ -335,6 +335,7 @@ public class PerpBasisReport {
                 + "конструкции за то же время**: если ошибка одной сигмы сопоставима с ней, "
                 + "нейтральность куплена ценой другого риска того же размера, и выигрыша "
                 + "нет — есть замена одного риска другим.\n");
+        sb.append(renderEpisodes(all, hours));
         return sb.toString();
     }
 
@@ -351,6 +352,105 @@ public class PerpBasisReport {
             }
         }
         return out.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    /**
+     * Частота и длительность эпизодов дислокации (док. 148 §2, пункт 1 очереди).
+     *
+     * <b>Зачем.</b> Ценность предохранителя из док. 146 §4 — это прибавка за
+     * эпизод, помноженная на число эпизодов в году, а второй множитель никто не
+     * мерил: оценки гуляли от 3 до 52 в год, то есть в шестнадцать раз, и от
+     * этого зависит, стоит ли механизм чего-нибудь вообще.
+     *
+     * <b>Что считается эпизодом.</b> Непрерывная цепочка минут, где
+     * {@code |базис| > θ}. Пропущенная минута ЛОМАЕТ цепочку, а не сшивает её:
+     * дырка в данных — это не наблюдение «базис вернулся», и склеивать через неё
+     * значит выдумывать длинные эпизоды там, где просто нет данных.
+     */
+    private static String renderEpisodes(List<Series> all, int hours) {
+        double[] ladder = {10, 20, 50, 100, 200};
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n## Частота дислокаций: сколько раз и надолго ли (док. 148 §2)\n\n");
+        sb.append("Ценность предохранителя (док. 146 §4) — это прибавка за эпизод, "
+                + "помноженная на число эпизодов в году. Второй множитель до сих пор "
+                + "брался по памяти, и оценки расходились в шестнадцать раз. Здесь он "
+                + "считается по ряду.\n\n");
+        sb.append("Эпизод — непрерывная цепочка минут с `|базис| > θ`. **Пропущенная "
+                + "минута ломает цепочку, а не сшивает её:** дырка в данных не есть "
+                + "наблюдение «базис вернулся».\n\n");
+        for (Series s : all) {
+            sb.append("**").append(s.symbol()).append("** (опора USD, ")
+                    .append(s.usd().size()).append(" общих минут)\n\n");
+            sb.append("| θ, б.п. | Эпизодов | **В год** | Минут всего | Доля времени "
+                    + "| Медиана эпизода | Максимум |\n");
+            sb.append("|---|---|---|---|---|---|---|\n");
+            for (double theta : ladder) {
+                List<Integer> runs = episodes(s.usd(), theta);
+                int total = runs.stream().mapToInt(Integer::intValue).sum();
+                double perYear = hours > 0 ? runs.size() * (8760.0 / hours) : 0;
+                double share = s.usd().isEmpty() ? 0 : 100.0 * total / s.usd().size();
+                sb.append("| ").append(trim(theta))
+                        .append(" | ").append(runs.size())
+                        .append(" | **").append(Math.round(perYear)).append("**")
+                        .append(" | ").append(total)
+                        .append(" | ").append(round(share, 2)).append("%")
+                        .append(" | ").append(runs.isEmpty() ? "—"
+                                : String.valueOf(runs.stream().sorted().toList()
+                                        .get(runs.size() / 2)))
+                        .append(" | ").append(runs.isEmpty() ? "—"
+                                : String.valueOf(runs.stream().mapToInt(Integer::intValue)
+                                        .max().orElse(0)))
+                        .append(" |\n");
+            }
+            sb.append("\n");
+        }
+        sb.append("**Как это использовать.** Годовая ценность предохранителя = прибавка "
+                + "за эпизод × число эпизодов в год. Прибавка измерена в док. 146 §4 на "
+                + "ОДНОМ эпизоде, поэтому она сама по себе неточна; но множитель теперь "
+                + "не гадательный.\n\n");
+        sb.append("⚠️ **Число эпизодов зависит от θ сильнее, чем от чего-либо ещё**, и "
+                + "порог 20 б.п. из док. 146 выбран на одном окне. Строки 10 и 50 стоят "
+                + "рядом именно чтобы было видно, насколько ответ держится за этот выбор.\n\n");
+        sb.append("⚠️ **Окно ряда — не год.** Экстраполяция линейная и предполагает, что "
+                + "дислокации распределены по времени равномерно. Они не распределены: "
+                + "они кластеризуются по рыночным событиям, поэтому годовая колонка — "
+                + "это оценка порядка величины, а не прогноз.\n\n");
+        return sb.toString();
+    }
+
+    /** Длины непрерывных цепочек минут с {@code |базис| > θ}, в минутах. */
+    private static List<Integer> episodes(TreeMap<Long, Double> series, double theta) {
+        List<Integer> out = new ArrayList<>();
+        int run = 0;
+        long prevMinute = Long.MIN_VALUE;
+        for (Map.Entry<Long, Double> e : series.entrySet()) {
+            boolean contiguous = prevMinute != Long.MIN_VALUE
+                    && e.getKey() - prevMinute == 60_000L;
+            boolean over = Math.abs(e.getValue()) > theta;
+            if (over && contiguous) {
+                run++;
+            } else if (over) {
+                if (run > 0) {
+                    out.add(run);
+                }
+                run = 1;
+            } else {
+                if (run > 0) {
+                    out.add(run);
+                }
+                run = 0;
+            }
+            prevMinute = e.getKey();
+        }
+        if (run > 0) {
+            out.add(run);
+        }
+        return out;
+    }
+
+    /** Порог без хвоста нулей: «20», а не «20.0». */
+    private static String trim(double v) {
+        return java.math.BigDecimal.valueOf(v).stripTrailingZeros().toPlainString();
     }
 
     private static double[] values(TreeMap<Long, Double> s) {

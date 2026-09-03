@@ -56,10 +56,17 @@ class ArrivalLawTest {
     @Test
     void persistenceFindsPlantedContinuation() {
         // Ряд с заведомым продолжением: каждый шаг повторяет предыдущий на 50%.
+        //
+        // ⚠️ Длина ряда — часть требования, а не оформление. Точки берутся раз в
+        // минуту при горизонте 120 минут, то есть перекрываются ×120, и на прежних
+        // 4000 минутах независимых наблюдений было 32: при них 2σ недостижимы даже
+        // для посаженного сигнала (IC 0.117 давал 0.66σ). Шестьдесят тысяч минут
+        // дают ~500 независимых наблюдений — вот сколько данных нужно, чтобы
+        // направление дрейфа на этом горизонте вообще стало измеримым.
         TreeMap<Long, Double> series = new TreeMap<>();
         double price = 100;
         double step = 0.001;
-        for (int i = 0; i < 4000; i++) {
+        for (int i = 0; i < 60_000; i++) {
             series.put(i * 60_000L, price);
             step = 0.5 * step + 0.5 * ((i % 7) - 3) * 0.0004;
             price *= 1 + step;
@@ -71,7 +78,10 @@ class ArrivalLawTest {
         assertTrue(stats.points() > 1000, "точек должно хватать: " + stats.points());
         assertTrue(Math.abs(stats.correlation()) > 0.05,
                 "посаженное продолжение обязано найтись: IC = " + stats.correlation());
-        assertTrue(stats.predictive());
+        assertTrue(stats.effectivePoints() > 100,
+                "независимых наблюдений должно хватать: " + stats.effectivePoints());
+        assertTrue(stats.predictive(),
+                "посаженный сигнал обязан быть значим: t = " + stats.tStat());
     }
 
     @Test
