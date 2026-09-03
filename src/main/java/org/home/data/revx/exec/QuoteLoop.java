@@ -149,7 +149,6 @@ public final class QuoteLoop implements Runnable {
     private long replaces;
     private long cancels;
     private long fills;
-    private long dayStartMs = System.currentTimeMillis();
     private long minuteStartMs = System.currentTimeMillis();
     private long lastReconcileMs = System.currentTimeMillis();
     private int replacesThisMinute;
@@ -464,11 +463,31 @@ public final class QuoteLoop implements Runnable {
                 + (ask.venueId != null ? ask.price * ask.size : 0);
     }
 
+    /**
+     * Постановок за последние 24 часа — ПО ЖУРНАЛУ, скользящим окном.
+     *
+     * Счётчик в памяти для этого не годится: он обнулялся на каждом запуске, а у
+     * бота A их было 23, то есть предел не действовал ни разу. Журнал переживает
+     * рестарт и деплой.
+     *
+     * Окно скользящее, потому что момент обнуления тысячи у площадки нам
+     * неизвестен: за всю историю ни одного отказа по лимиту не приходило.
+     * «Не более N за любые 24 часа» безопасно и при обнулении в полночь, и при
+     * скользящем окне у них; обратное неверно.
+     */
+    private long placementsLastDay() {
+        return journal.placementsSince(System.currentTimeMillis() - 86_400_000L);
+    }
+
     private void place(Side side, Resting resting, double price, double size) {
-        if (placements >= ExecLimits.maxPlacementsPerDay(tag.id())) {
-            log.error("исчерпан суточный лимит постановок ({}) — останавливаю котирование",
-                    ExecLimits.maxPlacementsPerDay(tag.id()));
-            journal.event("limit_blocked", "постановки за сутки");
+        long used = placementsLastDay();
+        if (used >= ExecLimits.maxPlacementsPerDay(tag.id())) {
+            log.error("исчерпан суточный лимит постановок ({} из {} за 24 ч) — "
+                            + "останавливаю котирование",
+                    used, ExecLimits.maxPlacementsPerDay(tag.id()));
+            journal.event("limit_blocked",
+                    "постановки за сутки: " + used + " из "
+                            + ExecLimits.maxPlacementsPerDay(tag.id()));
             stopQuoting();
             return;
         }
@@ -1014,11 +1033,10 @@ public final class QuoteLoop implements Runnable {
             // Остатки перечитываются раз в минуту: исполнение могло случиться молча.
             refreshBalances();
         }
-        if (now - dayStartMs >= 86_400_000L) {
-            dayStartMs = now;
-            placements = 0;
-            journal.event("day_roll", "суточные счётчики обнулены");
-        }
+        // Суточный счётчик постановок БОЛЬШЕ НЕ ОБНУЛЯЕТСЯ здесь: он считается
+        // по журналу скользящим окном (placementsLastDay). Прежнее обнуление было
+        // опрокидывающимся окном от старта процесса и допускало до 2N подряд на
+        // стыке, а рестарт сбрасывал его целиком.
         if (now - lastReconcileMs >= RECONCILE_PERIOD_MS) {
             lastReconcileMs = now;
             reconcile("плановая сверка");

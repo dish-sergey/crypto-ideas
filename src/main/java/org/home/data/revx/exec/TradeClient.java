@@ -81,6 +81,33 @@ public final class TradeClient {
         return call("DELETE", "/api/1.0/orders/" + id, null);
     }
 
+    /**
+     * Тело ответа плюс заголовки про КВОТУ, если площадка их шлёт.
+     *
+     * Вопрос «сколько постановок осталось» пока решается только нашим счётом, и
+     * это неприятно: суточная тысяча — единственный жёсткий ресурс, а сверить её
+     * не с чем. Отдельного эндпоинта в API нет, в телах ответов остатка тоже нет.
+     * Остаётся единственное место, где такие счётчики обычно и живут, —
+     * заголовки; мы их до сих пор просто выбрасывали.
+     *
+     * Пишется в журнал рядом с телом, а не в отдельную колонку: если заголовков
+     * нет, ничего и не появится, и схема не меняется ради гипотезы. Как только
+     * хоть один такой заголовок придёт, он окажется в `exec_request.response`, и
+     * тогда уже будет смысл заводить под него поле.
+     */
+    private static String withQuotaHeaders(HttpResponse<String> response) {
+        StringBuilder quota = new StringBuilder();
+        response.headers().map().forEach((name, values) -> {
+            String n = name.toLowerCase(java.util.Locale.ROOT);
+            if (n.contains("ratelimit") || n.contains("rate-limit") || n.contains("quota")
+                    || n.contains("remaining") || n.equals("retry-after")) {
+                quota.append(name).append('=').append(String.join(",", values)).append(' ');
+            }
+        });
+        return quota.isEmpty() ? response.body()
+                : "[quota " + quota.toString().trim() + "] " + response.body();
+    }
+
     private Response call(String method, String path, String body) {
         URI uri = URI.create(baseUrl + path);
         long started = System.currentTimeMillis();
@@ -100,7 +127,8 @@ public final class TradeClient {
             HttpResponse<String> response = http.send(request.build(),
                     HttpResponse.BodyHandlers.ofString());
             long latency = System.currentTimeMillis() - started;
-            journal.request(method, path, body, response.statusCode(), response.body(), latency, null);
+            journal.request(method, path, body, response.statusCode(),
+                    withQuotaHeaders(response), latency, null);
             return new Response(response.statusCode(), response.body(), latency);
         } catch (Exception e) {
             long latency = System.currentTimeMillis() - started;
