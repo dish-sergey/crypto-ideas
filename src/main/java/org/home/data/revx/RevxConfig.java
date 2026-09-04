@@ -99,7 +99,7 @@ public class RevxConfig {
     private final double simUnloadTarget;
     private final List<Double> simUnloadStallLadder;
     private final double simUnloadStallMargin;
-    private final int simWindowSeconds;
+    private final int simRateBucketSeconds;
     private final List<Double> simCostAwareLadder;
     private final double simGridMargin;
     private final double simGridBaseStep;
@@ -222,7 +222,7 @@ public class RevxConfig {
             @Value("${revx.sim.unload-target}") double simUnloadTarget,
             @Value("${revx.sim.unload-stall-ladder}") List<Double> simUnloadStallLadder,
             @Value("${revx.sim.unload-stall-margin}") double simUnloadStallMargin,
-            @Value("${revx.sim.window-seconds}") int simWindowSeconds,
+            @Value("${revx.sim.rate-bucket-seconds}") int simRateBucketSeconds,
             @Value("${revx.sim.cost-aware-ladder}") List<Double> simCostAwareLadder,
             @Value("${revx.sim.grid-margin}") double simGridMargin,
             @Value("${revx.sim.grid-base-step}") double simGridBaseStep,
@@ -342,7 +342,7 @@ public class RevxConfig {
         this.simUnloadTarget = simUnloadTarget;
         this.simUnloadStallLadder = simUnloadStallLadder;
         this.simUnloadStallMargin = simUnloadStallMargin;
-        this.simWindowSeconds = simWindowSeconds;
+        this.simRateBucketSeconds = simRateBucketSeconds;
         this.simCostAwareLadder = simCostAwareLadder;
         this.simGridMargin = simGridMargin;
         this.simGridBaseStep = simGridBaseStep;
@@ -768,19 +768,23 @@ public class RevxConfig {
     }
 
     /**
-     * Размер окна симуляции, с — СВОЙ ключ, не период опроса коллектора.
+     * Корзина для расчёта КУРСА, с. НЕ размер окна симуляции.
      *
-     * Разводит два разных решения, которые до док. 151 сидели на одном ключе:
-     * период опроса площадки (деплой, меняется под бюджет запросов) и период
-     * котирования, который мы моделируем (методика, определяет сравнимость с
-     * прошлыми доками). Правка первого молча сдвигала второе.
+     * Окно симуляции равно строке книги торгуемой пары и этим ключом не
+     * управляется: у BTC оно 1 с с 28.08, и симулятор моделирует именно
+     * секундный шаг («устаревание при шаге 1.0 с» = 1.28 бп).
      *
-     * ⚠️ Значение обязано соответствовать РЕАЛЬНОЙ плотности данных торгуемой
-     * пары в окне. Поставить 1 с там, где собиралось раз в 5, значит получить
-     * четыре пустых окна из пяти.
+     * Корзина группирует снимки ВСЕЛЕННОЙ, чтобы посчитать медиану implied по
+     * 23 парам, и обязана быть не меньше периода опроса вселенной В ЧИТАЕМЫХ
+     * ДАННЫХ. Иначе в корзину попадает меньше {@code fair.min-pairs} пар, гейт
+     * «мало пар» закрывается и отбраковываются ВСЕ окна: при значении 1
+     * отбраковка вышла 100%, исполнений ноль.
+     *
+     * ⚠️ Период опроса вселенной менялся: до 03.09.2026 18:49 UTC это 5 с,
+     * после — 6 с (док. 151 §4).
      */
-    public int simWindowSeconds() {
-        return simWindowSeconds;
+    public int simRateBucketSeconds() {
+        return simRateBucketSeconds;
     }
 
     /** Минимальная прибыль над входом при разгрузке по застою. */
