@@ -109,6 +109,8 @@ public final class QuoteLoop implements Runnable {
     private final Quoter.Params params;
     private final String symbol;
     private final String base;
+    /** Валюта котировки: касса тоже общая на трёх ботов и тоже делится реестром. */
+    private final String quote;
     private final long periodMs;
     /** Минимальный номинал заявки на площадке: ниже него постановка отвергается. */
     private final double minNotional;
@@ -177,6 +179,7 @@ public final class QuoteLoop implements Runnable {
                 params.erSampleMs() > 0 ? params.erSampleMs() : 3_600_000L);
         this.symbol = symbol;
         this.base = symbol.substring(0, symbol.indexOf('/'));
+        this.quote = symbol.substring(symbol.indexOf('/') + 1);
         this.periodMs = periodMs;
         this.minNotional = minNotional;
         this.tag = tag;
@@ -202,6 +205,33 @@ public final class QuoteLoop implements Runnable {
      * ломает.
      */
     private final double dust;
+
+    /**
+     * @return null, если включить можно; иначе причина отказа
+     *
+     * Отказ при непокрытых деньгах — не придирка. Бот без своей доли кассы
+     * встаёт на отказах «Insufficient balance» и тратит на них суточный лимит
+     * постановок: у бота B за сутки таких отказов было 197. Лучше не стартовать
+     * вовсе, чем стартовать и жечь общий ресурс впустую.
+     */
+    public String cannotStart() {
+        if (alloc == null) {
+            return null;
+        }
+        double price = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
+        if (!(price > 0)) {
+            return null;                  // цены нет — судить не о чем, гейт разберётся
+        }
+        double need = Math.max(0, (params.inventoryCap() - inventory) * price);
+        double have = alloc.own(tag.id(), quote);
+        if (need > 0 && have + 1e-9 < need) {
+            return String.format(java.util.Locale.ROOT,
+                    "Не хватает своей кассы: до потолка нужно %.2f %s, за ботом числится "
+                            + "%.2f. Возьмите недостающее через /claim.",
+                    need, quote, have);
+        }
+        return null;
+    }
 
     public void startQuoting() {
         if (quoting.compareAndSet(false, true)) {
@@ -1107,7 +1137,12 @@ public final class QuoteLoop implements Runnable {
         // при инициализации, иначе нельзя отличить «продал купленное» от «продал
         // найденное», и проверка логики бота теряет смысл.
         if (alloc != null) {
-            alloc.applyFill(tag.id(), base, side.sign() * qty, System.currentTimeMillis());
+            long now = System.currentTimeMillis();
+            alloc.applyFill(tag.id(), base, side.sign() * qty, now);
+            // Деньги двигаются зеркально монетам, и прибыль оседает ЗДЕСЬ:
+            // продали дороже, чем купили — в претензии бота стало больше USDC.
+            // Без этой строки заработанное становилось бы ничьим.
+            alloc.applyFill(tag.id(), quote, -side.sign() * qty * price, now);
         }
     }
 
@@ -1121,33 +1156,53 @@ public final class QuoteLoop implements Runnable {
         }
         refreshBalances();
         long now = System.currentTimeMillis();
-        AllocRegistry.Free f = alloc.free(base, baseTotal(), now);
         double lot = params.size();
-        double target = params.inventoryCap();
+        double cap = params.inventoryCap();
+        double price = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
+        AllocRegistry.Free fb = alloc.free(base, baseTotal(), now);
+        AllocRegistry.Free fq = alloc.free(quote, quoteTotal, now);
+        double myBase = alloc.own(tag.id(), base);
+        double myQuote = alloc.own(tag.id(), quote);
+
         StringBuilder sb = new StringBuilder();
         sb.append(String.format(java.util.Locale.ROOT,
-                "На счёте: %.8f %s = %.1f лота%n", f.venueTotal(), base,
-                lot > 0 ? f.venueTotal() / lot : 0));
-        sb.append(String.format(java.util.Locale.ROOT,
-                "Держат живые боты: %.8f = %.1f лота%n", f.claimedLive(),
-                lot > 0 ? f.claimedLive() / lot : 0));
-        if (f.claimedExpired() > 0) {
-            sb.append(String.format(java.util.Locale.ROOT,
-                    "Аренда истекла (можно забрать): %.8f = %.1f лота%n", f.claimedExpired(),
-                    lot > 0 ? f.claimedExpired() / lot : 0));
-        }
-        sb.append(String.format(java.util.Locale.ROOT,
-                "**Свободно: %.8f = %.1f лота**%n", f.free(), lot > 0 ? f.free() / lot : 0));
-        sb.append(String.format(java.util.Locale.ROOT,
-                "Моя претензия: %.8f = %.1f лота%n", alloc.own(tag.id(), base),
-                lot > 0 ? alloc.own(tag.id(), base) / lot : 0));
-        sb.append(String.format(java.util.Locale.ROOT,
-                "**Цель инвентаря: %.1f лота** (потолок %.8f)%n",
-                lot > 0 ? target / lot : 0, target));
+                "СЧЁТ%n  %s: %.8f = %.1f лота%n  %s: %.2f%n%n",
+                base, fb.venueTotal(), lot > 0 ? fb.venueTotal() / lot : 0,
+                quote, fq.venueTotal()));
+
+        sb.append("ДЕРЖАТ БОТЫ\n");
         for (AllocRegistry.Claim c : alloc.claims(base, now)) {
-            sb.append(String.format(java.util.Locale.ROOT, "  %s: %.1f лота%s%n",
+            sb.append(String.format(java.util.Locale.ROOT, "  %s: %.1f лота + %.2f %s%s%n",
                     c.botId(), lot > 0 ? c.qty() / lot : 0,
-                    c.live() ? "" : " (аренда истекла)"));
+                    alloc.own(c.botId(), quote), quote,
+                    c.live() ? "" : "  (аренда истекла — можно забрать)"));
+        }
+
+        sb.append(String.format(java.util.Locale.ROOT,
+                "%nСВОБОДНО%n  %s: %.1f лота (%.8f)%n  %s: %.2f%n%n",
+                base, lot > 0 ? fb.free() / lot : 0, fb.free(), quote, fq.free()));
+
+        // Своё состояние — отдельным блоком и без двусмысленных слов: «держу
+        // сейчас» это факт, а не заявка на будущее, и /claim к нему ПРИБАВЛЯЕТ.
+        sb.append(String.format(java.util.Locale.ROOT, "Я (бот %s)%n", tag.id()));
+        sb.append(String.format(java.util.Locale.ROOT,
+                "  держу сейчас: %.1f лота + %.2f %s%n",
+                lot > 0 ? myBase / lot : 0, myQuote, quote));
+        sb.append(String.format(java.util.Locale.ROOT,
+                "  потолок инвентаря: %.1f лота%s%n",
+                lot > 0 ? cap / lot : 0,
+                price > 0 ? String.format(java.util.Locale.ROOT, " (≈ %.2f %s)",
+                        cap * price, quote) : ""));
+        sb.append(String.format(java.util.Locale.ROOT,
+                "  цель скоса: %.0f%% потолка = %.1f лота%n",
+                params.skewTarget() * 100,
+                lot > 0 ? params.skewTarget() * cap / lot : 0));
+        if (price > 0) {
+            double needQuote = Math.max(0, (cap - myBase) * price);
+            sb.append(String.format(java.util.Locale.ROOT,
+                    "  до потолка не хватает: %.1f лота = %.2f %s%s%n",
+                    lot > 0 ? (cap - myBase) / lot : 0, needQuote, quote,
+                    myQuote + 1e-9 >= needQuote ? " — покрыто" : " ← НЕ ПОКРЫТО"));
         }
         return sb.toString();
     }
@@ -1179,20 +1234,45 @@ public final class QuoteLoop implements Runnable {
         refreshBalances();
         double qty = lots * params.size();
         long now = System.currentTimeMillis();
+
+        // Деньги забираются ВМЕСТЕ с монетами, одной командой и по принципу
+        // «либо всё, либо ничего». Смысл: бот должен уметь дойти до потолка, а
+        // не встать на полпути с отказами по средствам — у бота B их было 197
+        // за сутки. Нужно ровно столько, сколько стоит недостающая до потолка
+        // часть инвентаря: остальное он уже держит монетами.
+        double needQuote = Math.max(0, (params.inventoryCap() - (inventory + qty)) * price);
+        double freeQuote = alloc.free(quote, quoteTotal, now).free();
+        double haveQuote = alloc.own(tag.id(), quote);
+        double takeQuote = Math.max(0, needQuote - haveQuote);
+        if (takeQuote > freeQuote + 1e-9) {
+            return String.format(java.util.Locale.ROOT,
+                    "Отказ: до потолка нужно %.2f %s, свободно только %.2f. "
+                            + "Стартовать с нехваткой денег нельзя — бот встанет на "
+                            + "отказах по средствам.%n%n%s",
+                    takeQuote, quote, freeQuote, describeFree());
+        }
         if (!alloc.claim(tag.id(), base, qty, baseTotal(), price, now)) {
-            return "Отказ: свободно меньше запрошенного.\n\n" + describeFree();
+            return "Отказ: свободных лотов меньше запрошенного.\n\n" + describeFree();
+        }
+        if (takeQuote > 0 && !alloc.claim(tag.id(), quote, takeQuote, quoteTotal, price, now)) {
+            // Монеты уже взяты — возвращаем, чтобы не остаться в половинном состоянии.
+            alloc.applyFill(tag.id(), base, -qty, now);
+            return "Отказ: деньги забрать не удалось, монеты возвращены.\n\n" + describeFree();
         }
         inventory += qty;
         seedPosition += qty;
+        ownCash += takeQuote;
         journal.putState(STATE_POSITION, inventory);
         journal.putState(STATE_SEED, seedPosition);
+        journal.putState(STATE_CASH, ownCash);
         journal.fill(null, "BUY", qty, price, price, 0, null, "handover");
         journal.event("claim", String.format(java.util.Locale.ROOT,
-                "%.1f лота = %.8f %s по %.2f", lots, qty, base, price));
+                "%.1f лота = %.8f %s по %.2f, плюс %.2f %s",
+                lots, qty, base, price, takeQuote, quote));
         return String.format(java.util.Locale.ROOT,
-                "Захвачено %.1f лота = %.8f %s по справедливой %.2f.%n"
-                        + "Записано передачей (kind=handover), в статистику сделок не идёт.%n%n%s",
-                lots, qty, base, price, describeFree());
+                "Взято %.1f лота = %.8f %s по справедливой %.2f и %.2f %s.%n"
+                        + "Записано передачей (status=handover), в статистику сделок не идёт.%n%n%s",
+                lots, qty, base, price, takeQuote, quote, describeFree());
     }
 
     /** Отдать инвентарь в общий котёл. Заявки снимаются ДО освобождения. */
@@ -1210,18 +1290,29 @@ public final class QuoteLoop implements Runnable {
         cancelAll("освобождение инвентаря");
         reconcile("освобождение");
         double qty = alloc.own(tag.id(), base);
-        if (qty <= 0) {
+        double cash = alloc.own(tag.id(), quote);
+        if (qty <= 0 && cash <= 0) {
             return "Держать нечего.";
         }
-        alloc.release(tag.id(), base, price, System.currentTimeMillis());
-        journal.fill(null, "SELL", qty, price, price, 0, null, "handover");
+        long now = System.currentTimeMillis();
+        // Отдаём ОБЕ валюты: иначе касса бота останется за ним навсегда и станет
+        // недоступной остальным, а «ничьих денег» мы и добивались не допустить.
+        if (qty > 0) {
+            alloc.release(tag.id(), base, price, now);
+            journal.fill(null, "SELL", qty, price, price, 0, null, "handover");
+            inventory -= qty;
+            journal.putState(STATE_POSITION, inventory);
+        }
+        if (cash > 0) {
+            alloc.release(tag.id(), quote, price, now);
+            ownCash -= cash;
+            journal.putState(STATE_CASH, ownCash);
+        }
         journal.event("release", String.format(java.util.Locale.ROOT,
-                "%.8f %s по %.2f", qty, base, price));
-        inventory -= qty;
-        journal.putState(STATE_POSITION, inventory);
+                "%.8f %s и %.2f %s по %.2f", qty, base, cash, quote, price));
         return String.format(java.util.Locale.ROOT,
-                "Освобождено %.8f %s по %.2f, закрыто по переоценке.%n%n%s",
-                qty, base, price, describeFree());
+                "Освобождено %.8f %s и %.2f %s по %.2f, закрыто по переоценке.%n%n%s",
+                qty, base, cash, quote, price, describeFree());
     }
 
     /** Остаток счёта по базовой валюте — знаменатель для реестра. */

@@ -139,8 +139,16 @@ public final class ExecBot implements Runnable {
         journal.event("telegram_in", text);
         switch (text.split("\\s+")[0]) {
             case "/start" -> {
-                loop.startQuoting();
-                send("Котирование ВКЛЮЧЕНО.\n" + status());
+                // Бот без своей доли кассы встаёт на отказах «Insufficient
+                // balance» и жжёт на них общий суточный лимит постановок —
+                // у бота B таких отказов было 197 за сутки. Лучше не пустить.
+                String blocked = loop.cannotStart();
+                if (blocked != null) {
+                    send("НЕ включено. " + blocked);
+                } else {
+                    loop.startQuoting();
+                    send("Котирование ВКЛЮЧЕНО.\n" + status());
+                }
             }
             case "/stop" -> {
                 loop.stopQuoting();
