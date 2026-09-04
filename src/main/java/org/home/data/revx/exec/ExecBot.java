@@ -139,15 +139,22 @@ public final class ExecBot implements Runnable {
         journal.event("telegram_in", text);
         switch (text.split("\\s+")[0]) {
             case "/start" -> {
+                // Деньги бот берёт САМ: в этом решения нет, оно механическое —
+                // сколько стоит недостающая до потолка часть инвентаря, столько
+                // и нужно. Решение есть только в захвате ЛОТОВ (/claim N), а
+                // предпросмотр даёт /free.
+                String taken = loop.topUpCash();
                 // Бот без своей доли кассы встаёт на отказах «Insufficient
                 // balance» и жжёт на них общий суточный лимит постановок —
                 // у бота B таких отказов было 197 за сутки. Лучше не пустить.
                 String blocked = loop.cannotStart();
                 if (blocked != null) {
-                    send("НЕ включено. " + blocked);
+                    send("НЕ включено. " + blocked
+                            + (taken == null ? "" : "\n" + taken));
                 } else {
                     loop.startQuoting();
-                    send("Котирование ВКЛЮЧЕНО.\n" + status());
+                    send("Котирование ВКЛЮЧЕНО."
+                            + (taken == null ? "" : "\n" + taken) + "\n" + status());
                 }
             }
             case "/stop" -> {
@@ -227,12 +234,13 @@ public final class ExecBot implements Runnable {
                 /panic  — снять всё и выйти из процесса
                 /limits — жёсткие пределы (только показ)
                 /free   — сколько инвентаря свободно и кто чем владеет
-                /claim N — взять N свободных лотов И деньги под них
-                           (только пока не котирует; 0 = только деньги)
+                /claim N — взять N свободных ЛОТОВ (только пока не котирует).
+                           Деньги брать не нужно: /start берёт их сам
                 /release — отдать свой инвентарь и кассу в общий котёл
                 /help   — это сообщение
 
-                Порядок при запуске: /free → /claim N → /start.
+                Порядок при запуске: /free (посмотреть) → /claim N (взять лоты)
+                → /start (сам возьмёт деньги и включит).
                 Параметры котирования бот не меняет: они в конфиге и в коде.""";
     }
 
@@ -259,10 +267,10 @@ public final class ExecBot implements Runnable {
                     [{"command":"status","description":"состояние и инвентарь в % потолка"},
                      {"command":"pnl","description":"реализовано и нереализовано, окна 3ч-7дн"},
                      {"command":"free","description":"кто чем владеет и сколько свободно"},
-                     {"command":"claim","description":"взять N свободных лотов и деньги"},
+                     {"command":"claim","description":"взять N свободных лотов"},
                      {"command":"release","description":"отдать свой инвентарь и кассу"},
                      {"command":"stats","description":"исполнения против предсказания"},
-                     {"command":"start","description":"включить котирование"},
+                     {"command":"start","description":"взять деньги и включить котирование"},
                      {"command":"stop","description":"выключить и снять заявки"},
                      {"command":"panic","description":"снять всё и выйти"},
                      {"command":"limits","description":"жёсткие пределы"}]"""

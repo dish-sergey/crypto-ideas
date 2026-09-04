@@ -214,6 +214,53 @@ public final class QuoteLoop implements Runnable {
      * постановок: у бота B за сутки таких отказов было 197. Лучше не стартовать
      * вовсе, чем стартовать и жечь общий ресурс впустую.
      */
+    /**
+     * Взять недостающие деньги под свой потолок. Зовётся из {@code /start}.
+     *
+     * Отдельной командой это быть не должно: в захвате ДЕНЕГ нет решения, оно
+     * механическое — «сколько стоит недостающая до потолка часть инвентаря,
+     * столько и беру, если свободно». Решение есть только в захвате ЛОТОВ, и оно
+     * остаётся за человеком ({@code /claim N}). Предпросмотр даёт {@code /free}:
+     * там стоит строка «до потолка не хватает X лота = Y USDC».
+     *
+     * @return что взято, либо null, если брать было нечего
+     */
+    public String topUpCash() {
+        if (alloc == null) {
+            return null;
+        }
+        double price = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
+        if (!(price > 0)) {
+            return null;
+        }
+        long now = System.currentTimeMillis();
+        refreshBalances();
+        double need = Math.max(0, (params.inventoryCap() - inventory) * price);
+        double have = alloc.own(tag.id(), quote);
+        double want = Math.max(0, need - have);
+        if (want <= 0) {
+            return null;
+        }
+        double free = alloc.free(quote, quoteTotal, now).free();
+        double take = Math.min(want, free);
+        if (take <= 0) {
+            return String.format(java.util.Locale.ROOT,
+                    "Свободных денег нет: за ботом %.2f %s, до потолка нужно %.2f.",
+                    have, quote, need);
+        }
+        if (!alloc.claim(tag.id(), quote, take, quoteTotal, price, now)) {
+            return "Деньги забрать не удалось.";
+        }
+        ownCash += take;
+        journal.putState(STATE_CASH, ownCash);
+        journal.event("claim", String.format(java.util.Locale.ROOT,
+                "автозахват при старте: %.2f %s", take, quote));
+        return String.format(java.util.Locale.ROOT,
+                "Взято %.2f %s (нужно было %.2f, свободно было %.2f).%s",
+                take, quote, want, free,
+                take + 1e-9 < want ? " Потолок инвентаря фактически ниже заданного." : "");
+    }
+
     public String cannotStart() {
         if (alloc == null) {
             return null;
