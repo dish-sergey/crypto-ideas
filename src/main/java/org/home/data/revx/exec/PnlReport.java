@@ -1,5 +1,9 @@
 package org.home.data.revx.exec;
 
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Locale;
 
@@ -28,15 +32,35 @@ import java.util.Locale;
  * Реализация датируется моментом ЗАКРЫТИЯ, а не покупки: иначе «за три часа»
  * считалось бы по входам, которые прибыли ещё не дали.
  *
+ * <h2>Одна книга, а не две</h2>
+ *
+ * ⚠️ До 04.09.2026 торговая статистика считалась по ОТДЕЛЬНОЙ книге, из которой
+ * передачи и затравку выбрасывали. Книга от этого вставала в шорт ровно на
+ * размер подаренного (у бота A — на −0.00026055 BTC, 20.8 лота), и «реализовано»
+ * превращалось в ставку на направление рынка: обещание «от движения рынка не
+ * зависит» не выполнялось. Теперь книга ОДНА, передачи в ней участвуют
+ * (позицию они действительно открывают), а разделение идёт по происхождению
+ * ПАРЫ — см. {@link FifoLedger}.
+ *
+ * <h2>Окно «с запуска»</h2>
+ *
+ * Главная строка — не «за всё время», а от последнего старта процесса: только
+ * так видно, торгует ли новая версия лучше прежней. Скользящие окна оставлены
+ * рядом, но они ВЛОЖЕННЫЕ (все «от сейчас назад»), и читать их как
+ * непересекающиеся периоды нельзя.
+ *
  * ⚠️ Комиссии стоят ОТДЕЛЬНОЙ строкой, а не вычитаются из реализованного. У нас
  * мейкерский тариф 0%, и любое ненулевое значение — сигнал, что тариф изменился
  * (док. 91). Спрятав их внутрь, мы бы это заметили не сразу.
  */
 public final class PnlReport {
 
-    /** Окна, за которые интересно смотреть. Часы. */
+    /** Скользящие окна, за которые интересно смотреть. Часы. */
     private static final int[] WINDOWS = {3, 12, 24, 72, 168};
     private static final String[] LABELS = {"3 ч", "12 ч", "24 ч", "3 дня", "7 дней"};
+
+    private static final DateTimeFormatter STAMP =
+            DateTimeFormatter.ofPattern("dd.MM HH:mm").withZone(ZoneOffset.UTC);
 
     private PnlReport() {
     }
@@ -52,15 +76,7 @@ public final class PnlReport {
     public static String render(ExecJournal journal, double fair, double lotSize, String base,
                                 double tracked) {
         String body = render(journal, fair, lotSize, base);
-        FifoLedger ledger = new FifoLedger();
-        ExecJournal.FillRow seed = journal.seed();
-        if (seed != null) {
-            ledger.add(seed.tsMs(), true, seed.qty(), seed.price(), 0);
-        }
-        for (ExecJournal.FillRow f : journal.fills()) {
-            ledger.add(f.tsMs(), f.buy(), f.qty(), f.price(), f.fee());
-        }
-        double book = ledger.position().qty();
+        double book = build(journal).position().qty();
         double diff = tracked - book;
         StringBuilder sb = new StringBuilder(body);
         sb.append(String.format(Locale.ROOT, "%n%nСверка:%n"));
@@ -79,16 +95,26 @@ public final class PnlReport {
         return sb.toString();
     }
 
-    public static String render(ExecJournal journal, double fair, double lotSize, String base) {
+    /**
+     * Единственная книга партий: затравка, передачи и сделки в одном порядке.
+     * Затравка и передачи помечены — по этой метке отчёт и разделяет пары.
+     */
+    private static FifoLedger build(ExecJournal journal) {
         FifoLedger ledger = new FifoLedger();
         ExecJournal.FillRow seed = journal.seed();
         if (seed != null) {
-            ledger.add(seed.tsMs(), true, seed.qty(), seed.price(), 0);
+            ledger.add(seed.tsMs(), true, seed.qty(), seed.price(), 0, true);
         }
+        for (ExecJournal.FillRow f : journal.fills()) {
+            ledger.add(f.tsMs(), f.buy(), f.qty(), f.price(), f.fee(), f.handover());
+        }
+        return ledger;
+    }
+
+    public static String render(ExecJournal journal, double fair, double lotSize, String base) {
         List<ExecJournal.FillRow> fills = journal.fills();
-        for (ExecJournal.FillRow f : fills) {
-            ledger.add(f.tsMs(), f.buy(), f.qty(), f.price(), f.fee());
-        }
+        ExecJournal.FillRow seed = journal.seed();
+        FifoLedger ledger = build(journal);
 
         FifoLedger.Position pos = ledger.position();
         double avg = pos.averagePrice();
@@ -111,36 +137,49 @@ public final class PnlReport {
         }
         sb.append(String.format(Locale.ROOT, "Комиссии за всё время: %.4f%n%n", ledger.fees()));
 
-        // Вторая книга — ТОЛЬКО по торговым сделкам. Передачи инвентаря между
-        // ботами в ней не участвуют: иначе каждый перезапуск впрыскивает в
-        // «реализовано» и в «на сделку» фальшивое исполнение по справедливой
-        // цене, и сравнивать ботов между собой станет нечем.
-        FifoLedger trading = new FifoLedger();
-        for (ExecJournal.FillRow f : fills) {
-            if (!f.handover()) {
-                trading.add(f.tsMs(), f.buy(), f.qty(), f.price(), f.fee());
-            }
-        }
-
-        sb.append("Окно   | сделок | реализовано | на сделку | оборот | передачи\n");
         long now = System.currentTimeMillis();
+        ExecJournal.Boot boot = journal.lastBoot();
+
+        sb.append("Окно      | сделок | реализовано | на сделку |     оборот | передачи\n");
+        if (boot != null) {
+            sb.append(row("С ЗАПУСКА", ledger, boot.tsMs()));
+        }
         for (int i = 0; i < WINDOWS.length; i++) {
-            long from = now - WINDOWS[i] * 3600_000L;
-            int closed = trading.closedSince(from);
-            double realised = trading.realisedSince(from);
-            double qty = trading.closedQtySince(from);
-            // Передачи — разница между полной книгой и торговой.
-            double handover = ledger.realisedSince(from) - realised;
-            sb.append(String.format(Locale.ROOT, "%-6s | %6d | %+11.4f | %+9.5f | %.8f | %+8.4f%n",
-                    LABELS[i], closed, realised,
-                    closed > 0 ? realised / closed : 0, qty, handover));
+            sb.append(row(LABELS[i], ledger, now - WINDOWS[i] * 3600_000L));
+        }
+        sb.append(row("всего", ledger, 0));
+
+        if (boot != null) {
+            Duration up = Duration.ofMillis(Math.max(0, now - boot.tsMs()));
+            sb.append(String.format(Locale.ROOT, "%nВерсия запущена %s UTC (%d ч %d мин назад)%n",
+                    STAMP.format(Instant.ofEpochMilli(boot.tsMs())), up.toHours(),
+                    up.toMinutesPart()));
+            if (boot.detail() != null && !boot.detail().isBlank()) {
+                sb.append("  ").append(boot.detail()).append('\n');
+            }
+            sb.append("Сравнивать версии между собой — по строке «С ЗАПУСКА»: остальные\n");
+            sb.append("окна вложенные и захватывают торговлю прежних версий.\n");
+        } else {
+            sb.append("\nТочки запуска в журнале нет — строка «с запуска» появится\n");
+            sb.append("после ближайшего перезапуска.\n");
         }
 
         long handovers = fills.stream().filter(ExecJournal.FillRow::handover).count();
         sb.append("\nВсего исполнений в журнале: ").append(fills.size())
                 .append(", из них передач: ").append(handovers);
-        sb.append("\n\nРеализовано — по ЗАКРЫТЫМ парам, от движения рынка не зависит.");
-        sb.append("\nНереализовано — переоценка остатка, это ставка на рынок, а не заработок.");
+        sb.append("\n\nРеализовано — по парам, где ОБЕ ноги торговые: захват спреда,");
+        sb.append("\nот движения рынка не зависит. Передачи — пары, где хоть одна нога");
+        sb.append("\nпередача или затравка: это не заработок бота.");
+        sb.append("\nНереализовано — переоценка остатка, это ставка на рынок.");
         return sb.toString();
+    }
+
+    private static String row(String label, FifoLedger ledger, long from) {
+        int closed = ledger.tradingClosedSince(from);
+        double realised = ledger.tradingRealisedSince(from);
+        double qty = ledger.tradingClosedQtySince(from);
+        double handover = ledger.handoverRealisedSince(from);
+        return String.format(Locale.ROOT, "%-9s | %6d | %+11.4f | %+9.5f | %.8f | %+8.4f%n",
+                label, closed, realised, closed > 0 ? realised / closed : 0, qty, handover);
     }
 }

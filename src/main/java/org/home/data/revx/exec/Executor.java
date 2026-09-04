@@ -161,6 +161,20 @@ public class Executor {
                 {}""", symbol, size, symbol.substring(0, symbol.indexOf('/')), periodMs,
                 offset * 10_000, cfg.simOffset() * 10_000, cfg.simSkewK() * 100,
                 ExecLimits.describe(tag.id()));
+        // Точка отсчёта для «с запуска» в /pnl. Пишем ПАРАМЕТРЫ, а не просто
+        // отметку времени: сравнение версий имеет смысл только рядом с тем, чем
+        // они отличались — отступом, размером лота и скосом.
+        // ⚠️ Отступ берём ЖИВОЙ (revx.exec.offset), а не cfg.simOffset(): они
+        // намеренно разные (10 против 14 б.п., док. 113 §5). Скос k живой берёт
+        // из конфига симуляции, а вот цель — своя (revx.exec.skew-target), и
+        // без неё запись версии не полна: цель и есть то, что крутят.
+        journal.event("boot", String.format(java.util.Locale.ROOT,
+                "%s, лот %s, отступ %.1f б.п., скос k=%.4f, цель %.0f%% потолка",
+                // valueOf, а не new BigDecimal(double): конструктор печатает
+                // точное двоичное разложение (0.0000125000000000000000108…).
+                symbol, java.math.BigDecimal.valueOf(size).stripTrailingZeros().toPlainString(),
+                offset * 10_000, cfg.simSkewK(), skewTarget * 100));
+
         if (offset != cfg.simOffset()) {
             // Расхождение намеренное, но молчать о нём нельзя: иначе через месяц
             // живое сравнят с базовым прогоном и не поймут, почему не сходится.

@@ -282,6 +282,30 @@ public final class ExecJournal implements AutoCloseable {
         }
     }
 
+    /** Запуск процесса: когда и с какими параметрами. {@code null}, если записи нет. */
+    public record Boot(long tsMs, String detail) {
+    }
+
+    /**
+     * Последний запуск процесса — начало окна «с запуска».
+     *
+     * Считаем по СТАРТУ ПРОЦЕССА, а не по команде {@code /start}: сравнивать
+     * между собой надо версии бота, а котирование в пределах одной версии
+     * человек включает и выключает по десять раз. Если события нет (журнал
+     * старше этой правки) — {@code null}, и окно просто не печатается.
+     */
+    public synchronized Boot lastBoot() {
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT ts_ms, detail FROM exec_event WHERE kind = 'boot' "
+                             + "ORDER BY ts_ms DESC LIMIT 1")) {
+            return rs.next() ? new Boot(rs.getLong(1), rs.getString(2)) : null;
+        } catch (Exception e) {
+            log.error("не прочиталась точка запуска: {}", e.getMessage());
+            return null;
+        }
+    }
+
     /** События уровня решений: запуск, остановка, паника, срабатывание лимита. */
     public synchronized void event(String kind, String detail) {
         try (PreparedStatement ps = connection.prepareStatement(
