@@ -64,7 +64,6 @@ public class Executor {
     private final double anchorWidening;
     private final boolean ownPosition;
     private final double positionSeed;
-    private final double baseStep;
     private final double parkDistance;
     private final Panic panic;
 
@@ -86,7 +85,6 @@ public class Executor {
                     @Value("${revx.exec.anchor-widening}") double anchorWidening,
                     @Value("${revx.exec.own-position}") boolean ownPosition,
                     @Value("${revx.exec.position-seed}") double positionSeed,
-                    @Value("${revx.exec.base-step}") double baseStep,
                     @Value("${revx.exec.park-distance}") double parkDistance,
                     Panic panic) {
         this.cfg = cfg;
@@ -107,7 +105,6 @@ public class Executor {
         this.anchorWidening = anchorWidening;
         this.ownPosition = ownPosition;
         this.positionSeed = positionSeed;
-        this.baseStep = baseStep;
         this.parkDistance = parkDistance;
         this.panic = panic;
     }
@@ -125,6 +122,18 @@ public class Executor {
                 cfg.fairMaxSkewMs());
         TradeClient client = new TradeClient(cfg.baseUrl(), auth, journal);
 
+        // Спецификация пары читается У ПЛОЩАДКИ, а не берётся из констант: шаги
+        // цены и количества у каждой пары свои. Нет пары в каталоге — НЕ
+        // ЗАПУСКАЕМСЯ: подставить чужие шаги хуже, чем упасть, потому что
+        // заявка уйдёт с неверной точностью и узнаем мы об этом на живых деньгах.
+        this.spec = stand.spec(symbol);
+        if (spec == null) {
+            throw new IllegalStateException("нет спецификации пары " + symbol
+                    + " в каталоге стенда — запускаться нельзя");
+        }
+        log.warn("спецификация {}: шаг цены {}, шаг количества {}, минимум заявки {}",
+                symbol, spec.quoteStep(), spec.baseStep(), spec.minNotional());
+
         // Скос, порог и всё остальное — из конфига симуляции, чтобы живое и
         // посчитанное отличались ровно одним: реальностью исполнения.
         //
@@ -140,7 +149,7 @@ public class Executor {
                 cfg.simRequoteThreshold(), quoteStep());
         QuotePolicy policy = buildPolicy(params);
         QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs,
-                minNotional(), tag, policy, ownPosition, positionSeed, baseStep, parkDistance,
+                minNotional(), tag, policy, ownPosition, positionSeed, spec.baseStep(), parkDistance,
                 alloc);
 
         log.warn("""
@@ -240,8 +249,17 @@ public class Executor {
      * Шаг цены пары. Берётся из спецификации, а не угадывается: округление не по
      * шагу — прямой путь к отказу постановки (ТЗ §4.6 п.6).
      */
+    /**
+     * Спецификация торгуемой пары, прочитанная у площадки при запуске.
+     *
+     * До 04.09.2026 шаги были зашиты под BTC/USDC константами прямо здесь, и
+     * запустить бота на другой паре было нельзя: у SOL шаг цены 0.001 против
+     * 0.01, шаг количества 1e-6 против 1e-8.
+     */
+    private StandReader.PairSpec spec;
+
     private double quoteStep() {
-        return 0.01;                     // BTC/USDC: проверено в revx_pair
+        return spec.quoteStep();
     }
 
     /**
@@ -252,6 +270,6 @@ public class Executor {
      * гарантированные отказы.
      */
     private double minNotional() {
-        return 0.1;                      // BTC/USDC: проверено в revx_pair
+        return spec.minNotional();
     }
 }

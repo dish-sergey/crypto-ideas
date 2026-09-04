@@ -84,6 +84,21 @@ public final class StandReader implements AutoCloseable {
         }
     }
 
+    /**
+     * Спецификация пары с площадки: шаги и минимальный номинал.
+     *
+     * ⚠️ Эти числа У КАЖДОЙ ПАРЫ СВОИ, и до 04.09.2026 они были зашиты под
+     * BTC/USDC прямо в {@link Executor}. Для SOL они другие: шаг цены 0.001
+     * против 0.01, шаг количества 1e-6 против 1e-8. Бот на SOL с BTC-шагами
+     * ставил бы цены неверной точности.
+     *
+     * @param minNotional {@code min_order_size_quote} — связывает именно он, а
+     *                    не {@code min_order_size}: у BTC это 0.1 USDC против
+     *                    пренебрежимых 1e-8 BTC
+     */
+    public record PairSpec(String symbol, double baseStep, double quoteStep, double minNotional) {
+    }
+
     private final Connection connection;
     private final List<String> memecoins;
     private final FairPrice.Limits limits;
@@ -109,6 +124,39 @@ public final class StandReader implements AutoCloseable {
      * @param lookbackMs сколько последних миллисекунд смотреть; берётся ПОСЛЕДНИЙ
      *                   снимок, а окно нужно лишь чтобы не читать всю базу
      */
+    /**
+     * Спецификация пары из каталога площадки.
+     *
+     * @return null, если пары в каталоге нет — и тогда бот обязан НЕ ЗАПУСКАТЬСЯ.
+     *         Подставить чужие шаги здесь хуже, чем упасть: заявка уйдёт с
+     *         неверной точностью цены, а узнаем мы об этом по отказам площадки
+     *         уже на живых деньгах.
+     */
+    public PairSpec spec(String symbol) {
+        try (java.sql.PreparedStatement ps = connection.prepareStatement(
+                "SELECT base_step, quote_step, min_order_size_quote FROM revx_pair "
+                        + "WHERE symbol = ? AND status = 'active'")) {
+            ps.setString(1, symbol);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    log.error("пары {} нет в каталоге revx_pair", symbol);
+                    return null;
+                }
+                PairSpec spec = new PairSpec(symbol, rs.getDouble(1), rs.getDouble(2),
+                        rs.getDouble(3));
+                if (!(spec.quoteStep() > 0) || !(spec.baseStep() > 0)
+                        || !(spec.minNotional() > 0)) {
+                    log.error("спецификация {} неполная: {}", symbol, spec);
+                    return null;
+                }
+                return spec;
+            }
+        } catch (Exception e) {
+            log.error("не прочитать спецификацию {}: {}", symbol, e.toString());
+            return null;
+        }
+    }
+
     public Fair latest(String base, long lookbackMs) {
         long since = System.currentTimeMillis() - lookbackMs;
         List<PairQuote> quotes = new ArrayList<>();
