@@ -221,13 +221,23 @@ public final class AllocRegistry implements AutoCloseable {
         setQty(botId, currency, own + delta, nowMs, sinceOf(botId, currency, nowMs));
     }
 
-    /** Продление аренды. Зовётся, пока жив ПРОЦЕСС, а не пока идёт котирование. */
-    public synchronized void heartbeat(String botId, String currency, long nowMs) {
+    /**
+     * Продление аренды — сразу по ВСЕМ валютам бота.
+     *
+     * ⚠️ Аренда принадлежит ПРОЦЕССУ, а не паре «бот+валюта», и продлевать её
+     * по одной валюте нельзя. 04.09.2026 сердцебиение шло только по базовой:
+     * строки USDC у всех троих истекали через пять минут, переставали считаться
+     * живыми, и `/free` показывал «свободно 46.21» при полностью разобранных
+     * деньгах. Затем бот A при обычном `/start` РАСПУСТИЛ кассу B и C как
+     * бесхозную — 13.19 и 14.74 USDC, — и оба остались без денег на покупку.
+     *
+     * Зовётся, пока жив процесс, независимо от того, идёт ли котирование.
+     */
+    public synchronized void heartbeat(String botId, long nowMs) {
         try (PreparedStatement ps = connection.prepareStatement(
-                "UPDATE claim SET heartbeat_ms = ? WHERE bot_id = ? AND currency = ?")) {
+                "UPDATE claim SET heartbeat_ms = ? WHERE bot_id = ?")) {
             ps.setLong(1, nowMs);
             ps.setString(2, botId);
-            ps.setString(3, currency);
             ps.executeUpdate();
         } catch (Exception e) {
             log.error("не продлить аренду: {}", e.getMessage());

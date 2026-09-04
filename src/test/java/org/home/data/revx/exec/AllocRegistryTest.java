@@ -93,10 +93,32 @@ class AllocRegistryTest {
         try (AllocRegistry r = open(dir)) {
             r.claim("a", BTC, 8 * LOT, TOTAL, 80_000, T0);
             long later = T0 + AllocRegistry.LEASE_MS + 1;
-            r.heartbeat("a", BTC, later);
+            r.heartbeat("a", later);
             assertEquals(8 * LOT, r.free(BTC, TOTAL, later + 1000).claimedLive(), 1e-15,
                     "продление спасает претензию");
             assertEquals(12 * LOT, r.free(BTC, TOTAL, later + 1000).free(), 1e-15);
+        }
+    }
+
+    @Test
+    void heartbeatRenewsEVERYcurrencyOfTheBot(@TempDir Path dir) {
+        // Аренда принадлежит ПРОЦЕССУ, а не паре «бот+валюта».
+        //
+        // 04.09.2026 сердцебиение шло только по базовой валюте: строки USDC
+        // истекали через пять минут, `/free` показывал «свободно 46.21» при
+        // полностью разобранных деньгах, и бот A обычным /start РАСПУСТИЛ кассу
+        // B и C — 13.19 и 14.74 USDC. Оба остались без денег на покупку.
+        try (AllocRegistry r = open(dir)) {
+            r.claim("a", BTC, 8 * LOT, TOTAL, 80_000, T0);
+            r.claim("a", "USDC", 18.27, 46.21, 80_000, T0);
+            long later = T0 + AllocRegistry.LEASE_MS + 1;
+            r.heartbeat("a", later);
+            assertEquals(8 * LOT, r.free(BTC, TOTAL, later + 1000).claimedLive(), 1e-15,
+                    "монеты продлились");
+            assertEquals(18.27, r.free("USDC", 46.21, later + 1000).claimedLive(), 1e-9,
+                    "ДЕНЬГИ ТОЖЕ обязаны продлиться одним сердцебиением");
+            assertEquals(46.21 - 18.27, r.free("USDC", 46.21, later + 1000).free(), 1e-9,
+                    "свободно — остаток счёта минус живая касса, а не весь счёт");
         }
     }
 

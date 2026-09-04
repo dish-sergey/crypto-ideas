@@ -318,6 +318,9 @@ public final class QuoteLoop implements Runnable {
 
     public void startQuoting() {
         if (quoting.compareAndSet(false, true)) {
+            // Иначе /status отвечает «котирует (не запущен)»: причина паузы
+            // держится до следующего тика и противоречит состоянию.
+            pausedReason = null;
             journal.event("start", "котирование включено");
             log.warn("КОТИРОВАНИЕ ВКЛЮЧЕНО: {} по {} USDC", symbol, params.size());
         }
@@ -1302,7 +1305,7 @@ public final class QuoteLoop implements Runnable {
             sb.append(String.format(java.util.Locale.ROOT,
                     "  до потолка не хватает: %.1f лота = %.2f %s%s%n",
                     lot > 0 ? (cap - myBase) / lot : 0, needQuote, quote,
-                    myQuote + 1e-9 >= needQuote ? " — покрыто" : " ← НЕ ПОКРЫТО"));
+                    myQuote >= needQuote * 0.995 ? " — покрыто" : " ← НЕ ПОКРЫТО"));
         }
         return sb.toString();
     }
@@ -1432,7 +1435,7 @@ public final class QuoteLoop implements Runnable {
             // Аренда продлевается, пока ЖИВ ПРОЦЕСС, а не пока идёт котирование:
             // /stop на час претензию терять не должен, а убитый процесс — должен.
             if (alloc != null) {
-                alloc.heartbeat(tag.id(), base, now);
+                alloc.heartbeat(tag.id(), now);
             }
             // Остатки перечитываются раз в минуту: исполнение могло случиться молча.
             refreshBalances();
