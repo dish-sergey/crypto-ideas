@@ -106,8 +106,13 @@ public class ExecReport {
         String url = "jdbc:sqlite:file:" + journalPath.replace('\\', '/') + "?mode=ro";
         try (Connection c = DriverManager.getConnection(url)) {
             try (PreparedStatement ps = c.prepareStatement(
+                    // Передачи инвентаря между ботами — не сделки с рынком, и в
+                    // разложение края они идти не должны: захват у них равен нулю
+                    // по построению (цена = справедливая), и они разбавили бы
+                    // измерение тем сильнее, чем чаще мы перезапускаем ботов.
                     "SELECT ts_ms, side, qty, price, fair, fee, status FROM exec_fill "
-                            + "WHERE ts_ms BETWEEN ? AND ? ORDER BY ts_ms")) {
+                            + "WHERE ts_ms BETWEEN ? AND ? "
+                            + "AND (status IS NULL OR status <> 'handover') ORDER BY ts_ms")) {
                 ps.setLong(1, fromMs);
                 ps.setLong(2, toMs);
                 try (ResultSet rs = ps.executeQuery()) {

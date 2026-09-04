@@ -154,6 +154,13 @@ public final class ExecBot implements Runnable {
             case "/status" -> send(status());
             case "/stats" -> send(stats());
             case "/limits" -> send(ExecLimits.describe(loop.botId()));
+            case "/free" -> send(loop.describeFree());
+            case "/claim" -> {
+                String[] parts = text.split("\s+");
+                send(parts.length < 2 ? "Сколько лотов? Например: /claim 8"
+                        : loop.claimLots(parseLots(parts[1])));
+            }
+            case "/release" -> send(loop.release());
             case "/pnl" -> send(PnlReport.render(journal, loop.stats().lastFair(),
                     loop.lotSize(), loop.base(), loop.stats().inventory()));
             case "/help" -> send(help());
@@ -166,11 +173,14 @@ public final class ExecBot implements Runnable {
         return """
                 Состояние: %s%s
                 Справедливая цена: %.2f
-                Инвентарь: %.8f
+                Инвентарь: %.8f (%.0f%% потолка, %.1f лота)
                 Постановок: %d, замен: %d, отмен: %d""".formatted(
                 s.state(),
                 s.pausedReason() == null ? "" : " (" + s.pausedReason() + ")",
-                s.lastFair(), s.inventory(), s.placements(), s.replaces(), s.cancels());
+                s.lastFair(), s.inventory(),
+                loop.inventoryCap() > 0 ? 100 * s.inventory() / loop.inventoryCap() : 0,
+                loop.lotSize() > 0 ? s.inventory() / loop.lotSize() : 0,
+                s.placements(), s.replaces(), s.cancels());
     }
 
     /**
@@ -190,6 +200,15 @@ public final class ExecBot implements Runnable {
                 s.replaces(), s.inventory(), journal.countRequests());
     }
 
+    /** Лоты человеку удобнее монет, но опечатку на порядок ловить всё равно надо. */
+    private static double parseLots(String s) {
+        try {
+            return Double.parseDouble(s.trim().replace(",", "."));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
     private String help() {
         return """
                 /status — состояние и текущие котировки
@@ -199,6 +218,9 @@ public final class ExecBot implements Runnable {
                 /stop   — выключить и снять заявки
                 /panic  — снять всё и выйти из процесса
                 /limits — жёсткие пределы (только показ)
+                /free   — сколько инвентаря свободно и кто чем владеет
+                /claim N — взять N свободных лотов (только пока не котирует)
+                /release — отдать свой инвентарь в общий котёл
 
                 Параметры котирования бот не меняет: они в конфиге и в коде.""";
     }

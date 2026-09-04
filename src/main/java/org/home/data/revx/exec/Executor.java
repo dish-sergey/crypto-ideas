@@ -55,6 +55,7 @@ public class Executor {
     private final double offset;
     private final BotTag tag;
     private final String journalPath;
+    private final String allocPath;
     private final double skewTarget;
     private final double costFloorMargin;
     private final double widening;
@@ -76,6 +77,7 @@ public class Executor {
                     @Value("${revx.exec.offset}") double offset,
                     @Value("${revx.exec.bot-id}") String botId,
                     @Value("${revx.exec.journal}") String journalPath,
+                    @Value("${revx.exec.alloc}") String allocPath,
                     @Value("${revx.exec.skew-target}") double skewTarget,
                     @Value("${revx.exec.cost-floor-margin}") double costFloorMargin,
                     @Value("${revx.exec.widening}") double widening,
@@ -96,6 +98,7 @@ public class Executor {
         this.offset = offset;
         this.tag = new BotTag(botId);
         this.journalPath = journalPath;
+        this.allocPath = allocPath;
         this.skewTarget = skewTarget;
         this.costFloorMargin = costFloorMargin;
         this.widening = widening;
@@ -112,6 +115,10 @@ public class Executor {
     public void run() {
         TradeAuth auth = TradeAuth.fromEnvironment();
         ExecJournal journal = new ExecJournal(journalPath);
+        // Реестр владения ОБЩИЙ для всех ботов машины: счёт у площадки один,
+        // субсчетов нет (проверено 04.09.2026), значит разделять инвентарь
+        // приходится нам. Путь намеренно вне каталога бота.
+        AllocRegistry alloc = new AllocRegistry(allocPath);
         StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
@@ -133,7 +140,8 @@ public class Executor {
                 cfg.simRequoteThreshold(), quoteStep());
         QuotePolicy policy = buildPolicy(params);
         QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs,
-                minNotional(), tag, policy, ownPosition, positionSeed, baseStep, parkDistance);
+                minNotional(), tag, policy, ownPosition, positionSeed, baseStep, parkDistance,
+                alloc);
 
         log.warn("""
 

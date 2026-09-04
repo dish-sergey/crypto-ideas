@@ -219,7 +219,15 @@ public final class ExecJournal implements AutoCloseable {
     }
 
     /** Одно исполнение из журнала — вход для {@link FifoLedger}. */
-    public record FillRow(long tsMs, boolean buy, double qty, double price, double fee) {
+    /**
+     *  handover передача инвентаря между ботами, а не сделка с рынком.
+     *                 Вся статистика (захват, κ, markout, «на сделку») обязана
+     *                 её исключать, иначе каждый перезапуск впрыскивает в
+     *                 измерения фальшивое исполнение. Книга партий, наоборот,
+     *                 её учитывает: партии передача действительно открывает.
+     */
+    public record FillRow(long tsMs, boolean buy, double qty, double price, double fee,
+                          boolean handover) {
     }
 
     /**
@@ -231,11 +239,12 @@ public final class ExecJournal implements AutoCloseable {
         List<FillRow> out = new ArrayList<>();
         try (Statement st = connection.createStatement();
              ResultSet rs = st.executeQuery(
-                     "SELECT ts_ms, side, qty, price, fee FROM exec_fill ORDER BY ts_ms")) {
+                     "SELECT ts_ms, side, qty, price, fee, status FROM exec_fill ORDER BY ts_ms")) {
             while (rs.next()) {
                 out.add(new FillRow(rs.getLong(1),
                         "BUY".equalsIgnoreCase(rs.getString(2)),
-                        rs.getDouble(3), rs.getDouble(4), rs.getDouble(5)));
+                        rs.getDouble(3), rs.getDouble(4), rs.getDouble(5),
+                        "handover".equalsIgnoreCase(rs.getString(6))));
             }
         } catch (Exception e) {
             log.error("не прочитались исполнения: {}", e.getMessage());
@@ -266,7 +275,7 @@ public final class ExecJournal implements AutoCloseable {
             String detail = rs.getString(2);
             double qty = Double.parseDouble(detail.trim().split("\\s+")[0]);
             double fair = rs.getDouble(3);
-            return qty > 0 && fair > 0 ? new FillRow(rs.getLong(1), true, qty, fair, 0) : null;
+            return qty > 0 && fair > 0 ? new FillRow(rs.getLong(1), true, qty, fair, 0, true) : null;
         } catch (Exception e) {
             log.error("не прочиталась затравка: {}", e.getMessage());
             return null;

@@ -142,6 +142,8 @@ public final class QuoteLoop implements Runnable {
     private volatile double lastTrustedFair;
     /** Относительное расстояние отвода; ≤ 0 — отвод выключен, работает отмена. */
     private final double parkDistance;
+    /** Реестр владения инвентарём: счёт у площадки один на всех ботов. */
+    private final AllocRegistry alloc;
     private final java.util.ArrayDeque<long[]> fairHistory = new java.util.ArrayDeque<>();
     private final org.home.data.revx.sim.EfficiencyRatio efficiency;
     private volatile String pausedReason = "не запущен";
@@ -163,7 +165,8 @@ public final class QuoteLoop implements Runnable {
                      Quoter.Params params, String symbol, long periodMs, double minNotional,
                      BotTag tag, org.home.data.revx.sim.QuotePolicy policy,
                      boolean ownPosition, double positionSeed, double baseStep,
-                     double parkDistance) {
+                     double parkDistance, AllocRegistry alloc) {
+        this.alloc = alloc;
         this.client = client;
         this.stand = stand;
         this.journal = journal;
@@ -238,6 +241,11 @@ public final class QuoteLoop implements Runnable {
     /** Метка бота: суточный лимит постановок у каждого свой (см. {@link ExecLimits}). */
     public String botId() {
         return tag.id();
+    }
+
+    /** Потолок инвентаря — знаменатель для доли в процентах. */
+    public double inventoryCap() {
+        return params.inventoryCap();
     }
 
     /** Размер лота — знаменатель, чтобы показывать инвентарь в лотах, а не в BTC. */
@@ -1095,6 +1103,130 @@ public final class QuoteLoop implements Runnable {
         ownCash -= side.sign() * qty * price;
         journal.putState(STATE_POSITION, inventory);
         journal.putState(STATE_CASH, ownCash);
+        // Реестр двигается ТОЛЬКО здесь — своими сделками. Захват возможен лишь
+        // при инициализации, иначе нельзя отличить «продал купленное» от «продал
+        // найденное», и проверка логики бота теряет смысл.
+        if (alloc != null) {
+            alloc.applyFill(tag.id(), base, side.sign() * qty, System.currentTimeMillis());
+        }
+    }
+
+    /**
+     * Что бот увидит перед захватом: сколько монет свободно и сколько это лотов
+     * против его собственной цели инвентаря.
+     */
+    public String describeFree() {
+        if (alloc == null) {
+            return "реестр владения не подключён";
+        }
+        refreshBalances();
+        long now = System.currentTimeMillis();
+        AllocRegistry.Free f = alloc.free(base, baseTotal(), now);
+        double lot = params.size();
+        double target = params.inventoryCap();
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format(java.util.Locale.ROOT,
+                "На счёте: %.8f %s = %.1f лота%n", f.venueTotal(), base,
+                lot > 0 ? f.venueTotal() / lot : 0));
+        sb.append(String.format(java.util.Locale.ROOT,
+                "Держат живые боты: %.8f = %.1f лота%n", f.claimedLive(),
+                lot > 0 ? f.claimedLive() / lot : 0));
+        if (f.claimedExpired() > 0) {
+            sb.append(String.format(java.util.Locale.ROOT,
+                    "Аренда истекла (можно забрать): %.8f = %.1f лота%n", f.claimedExpired(),
+                    lot > 0 ? f.claimedExpired() / lot : 0));
+        }
+        sb.append(String.format(java.util.Locale.ROOT,
+                "**Свободно: %.8f = %.1f лота**%n", f.free(), lot > 0 ? f.free() / lot : 0));
+        sb.append(String.format(java.util.Locale.ROOT,
+                "Моя претензия: %.8f = %.1f лота%n", alloc.own(tag.id(), base),
+                lot > 0 ? alloc.own(tag.id(), base) / lot : 0));
+        sb.append(String.format(java.util.Locale.ROOT,
+                "**Цель инвентаря: %.1f лота** (потолок %.8f)%n",
+                lot > 0 ? target / lot : 0, target));
+        for (AllocRegistry.Claim c : alloc.claims(base, now)) {
+            sb.append(String.format(java.util.Locale.ROOT, "  %s: %.1f лота%s%n",
+                    c.botId(), lot > 0 ? c.qty() / lot : 0,
+                    c.live() ? "" : " (аренда истекла)"));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Захват свободных лотов при инициализации.
+     *
+     * Разрешён ТОЛЬКО пока бот не котирует: во время работы инвентарь обязан
+     * быть функцией собственных сделок и ничего больше.
+     *
+     * @return текст для человека; захват либо состоялся, либо объяснён отказ
+     */
+    public String claimLots(double lots) {
+        if (alloc == null) {
+            return "реестр владения не подключён";
+        }
+        if (quoting.get()) {
+            return "Захват запрещён при включённом котировании: инвентарь во время "
+                    + "работы обязан меняться только своими сделками. Сначала /stop.";
+        }
+        if (!(lots > 0)) {
+            return "Сколько лотов брать?";
+        }
+        double price = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
+        if (!(price > 0)) {
+            return "Нет доверенной справедливой цены — передачу оценить нечем. "
+                    + "Подождите, пока опора заработает.";
+        }
+        refreshBalances();
+        double qty = lots * params.size();
+        long now = System.currentTimeMillis();
+        if (!alloc.claim(tag.id(), base, qty, baseTotal(), price, now)) {
+            return "Отказ: свободно меньше запрошенного.\n\n" + describeFree();
+        }
+        inventory += qty;
+        seedPosition += qty;
+        journal.putState(STATE_POSITION, inventory);
+        journal.putState(STATE_SEED, seedPosition);
+        journal.fill(null, "BUY", qty, price, price, 0, null, "handover");
+        journal.event("claim", String.format(java.util.Locale.ROOT,
+                "%.1f лота = %.8f %s по %.2f", lots, qty, base, price));
+        return String.format(java.util.Locale.ROOT,
+                "Захвачено %.1f лота = %.8f %s по справедливой %.2f.%n"
+                        + "Записано передачей (kind=handover), в статистику сделок не идёт.%n%n%s",
+                lots, qty, base, price, describeFree());
+    }
+
+    /** Отдать инвентарь в общий котёл. Заявки снимаются ДО освобождения. */
+    public String release() {
+        if (alloc == null) {
+            return "реестр владения не подключён";
+        }
+        if (quoting.get()) {
+            return "Сначала /stop: освобождать инвентарь под работающими заявками нельзя.";
+        }
+        double price = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
+        if (!(price > 0)) {
+            return "Нет доверенной справедливой цены — передачу оценить нечем.";
+        }
+        cancelAll("освобождение инвентаря");
+        reconcile("освобождение");
+        double qty = alloc.own(tag.id(), base);
+        if (qty <= 0) {
+            return "Держать нечего.";
+        }
+        alloc.release(tag.id(), base, price, System.currentTimeMillis());
+        journal.fill(null, "SELL", qty, price, price, 0, null, "handover");
+        journal.event("release", String.format(java.util.Locale.ROOT,
+                "%.8f %s по %.2f", qty, base, price));
+        inventory -= qty;
+        journal.putState(STATE_POSITION, inventory);
+        return String.format(java.util.Locale.ROOT,
+                "Освобождено %.8f %s по %.2f, закрыто по переоценке.%n%n%s",
+                qty, base, price, describeFree());
+    }
+
+    /** Остаток счёта по базовой валюте — знаменатель для реестра. */
+    private double baseTotal() {
+        return baseAvailable + (ask.venueId != null ? ask.size : 0);
     }
 
     private void rollCounters() {
@@ -1102,6 +1234,11 @@ public final class QuoteLoop implements Runnable {
         if (now - minuteStartMs >= 60_000) {
             minuteStartMs = now;
             replacesThisMinute = 0;
+            // Аренда продлевается, пока ЖИВ ПРОЦЕСС, а не пока идёт котирование:
+            // /stop на час претензию терять не должен, а убитый процесс — должен.
+            if (alloc != null) {
+                alloc.heartbeat(tag.id(), base, now);
+            }
             // Остатки перечитываются раз в минуту: исполнение могло случиться молча.
             refreshBalances();
         }

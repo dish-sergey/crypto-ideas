@@ -111,19 +111,34 @@ public final class PnlReport {
         }
         sb.append(String.format(Locale.ROOT, "Комиссии за всё время: %.4f%n%n", ledger.fees()));
 
-        sb.append("Окно   | сделок | реализовано | на сделку | оборот\n");
+        // Вторая книга — ТОЛЬКО по торговым сделкам. Передачи инвентаря между
+        // ботами в ней не участвуют: иначе каждый перезапуск впрыскивает в
+        // «реализовано» и в «на сделку» фальшивое исполнение по справедливой
+        // цене, и сравнивать ботов между собой станет нечем.
+        FifoLedger trading = new FifoLedger();
+        for (ExecJournal.FillRow f : fills) {
+            if (!f.handover()) {
+                trading.add(f.tsMs(), f.buy(), f.qty(), f.price(), f.fee());
+            }
+        }
+
+        sb.append("Окно   | сделок | реализовано | на сделку | оборот | передачи\n");
         long now = System.currentTimeMillis();
         for (int i = 0; i < WINDOWS.length; i++) {
             long from = now - WINDOWS[i] * 3600_000L;
-            int closed = ledger.closedSince(from);
-            double realised = ledger.realisedSince(from);
-            double qty = ledger.closedQtySince(from);
-            sb.append(String.format(Locale.ROOT, "%-6s | %6d | %+11.4f | %+9.5f | %.8f%n",
+            int closed = trading.closedSince(from);
+            double realised = trading.realisedSince(from);
+            double qty = trading.closedQtySince(from);
+            // Передачи — разница между полной книгой и торговой.
+            double handover = ledger.realisedSince(from) - realised;
+            sb.append(String.format(Locale.ROOT, "%-6s | %6d | %+11.4f | %+9.5f | %.8f | %+8.4f%n",
                     LABELS[i], closed, realised,
-                    closed > 0 ? realised / closed : 0, qty));
+                    closed > 0 ? realised / closed : 0, qty, handover));
         }
 
-        sb.append("\nВсего исполнений в журнале: ").append(fills.size());
+        long handovers = fills.stream().filter(ExecJournal.FillRow::handover).count();
+        sb.append("\nВсего исполнений в журнале: ").append(fills.size())
+                .append(", из них передач: ").append(handovers);
         sb.append("\n\nРеализовано — по ЗАКРЫТЫМ парам, от движения рынка не зависит.");
         sb.append("\nНереализовано — переоценка остатка, это ставка на рынок, а не заработок.");
         return sb.toString();
