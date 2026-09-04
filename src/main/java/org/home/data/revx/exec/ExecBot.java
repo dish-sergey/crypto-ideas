@@ -227,9 +227,12 @@ public final class ExecBot implements Runnable {
                 /panic  — снять всё и выйти из процесса
                 /limits — жёсткие пределы (только показ)
                 /free   — сколько инвентаря свободно и кто чем владеет
-                /claim N — взять N свободных лотов (только пока не котирует)
-                /release — отдать свой инвентарь в общий котёл
+                /claim N — взять N свободных лотов И деньги под них
+                           (только пока не котирует; 0 = только деньги)
+                /release — отдать свой инвентарь и кассу в общий котёл
+                /help   — это сообщение
 
+                Порядок при запуске: /free → /claim N → /start.
                 Параметры котирования бот не меняет: они в конфиге и в коде.""";
     }
 
@@ -242,16 +245,37 @@ public final class ExecBot implements Runnable {
         }
     }
 
+    /**
+     * Меню команд в Telegram.
+     *
+     * ⚠️ Список ЗДЕСЬ — отдельный от обработчика и от {@link #help()}, и три
+     * места приходится держать в согласии руками. 04.09.2026 добавили `/free`,
+     * `/claim`, `/release` и `/pnl` в обработчик, а меню не тронули — в клиенте
+     * их не стало видно вовсе. Добавляя команду, правь все три.
+     */
     private void registerCommands() {
         try {
-            call("setMyCommands", "commands=" + URLEncoder.encode("""
-                    [{"command":"status","description":"состояние"},
+            String response = call("setMyCommands", "commands=" + URLEncoder.encode("""
+                    [{"command":"status","description":"состояние и инвентарь в % потолка"},
+                     {"command":"pnl","description":"реализовано и нереализовано, окна 3ч-7дн"},
+                     {"command":"free","description":"кто чем владеет и сколько свободно"},
+                     {"command":"claim","description":"взять N свободных лотов и деньги"},
+                     {"command":"release","description":"отдать свой инвентарь и кассу"},
                      {"command":"stats","description":"исполнения против предсказания"},
                      {"command":"start","description":"включить котирование"},
                      {"command":"stop","description":"выключить и снять заявки"},
                      {"command":"panic","description":"снять всё и выйти"},
                      {"command":"limits","description":"жёсткие пределы"}]"""
                     .replaceAll("\\s*\\n\\s*", ""), StandardCharsets.UTF_8));
+            // ⚠️ Ответ обязателен к проверке. Telegram отвечает 200 и телом
+            // {"ok":false,...} — исключения не будет, и молчаливое выбрасывание
+            // ответа скрывало поломку регистрации ЦЕЛИКОМ: 04.09.2026 меню бота
+            // было пустым (0 команд), а в логе ни строчки. Узнали от человека.
+            if (response == null || !response.contains("\"ok\":true")) {
+                log.error("МЕНЮ КОМАНД НЕ ЗАРЕГИСТРИРОВАНО, Telegram ответил: {}", response);
+            } else {
+                log.info("меню команд зарегистрировано");
+            }
         } catch (Exception e) {
             log.warn("не зарегистрировались команды: {}", e.toString());
         }

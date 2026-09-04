@@ -222,13 +222,24 @@ public final class QuoteLoop implements Runnable {
         if (!(price > 0)) {
             return null;                  // цены нет — судить не о чем, гейт разберётся
         }
-        double need = Math.max(0, (params.inventoryCap() - inventory) * price);
         double have = alloc.own(tag.id(), quote);
-        if (need > 0 && have + 1e-9 < need) {
+        double oneLot = params.size() * price;
+        // Требовать ПОЛНЫЙ потолок нельзя: 04.09.2026 на счёте было $46.21 при
+        // сумме потолков трёх ботов $49.13, и такой гейт не пустил бы никого.
+        // Меньшая касса — это просто меньший ФАКТИЧЕСКИЙ потолок: покупка и так
+        // ограничена своей долей денег (см. sizeFor). Отказываем только когда
+        // не хватает даже на одну заявку — тогда бот способен лишь жечь
+        // суточный лимит отказами «Insufficient balance».
+        if (have + 1e-9 < Math.max(oneLot, minNotional)) {
             return String.format(java.util.Locale.ROOT,
-                    "Не хватает своей кассы: до потолка нужно %.2f %s, за ботом числится "
-                            + "%.2f. Возьмите недостающее через /claim.",
-                    need, quote, have);
+                    "Не хватает своей кассы: за ботом числится %.2f %s, на одну заявку "
+                            + "нужно %.2f. Возьмите деньги через /claim.",
+                    have, quote, Math.max(oneLot, minNotional));
+        }
+        double need = Math.max(0, (params.inventoryCap() - inventory) * price);
+        if (have + 1e-9 < need) {
+            log.warn("касса {} {} меньше потолка {}: фактический потолок инвентаря ниже",
+                    have, quote, need);
         }
         return null;
     }
@@ -480,7 +491,19 @@ public final class QuoteLoop implements Runnable {
         // (10 лотов × 0.0000125 × 4 400 ≈ 0.55). Продаж 201 против 192 покупок
         // при нулевой затравке — на споте это невозможно.
         double ownPositionCap = side == Side.SELL ? Math.max(0, inventory) : Double.MAX_VALUE;
-        return Math.min(want, Math.min(affordable, ownPositionCap));
+        // Симметрично для покупки: тратить можно только СВОЮ долю кассы, иначе
+        // бот покупает на деньги соседа. У бота B это стоило 197 отказов
+        // «Insufficient balance» за сутки — каждый из них тратит постановку из
+        // общей суточной тысячи.
+        //
+        // Меньшая касса означает меньший фактический потолок инвентаря, и это
+        // нормальное рабочее состояние: 04.09.2026 счёта хватало на $46.21 при
+        // сумме потолков $49.13, и требовать полного покрытия было бы нельзя.
+        double ownCashCap = Double.MAX_VALUE;
+        if (side == Side.BUY && alloc != null && price > 0) {
+            ownCashCap = Math.max(0, alloc.own(tag.id(), quote)) / price;
+        }
+        return Math.min(want, Math.min(Math.min(affordable, ownPositionCap), ownCashCap));
     }
 
     /**
@@ -1223,8 +1246,8 @@ public final class QuoteLoop implements Runnable {
             return "Захват запрещён при включённом котировании: инвентарь во время "
                     + "работы обязан меняться только своими сделками. Сначала /stop.";
         }
-        if (!(lots > 0)) {
-            return "Сколько лотов брать?";
+        if (lots < 0) {
+            return "Сколько лотов брать? Ноль означает «только деньги».";
         }
         double price = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
         if (!(price > 0)) {
@@ -1256,7 +1279,9 @@ public final class QuoteLoop implements Runnable {
         }
         if (takeQuote > 0 && !alloc.claim(tag.id(), quote, takeQuote, quoteTotal, price, now)) {
             // Монеты уже взяты — возвращаем, чтобы не остаться в половинном состоянии.
-            alloc.applyFill(tag.id(), base, -qty, now);
+            if (qty > 0) {
+                alloc.applyFill(tag.id(), base, -qty, now);
+            }
             return "Отказ: деньги забрать не удалось, монеты возвращены.\n\n" + describeFree();
         }
         inventory += qty;
@@ -1265,7 +1290,9 @@ public final class QuoteLoop implements Runnable {
         journal.putState(STATE_POSITION, inventory);
         journal.putState(STATE_SEED, seedPosition);
         journal.putState(STATE_CASH, ownCash);
-        journal.fill(null, "BUY", qty, price, price, 0, null, "handover");
+        if (qty > 0) {
+            journal.fill(null, "BUY", qty, price, price, 0, null, "handover");
+        }
         journal.event("claim", String.format(java.util.Locale.ROOT,
                 "%.1f лота = %.8f %s по %.2f, плюс %.2f %s",
                 lots, qty, base, price, takeQuote, quote));
