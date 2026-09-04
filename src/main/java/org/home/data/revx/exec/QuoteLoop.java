@@ -50,6 +50,16 @@ public final class QuoteLoop implements Runnable {
      * и вывод «её там нет, значит исполнилась» на свежем id даёт дубль.
      */
     private static final long ADOPT_GRACE_MS = 5_000L;
+    /**
+     * Какую долю потолка обязана покрывать своя касса, чтобы бот пустили в работу.
+     *
+     * Полное покрытие требовать нельзя: 04.09.2026 счёта хватало на $46.21 при
+     * сумме потолков трёх ботов $49.13, и строгий порог не пустил бы третьего
+     * из-за 11% нехватки. Ноль тоже не годится: бот с четвертью денег — уже
+     * другой бот, и сравнивать его с остальными нечестно.
+     */
+    private static final double MIN_FUNDING_SHARE = 0.80;
+
     /** Как часто сверяться с книгой площадки, даже когда всё выглядит хорошо. */
     private static final long RECONCILE_PERIOD_MS = 60_000L;
     /** Сколько расхождение позиции должно продержаться, чтобы стать тревогой. */
@@ -271,22 +281,37 @@ public final class QuoteLoop implements Runnable {
         }
         double have = alloc.own(tag.id(), quote);
         double oneLot = params.size() * price;
-        // Требовать ПОЛНЫЙ потолок нельзя: 04.09.2026 на счёте было $46.21 при
-        // сумме потолков трёх ботов $49.13, и такой гейт не пустил бы никого.
-        // Меньшая касса — это просто меньший ФАКТИЧЕСКИЙ потолок: покупка и так
-        // ограничена своей долей денег (см. sizeFor). Отказываем только когда
-        // не хватает даже на одну заявку — тогда бот способен лишь жечь
-        // суточный лимит отказами «Insufficient balance».
         if (have + 1e-9 < Math.max(oneLot, minNotional)) {
             return String.format(java.util.Locale.ROOT,
                     "Не хватает своей кассы: за ботом числится %.2f %s, на одну заявку "
-                            + "нужно %.2f. Возьмите деньги через /claim.",
+                            + "нужно %.2f.",
                     have, quote, Math.max(oneLot, minNotional));
         }
         double need = Math.max(0, (params.inventoryCap() - inventory) * price);
-        if (have + 1e-9 < need) {
-            log.warn("касса {} {} меньше потолка {}: фактический потолок инвентаря ниже",
-                    have, quote, need);
+        if (need <= 0) {
+            return null;                  // инвентарь уже у потолка, покупать не на что
+        }
+        // Порог покрытия. Требовать ПОЛНОГО покрытия нельзя: 04.09.2026 на счёте
+        // было $46.21 при сумме потолков трёх ботов $49.13, и строгий гейт не
+        // пустил бы третьего из-за 11% нехватки. Но и стартовать с любой
+        // недостачей неправильно: бот с четвертью денег — это уже другой бот, и
+        // сравнивать его с остальными нечестно.
+        //
+        // Недостача при этом БЕЗОПАСНА: покупка ограничена своей долей кассы
+        // (см. sizeFor), поэтому в чужие деньги бот не залезет и отказов
+        // «Insufficient balance» не наберёт. Порог здесь про сопоставимость
+        // измерения, а не про риск.
+        double share = have / need;
+        if (share + 1e-9 < MIN_FUNDING_SHARE) {
+            return String.format(java.util.Locale.ROOT,
+                    "Касса покрывает только %.0f%% потолка (%.2f из %.2f %s), нужно не "
+                            + "меньше %.0f%%. Долейте на счёт или освободите кассу у "
+                            + "другого бота через /release.",
+                    share * 100, have, need, quote, MIN_FUNDING_SHARE * 100);
+        }
+        if (share < 1) {
+            log.warn("касса покрывает {}% потолка: фактический потолок инвентаря ниже",
+                    Math.round(share * 100));
         }
         return null;
     }
@@ -329,6 +354,11 @@ public final class QuoteLoop implements Runnable {
     /** Метка бота: суточный лимит постановок у каждого свой (см. {@link ExecLimits}). */
     public String botId() {
         return tag.id();
+    }
+
+    /** Цель скоса: доля потолка, к которой котировщик тянет инвентарь. */
+    public double skewTarget() {
+        return params.skewTarget();
     }
 
     /** Потолок инвентаря — знаменатель для доли в процентах. */
@@ -655,7 +685,7 @@ public final class QuoteLoop implements Runnable {
      * «Не более N за любые 24 часа» безопасно и при обнулении в полночь, и при
      * скользящем окне у них; обратное неверно.
      */
-    private long placementsLastDay() {
+    public long placementsLastDay() {
         return journal.placementsSince(System.currentTimeMillis() - 86_400_000L);
     }
 

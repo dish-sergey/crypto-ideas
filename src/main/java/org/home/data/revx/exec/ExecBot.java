@@ -204,15 +204,28 @@ public final class ExecBot implements Runnable {
      */
     private String stats() {
         QuoteLoop.Stats s = loop.stats();
+        double cap = loop.inventoryCap();
+        double lot = loop.lotSize();
+        int limit = ExecLimits.maxPlacementsPerDay(loop.botId());
+        // ⚠️ Постановки берутся из ЖУРНАЛА за скользящие 24 часа — тем же
+        // способом, каким считает предел. Раньше здесь стоял счётчик в памяти,
+        // и он обнулялся при каждом запуске: 04.09.2026 бот показывал
+        // «0 из 400» и в ту же секунду блокировался на 407 из 400.
+        long used = loop.placementsLastDay();
         return """
                 Исполнений: %d
-                Предсказано моделью: 104 в сутки
-                Постановок сегодня: %d из %d
+                Постановок за 24 ч: %d из %d (осталось %d)
                 Замен: %d
-                Инвентарь: %.8f
+                Инвентарь: %.8f = %.1f лота (%.0f%% потолка)
+                Цель скоса: %.0f%% потолка = %.1f лота
                 Записей в журнале: %d""".formatted(
-                s.fills(), s.placements(), ExecLimits.maxPlacementsPerDay(loop.botId()),
-                s.replaces(), s.inventory(), journal.countRequests());
+                s.fills(), used, limit, Math.max(0, limit - used),
+                s.replaces(), s.inventory(),
+                lot > 0 ? s.inventory() / lot : 0,
+                cap > 0 ? 100 * s.inventory() / cap : 0,
+                loop.skewTarget() * 100,
+                lot > 0 ? loop.skewTarget() * cap / lot : 0,
+                journal.countRequests());
     }
 
     /** Лоты человеку удобнее монет, но опечатку на порядок ловить всё равно надо. */
