@@ -240,6 +240,16 @@ public final class QuoteLoop implements Runnable {
         return tag.id();
     }
 
+    /** Размер лота — знаменатель, чтобы показывать инвентарь в лотах, а не в BTC. */
+    public double lotSize() {
+        return params.size();
+    }
+
+    /** Базовая валюта пары: для подписей в отчётах. */
+    public String base() {
+        return base;
+    }
+
     public Stats stats() {
         return new Stats(placements, replaces, cancels, fills, inventory, lastFair,
                 quoting.get() ? "котирует" : "остановлен", pausedReason);

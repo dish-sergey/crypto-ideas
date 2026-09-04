@@ -10,6 +10,8 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Журнал исполнителя (ТЗ §6: «полный журнал всех отправленных запросов и ответов»).
@@ -213,6 +215,61 @@ public final class ExecJournal implements AutoCloseable {
             ps.executeUpdate();
         } catch (Exception e) {
             log.error("не записалось исполнение: {}", e.getMessage());
+        }
+    }
+
+    /** Одно исполнение из журнала — вход для {@link FifoLedger}. */
+    public record FillRow(long tsMs, boolean buy, double qty, double price, double fee) {
+    }
+
+    /**
+     * Все исполнения по времени. Читается целиком: за неделю их сотни, а книга
+     * партий по построению требует ВСЮ историю — остаток сегодня объясняется
+     * покупками произвольной давности.
+     */
+    public synchronized List<FillRow> fills() {
+        List<FillRow> out = new ArrayList<>();
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT ts_ms, side, qty, price, fee FROM exec_fill ORDER BY ts_ms")) {
+            while (rs.next()) {
+                out.add(new FillRow(rs.getLong(1),
+                        "BUY".equalsIgnoreCase(rs.getString(2)),
+                        rs.getDouble(3), rs.getDouble(4), rs.getDouble(5)));
+            }
+        } catch (Exception e) {
+            log.error("не прочитались исполнения: {}", e.getMessage());
+        }
+        return out;
+    }
+
+    /**
+     * Затравка позиции: когда принята и сколько.
+     *
+     * У неё НЕТ цены входа — это позиция, существовавшая до бота. Для книги
+     * партий цена нужна, и берётся справедливая цена того момента: то есть бот
+     * считается «купившим» остаток по рынку в секунду своего первого запуска.
+     * Условность, но единственная, при которой реализованный результат СОБСТВЕННОЙ
+     * торговли остаётся верным.
+     */
+    public synchronized FillRow seed() {
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT e.ts_ms, e.detail, (SELECT q.fair FROM exec_quote q "
+                             + "WHERE q.ts_ms <= e.ts_ms AND q.fair > 0 "
+                             + "ORDER BY q.ts_ms DESC LIMIT 1) fair "
+                             + "FROM exec_event e WHERE e.kind = 'position_seed' "
+                             + "ORDER BY e.ts_ms LIMIT 1")) {
+            if (!rs.next()) {
+                return null;
+            }
+            String detail = rs.getString(2);
+            double qty = Double.parseDouble(detail.trim().split("\\s+")[0]);
+            double fair = rs.getDouble(3);
+            return qty > 0 && fair > 0 ? new FillRow(rs.getLong(1), true, qty, fair, 0) : null;
+        } catch (Exception e) {
+            log.error("не прочиталась затравка: {}", e.getMessage());
+            return null;
         }
     }
 

@@ -154,6 +154,8 @@ public final class ExecBot implements Runnable {
             case "/status" -> send(status());
             case "/stats" -> send(stats());
             case "/limits" -> send(ExecLimits.describe(loop.botId()));
+            case "/pnl" -> send(PnlReport.render(journal, loop.stats().lastFair(),
+                    loop.lotSize(), loop.base(), loop.stats().inventory()));
             case "/help" -> send(help());
             default -> { }                // неизвестная команда — без ответа
         }
@@ -192,6 +194,7 @@ public final class ExecBot implements Runnable {
         return """
                 /status — состояние и текущие котировки
                 /stats  — исполнения против предсказания модели
+                /pnl    — реализовано и нереализовано по FIFO, окна 3ч…7дн
                 /start  — включить котирование
                 /stop   — выключить и снять заявки
                 /panic  — снять всё и выйти из процесса
