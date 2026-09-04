@@ -76,7 +76,7 @@ public final class ExecBot implements Runnable {
         registerCommands();
         dropBacklog();
         send("Исполнитель запущен. Котирование ВЫКЛЮЧЕНО — включить: /start\n\n"
-                + ExecLimits.describe(loop.botId()));
+                + loop.profile() + "\n" + ExecLimits.describe(loop.botId()));
         while (alive) {
             try {
                 String body = call("getUpdates?timeout=25&offset=" + offset, null);
@@ -185,7 +185,7 @@ public final class ExecBot implements Runnable {
 
     private String status() {
         QuoteLoop.Stats s = loop.stats();
-        return """
+        return loop.profile() + """
                 Состояние: %s%s
                 Справедливая цена: %.2f
                 Инвентарь: %.8f (%.0f%% потолка, %.1f лота)
@@ -204,6 +204,7 @@ public final class ExecBot implements Runnable {
      */
     private String stats() {
         QuoteLoop.Stats s = loop.stats();
+        String head = loop.profile() + "\n";
         double cap = loop.inventoryCap();
         double lot = loop.lotSize();
         int limit = ExecLimits.maxPlacementsPerDay(loop.botId());
@@ -212,7 +213,7 @@ public final class ExecBot implements Runnable {
         // и он обнулялся при каждом запуске: 04.09.2026 бот показывал
         // «0 из 400» и в ту же секунду блокировался на 407 из 400.
         long used = loop.placementsLastDay();
-        return """
+        return head + """
                 Исполнений: %d
                 Постановок за 24 ч: %d из %d (осталось %d)
                 Замен: %d

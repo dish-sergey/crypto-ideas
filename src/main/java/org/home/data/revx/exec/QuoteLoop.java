@@ -359,6 +359,37 @@ public final class QuoteLoop implements Runnable {
         return tag.id();
     }
 
+    /**
+     * Кто этот бот и чем торгует — шапка любого ответа в Telegram.
+     *
+     * Ботов на счёте несколько, у каждого свой чат, и отличаются они парой и
+     * настройками. Без этой строки в переписке нельзя понять, на что смотришь:
+     * 05.09.2026 бот B переезжает с BTC на SOL, а чат у него остаётся прежним.
+     */
+    public String profile() {
+        double price = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
+        double lot = params.size();
+        double cap = params.inventoryCap();
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format(java.util.Locale.ROOT, "Бот %s · %s%n",
+                tag.id().toUpperCase(java.util.Locale.ROOT), symbol));
+        sb.append(String.format(java.util.Locale.ROOT,
+                "Отступ %.1f б.п., скос %.2f%%, цель %.0f%% потолка%n",
+                params.offset() * 10_000, params.skewK() * 100, params.skewTarget() * 100));
+        sb.append(String.format(java.util.Locale.ROOT, "Лот %s %s%s, потолок %.1f лота%s%n",
+                fmt(lot), base,
+                price > 0 ? String.format(java.util.Locale.ROOT, " (%.2f %s)",
+                        lot * price, quote) : "",
+                lot > 0 ? cap / lot : 0,
+                price > 0 ? String.format(java.util.Locale.ROOT, " (%.2f %s)",
+                        cap * price, quote) : ""));
+        sb.append(String.format(java.util.Locale.ROOT,
+                "Период опроса %d мс, отвод заявок %s%n", periodMs,
+                parkDistance > 0 ? String.format(java.util.Locale.ROOT, "%.0f%%",
+                        parkDistance * 100) : "выключен"));
+        return sb.toString();
+    }
+
     /** Цель скоса: доля потолка, к которой котировщик тянет инвентарь. */
     public double skewTarget() {
         return params.skewTarget();
