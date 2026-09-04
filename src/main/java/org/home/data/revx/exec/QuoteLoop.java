@@ -71,6 +71,13 @@ public final class QuoteLoop implements Runnable {
     private static final String STATE_POSITION = "position";
     private static final String STATE_CASH = "cash";
     private static final String STATE_SEED = "seed_position";
+    /**
+     * База для КАССЫ. До 04.09.2026 её не было вовсе — в расчёт подставлялся
+     * ноль, и любая передача денег выглядела торговым результатом: захват
+     * прибылью, освобождение убытком. Бот B после /release отчитался об убытке
+     * −6.77 USDC, которого не было.
+     */
+    private static final String STATE_SEED_CASH = "seed_cash";
 
     private static final Pattern VENUE_ID =
             Pattern.compile("\"venue_order_id\"\\s*:\\s*\"([^\"]+)\"");
@@ -133,6 +140,8 @@ public final class QuoteLoop implements Runnable {
     private final double positionSeed;
     /** Позиция, принятая за точку отсчёта P&L: с неё началась жизнь этого бота. */
     private volatile double seedPosition;
+    /** Та же точка отсчёта для кассы: передачи двигают её вместе с остатком. */
+    private volatile double seedCash;
     private volatile long mismatchSinceMs;
     private volatile long mismatchWarnedMs;
 
@@ -262,7 +271,9 @@ public final class QuoteLoop implements Runnable {
             return "Деньги забрать не удалось.";
         }
         ownCash += take;
+        seedCash += take;
         journal.putState(STATE_CASH, ownCash);
+        journal.putState(STATE_SEED_CASH, seedCash);
         journal.event("claim", String.format(java.util.Locale.ROOT,
                 "автозахват при старте: %.2f %s", take, quote));
         return String.format(java.util.Locale.ROOT,
@@ -972,13 +983,16 @@ public final class QuoteLoop implements Runnable {
      * свободно или в резерве.
      */
     private void checkTradingPnl() {
-        if (!startCaptured || !(lastFair > 0)) {
+        // Только пока котируем. Иначе предупреждение повторяется каждую минуту у
+        // уже остановленного бота: 04.09.2026 бот B после /release прислал его
+        // трижды подряд, хотя котирование выключилось первым же разом.
+        if (!quoting.get() || !startCaptured || !(lastFair > 0)) {
             return;
         }
         // При своей позиции касса тоже своя: разница остатков аккаунта содержит
         // сделки соседнего бота и торговым результатом этого бота не является.
         double pnl = ownPosition
-                ? tradingPnl(ownCash, 0, inventory, seedPosition, lastFair)
+                ? tradingPnl(ownCash, seedCash, inventory, seedPosition, lastFair)
                 : tradingPnl(quoteTotal, startQuote, inventory, startInventory, lastFair);
         if (pnl < -ExecLimits.MAX_TRADING_LOSS_USDC) {
             String message = ("ОСТАНОВКА: торговый убыток %s USDC против buy & hold превысил "
@@ -1225,6 +1239,8 @@ public final class QuoteLoop implements Runnable {
             ownCash = savedCash == null ? 0 : savedCash;
             Double savedSeed = journal.getState(STATE_SEED);
             seedPosition = savedSeed == null ? 0 : savedSeed;
+            Double savedSeedCash = journal.getState(STATE_SEED_CASH);
+            seedCash = savedSeedCash == null ? 0 : savedSeedCash;
             log.warn("позиция восстановлена из журнала: {} {}, касса {}",
                     fmt(inventory), base, fmt(ownCash));
             return;
@@ -1312,9 +1328,21 @@ public final class QuoteLoop implements Runnable {
                     c.live() ? "" : "  (аренда истекла — можно забрать)"));
         }
 
+        // ⚠️ Свободное округляется ВНИЗ, а не «как получится».
+        //
+        // 04.09.2026 здесь стоял %.1f: свободно было 9.859 лота, напечаталось
+        // «9.9», человек скопировал подсказку в /claim 9.9 и получил отказ.
+        // Число, которое предлагают ввести, обязано быть заведомо принимаемым —
+        // округление вверх превращает подсказку в ловушку.
+        double freeLots = lot > 0 ? Math.floor(fb.free() / lot * 10) / 10 : 0;
+        double freeCash = Math.floor(fq.free() * 100) / 100;
         sb.append(String.format(java.util.Locale.ROOT,
-                "%nСВОБОДНО%n  %s: %.1f лота (%.8f)%n  %s: %.2f%n%n",
-                base, lot > 0 ? fb.free() / lot : 0, fb.free(), quote, fq.free()));
+                "%nСВОБОДНО%n  %s: %.1f лота (%.8f)%n  %s: %.2f%n",
+                base, freeLots, fb.free(), quote, freeCash));
+        if (freeLots > 0) {
+            sb.append(String.format(java.util.Locale.ROOT, "  взять всё: /claim %.1f%n", freeLots));
+        }
+        sb.append("\n");
 
         // Своё состояние — отдельным блоком и без двусмысленных слов: «держу
         // сейчас» это факт, а не заявка на будущее, и /claim к нему ПРИБАВЛЯЕТ.
@@ -1395,12 +1423,18 @@ public final class QuoteLoop implements Runnable {
             }
             return "Отказ: деньги забрать не удалось, монеты возвращены.\n\n" + describeFree();
         }
+        // Передача двигает и позицию, и ЕЁ ТОЧКУ ОТСЧЁТА — иначе она попадёт в
+        // торговый результат. Захват денег без сдвига базы выглядел бы прибылью,
+        // освобождение — убытком; на этом бот B отчитался о −6.77 USDC, которых
+        // не было (04.09.2026).
         inventory += qty;
         seedPosition += qty;
         ownCash += takeQuote;
+        seedCash += takeQuote;
         journal.putState(STATE_POSITION, inventory);
         journal.putState(STATE_SEED, seedPosition);
         journal.putState(STATE_CASH, ownCash);
+        journal.putState(STATE_SEED_CASH, seedCash);
         if (qty > 0) {
             journal.fill(null, "BUY", qty, price, price, 0, null, "handover");
         }
@@ -1439,12 +1473,16 @@ public final class QuoteLoop implements Runnable {
             alloc.release(tag.id(), base, price, now);
             journal.fill(null, "SELL", qty, price, price, 0, null, "handover");
             inventory -= qty;
+            seedPosition -= qty;
             journal.putState(STATE_POSITION, inventory);
+            journal.putState(STATE_SEED, seedPosition);
         }
         if (cash > 0) {
             alloc.release(tag.id(), quote, price, now);
             ownCash -= cash;
+            seedCash -= cash;
             journal.putState(STATE_CASH, ownCash);
+            journal.putState(STATE_SEED_CASH, seedCash);
         }
         journal.event("release", String.format(java.util.Locale.ROOT,
                 "%.8f %s и %.2f %s по %.2f", qty, base, cash, quote, price));
