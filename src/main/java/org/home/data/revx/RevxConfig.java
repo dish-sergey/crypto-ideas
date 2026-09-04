@@ -100,6 +100,7 @@ public class RevxConfig {
     private final List<Double> simUnloadStallLadder;
     private final double simUnloadStallMargin;
     private final int simWindowSeconds;
+    private final List<Double> simCostAwareLadder;
     private final double simGridMargin;
     private final double simGridBaseStep;
     private final double simGridWidening;
@@ -222,6 +223,7 @@ public class RevxConfig {
             @Value("${revx.sim.unload-stall-ladder}") List<Double> simUnloadStallLadder,
             @Value("${revx.sim.unload-stall-margin}") double simUnloadStallMargin,
             @Value("${revx.sim.window-seconds}") int simWindowSeconds,
+            @Value("${revx.sim.cost-aware-ladder}") List<Double> simCostAwareLadder,
             @Value("${revx.sim.grid-margin}") double simGridMargin,
             @Value("${revx.sim.grid-base-step}") double simGridBaseStep,
             @Value("${revx.sim.grid-widening}") double simGridWidening,
@@ -341,6 +343,7 @@ public class RevxConfig {
         this.simUnloadStallLadder = simUnloadStallLadder;
         this.simUnloadStallMargin = simUnloadStallMargin;
         this.simWindowSeconds = simWindowSeconds;
+        this.simCostAwareLadder = simCostAwareLadder;
         this.simGridMargin = simGridMargin;
         this.simGridBaseStep = simGridBaseStep;
         this.simGridWidening = simGridWidening;
@@ -749,6 +752,14 @@ public class RevxConfig {
      */
     public double[] simUnloadLadder() {
         return simUnloadLadder.stream().mapToDouble(Double::doubleValue).toArray();
+    }
+
+    /**
+     * Лестница потолка поправки «отступ знает о себестоимости» (док. 152).
+     * Ноль — правило выключено, опорная строка.
+     */
+    public double[] simCostAwareLadder() {
+        return simCostAwareLadder.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     /** Лестница застоя: сколько окон без продажи включает разгрузку. */

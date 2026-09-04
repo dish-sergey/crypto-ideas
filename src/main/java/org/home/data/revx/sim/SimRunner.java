@@ -504,6 +504,20 @@ public class SimRunner {
                     new SimEngine(base, limits, cfg.simMakerFee(), p).run(data.windows())));
         }
 
+        // Отступ, знающий о СЕБЕСТОИМОСТИ (док. 152). Асимметричная поправка:
+        // выше цели и в прибыли — придвинуть аск (разгрузиться в деньгах); выше
+        // цели и под водой — отодвинуть бид (замедлить набор). Потолок поправки
+        // единицы б.п.: трогается ОТСТУП, а не цена, и это отличает правило от
+        // провалившейся UnloadPolicy, отдававшей весь спред.
+        List<RatioRung> costAware = new ArrayList<>();
+        for (double shift : cfg.simCostAwareLadder()) {
+            QuotePolicy p = shift <= 0 ? new Quoter(base)
+                    : new CostAwarePolicy(new Quoter(base), cfg.simUnloadTarget(),
+                            base.inventoryCap(), shift);
+            costAware.add(new RatioRung(shift,
+                    new SimEngine(base, limits, cfg.simMakerFee(), p).run(data.windows())));
+        }
+
         // Разгрузка ПРИ ЗАСТОЕ (док. 151 §5). Отличие от предыдущей лестницы одно
         // и решающее: цена привязана к КНИГЕ, а не к нашему входу. Правило ставит
         // аск первым в книге (лучший аск − тик) и только когда продаж давно не
@@ -685,7 +699,7 @@ public class SimRunner {
 
         String markdown = render(symbol, hours, data, base, limits, runs, baseResult, ladder,
                 skewLadder, capLadder, latencyLadder, driftLadder, ratioLadder, shapeLadder,
-                cross, stopLadder, targetLadder, targetFloored, hedgeLadder, hedgeBandLadder, leashLadder, lotLadder, dislocation, wideStep, costFloor, unload, stallUnload, gridMargin, gridWidening, gridLots,
+                cross, stopLadder, targetLadder, targetFloored, hedgeLadder, hedgeBandLadder, leashLadder, lotLadder, dislocation, wideStep, costFloor, unload, stallUnload, costAware, gridMargin, gridWidening, gridLots,
                 frozenCool, frozenAge, stickyOuter, stickyInner, queueControl,
                 anchorDepth, noSkewResult, ownBookResult);
         write(out, markdown);
@@ -1091,6 +1105,7 @@ public class SimRunner {
                           List<DislocationRung> dislocation,
                           List<RatioRung> wideStep, List<RatioRung> costFloor,
                           List<RatioRung> unload, List<RatioRung> stallUnload,
+                          List<RatioRung> costAware,
                           List<GridRung> gridMargin, List<GridRung> gridWidening,
                           List<GridRung> gridLots,
                           List<RatioRung> frozenCool, List<RatioRung> frozenAge,
@@ -1863,6 +1878,7 @@ public class SimRunner {
 
         renderUnload(sb, unload, baseResult, base);
         renderStallUnload(sb, stallUnload, data);
+        renderCostAware(sb, costAware, baseResult);
         sb.append("### Сетка с якорем на себестоимости (док. 115)\n\n");
         sb.append("Другой механизм, а не настройка. У котировщика аск привязан к рынку "
                 + "(`справедливая × (1 + отступ − скос)`), и при уходе цены вниз скос "
@@ -3112,6 +3128,62 @@ public class SimRunner {
                 + "срабатывает почти всегда, пока инвентарь высок, и превращается в "
                 + "«котировать у́же» — то есть в лестницу отступа, давно измеренную. Смысл "
                 + "именно в редком срабатывании.\n\n");
+    }
+
+    /**
+     * Отступ, знающий о себестоимости (док. 152).
+     *
+     * Асимметричное правило: выше цели и в прибыли — придвинуть АСК, выше цели и
+     * под водой — отодвинуть БИД. Потолок поправки единицы б.п., то есть
+     * трогается отступ, а не цена.
+     */
+    private void renderCostAware(StringBuilder sb, List<RatioRung> ladder,
+                                 SimEngine.Result baseResult) {
+        if (ladder.isEmpty()) {
+            return;
+        }
+        sb.append("### Отступ, знающий о себестоимости (док. 152)\n\n");
+        sb.append("Нынешний скос знает только УРОВЕНЬ инвентаря и ничего — о том, дорого "
+                + "он куплен или дёшево. А это разные положения, и правило асимметрично "
+                + "по знаку нереализованного:\n\n");
+        sb.append("- **выше цели и в прибыли** → аск придвигается к рынку: разгружаемся "
+                + "до цели и в деньгах;\n");
+        sb.append("- **выше цели и под водой** → бид отодвигается от рынка: набор "
+                + "замедляется. Аск не трогаем — продавать в убыток это пол по "
+                + "себестоимости наоборот, и он проигран в док. 147.\n\n");
+        sb.append("Поправка выходит на потолок при **0.5%** нереализованного — это "
+                + "наблюдённый на живых ботах разброс себестоимости против рынка "
+                + "(03.09.2026: +0.33%, +0.89%, +0.44%; наутро −0.167%).\n\n");
+        sb.append("| Потолок поправки | Исполнений | Покупок / продаж | Захват, б.п. "
+                + "| Чистый край 60 с | Ср. инвентарь | **Total** | **Buy & hold** "
+                + "| **При возврате цены** |\n");
+        sb.append("|---|---|---|---|---|---|---|---|---|\n");
+        for (RatioRung rung : ladder) {
+            SimEngine.Result r = rung.result();
+            long buys = r.fills().stream().filter(f -> f.side() == Side.BUY).count();
+            sb.append("| ").append(rung.ratio() <= 0 ? "**правило выключено**"
+                            : round(rung.ratio() * 10_000, 1) + " б.п.")
+                    .append(" | ").append(r.fills().size())
+                    .append(" | ").append(buys).append(" / ").append(r.fills().size() - buys)
+                    .append(" | ").append(round(captureBp(r), 2))
+                    .append(" | ").append(round(netEdgeBp(r, 60_000), 2))
+                    .append(" | ").append(round(r.avgInventory(), 5))
+                    .append(" | **").append(round(r.pnl().total(), 1)).append("**")
+                    .append(" | ").append(round(r.buyAndHoldPnl(), 1))
+                    .append(" | ").append(round(r.pnlAtStart(), 1))
+                    .append(" |\n");
+        }
+        sb.append("\n⚠️ **Правило меняет экспозицию, поэтому одно окно ничего не решает.** "
+                + "На растущем окне «разгрузка в прибыли» продаёт раньше и теряет; на "
+                + "падающем «замедление набора под водой» экономит. По док. 148 §8 "
+                + "сравнивать такой механизм надо не с «выключено», а с прямой покупкой "
+                + "той же экспозиции — поэтому решающая колонка здесь **«при возврате "
+                + "цены»**, где контроль `buy & hold` тождественно ноль.\n\n");
+        sb.append("**Отличие от провалившейся разгрузки по себестоимости** (док. 151 §5): "
+                + "там аск опускался ДО себестоимости и отдавал весь спред, захват падал "
+                + "с 10.9 до 1.1 б.п. Здесь потолок поправки — единицы базисных пунктов, "
+                + "и захват обязан почти не измениться. Если он просел заметно, правило "
+                + "реализовано неверно.\n\n");
     }
 
     /** Шаги бывают мельче 1e-8: без %f они печатаются нулём. */
