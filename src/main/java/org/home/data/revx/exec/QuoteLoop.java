@@ -427,8 +427,22 @@ public final class QuoteLoop implements Runnable {
         // разгружаемся (док. 98 §6). При симметричной настройке это прежний size().
         double want = params.sizeFor(side, inventory);
         double ownSize = resting.venueId == null ? 0 : resting.size;
-        return Math.min(want, affordable(side, price, baseAvailable, quoteBalance,
-                ownSize, resting.price));
+        double affordable = affordable(side, price, baseAvailable, quoteBalance,
+                ownSize, resting.price);
+        // ⚠️ Продать больше СВОЕЙ позиции нельзя, даже если на счёте есть чужое.
+        //
+        // `affordable` для продажи смотрит на `baseAvailable` — общий остаток
+        // аккаунта, а ботов на нём три. Без этого потолка заявка одного
+        // исполняется против инвентаря, набранного другим, и бот уходит в шорт,
+        // которого на споте быть не может.
+        //
+        // Так и случилось 03.09.2026: бот A весь день стоял в шорте на 7–13 лотов
+        // и прошёл в нём ралли 77 000 → 81 400. Убыток за сутки −0.4354 USDC при
+        // прибыли во все остальные дни; арифметика сходится точно
+        // (10 лотов × 0.0000125 × 4 400 ≈ 0.55). Продаж 201 против 192 покупок
+        // при нулевой затравке — на споте это невозможно.
+        double ownPositionCap = side == Side.SELL ? Math.max(0, inventory) : Double.MAX_VALUE;
+        return Math.min(want, Math.min(affordable, ownPositionCap));
     }
 
     /**
