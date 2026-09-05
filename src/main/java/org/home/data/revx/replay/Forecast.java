@@ -145,6 +145,7 @@ public final class Forecast {
 
             log.warn("площадка исполнила заявок: {} (это НЕ то же, что заметил бот)",
                     venue.appliedFills());
+            log.warn("присутствие в книге: {}", venue.presence());
             List<BotResult> out = new ArrayList<>();
             for (int i = 0; i < bots.size(); i++) {
                 out.add(measure(bots.get(i), journals.get(i), loops.get(i), base,

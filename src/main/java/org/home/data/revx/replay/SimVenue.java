@@ -71,6 +71,16 @@ public final class SimVenue implements Venue {
     private long cancels;
     private long applied;
     private long replaceRejects;
+    /** Сколько раз площадку спросили и сколько из них заявка на стороне СТОЯЛА. */
+    private long probes;
+    private long bidPresent;
+    private long askPresent;
+
+    public String presence() {
+        return probes == 0 ? "нет данных"
+                : String.format(java.util.Locale.ROOT, "бид в книге %.1f%%, аск %.1f%%",
+                        100.0 * bidPresent / probes, 100.0 * askPresent / probes);
+    }
 
     public SimVenue(Clock clock, FillModel model, String symbol,
                     double baseStart, double quoteStart) {
@@ -115,6 +125,14 @@ public final class SimVenue implements Venue {
      * ответ» обязан совпадать с живым.
      */
     private void advance() {
+        probes++;
+        for (Order o : live.values()) {
+            if (o.buy) {
+                bidPresent++;
+            } else {
+                askPresent++;
+            }
+        }
         List<FillModel.Resting> resting = new ArrayList<>();
         for (Order o : live.values()) {
             resting.add(new FillModel.Resting(o.id, o.buy, o.price, o.size, o.createdMs));
