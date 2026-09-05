@@ -34,6 +34,17 @@ public final class MarketData {
     private int tradeCursor;
     private int bookCursor;
 
+    /**
+     * Рынок из готовых рядов — для тестов.
+     *
+     * Модели исполнения проверяются на СИНТЕТИЧЕСКОМ рынке намеренно: правила
+     * дележа объёма и приоритета цены должны держаться на данных, которые
+     * подобраны под проверку, а не на тех, где всё и так сходится.
+     */
+    public static MarketData of(List<MarketTrade> trades, long[] bookTs, List<BookView> books) {
+        return new MarketData(trades, bookTs, books);
+    }
+
     private MarketData(List<MarketTrade> trades, long[] bookTs, List<BookView> books) {
         this.trades = trades;
         this.bookTs = bookTs;
