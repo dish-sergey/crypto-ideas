@@ -248,7 +248,7 @@
   | Бот | Пара | Отступ | Постановок/сут | Журнал | Юнит |
   |---|---|---|---|---|---|
   | A | BTC/USDC | 10 б.п. | **300** | `state/exec.db` | `revx-exec` |
-  | B | **SOL/USDC** | 13 б.п. | **200** | `state/exec-b-sol.db` | `revx-exec-b` |
+  | B | **SOL/USDC** | **10 б.п.** | **200** | `state/exec-b-sol.db` | `revx-exec-b` |
   | C | BTC/USDC | **7 б.п.** | **400** | `state/exec-c.db` | `revx-exec-c` |
 
   **A ↔ C — проверка лестницы отступов ВНЕ ВЫБОРКИ (с 05.09.2026).** Стенд на
