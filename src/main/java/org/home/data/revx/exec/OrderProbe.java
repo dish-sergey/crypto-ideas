@@ -101,7 +101,7 @@ public class OrderProbe {
                         .formatted(probeClientId(), SIZE, UNFILLABLE_PRICE)
                         .replaceAll("\\s*\\n\\s*", "");
 
-                TradeClient.Response placed = client.place(placeBody);
+                Venue.Response placed = client.place(placeBody);
                 report.append(line("POST /orders", placed));
                 if (!placed.ok()) {
                     report.append("\nПостановка не прошла — дальше идти незачем.\n");
@@ -121,7 +121,7 @@ public class OrderProbe {
                          "execution_instructions":["post_only"]}"""
                         .formatted(probeClientId(), SIZE, NEXT_PRICE)
                         .replaceAll("\\s*\\n\\s*", "");
-                TradeClient.Response replaced = client.replace(venueId, replaceBody);
+                Venue.Response replaced = client.replace(venueId, replaceBody);
                 report.append(line("PUT /orders/{id} (цена → " + NEXT_PRICE + ")", replaced));
                 String staleId = venueId;
                 if (replaced.ok()) {
@@ -174,7 +174,7 @@ public class OrderProbe {
                  "execution_instructions":["post_only"]}"""
                 .formatted(probeClientId(), SIZE, ORPHAN_PRICE)
                 .replaceAll("\\s*\\n\\s*", "");
-        TradeClient.Response stale = client.replace(staleId, body);
+        Venue.Response stale = client.replace(staleId, body);
         out.append(line("PUT /orders/{УСТАРЕВШИЙ id}", stale));
 
         Thread.sleep(700);
@@ -211,7 +211,7 @@ public class OrderProbe {
         return out.toString();
     }
 
-    private static String line(String what, TradeClient.Response response) {
+    private static String line(String what, Venue.Response response) {
         String body = response.body() == null || response.body().isBlank()
                 ? "(без тела)" : response.body().replaceAll("\\s+", " ").trim();
         return String.format("%-36s → %d за %d мс  %s%n", what, response.status(),
@@ -266,7 +266,7 @@ public class OrderProbe {
      * прежняя уборка «отменить всё активное» снесла бы их котировки.
      */
     private String cleanup(TradeClient client, ExecJournal journal, Set<String> mine) {
-        TradeClient.Response active = client.activeOrders();
+        Venue.Response active = client.activeOrders();
         Set<String> inBook = activeIds(active.body());
         String body = active.body() == null ? "" : active.body().trim();
         boolean parsed = inBook.isEmpty()
@@ -291,7 +291,7 @@ public class OrderProbe {
             out.append("  своих заявок в книге нет\n");
         }
         for (String id : toCancel) {
-            TradeClient.Response cancelled = client.cancel(id);
+            Venue.Response cancelled = client.cancel(id);
             out.append("  DELETE ").append(id).append(" → ")
                     .append(cancelled.status()).append('\n');
             journal.event("probe_cancel", id + " → " + cancelled.status());

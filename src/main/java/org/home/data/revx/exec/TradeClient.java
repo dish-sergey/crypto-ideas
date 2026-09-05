@@ -29,16 +29,10 @@ import java.time.Duration;
  * ТЗ §6, и оно же — единственный способ потом разобраться, почему заявка повела
  * себя не так, как ожидалось.
  */
-public final class TradeClient {
+public final class TradeClient implements Venue {
 
     private static final Logger log = LoggerFactory.getLogger(TradeClient.class);
 
-    public record Response(int status, String body, long latencyMs) {
-
-        public boolean ok() {
-            return status >= 200 && status < 300;
-        }
-    }
 
     private final String baseUrl;
     private final TradeAuth auth;
@@ -55,29 +49,29 @@ public final class TradeClient {
                 .build();
     }
 
-    public Response activeOrders() {
+    public Venue.Response activeOrders() {
         return call("GET", "/api/1.0/orders/active", null);
     }
 
-    public Response balances() {
+    public Venue.Response balances() {
         return call("GET", "/api/1.0/balances", null);
     }
 
-    public Response order(String id) {
+    public Venue.Response order(String id) {
         return call("GET", "/api/1.0/orders/" + id, null);
     }
 
     /** Постановка. Тратит суточный лимит — 1000 штук, и другого источника нет. */
-    public Response place(String json) {
+    public Venue.Response place(String json) {
         return call("POST", "/api/1.0/orders", json);
     }
 
     /** Замена цены. Суточного потолка нет, поэтому перевыставление идёт сюда. */
-    public Response replace(String id, String json) {
+    public Venue.Response replace(String id, String json) {
         return call("PUT", "/api/1.0/orders/" + id, json);
     }
 
-    public Response cancel(String id) {
+    public Venue.Response cancel(String id) {
         return call("DELETE", "/api/1.0/orders/" + id, null);
     }
 
@@ -108,7 +102,7 @@ public final class TradeClient {
                 : "[quota " + quota.toString().trim() + "] " + response.body();
     }
 
-    private Response call(String method, String path, String body) {
+    private Venue.Response call(String method, String path, String body) {
         URI uri = URI.create(baseUrl + path);
         long started = System.currentTimeMillis();
         try {
@@ -129,14 +123,14 @@ public final class TradeClient {
             long latency = System.currentTimeMillis() - started;
             journal.request(method, path, body, response.statusCode(),
                     withQuotaHeaders(response), latency, null);
-            return new Response(response.statusCode(), response.body(), latency);
+            return new Venue.Response(response.statusCode(), response.body(), latency);
         } catch (Exception e) {
             long latency = System.currentTimeMillis() - started;
             // Неотправленный запрос тоже пишется: «ответа нет» и «не спрашивали» —
             // разные состояния, и при разборе аварии их надо различать.
             journal.request(method, path, body, null, null, latency, e.toString());
             log.error("{} {} упал за {} мс: {}", method, path, latency, e.toString());
-            return new Response(-1, null, latency);
+            return new Venue.Response(-1, null, latency);
         }
     }
 }

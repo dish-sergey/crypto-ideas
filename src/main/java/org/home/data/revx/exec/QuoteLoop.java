@@ -113,8 +113,9 @@ public final class QuoteLoop implements Runnable {
                         double inventory, double lastFair, String state, String pausedReason) {
     }
 
-    private final TradeClient client;
-    private final StandReader stand;
+    private final Venue client;
+    private final Clock clock;
+    private final FairSource stand;
     private final ExecJournal journal;
     private final Quoter quoter;
     /**
@@ -172,8 +173,8 @@ public final class QuoteLoop implements Runnable {
     private long replaces;
     private long cancels;
     private long fills;
-    private long minuteStartMs = System.currentTimeMillis();
-    private long lastReconcileMs = System.currentTimeMillis();
+    private long minuteStartMs;
+    private long lastReconcileMs;
     private int replacesThisMinute;
     private double totalFees;
     private double totalFilledNotional;
@@ -182,13 +183,16 @@ public final class QuoteLoop implements Runnable {
     private boolean startCaptured;
     private java.util.function.Consumer<String> alert = message -> { };
 
-    public QuoteLoop(TradeClient client, StandReader stand, ExecJournal journal,
+    public QuoteLoop(Venue client, Clock clock, FairSource stand, ExecJournal journal,
                      Quoter.Params params, String symbol, long periodMs, double minNotional,
                      BotTag tag, org.home.data.revx.sim.QuotePolicy policy,
                      boolean ownPosition, double positionSeed, double baseStep,
                      double parkDistance, AllocRegistry alloc) {
         this.alloc = alloc;
         this.client = client;
+        this.clock = clock != null ? clock : Clock.system();
+        this.minuteStartMs = this.clock.now();
+        this.lastReconcileMs = this.minuteStartMs;
         this.stand = stand;
         this.journal = journal;
         this.params = params;
@@ -252,7 +256,7 @@ public final class QuoteLoop implements Runnable {
         if (!(price > 0)) {
             return null;
         }
-        long now = System.currentTimeMillis();
+        long now = clock.now();
         refreshBalances();
         double need = Math.max(0, (params.inventoryCap() - inventory) * price);
         double have = alloc.own(tag.id(), quote);
@@ -434,7 +438,7 @@ public final class QuoteLoop implements Runnable {
         // переживают наш процесс, и оставшиеся после падения — уже не наши.
         reconcile("старт");
         while (alive) {
-            long started = System.currentTimeMillis();
+            long started = clock.now();
             try {
                 tick();
             } catch (Exception e) {
@@ -443,10 +447,10 @@ public final class QuoteLoop implements Runnable {
                 log.error("тик упал: {}", e.toString());
                 journal.event("tick_error", e.toString());
             }
-            long sleep = periodMs - (System.currentTimeMillis() - started);
+            long sleep = periodMs - (clock.now() - started);
             if (sleep > 0) {
                 try {
-                    Thread.sleep(sleep);
+                    clock.sleep(sleep);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
@@ -461,7 +465,7 @@ public final class QuoteLoop implements Runnable {
         lastFair = fair.price();
         rememberFair(fair.price());
         if (fair.price() > 0) {
-            efficiency.accept(System.currentTimeMillis(), fair.price());
+            efficiency.accept(clock.now(), fair.price());
         }
 
         if (!quoting.get()) {
@@ -475,7 +479,7 @@ public final class QuoteLoop implements Runnable {
             standAside(pausedReason);
             return;
         }
-        long staleMs = System.currentTimeMillis() - fair.asOfMs();
+        long staleMs = clock.now() - fair.asOfMs();
         if (staleMs > 15_000) {
             pausedReason = "данные стенда устарели на " + staleMs / 1000 + " с";
             standAside(pausedReason);
@@ -579,7 +583,7 @@ public final class QuoteLoop implements Runnable {
         // Пауза после отказа площадки распространяется на ОБА действия. Отказ на
         // замене стоит четырёх запросов, и повторять его каждую секунду так же
         // вредно, как долбиться постановкой.
-        if (System.currentTimeMillis() < resting.blockedUntilMs) {
+        if (clock.now() < resting.blockedUntilMs) {
             return;
         }
         if (resting.venueId == null) {
@@ -660,7 +664,7 @@ public final class QuoteLoop implements Runnable {
      * скрывала ночную аварию), а писать каждую секунду — бесполезно.
      */
     private void warnNoFunds(Side side, Resting resting) {
-        long now = System.currentTimeMillis();
+        long now = clock.now();
         if (now - resting.fundsWarnedMs < 60_000) {
             return;
         }
@@ -686,7 +690,7 @@ public final class QuoteLoop implements Runnable {
         if (!(fair > 0) || params.driftBeta() == 0 || window <= 0) {
             return;
         }
-        long now = System.currentTimeMillis();
+        long now = clock.now();
         fairHistory.addLast(new long[]{now, Double.doubleToRawLongBits(fair)});
         while (!fairHistory.isEmpty() && fairHistory.peekFirst()[0] < now - 2 * window) {
             fairHistory.pollFirst();
@@ -698,7 +702,7 @@ public final class QuoteLoop implements Runnable {
         if (params.driftBeta() == 0 || window <= 0 || fairHistory.isEmpty()) {
             return 0;
         }
-        long since = System.currentTimeMillis() - window;
+        long since = clock.now() - window;
         double anchor = 0;
         for (long[] point : fairHistory) {
             if (point[0] <= since) {
@@ -731,7 +735,7 @@ public final class QuoteLoop implements Runnable {
      * скользящем окне у них; обратное неверно.
      */
     public long placementsLastDay() {
-        return journal.placementsSince(System.currentTimeMillis() - 86_400_000L);
+        return journal.placementsSince(clock.now() - 86_400_000L);
     }
 
     private void place(Side side, Resting resting, double price, double size) {
@@ -753,13 +757,13 @@ public final class QuoteLoop implements Runnable {
                 .formatted(tag.newClientOrderId(), symbol.replace('/', '-'),
                         side == Side.BUY ? "buy" : "sell", fmt(size), fmt(price))
                 .replaceAll("\\s*\\n\\s*", "");
-        TradeClient.Response response = client.place(body);
+        Venue.Response response = client.place(body);
         placements++;
         if (response.ok()) {
             resting.venueId = extract(response.body());
             resting.price = price;
             resting.size = size;
-            resting.sinceMs = System.currentTimeMillis();
+            resting.sinceMs = clock.now();
             resting.failures = 0;
             resting.blockedUntilMs = 0;
         } else {
@@ -768,7 +772,7 @@ public final class QuoteLoop implements Runnable {
             // успевать съесть тысячу постановок, как в ночь на 29.08.2026.
             resting.failures++;
             long pause = Math.min(MAX_PLACE_BACKOFF_MS, 5_000L << Math.min(4, resting.failures - 1));
-            resting.blockedUntilMs = System.currentTimeMillis() + pause;
+            resting.blockedUntilMs = clock.now() + pause;
             log.warn("постановка {} не прошла: {} {} — пауза {} с", side, response.status(),
                     response.body(), pause / 1000);
             journal.event("place_failed", side + " " + response.status() + ", пауза "
@@ -789,7 +793,7 @@ public final class QuoteLoop implements Runnable {
                  "execution_instructions":["post_only"]}"""
                 .formatted(tag.newClientOrderId(), fmt(size), fmt(price))
                 .replaceAll("\\s*\\n\\s*", "");
-        TradeClient.Response response = client.replace(resting.venueId, body);
+        Venue.Response response = client.replace(resting.venueId, body);
         replaces++;
         replacesThisMinute++;
         if (response.ok()) {
@@ -798,7 +802,7 @@ public final class QuoteLoop implements Runnable {
             resting.venueId = newId != null ? newId : resting.venueId;
             resting.price = price;
             resting.size = size;
-            resting.sinceMs = System.currentTimeMillis();
+            resting.sinceMs = clock.now();
             resting.failures = 0;
             resting.blockedUntilMs = 0;
         } else {
@@ -817,7 +821,7 @@ public final class QuoteLoop implements Runnable {
             // Пауза на сторону: без неё каждый отказ тянет за собой четыре запроса
             // (замена, статус, остатки, активные), и на устойчивом отказе это
             // 8 запросов в секунду по кругу — наблюдалось 01.09.2026.
-            resting.blockedUntilMs = System.currentTimeMillis()
+            resting.blockedUntilMs = clock.now()
                     + Math.min(MAX_PLACE_BACKOFF_MS, 2_000L << Math.min(5, resting.failures - 1));
             reconcile("отказ замены");
             refreshBalances();
@@ -843,7 +847,7 @@ public final class QuoteLoop implements Runnable {
      * </ul>
      */
     private void reconcile(String why) {
-        TradeClient.Response active = client.activeOrders();
+        Venue.Response active = client.activeOrders();
         if (!active.ok() || active.body() == null) {
             return;                       // не знаем состояние — ничего не трогаем
         }
@@ -882,7 +886,7 @@ public final class QuoteLoop implements Runnable {
                 .sorted(java.util.Comparator.comparingLong(ActiveOrder::createdMs).reversed())
                 .toList();
         if (mine.isEmpty()) {
-            boolean fresh = System.currentTimeMillis() - resting.sinceMs < ADOPT_GRACE_MS;
+            boolean fresh = clock.now() - resting.sinceMs < ADOPT_GRACE_MS;
             if (resting.venueId != null && !fresh) {
                 inspectGoneOrder(side, resting.venueId);
                 resting.venueId = null;
@@ -901,7 +905,7 @@ public final class QuoteLoop implements Runnable {
             resting.venueId = keep.id();
             resting.price = keep.price();
             resting.size = keep.size();
-            resting.sinceMs = System.currentTimeMillis();
+            resting.sinceMs = clock.now();
             // Наследник найден — значит предыдущий отказ был мнимым, и держать
             // за него паузу не за что.
             resting.failures = 0;
@@ -915,7 +919,7 @@ public final class QuoteLoop implements Runnable {
     }
 
     private void cancelStray(ActiveOrder order, String why) {
-        TradeClient.Response response = client.cancel(order.id());
+        Venue.Response response = client.cancel(order.id());
         cancels++;
         log.warn("снимаю бесхозную заявку {} {} по {} ({}) → {}", order.side(), order.id(),
                 order.price(), why, response.status());
@@ -934,7 +938,7 @@ public final class QuoteLoop implements Runnable {
      * то есть смену экономики, а не параметра. Решение принимает человек.
      */
     private void inspectGoneOrder(Side side, String venueId) {
-        TradeClient.Response order = client.order(venueId);
+        Venue.Response order = client.order(venueId);
         if (!order.ok() || order.body() == null) {
             fills++;                      // судьбу не выяснили, но заявки нет
             return;
@@ -955,7 +959,7 @@ public final class QuoteLoop implements Runnable {
             // Политике, чьи цены зависят от собственных сделок (пол по
             // себестоимости), факт исполнения нужен раньше следующего тика.
             policy.onFill(new org.home.data.revx.sim.Fill(
-                    System.currentTimeMillis(), side, price, filled, lastFair));
+                    clock.now(), side, price, filled, lastFair));
         }
         if (fee > ExecLimits.MAX_FEE_USDC) {
             totalFees += fee;
@@ -1053,7 +1057,7 @@ public final class QuoteLoop implements Runnable {
         // Обнуляем ДО выяснения: предохранитель по комиссии внутри может позвать
         // остановку, а та — снова сюда, и рекурсия должна упереться в этот null.
         resting.venueId = null;
-        TradeClient.Response response = client.cancel(dead);
+        Venue.Response response = client.cancel(dead);
         cancels++;
         journal.event("cancel", side + " " + dead + " (" + why + ") → " + response.status());
         if (!response.ok()) {
@@ -1147,7 +1151,7 @@ public final class QuoteLoop implements Runnable {
      * подстраиваться под остатки (там чужое), а повод кричать.
      */
     private void refreshBalances() {
-        TradeClient.Response response = client.balances();
+        Venue.Response response = client.balances();
         if (!response.ok() || response.body() == null) {
             return;
         }
@@ -1195,7 +1199,7 @@ public final class QuoteLoop implements Runnable {
         if (!ownPosition || Double.isNaN(baseTotal)) {
             return;
         }
-        long now = System.currentTimeMillis();
+        long now = clock.now();
         if (inventory <= baseTotal + 1e-12) {
             mismatchSinceMs = 0;          // сошлось — счётчик выдержки сбрасывается
             return;
@@ -1249,7 +1253,7 @@ public final class QuoteLoop implements Runnable {
             inventory = positionSeed;
         } else {
             // Затравка «из аккаунта»: осмысленна только пока бот один.
-            TradeClient.Response response = client.balances();
+            Venue.Response response = client.balances();
             Matcher matcher = BALANCE.matcher(response.body() == null ? "" : response.body());
             while (matcher.find()) {
                 if (base.equals(matcher.group(1))) {
@@ -1287,7 +1291,7 @@ public final class QuoteLoop implements Runnable {
         // при инициализации, иначе нельзя отличить «продал купленное» от «продал
         // найденное», и проверка логики бота теряет смысл.
         if (alloc != null) {
-            long now = System.currentTimeMillis();
+            long now = clock.now();
             alloc.applyFill(tag.id(), base, side.sign() * qty, now);
             // Деньги двигаются зеркально монетам, и прибыль оседает ЗДЕСЬ:
             // продали дороже, чем купили — в претензии бота стало больше USDC.
@@ -1305,7 +1309,7 @@ public final class QuoteLoop implements Runnable {
             return "реестр владения не подключён";
         }
         refreshBalances();
-        long now = System.currentTimeMillis();
+        long now = clock.now();
         double lot = params.size();
         double cap = params.inventoryCap();
         double price = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
@@ -1395,7 +1399,7 @@ public final class QuoteLoop implements Runnable {
         }
         refreshBalances();
         double qty = lots * params.size();
-        long now = System.currentTimeMillis();
+        long now = clock.now();
 
         // Деньги забираются ВМЕСТЕ с монетами, одной командой и по принципу
         // «либо всё, либо ничего». Смысл: бот должен уметь дойти до потолка, а
@@ -1466,7 +1470,7 @@ public final class QuoteLoop implements Runnable {
         if (qty <= 0 && cash <= 0) {
             return "Держать нечего.";
         }
-        long now = System.currentTimeMillis();
+        long now = clock.now();
         // Отдаём ОБЕ валюты: иначе касса бота останется за ним навсегда и станет
         // недоступной остальным, а «ничьих денег» мы и добивались не допустить.
         if (qty > 0) {
@@ -1497,7 +1501,7 @@ public final class QuoteLoop implements Runnable {
     }
 
     private void rollCounters() {
-        long now = System.currentTimeMillis();
+        long now = clock.now();
         if (now - minuteStartMs >= 60_000) {
             minuteStartMs = now;
             replacesThisMinute = 0;

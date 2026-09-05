@@ -1,6 +1,7 @@
 package org.home.data.revx.exec;
 
 import org.home.data.revx.RevxConfig;
+import org.home.data.revx.replay.ReplayRunner;
 import org.home.data.revx.sim.FairPrice;
 import org.home.data.revx.sim.AnchoredBidPolicy;
 import org.home.data.revx.sim.CostFloorPolicy;
@@ -141,17 +142,71 @@ public class Executor {
         // базисом доков 74-113, а живое стоит на рабочей точке, измеренной ВНЕ
         // ВЫБОРКИ (док. 113 §5). Сверять живое надо со ступенью лестницы, равной
         // `revx.exec.offset`, а не с базовым прогоном симуляции.
-        Quoter.Params params = new Quoter.Params(offset, size, inventoryCap,
+        Quoter.Params params = buildParams();
+        QuotePolicy policy = buildPolicy(params);
+        QuoteLoop loop = new QuoteLoop(client, Clock.system(), stand, journal, params, symbol,
+                periodMs, minNotional(), tag, policy, ownPosition, positionSeed, spec.baseStep(),
+                parkDistance, alloc);
+        runLive(loop, journal, client, stand, alloc);
+    }
+
+    /**
+     * Параметры котирования. Отдельный метод не ради красоты: ровно эти же числа
+     * обязан получить повтор ({@code --revx-replay}), иначе сверка «один в один»
+     * сравнивает не логику бота, а две разные настройки.
+     */
+    private Quoter.Params buildParams() {
+        return new Quoter.Params(offset, size, inventoryCap,
                 cfg.simSkewK(), skewTarget, cfg.simDriftBeta(), cfg.simBuySizeRatio(),
                 cfg.simDriftWindowMs(), cfg.simSizeShapeEta(), cfg.simDriftGateEr(),
                 cfg.simErWindowMs(), cfg.simErSampleMs(), cfg.simStopDrawdownPct(),
                 Quoter.Sticky.OFF, Quoter.Frozen.OFF, Quoter.Hedge.OFF, cfg.simStopCoolOffMs(),
                 cfg.simRequoteThreshold(), quoteStep());
-        QuotePolicy policy = buildPolicy(params);
-        QuoteLoop loop = new QuoteLoop(client, stand, journal, params, symbol, periodMs,
-                minNotional(), tag, policy, ownPosition, positionSeed, spec.baseStep(), parkDistance,
-                alloc);
+    }
 
+    /**
+     * {@code --revx-replay --journal=<путь>}: прогнать записанную сессию через
+     * тот же котировщик и сверить котировки тик в тик.
+     *
+     * Сети не касается вовсе: площадкой служит
+     * {@link org.home.data.revx.replay.ReplayVenue}, ценой — записанная в
+     * {@code exec_quote}, исполнениями — записанные в {@code exec_fill}.
+     * Спецификация пары читается у стенда тем же вызовом, что и в живом режиме:
+     * шаги цены и количества входят в округление котировки, и подставить сюда
+     * другие значит гарантированно разойтись.
+     */
+    public void replay(String journalPath) {
+        try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
+                new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
+                        cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
+                cfg.fairMaxSkewMs())) {
+            this.spec = stand.spec(symbol);
+            if (spec == null) {
+                throw new IllegalStateException("нет спецификации пары " + symbol);
+            }
+            long boot = ReplayRunner.lastBoot(journalPath);
+            if (boot == 0) {
+                throw new IllegalStateException("в журнале нет события boot — "
+                        + "нечего считать чистым окном");
+            }
+            var ticks = ReplayRunner.readTicks(journalPath, boot);
+            var fills = ReplayRunner.readFills(journalPath, boot);
+            log.warn("повтор {}: тиков {}, исполнений {}, с {}", symbol, ticks.size(),
+                    fills.size(), java.time.Instant.ofEpochMilli(boot));
+
+            Quoter.Params params = buildParams();
+            ReplayRunner.Result result = ReplayRunner.run(ticks, fills, params,
+                    buildPolicy(params), symbol, periodMs, minNotional(), tag.id(),
+                    spec.baseStep(), parkDistance, inventoryCap * 1.2 * ticks.get(0).fair(),
+                    0);
+            log.info("\n{}", ReplayRunner.render(result));
+        } catch (Exception e) {
+            log.error("повтор не прошёл: {}", e.toString(), e);
+        }
+    }
+
+    private void runLive(QuoteLoop loop, ExecJournal journal, TradeClient client,
+                         StandReader stand, AllocRegistry alloc) {
         log.warn("""
 
                 === МИКРО-LIVE, РЕАЛЬНЫЕ ОРДЕРА ===

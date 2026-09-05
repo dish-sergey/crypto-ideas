@@ -70,7 +70,7 @@ public class Panic {
             }
             log.warn("открытых заявок: {} — снимаю все", ids.size());
             for (String id : ids) {
-                TradeClient.Response cancelled = client.cancel(id);
+                Venue.Response cancelled = client.cancel(id);
                 log.warn("DELETE {} → {}", id, cancelled.status());
                 journal.event("panic_cancel", id + " → " + cancelled.status());
             }
@@ -97,7 +97,7 @@ public class Panic {
      * действие человека, а не побочный эффект рестарта.
      */
     private List<String> openOrderIds(TradeClient client) {
-        TradeClient.Response active = client.activeOrders();
+        Venue.Response active = client.activeOrders();
         List<String> ids = new ArrayList<>();
         if (active.body() == null) {
             return ids;

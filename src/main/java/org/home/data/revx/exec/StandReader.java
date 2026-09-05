@@ -32,7 +32,7 @@ import java.util.List;
  * снимка, курс USDC/USD считается по всей вселенной, и уже он даёт справедливую
  * цену конкретной пары.
  */
-public final class StandReader implements AutoCloseable {
+public final class StandReader implements FairSource, AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(StandReader.class);
 

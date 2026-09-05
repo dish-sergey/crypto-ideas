@@ -80,6 +80,17 @@ public final class ExecJournal implements AutoCloseable {
 
     private final Connection connection;
 
+    /**
+     * Часы журнала. ⚠️ Отметки времени обязаны идти ОТТУДА ЖЕ, откуда их берёт
+     * цикл котирования: повтор сверяет свои тики с живыми ПО ВРЕМЕНИ, и журнал,
+     * пишущий настоящее время в прогоне по записи, не совпадёт ни с чем.
+     */
+    private Clock clock = Clock.system();
+
+    public void clock(Clock clock) {
+        this.clock = clock != null ? clock : Clock.system();
+    }
+
     public ExecJournal(String path) {
         try {
             Path file = Path.of(path);
@@ -116,7 +127,7 @@ public final class ExecJournal implements AutoCloseable {
                         + "ON CONFLICT(key) DO UPDATE SET value=excluded.value, ts_ms=excluded.ts_ms")) {
             ps.setString(1, key);
             ps.setDouble(2, value);
-            ps.setLong(3, System.currentTimeMillis());
+            ps.setLong(3, clock.now());
             ps.executeUpdate();
         } catch (Exception e) {
             log.error("не записать состояние {}: {}", key, e.toString());
@@ -143,7 +154,7 @@ public final class ExecJournal implements AutoCloseable {
         try (PreparedStatement ps = connection.prepareStatement(
                 "INSERT INTO exec_request(ts_ms, method, path, body, status, response, latency_ms, error)"
                         + " VALUES (?,?,?,?,?,?,?,?)")) {
-            ps.setLong(1, System.currentTimeMillis());
+            ps.setLong(1, clock.now());
             ps.setString(2, method);
             ps.setString(3, path);
             ps.setString(4, body);
@@ -175,7 +186,7 @@ public final class ExecJournal implements AutoCloseable {
         try (PreparedStatement ps = connection.prepareStatement(
                 "INSERT INTO exec_quote(ts_ms, fair, bid, ask, inventory, quotable, reason)"
                         + " VALUES (?,?,?,?,?,?,?)")) {
-            ps.setLong(1, System.currentTimeMillis());
+            ps.setLong(1, clock.now());
             ps.setDouble(2, fair);
             if (bid == null) ps.setNull(3, java.sql.Types.REAL); else ps.setDouble(3, bid);
             if (ask == null) ps.setNull(4, java.sql.Types.REAL); else ps.setDouble(4, ask);
@@ -203,7 +214,7 @@ public final class ExecJournal implements AutoCloseable {
         try (PreparedStatement ps = connection.prepareStatement(
                 "INSERT INTO exec_fill(ts_ms, venue_id, side, qty, price, fair, fee, fee_currency, status)"
                         + " VALUES (?,?,?,?,?,?,?,?,?)")) {
-            ps.setLong(1, System.currentTimeMillis());
+            ps.setLong(1, clock.now());
             ps.setString(2, venueId);
             ps.setString(3, side);
             ps.setDouble(4, qty);
@@ -310,7 +321,7 @@ public final class ExecJournal implements AutoCloseable {
     public synchronized void event(String kind, String detail) {
         try (PreparedStatement ps = connection.prepareStatement(
                 "INSERT INTO exec_event(ts_ms, kind, detail) VALUES (?,?,?)")) {
-            ps.setLong(1, System.currentTimeMillis());
+            ps.setLong(1, clock.now());
             ps.setString(2, kind);
             ps.setString(3, detail);
             ps.executeUpdate();
