@@ -79,6 +79,12 @@ public final class ExecJournal implements AutoCloseable {
             """;
 
     private final Connection connection;
+    private final String path;
+
+    /** Путь к файлу журнала: прогнозу нужно перечитать свои же тики. */
+    public String path() {
+        return path;
+    }
 
     /**
      * Часы журнала. ⚠️ Отметки времени обязаны идти ОТТУДА ЖЕ, откуда их берёт
@@ -97,6 +103,7 @@ public final class ExecJournal implements AutoCloseable {
             if (file.getParent() != null) {
                 Files.createDirectories(file.getParent());
             }
+            this.path = path;
             connection = DriverManager.getConnection("jdbc:sqlite:" + path);
             try (Statement st = connection.createStatement()) {
                 st.execute("PRAGMA journal_mode=WAL");

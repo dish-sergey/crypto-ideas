@@ -166,6 +166,21 @@ public final class QuoteLoop implements Runnable {
     private final int levels;
     /** Расстояние между уровнями в долях цены. 0 при одном уровне. */
     private final double levelStep;
+    /**
+     * Кому из уровней достаётся инвентарь под продажу первым.
+     *
+     * ⚠️ Выбор НЕ безобидный, и первая реализация выбрала неверно. Раздача
+     * «внутренним вперёд» означает: держим один лот — аск стоит на ближнем
+     * уровне, то есть по САМОЙ ХУДШЕЙ из доступных цен. Покупки при этом идут на
+     * всех уровнях, включая дальние и выгодные. Перекос систематический:
+     * покупаем в среднем лучше базового отступа, а продаём почти всегда по нему.
+     * На измерении 05.09.2026 это дало −0.3090 на падении против −0.1724 у
+     * одиночной котировки — хуже всех.
+     *
+     * При {@code false} инвентарь достаётся ДАЛЬНИМ уровням первыми: продаём
+     * настолько далеко от рынка, насколько хватает лотов.
+     */
+    private final boolean sellInnerFirst;
 
     private volatile double inventory;
     private volatile double baseAvailable;
@@ -204,7 +219,7 @@ public final class QuoteLoop implements Runnable {
                      boolean ownPosition, double positionSeed, double baseStep,
                      double parkDistance, AllocRegistry alloc) {
         this(client, clock, stand, journal, params, symbol, periodMs, minNotional, tag, policy,
-                ownPosition, positionSeed, baseStep, parkDistance, alloc, 1, 0);
+                ownPosition, positionSeed, baseStep, parkDistance, alloc, 1, 0, true);
     }
 
     /**
@@ -215,7 +230,9 @@ public final class QuoteLoop implements Runnable {
                      Quoter.Params params, String symbol, long periodMs, double minNotional,
                      BotTag tag, org.home.data.revx.sim.QuotePolicy policy,
                      boolean ownPosition, double positionSeed, double baseStep,
-                     double parkDistance, AllocRegistry alloc, int levels, double levelStep) {
+                     double parkDistance, AllocRegistry alloc, int levels, double levelStep,
+                     boolean sellInnerFirst) {
+        this.sellInnerFirst = sellInnerFirst;
         this.levels = Math.max(1, levels);
         this.levelStep = levelStep;
         for (int i = 0; i < this.levels; i++) {
@@ -539,13 +556,21 @@ public final class QuoteLoop implements Runnable {
         // нужно, она выпадает из правила распределения.
         //
         // При одном уровне пул целиком уходит ему, то есть поведение прежнее.
-        double sellPool = Math.max(0, inventory);
         double buyPool = Double.MAX_VALUE;
         for (int i = 0; i < levels; i++) {
             Double bidPrice = levelPrice(Side.BUY, target.bid(), fair.price(), i);
-            Double askPrice = levelPrice(Side.SELL, target.ask(), fair.price(), i);
             buyPool -= syncSide(Side.BUY, bids.get(i),
                     noCross(Side.BUY, bidPrice, fair), fair.price(), buyPool);
+        }
+        // ⚠️ Порядок раздачи инвентаря под продажу решает исход. Внутренними
+        // вперёд — значит один лот всегда уходит по ХУДШЕЙ доступной цене, тогда
+        // как покупки идут на всех уровнях, включая дальние и выгодные. Перекос
+        // систематический и стоил −0.3090 на падении против −0.1724 у одиночной
+        // котировки.
+        double sellPool = Math.max(0, inventory);
+        for (int k = 0; k < levels; k++) {
+            int i = sellInnerFirst ? k : levels - 1 - k;
+            Double askPrice = levelPrice(Side.SELL, target.ask(), fair.price(), i);
             sellPool -= syncSide(Side.SELL, asks.get(i),
                     noCross(Side.SELL, askPrice, fair), fair.price(), sellPool);
             sellPool = Math.max(0, sellPool);

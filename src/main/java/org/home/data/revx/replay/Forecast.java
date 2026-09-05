@@ -51,13 +51,15 @@ public final class Forecast {
      *                     на капитал — деление общего потолка между уровнями.
      */
     public record BotSpec(String botId, double offset, double skewTarget,
-                          double inventoryCap, int levels, double levelStep) {
+                          double inventoryCap, int levels, double levelStep,
+                          double size, boolean sellInnerFirst) {
     }
 
     /** Что получилось у одного котировщика. */
     public record BotResult(String botId, double offsetBp, int fills, double realised,
                             double inventoryLots, long placements, long replaces,
-                            long placementCap, double days, String state, long lossStops) {
+                            long placementCap, double days, String state, long lossStops,
+                            double atCapShare, double lotSize) {
     }
 
     private Forecast() {
@@ -98,7 +100,7 @@ public final class Forecast {
                 alloc.claim(spec.botId(), base.symbol().substring(base.symbol().indexOf('/') + 1),
                         quoteStart / bots.size(), quoteStart, ticks.get(0).fair(), start);
 
-                Quoter.Params params = new Quoter.Params(spec.offset(), base.size(),
+                Quoter.Params params = new Quoter.Params(spec.offset(), spec.size(),
                         spec.inventoryCap(), base.skewK(), spec.skewTarget(), cfg.simDriftBeta(),
                         cfg.simBuySizeRatio(), cfg.simDriftWindowMs(), cfg.simSizeShapeEta(),
                         cfg.simDriftGateEr(), cfg.simErWindowMs(), cfg.simErSampleMs(),
@@ -110,9 +112,9 @@ public final class Forecast {
                         new BotTag(spec.botId()),
                         Executor.buildPolicy(params, base.costFloorMargin(), base.anchorLeash(),
                                 base.anchorWidening(), base.widening(), base.wideningMaxStep(),
-                                base.size(), spec.inventoryCap(), base.quoteStep()),
+                                spec.size(), spec.inventoryCap(), base.quoteStep()),
                         true, 0, base.baseStep(), base.parkDistance(), alloc,
-                        spec.levels(), spec.levelStep());
+                        spec.levels(), spec.levelStep(), spec.sellInnerFirst());
                 loops.add(loop);
             }
             for (int i = 1; i < loops.size(); i++) {
@@ -164,13 +166,26 @@ public final class Forecast {
             fills++;
             ledger.add(f.tsMs(), f.buy(), f.qty(), f.price(), f.fee());
         }
+        // Доля времени с ПОЛНЫМ инвентарём. Пока бот упёрт в потолок, он только
+        // продаёт: покупать нечем, и половина конструкции простаивает. Без этого
+        // числа «доход за окно» скрывает, какой ценой он получен.
+        double atCap = 0;
+        int ticks = 0;
+        for (ReplayFair.Tick t : ReplayRunner.readTicks(
+                journal.path(), 0, Long.MAX_VALUE)) {
+            ticks++;
+            if (spec.inventoryCap() > 0 && t.inventory() >= 0.9 * spec.inventoryCap()) {
+                atCap++;
+            }
+        }
         QuoteLoop.Stats st = loop.stats();
         return new BotResult(spec.botId(), spec.offset() * 10_000, fills,
                 ledger.tradingRealisedSince(0),
-                base.size() > 0 ? st.inventory() / base.size() : 0,
+                spec.size() > 0 ? st.inventory() / spec.size() : 0,
                 st.placements(), st.replaces(),
                 org.home.data.revx.exec.ExecLimits.maxPlacementsPerDay(spec.botId()), days,
-                st.state(), journal.countEvents("loss_stop"));
+                st.state(), journal.countEvents("loss_stop"),
+                ticks > 0 ? atCap / ticks : 0, spec.size());
     }
 
     public static String render(String modelName, List<BotResult> results) {
@@ -180,8 +195,8 @@ public final class Forecast {
         // суточные. Прежде печаталось «634/300» — общее число за 5.4 суток
         // против СУТОЧНОГО потолка, и это читалось как «пробил лимит», хотя на
         // деле было 117 в сутки.
-        sb.append("бот | отступ | исполнений | реализовано | инвентарь"
-                + " | постановок/сут | замен/с | состояние\n");
+        sb.append("бот | отступ |  лот | исполнений | реализовано | инвентарь"
+                + " | в потолке | постановок/сут | замен/с\n");
         for (BotResult r : results) {
             // ⚠️ Состояние на конец прогона печатается не для полноты. Бот
             // встаёт сам, когда торговый убыток против buy & hold превышает
@@ -189,12 +204,12 @@ public final class Forecast {
             // инвентаря и движением в 5% это обычное дело. Прогон, где бот
             // простоял три четверти окна, внешне неотличим от честного, и
             // сравнивать их между собой нельзя.
-            String state = r.lossStops() > 0
-                    ? "СТОП по убытку ×" + r.lossStops()
-                    : r.state();
+            String state = r.lossStops() > 0 ? "  СТОП по убытку ×" + r.lossStops() : "";
             sb.append(String.format(Locale.ROOT,
-                    "%-3s | %5.1f  | %10d | %+11.4f | %8.1f  | %6.0f/%-5d | %6.2f  | %s%n",
-                    r.botId(), r.offsetBp(), r.fills(), r.realised(), r.inventoryLots(),
+                    "%-3s | %5.1f  | %4.2f | %10d | %+11.4f | %8.1f  | %8.1f%% | %6.0f/%-5d "
+                            + "| %6.2f%s%n",
+                    r.botId(), r.offsetBp(), r.lotSize() * 80_000, r.fills(), r.realised(),
+                    r.inventoryLots(), 100 * r.atCapShare(),
                     r.placements() / r.days(), r.placementCap(),
                     r.replaces() / (r.days() * 86_400), state));
         }
