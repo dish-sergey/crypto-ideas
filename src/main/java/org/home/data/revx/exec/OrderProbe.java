@@ -71,6 +71,8 @@ public class OrderProbe {
      */
     private static final char FREE_PREFIX = 'f';
     private static final String SIZE = "0.1";
+    /** Другой объём для проверки, меняет ли замена не только цену. */
+    private static final String BIGGER_SIZE = "0.25";
 
     private final RevxConfig cfg;
 
@@ -116,13 +118,20 @@ public class OrderProbe {
                 report.append(line("GET /orders/active", client.activeOrders()));
 
                 Thread.sleep(500);
+                // ⚠️ Меняем ЦЕНУ И ОБЪЁМ разом. Документация площадки кладёт
+                // base_size в тело замены, но проверено это не было: до сих пор
+                // зонд подставлял туда прежний размер. Вопрос не праздный —
+                // от него зависит, можно ли держать сетку заявок и двигать её
+                // одними PUT (суточного потолка у них нет) или каждое изменение
+                // объёма придётся оплачивать постановкой из тысячи в сутки.
                 String replaceBody = """
                         {"client_order_id":"%s","base_size":"%s","price":"%s",
                          "execution_instructions":["post_only"]}"""
-                        .formatted(probeClientId(), SIZE, NEXT_PRICE)
+                        .formatted(probeClientId(), BIGGER_SIZE, NEXT_PRICE)
                         .replaceAll("\\s*\\n\\s*", "");
                 Venue.Response replaced = client.replace(venueId, replaceBody);
-                report.append(line("PUT /orders/{id} (цена → " + NEXT_PRICE + ")", replaced));
+                report.append(line("PUT /orders/{id} (цена → " + NEXT_PRICE
+                        + ", объём " + SIZE + " → " + BIGGER_SIZE + ")", replaced));
                 String staleId = venueId;
                 if (replaced.ok()) {
                     String newId = extract(replaced.body());
@@ -135,6 +144,8 @@ public class OrderProbe {
                 }
 
                 Thread.sleep(500);
+                report.append(line("GET /orders/active (проверяем ОБЪЁМ)",
+                        client.activeOrders()));
                 report.append(orphanStage(client, staleId, venueId, mine));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
