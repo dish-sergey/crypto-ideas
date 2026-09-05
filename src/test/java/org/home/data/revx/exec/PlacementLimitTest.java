@@ -31,16 +31,17 @@ class PlacementLimitTest {
     }
 
     @Test
-    void controlGetsMoreBecauseItTradesMore() {
-        // A — контроль, на котором копится статистика: 48 исполнений за 6.6 ч
-        // против шести у B. Каждое исполнение съедает заявку.
-        assertTrue(ExecLimits.maxPlacementsPerDay("a") > ExecLimits.maxPlacementsPerDay("b"));
-        // ⚠️ Прежде здесь стояло «у B и C лимит обязан совпадать»: они отличались
-        // только отступом и сравнивались между собой. С 05.09.2026 B переведён на
-        // SOL, сравнивать их больше не с чем, и равенство отменено намеренно.
-        assertTrue(ExecLimits.maxPlacementsPerDay("b") > ExecLimits.maxPlacementsPerDay("c"),
-                "у B первая пара кроме биткойна — ему нужен запас, чтобы измерение "
-                        + "не упёрлось в лимит вместо рынка");
+    void tightestOffsetGetsTheBiggestBudget() {
+        // ⚠️ Раскладка перевёрнута 05.09.2026. Прежде больше всех получал A как
+        // контроль; теперь самый узкий отступ у C (7 б.п. против 10 у A), а
+        // расход постановок идёт за исполнениями: каждое съедает заявку и
+        // требует новой. По лестнице отступов на 7 б.п. ожидается около
+        // 100 постановок в сутки против 25 у A — значит бюджет нужен C.
+        assertTrue(ExecLimits.maxPlacementsPerDay("c") > ExecLimits.maxPlacementsPerDay("a"),
+                "у C отступ уже, исполнений больше — ему и бюджет");
+        // B на SOL: поток там тоньше всего, 12 постановок за 17 часов.
+        assertTrue(ExecLimits.maxPlacementsPerDay("a") > ExecLimits.maxPlacementsPerDay("b"),
+                "B на SOL расходует меньше всех");
     }
 
     @Test
