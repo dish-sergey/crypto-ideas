@@ -31,17 +31,20 @@ class PlacementLimitTest {
     }
 
     @Test
-    void tightestOffsetGetsTheBiggestBudget() {
-        // ⚠️ Раскладка перевёрнута 05.09.2026. Прежде больше всех получал A как
-        // контроль; теперь самый узкий отступ у C (7 б.п. против 10 у A), а
-        // расход постановок идёт за исполнениями: каждое съедает заявку и
-        // требует новой. По лестнице отступов на 7 б.п. ожидается около
-        // 100 постановок в сутки против 25 у A — значит бюджет нужен C.
-        assertTrue(ExecLimits.maxPlacementsPerDay("c") > ExecLimits.maxPlacementsPerDay("a"),
-                "у C отступ уже, исполнений больше — ему и бюджет");
-        // B на SOL: поток там тоньше всего, 12 постановок за 17 часов.
+    void gridBotsGetTheBudgetAndTheStoppedOneGetsLeast() {
+        // ⚠️ Раскладка менялась дважды за 05.09.2026 и теперь стоит под СЕТКИ:
+        // A ведёт сетку на BTC, B — на SOL, C остановлен.
+        //
+        // Сетке измерено 278 постановок в сутки против 233 у одиночной
+        // котировки, поэтому A нужно 400: при 300 она встала бы впритык, а
+        // упереться нельзя — при исчерпании лимита бот не пропускает
+        // постановку, а ВЫКЛЮЧАЕТСЯ совсем.
         assertTrue(ExecLimits.maxPlacementsPerDay("a") > ExecLimits.maxPlacementsPerDay("b"),
-                "B на SOL расходует меньше всех");
+                "сетка на BTC расходует больше всех: поток там втрое гуще, чем на SOL");
+        assertTrue(ExecLimits.maxPlacementsPerDay("b") > ExecLimits.maxPlacementsPerDay("c"),
+                "C остановлен — ему нужен наименьший бюджет");
+        assertTrue(ExecLimits.maxPlacementsPerDay("a") >= 400,
+                "сетке нужно 278 в сутки, 300 было бы впритык");
     }
 
     @Test
