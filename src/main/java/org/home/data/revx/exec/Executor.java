@@ -217,7 +217,7 @@ public class Executor {
      * шаги цены и количества входят в округление котировки, и подставить сюда
      * другие значит гарантированно разойтись.
      */
-    public void replay(String journalPath) {
+    public void replay(String journalPath, String fillModel) {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
@@ -262,11 +262,29 @@ public class Executor {
             QuotePolicy policy = buildPolicy(params, bp.costFloorMargin(), bp.anchorLeash(),
                     bp.anchorWidening(), bp.widening(), bp.wideningMaxStep(), bp.size(),
                     bp.inventoryCap(), bp.quoteStep());
+            // Модель исполнения — ЕДИНСТВЕННАЯ неизвестная стенда. Всё остальное
+            // проверено повтором: при верных исполнениях котировки сходятся с
+            // живым на 99.92%. Поэтому моделей три, и у каждой своя роль.
+            org.home.data.revx.replay.FillModel model = switch (fillModel) {
+                case "recorded" -> new org.home.data.revx.replay.RecordedFillModel(fills,
+                        org.home.data.revx.replay.RecordedFillModel.DETECTION_LAG_MS);
+                case "touch" -> new org.home.data.revx.replay.TouchFillModel(
+                        org.home.data.revx.replay.MarketData.load(standDbPath, bp.symbol(),
+                                ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs()));
+                case "market" -> new org.home.data.revx.replay.MarketFillModel(
+                        org.home.data.revx.replay.MarketData.load(standDbPath, bp.symbol(),
+                                ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs()));
+                default -> throw new IllegalArgumentException(
+                        "неизвестная модель исполнения: " + fillModel
+                                + " (recorded | market | touch)");
+            };
+            log.warn("модель исполнения: {}", model.describe());
+
             ReplayRunner.Result result = ReplayRunner.run(ticks, fills, params, policy,
                     bp.symbol(), bp.periodMs(), bp.minNotional(), bp.botId(),
                     bp.baseStep(), bp.parkDistance(),
                     bp.inventoryCap() * 1.2 * ticks.get(0).fair(),
-                    0);
+                    model, 0);
             log.info("\n{}", ReplayRunner.render(result));
         } catch (Exception e) {
             log.error("повтор не прошёл: {}", e.toString(), e);

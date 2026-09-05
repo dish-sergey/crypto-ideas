@@ -15,41 +15,31 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * Площадка, отвечающая по ЗАПИСИ живого бота.
+ * Площадка стенда: вторая реализация {@link Venue}.
  *
- * <h2>Что это и чем не является</h2>
+ * <h2>Что здесь и чего здесь нет</h2>
  *
- * Это вторая реализация {@link Venue}. Первая, {@link
- * org.home.data.revx.exec.TradeClient}, шлёт запросы на Revolut X; эта отвечает
- * на те же запросы теми же формами JSON, а исполнения берёт не из модели, а из
- * журнала: что случилось у живого бота, то случается и здесь.
+ * Здесь — весь учёт: заявки, остатки, резервы под стоящими заявками, семантика
+ * замены (новый идентификатор), 422 на мёртвый идентификатор, {@code
+ * filled_quantity} по исполнившейся заявке. Всё это проверено повтором живого
+ * журнала: при верных исполнениях котировки сходятся с живым на 99.92%
+ * (61 542 тика из 61 592, бот A, 17 часов).
  *
- * Поэтому сверка получается ЗАМКНУТОЙ. При одинаковых входах — та же цена, те же
- * исполнения — котировщик обязан выдать те же котировки до последнего знака.
- * Любое расхождение здесь означает поломку в самом повторе (часы, разбор,
- * состояние), а не спор моделей. Это и есть первая ступень: убедиться, что стенд
- * умеет воспроизвести живого, прежде чем что-то на нём прогнозировать.
- *
- * ⚠️ Предсказанием исполнений эта площадка НЕ занимается. Модель исполнения
- * ({@code sim.ExecutionModel}) подключается второй ступенью и меряется против
- * этих же записанных исполнений — там стопроцентного совпадения не будет и быть
- * не может.
+ * Здесь НЕТ решения, исполнилась ли заявка. Это единственная неизвестная, и она
+ * вынесена в {@link FillModel} — чтобы любое расхождение стенда с реальностью
+ * относилось к ней одной, а не размазывалось по десятку подозреваемых.
  *
  * <h2>Почему обмен строками JSON</h2>
  *
- * Чтобы повтор гонял ТОТ ЖЕ разбор, что и живой бот. Самые дорогие ошибки жили
+ * Чтобы стенд гонял ТОТ ЖЕ разбор, что и живой бот. Самые дорогие ошибки жили
  * именно в разборе: имя поля с идентификатором различается между ответами
  * ({@code venue_order_id} против {@code id}), замена возвращает новый
  * идентификатор, 422 не означает, что замены не было. Отдай мы типизированные
  * объекты — проверяли бы не бота, а свою модель бота.
  */
-public final class ReplayVenue implements Venue {
+public final class SimVenue implements Venue {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-
-    /** Записанное исполнение: то, что на самом деле произошло у живого бота. */
-    public record RecordedFill(long tsMs, boolean buy, double qty, double price) {
-    }
 
     private static final class Order {
         String id;
@@ -62,7 +52,7 @@ public final class ReplayVenue implements Venue {
     }
 
     private final Clock clock;
-    private final List<RecordedFill> fills;
+    private final FillModel model;
     private final String base;
     private final String quote;
 
@@ -71,33 +61,17 @@ public final class ReplayVenue implements Venue {
     private final Map<String, double[]> done = new LinkedHashMap<>();
     private double baseTotal;
     private double quoteTotal;
-    private int fillCursor;
-    /**
-     * На сколько сдвинуть записанные исполнения НАЗАД.
-     *
-     * ⚠️ {@code exec_fill.ts_ms} — момент ОБНАРУЖЕНИЯ, а не сделки. Бот не
-     * считает заявку исчезнувшей, пока ей меньше {@code ADOPT_GRACE_MS} = 5 с
-     * (список активных отстаёт от постановки, и поспешный вывод даёт дубль).
-     * Значит в записанную отметку уже вложены чужие пять секунд, и повтор,
-     * убирающий заявку в этот момент, добавляет к ним свои: измерено 5.82, 5.80,
-     * 4.37, 10.86, 5.69 с по первым исполнениям. Сдвиг назад возвращает отметку
-     * к рынку, и собственное правило бота приводит обнаружение туда, где оно
-     * было у живого.
-     */
-    private final long detectionLagMs;
 
     private long placements;
     private long replaces;
     private long cancels;
     private long applied;
-    private long unattributed;
     private long replaceRejects;
 
-    public ReplayVenue(Clock clock, List<RecordedFill> fills, String symbol,
-                       double baseStart, double quoteStart, long detectionLagMs) {
-        this.detectionLagMs = detectionLagMs;
+    public SimVenue(Clock clock, FillModel model, String symbol,
+                    double baseStart, double quoteStart) {
         this.clock = clock;
-        this.fills = fills;
+        this.model = model;
         this.base = symbol.substring(0, symbol.indexOf('/'));
         this.quote = symbol.substring(symbol.indexOf('/') + 1);
         this.baseTotal = baseStart;
@@ -125,64 +99,54 @@ public final class ReplayVenue implements Venue {
         return applied;
     }
 
-    /**
-     * Записанные исполнения, которые НЕ на что было положить.
-     *
-     * Каждое такое — расхождение повтора с живым: у бота в этот момент стояла
-     * заявка, а у нас нет. Молча пропускать их нельзя, это и есть измеряемая
-     * ошибка воспроизведения.
-     */
-    public long unattributedFills() {
-        return unattributed;
+    public FillModel model() {
+        return model;
     }
 
     /**
-     * Догнать записанные исполнения до текущего момента часов.
+     * Догнать исполнения до текущего момента часов.
      *
-     * Вызывается перед КАЖДЫМ ответом: живой бот узнаёт об исполнении из
-     * остатков и из списка активных, и порядок «сначала событие, потом ответ»
-     * обязан совпадать.
+     * Вызывается перед КАЖДЫМ ответом: бот узнаёт об исполнении из списка
+     * активных и из {@code GET /orders/{id}}, и порядок «сначала событие, потом
+     * ответ» обязан совпадать с живым.
      */
     private void advance() {
-        long now = clock.now();
-        while (fillCursor < fills.size()
-                && fills.get(fillCursor).tsMs() - detectionLagMs <= now) {
-            apply(fills.get(fillCursor++));
+        List<FillModel.Resting> resting = new ArrayList<>();
+        for (Order o : live.values()) {
+            resting.add(new FillModel.Resting(o.id, o.buy, o.price, o.size, o.createdMs));
+        }
+        for (FillModel.Filled f : model.advance(clock.now(), resting)) {
+            apply(f);
         }
     }
 
-    private void apply(RecordedFill f) {
-        Order hit = null;
-        for (Order o : live.values()) {
-            if (o.buy == f.buy()) {
-                hit = o;
-                break;
-            }
-        }
+    private void apply(FillModel.Filled f) {
+        Order hit = live.get(f.orderId());
         if (hit == null) {
-            unattributed++;
             return;
         }
         applied++;
-        if (f.buy()) {
-            baseTotal += f.qty();
-            quoteTotal -= f.qty() * f.price();
+        double qty = Math.min(f.qty(), hit.size);
+        if (hit.buy) {
+            baseTotal += qty;
+            quoteTotal -= qty * f.price();
         } else {
-            baseTotal -= f.qty();
-            quoteTotal += f.qty() * f.price();
+            baseTotal -= qty;
+            quoteTotal += qty * f.price();
         }
         // ⚠️ Исполнение надо ЗАПОМНИТЬ за заявкой. Бот узнаёт о нём не из
-        // остатков, а из GET /orders/{id} по полю filled_quantity: при двух
+        // остатков, а из GET /orders/{id} по полю filled_quantity: при трёх
         // ботах на счёте остатки содержат чужие сделки, и других источников у
         // него нет. Площадка, отвечающая на исчезнувшую заявку нулём, оставляет
-        // бота с нулевым инвентарём навсегда — первый же прогон разошёлся с
-        // живым ровно здесь, на 383-м тике.
+        // бота с нулевым инвентарём навсегда — первый прогон разошёлся с живым
+        // ровно здесь, на 383-м тике.
         double[] acc = done.computeIfAbsent(hit.id, k -> new double[2]);
-        acc[0] += f.qty();
-        acc[1] += f.qty() * f.price();
-        hit.size -= f.qty();
+        acc[0] += qty;
+        acc[1] += qty * f.price();
+        hit.size -= qty;
         if (hit.size <= 1e-12) {
             live.remove(hit.id);
+            model.cancelled(hit.id);
         }
     }
 
@@ -268,6 +232,7 @@ public final class ReplayVenue implements Venue {
         o.size = limit.path("base_size").asDouble();
         o.createdMs = clock.now();
         live.put(o.id, o);
+        model.placed(new FillModel.Resting(o.id, o.buy, o.price, o.size, o.createdMs));
         placements++;
         return new Response(200, String.format(
                 "{\"data\":{\"venue_order_id\":\"%s\",\"client_order_id\":\"%s\",\"state\":\"new\"}}",
@@ -285,6 +250,7 @@ public final class ReplayVenue implements Venue {
             return new Response(422,
                     "{\"message\":\"Cannot replace an order that is not in the 'NEW' state\"}", 0);
         }
+        model.cancelled(id);
         JsonNode n = read(json);
         if (n == null) {
             live.put(id, old);
@@ -292,7 +258,9 @@ public final class ReplayVenue implements Venue {
         }
         Order o = new Order();
         // ⚠️ Замена создаёт ДРУГУЮ заявку с новым идентификатором — именно это
-        // поведение площадки ломало учёт, и повтор обязан его повторять.
+        // поведение площадки ломало учёт, и стенд обязан его повторять. Для
+        // модели очереди это тоже принципиально: наследник встаёт в КОНЕЦ
+        // очереди, приоритета предшественника он не наследует.
         o.id = UUID.randomUUID().toString();
         o.clientId = n.path("client_order_id").asText(old.clientId);
         o.symbol = old.symbol;
@@ -301,6 +269,7 @@ public final class ReplayVenue implements Venue {
         o.size = n.path("base_size").asDouble(old.size);
         o.createdMs = clock.now();
         live.put(o.id, o);
+        model.placed(new FillModel.Resting(o.id, o.buy, o.price, o.size, o.createdMs));
         replaces++;
         return new Response(200, String.format(
                 "{\"data\":{\"venue_order_id\":\"%s\",\"client_order_id\":\"%s\",\"state\":\"new\"}}",
@@ -311,9 +280,11 @@ public final class ReplayVenue implements Venue {
     public Response cancel(String id) {
         advance();
         cancels++;
-        return live.remove(id) == null
-                ? new Response(404, "{\"message\":\"not found\"}", 0)
-                : new Response(204, "", 0);
+        if (live.remove(id) == null) {
+            return new Response(404, "{\"message\":\"not found\"}", 0);
+        }
+        model.cancelled(id);
+        return new Response(204, "", 0);
     }
 
     private static JsonNode read(String json) {

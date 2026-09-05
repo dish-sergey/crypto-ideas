@@ -85,15 +85,15 @@ public final class ReplayRunner {
     }
 
     /** Исполнения из журнала. Передачи между ботами исключены: рынок их не делал. */
-    public static List<ReplayVenue.RecordedFill> readFills(String journalPath, long fromMs) {
-        List<ReplayVenue.RecordedFill> out = new ArrayList<>();
+    public static List<RecordedFillModel.RecordedFill> readFills(String journalPath, long fromMs) {
+        List<RecordedFillModel.RecordedFill> out = new ArrayList<>();
         String sql = "SELECT ts_ms, side, qty, price FROM exec_fill WHERE ts_ms >= " + fromMs
                 + " AND (status IS NULL OR status = 'filled') ORDER BY ts_ms";
         try (Connection c = open(journalPath);
              Statement st = c.createStatement();
              ResultSet rs = st.executeQuery(sql)) {
             while (rs.next()) {
-                out.add(new ReplayVenue.RecordedFill(rs.getLong(1),
+                out.add(new RecordedFillModel.RecordedFill(rs.getLong(1),
                         "BUY".equalsIgnoreCase(rs.getString(2)),
                         rs.getDouble(3), rs.getDouble(4)));
             }
@@ -137,10 +137,11 @@ public final class ReplayRunner {
      *
      * @param tolerance допуск сравнения цен в долях (0 — совпадение до знака)
      */
-    public static Result run(List<ReplayFair.Tick> ticks, List<ReplayVenue.RecordedFill> fills,
+    public static Result run(List<ReplayFair.Tick> ticks, List<RecordedFillModel.RecordedFill> fills,
                              Quoter.Params params, QuotePolicy policy, String symbol,
                              long periodMs, double minNotional, String botId,
                              double baseStep, double parkDistance, double quoteStart,
+                             FillModel model,
 
                              double tolerance) throws Exception {
         if (ticks.isEmpty()) {
@@ -152,8 +153,8 @@ public final class ReplayRunner {
         SimClock clock = new SimClock(start);
         clock.followSchedule(ticks.stream().mapToLong(ReplayFair.Tick::tsMs).toArray());
         ReplayFair fair = new ReplayFair(ticks, clock);
-        ReplayVenue venue = new ReplayVenue(clock, fills, symbol,
-                ticks.get(0).inventory(), quoteStart, 5000);
+        SimVenue venue = new SimVenue(clock, model, symbol,
+                ticks.get(0).inventory(), quoteStart);
 
         // Журнал и реестр — во временных файлах: повтор не имеет права трогать
         // ни живой журнал, ни общий реестр владения.
@@ -188,8 +189,8 @@ public final class ReplayRunner {
      * «не котировал» — тоже решение, и разойтись здесь так же плохо.
      */
     private static Result compare(List<ReplayFair.Tick> live, ExecJournal journal, Path dir,
-                                  ReplayVenue venue, double tolerance,
-                                  List<ReplayVenue.RecordedFill> liveFills) throws Exception {
+                                  SimVenue venue, double tolerance,
+                                  List<RecordedFillModel.RecordedFill> liveFills) throws Exception {
         List<ReplayFair.Tick> mine = readTicks(dir.resolve("replay.db").toString(), 0);
         java.util.Map<Long, ReplayFair.Tick> byTs = new java.util.HashMap<>();
         for (ReplayFair.Tick t : mine) {
@@ -236,9 +237,10 @@ public final class ReplayRunner {
         }
         // Прямая диагностика запаздывания: когда живой и повтор ЗАРЕГИСТРИРОВАЛИ
         // каждое исполнение. Всё остальное — следствие этих моментов.
-        List<ReplayVenue.RecordedFill> mineFills =
+        List<RecordedFillModel.RecordedFill> mineFills =
                 readFills(dir.resolve("replay.db").toString(), 0);
-        log.warn("исполнений: у живого {}, у повтора {}", liveFills.size(), mineFills.size());
+        log.warn("исполнений: у живого {}, у стенда {}", liveFills.size(), mineFills.size());
+        matchFills(liveFills, mineFills);
         for (int i = 0; i < Math.min(10, Math.min(liveFills.size(), mineFills.size())); i++) {
             long a = liveFills.get(i).tsMs();
             long b = mineFills.get(i).tsMs();
@@ -254,7 +256,9 @@ public final class ReplayRunner {
         return new Result(live.size(), compared, bidMatch, askMatch,
                 compared - bidMatch, compared - askMatch,
                 venue.placements(), venue.replaces(), venue.cancels(), venue.replaceRejects(),
-                venue.appliedFills(), venue.unattributedFills(), worstBid, worstAsk);
+                venue.appliedFills(),
+                venue.model() instanceof RecordedFillModel r ? r.unattributed() : 0,
+                worstBid, worstAsk);
     }
 
     private static boolean same(Double a, Double b, double fair, double tolerance) {
@@ -269,6 +273,45 @@ public final class ReplayRunner {
             return a == null && b == null ? 0 : Double.POSITIVE_INFINITY;
         }
         return Math.abs(a - b) / fair * 10_000;
+    }
+
+    /**
+     * Сверка ИСПОЛНЕНИЙ: угадала ли модель то, что случилось на самом деле.
+     *
+     * Для контрольной модели это тавтология (исполнения взяты из записи), а вот
+     * для прогнозных — единственная честная метрика. Стопроцентного совпадения
+     * тут не будет никогда, и требовать его нельзя: модель отвечает на вопрос,
+     * дошёл ли поток до нашей цены, а он по построению вероятностный.
+     *
+     * Совпадением считается исполнение той же стороны в пределах минуты:
+     * обнаружение у живого привязано к минутной сверке с книгой, и требовать
+     * секундной точности значило бы мерить не модель, а расписание опросов.
+     */
+    private static void matchFills(List<RecordedFillModel.RecordedFill> live,
+                                   List<RecordedFillModel.RecordedFill> mine) {
+        boolean[] used = new boolean[mine.size()];
+        int matched = 0;
+        for (RecordedFillModel.RecordedFill l : live) {
+            for (int i = 0; i < mine.size(); i++) {
+                RecordedFillModel.RecordedFill m = mine.get(i);
+                if (!used[i] && m.buy() == l.buy()
+                        && Math.abs(m.tsMs() - l.tsMs()) <= 60_000) {
+                    used[i] = true;
+                    matched++;
+                    break;
+                }
+            }
+        }
+        int spurious = mine.size() - matched;
+        double recall = live.isEmpty() ? Double.NaN : 100.0 * matched / live.size();
+        double precision = mine.isEmpty() ? Double.NaN : 100.0 * matched / mine.size();
+        log.warn("сверка исполнений: угадано {} из {} ({}%), выдумано {} ({}% предсказанных)",
+                matched, live.size(), String.format(Locale.ROOT, "%.1f", recall),
+                spurious, String.format(Locale.ROOT, "%.1f", 100 - precision));
+        double lq = live.stream().mapToDouble(RecordedFillModel.RecordedFill::qty).sum();
+        double mq = mine.stream().mapToDouble(RecordedFillModel.RecordedFill::qty).sum();
+        log.warn("оборот: у живого {}, у стенда {} ({}x)", lq, mq,
+                lq > 0 ? String.format(Locale.ROOT, "%.2f", mq / lq) : "—");
     }
 
     public static String render(Result r) {

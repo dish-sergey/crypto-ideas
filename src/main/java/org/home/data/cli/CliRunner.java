@@ -197,7 +197,8 @@ public class CliRunner implements ApplicationRunner {
                 tradeCheck.getObject().run();
             }
             if (args.containsOption("revx-replay")) {
-                executor.getObject().replay(firstOr(args, "journal", "state/exec.db"));
+                executor.getObject().replay(firstOr(args, "journal", "state/exec.db"),
+                        firstOr(args, "model", "recorded"));
             }
             if (args.containsOption("revx-order-probe")) {
                 orderProbe.getObject().run();
