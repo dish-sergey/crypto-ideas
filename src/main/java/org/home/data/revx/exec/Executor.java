@@ -151,6 +151,48 @@ public class Executor {
     }
 
     /**
+     * Запись версии в событии {@code boot}: человеческая строка и следом, через
+     * {@code |}, машинная.
+     *
+     * ⚠️ Машинная часть появилась потому, что повтор брал параметры из
+     * {@code application.properties}, а живому боту половина приходит из
+     * systemd-юнита: {@code skew-target} 0.3 против 0.0, {@code park-distance}
+     * 0.10 против −1. Из-за нулевого скоса повтор котировал чистый отступ
+     * 10 б.п. там, где живой стоял на 5.7, и сверка сравнивала не логику бота, а
+     * две разные настройки. Настройки обязаны ехать вместе с записью, а не
+     * подбираться к ней задним числом.
+     *
+     * Человеческая часть остаётся первой: её печатает {@code /pnl}.
+     */
+    String bootDetail() {
+        return String.format(java.util.Locale.ROOT,
+                "%s, лот %s, отступ %.1f б.п., скос k=%.4f, цель %.0f%% потолка | %s",
+                // valueOf, а не new BigDecimal(double): конструктор печатает
+                // точное двоичное разложение (0.0000125000000000000000108…).
+                symbol, java.math.BigDecimal.valueOf(size).stripTrailingZeros().toPlainString(),
+                offset * 10_000, cfg.simSkewK(), skewTarget * 100, bootJson());
+    }
+
+    private String bootJson() {
+        return String.format(java.util.Locale.ROOT,
+                "{\"symbol\":\"%s\",\"botId\":\"%s\",\"size\":%s,\"inventoryCap\":%s,"
+                        + "\"offset\":%s,\"skewK\":%s,\"skewTarget\":%s,\"periodMs\":%d,"
+                        + "\"minNotional\":%s,\"baseStep\":%s,\"quoteStep\":%s,"
+                        + "\"parkDistance\":%s,\"costFloorMargin\":%s,\"anchorLeash\":%s,"
+                        + "\"widening\":%s,\"wideningMaxStep\":%s,\"anchorWidening\":%s,"
+                        + "\"ownPosition\":%b}",
+                symbol, tag.id(), num(size), num(inventoryCap), num(offset),
+                num(cfg.simSkewK()), num(skewTarget), periodMs, num(minNotional()),
+                num(spec.baseStep()), num(quoteStep()), num(parkDistance),
+                num(costFloorMargin), num(anchorLeash), num(widening),
+                num(wideningMaxStep), num(anchorWidening), ownPosition);
+    }
+
+    private static String num(double v) {
+        return java.math.BigDecimal.valueOf(v).stripTrailingZeros().toPlainString();
+    }
+
+    /**
      * Параметры котирования. Отдельный метод не ради красоты: ровно эти же числа
      * обязан получить повтор ({@code --revx-replay}), иначе сверка «один в один»
      * сравнивает не логику бота, а две разные настройки.
@@ -194,10 +236,36 @@ public class Executor {
             log.warn("повтор {}: тиков {}, исполнений {}, с {}", symbol, ticks.size(),
                     fills.size(), java.time.Instant.ofEpochMilli(boot));
 
-            Quoter.Params params = buildParams();
-            ReplayRunner.Result result = ReplayRunner.run(ticks, fills, params,
-                    buildPolicy(params), symbol, periodMs, minNotional(), tag.id(),
-                    spec.baseStep(), parkDistance, inventoryCap * 1.2 * ticks.get(0).fair(),
+            // ⚠️ Настройки берём ИЗ ЖУРНАЛА, а не из окружения. Живому боту
+            // половина приходит из systemd-юнита, и подстановка умолчаний
+            // однажды уже превратила сверку в сравнение двух разных настроек.
+            org.home.data.revx.replay.BootParams bp =
+                    org.home.data.revx.replay.BootParams.parse(
+                            ReplayRunner.lastBootDetail(journalPath));
+            if (bp == null) {
+                throw new IllegalStateException("в событии boot нет машинной части — "
+                        + "запись сделана до 05.09.2026. Подставлять окружение нельзя: "
+                        + "именно так сверка и врала. Нужен свежий журнал.");
+            }
+            log.warn("настройки из журнала: отступ {} б.п., скос k={}, цель {}%, "
+                            + "лот {}, потолок {}, отвод {}",
+                    bp.offset() * 10_000, bp.skewK(), bp.skewTarget() * 100,
+                    bp.size(), bp.inventoryCap(), bp.parkDistance());
+
+            Quoter.Params params = new Quoter.Params(bp.offset(), bp.size(),
+                    bp.inventoryCap(), bp.skewK(), bp.skewTarget(), cfg.simDriftBeta(),
+                    cfg.simBuySizeRatio(), cfg.simDriftWindowMs(), cfg.simSizeShapeEta(),
+                    cfg.simDriftGateEr(), cfg.simErWindowMs(), cfg.simErSampleMs(),
+                    cfg.simStopDrawdownPct(), Quoter.Sticky.OFF, Quoter.Frozen.OFF,
+                    Quoter.Hedge.OFF, cfg.simStopCoolOffMs(), cfg.simRequoteThreshold(),
+                    bp.quoteStep());
+            QuotePolicy policy = buildPolicy(params, bp.costFloorMargin(), bp.anchorLeash(),
+                    bp.anchorWidening(), bp.widening(), bp.wideningMaxStep(), bp.size(),
+                    bp.inventoryCap(), bp.quoteStep());
+            ReplayRunner.Result result = ReplayRunner.run(ticks, fills, params, policy,
+                    bp.symbol(), bp.periodMs(), bp.minNotional(), bp.botId(),
+                    bp.baseStep(), bp.parkDistance(),
+                    bp.inventoryCap() * 1.2 * ticks.get(0).fair(),
                     0);
             log.info("\n{}", ReplayRunner.render(result));
         } catch (Exception e) {
@@ -223,12 +291,7 @@ public class Executor {
         // намеренно разные (10 против 14 б.п., док. 113 §5). Скос k живой берёт
         // из конфига симуляции, а вот цель — своя (revx.exec.skew-target), и
         // без неё запись версии не полна: цель и есть то, что крутят.
-        journal.event("boot", String.format(java.util.Locale.ROOT,
-                "%s, лот %s, отступ %.1f б.п., скос k=%.4f, цель %.0f%% потолка",
-                // valueOf, а не new BigDecimal(double): конструктор печатает
-                // точное двоичное разложение (0.0000125000000000000000108…).
-                symbol, java.math.BigDecimal.valueOf(size).stripTrailingZeros().toPlainString(),
-                offset * 10_000, cfg.simSkewK(), skewTarget * 100));
+        journal.event("boot", bootDetail());
 
         if (offset != cfg.simOffset()) {
             // Расхождение намеренное, но молчать о нём нельзя: иначе через месяц
@@ -296,9 +359,22 @@ public class Executor {
      * аск, а не сырой.
      */
     private QuotePolicy buildPolicy(Quoter.Params params) {
+        return buildPolicy(params, costFloorMargin, anchorLeash, anchorWidening,
+                widening, wideningMaxStep, size, inventoryCap, quoteStep());
+    }
+
+    /**
+     * ⚠️ Все ручки — аргументами, а не полями. Повтор собирает политику из
+     * настроек, записанных в журнале, и брать их из окружения он не имеет права:
+     * именно так сверка однажды сравнила не логику бота, а две разные настройки.
+     */
+    static QuotePolicy buildPolicy(Quoter.Params params, double costFloorMargin,
+                                   double anchorLeash, double anchorWidening,
+                                   double widening, double wideningMaxStep,
+                                   double size, double inventoryCap, double quoteStep) {
         QuotePolicy policy = new Quoter(params);
         if (costFloorMargin >= 0) {
-            policy = new CostFloorPolicy(policy, costFloorMargin, quoteStep());
+            policy = new CostFloorPolicy(policy, costFloorMargin, quoteStep);
         }
         // Поводок и растущий шаг решают ОДНУ задачу — пережить падение, — и
         // ставить их вместе бессмысленно: оба двигают бид вниз, и разложить
@@ -306,10 +382,10 @@ public class Executor {
         // (док. 119 §5), поэтому при заданном поводке растущий шаг не ставится.
         if (anchorLeash >= 0) {
             policy = new AnchoredBidPolicy(policy, params.offset(), anchorWidening,
-                    params.offset(), anchorLeash, size, inventoryCap, quoteStep());
+                    params.offset(), anchorLeash, size, inventoryCap, quoteStep);
         } else if (widening > 0) {
             policy = new WideningBidPolicy(policy, params.offset(), widening,
-                    wideningMaxStep, size, inventoryCap, quoteStep());
+                    wideningMaxStep, size, inventoryCap, quoteStep);
         }
         return policy;
     }

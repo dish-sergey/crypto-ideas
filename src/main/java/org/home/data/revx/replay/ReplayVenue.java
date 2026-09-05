@@ -72,6 +72,19 @@ public final class ReplayVenue implements Venue {
     private double baseTotal;
     private double quoteTotal;
     private int fillCursor;
+    /**
+     * На сколько сдвинуть записанные исполнения НАЗАД.
+     *
+     * ⚠️ {@code exec_fill.ts_ms} — момент ОБНАРУЖЕНИЯ, а не сделки. Бот не
+     * считает заявку исчезнувшей, пока ей меньше {@code ADOPT_GRACE_MS} = 5 с
+     * (список активных отстаёт от постановки, и поспешный вывод даёт дубль).
+     * Значит в записанную отметку уже вложены чужие пять секунд, и повтор,
+     * убирающий заявку в этот момент, добавляет к ним свои: измерено 5.82, 5.80,
+     * 4.37, 10.86, 5.69 с по первым исполнениям. Сдвиг назад возвращает отметку
+     * к рынку, и собственное правило бота приводит обнаружение туда, где оно
+     * было у живого.
+     */
+    private final long detectionLagMs;
 
     private long placements;
     private long replaces;
@@ -81,7 +94,8 @@ public final class ReplayVenue implements Venue {
     private long replaceRejects;
 
     public ReplayVenue(Clock clock, List<RecordedFill> fills, String symbol,
-                       double baseStart, double quoteStart) {
+                       double baseStart, double quoteStart, long detectionLagMs) {
+        this.detectionLagMs = detectionLagMs;
         this.clock = clock;
         this.fills = fills;
         this.base = symbol.substring(0, symbol.indexOf('/'));
@@ -131,7 +145,8 @@ public final class ReplayVenue implements Venue {
      */
     private void advance() {
         long now = clock.now();
-        while (fillCursor < fills.size() && fills.get(fillCursor).tsMs() <= now) {
+        while (fillCursor < fills.size()
+                && fills.get(fillCursor).tsMs() - detectionLagMs <= now) {
             apply(fills.get(fillCursor++));
         }
     }

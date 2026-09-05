@@ -115,6 +115,19 @@ public final class ReplayRunner {
         }
     }
 
+
+    /** Текст события boot: в нём едут настройки, с которыми бот работал. */
+    public static String lastBootDetail(String journalPath) {
+        try (Connection c = open(journalPath);
+             Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT detail FROM exec_event WHERE kind = 'boot' ORDER BY ts_ms DESC LIMIT 1")) {
+            return rs.next() ? rs.getString(1) : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private static Connection open(String path) throws Exception {
         return DriverManager.getConnection("jdbc:sqlite:file:" + path + "?mode=ro");
     }
@@ -128,6 +141,7 @@ public final class ReplayRunner {
                              Quoter.Params params, QuotePolicy policy, String symbol,
                              long periodMs, double minNotional, String botId,
                              double baseStep, double parkDistance, double quoteStart,
+
                              double tolerance) throws Exception {
         if (ticks.isEmpty()) {
             return new Result(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -139,7 +153,7 @@ public final class ReplayRunner {
         clock.followSchedule(ticks.stream().mapToLong(ReplayFair.Tick::tsMs).toArray());
         ReplayFair fair = new ReplayFair(ticks, clock);
         ReplayVenue venue = new ReplayVenue(clock, fills, symbol,
-                ticks.get(0).inventory(), quoteStart);
+                ticks.get(0).inventory(), quoteStart, 5000);
 
         // Журнал и реестр — во временных файлах: повтор не имеет права трогать
         // ни живой журнал, ни общий реестр владения.
@@ -160,7 +174,7 @@ public final class ReplayRunner {
             loop.startQuoting();
             loop.run();
 
-            return compare(ticks, journal, dir, venue, tolerance);
+            return compare(ticks, journal, dir, venue, tolerance, fills);
         } finally {
             delete(dir);
         }
@@ -174,7 +188,8 @@ public final class ReplayRunner {
      * «не котировал» — тоже решение, и разойтись здесь так же плохо.
      */
     private static Result compare(List<ReplayFair.Tick> live, ExecJournal journal, Path dir,
-                                  ReplayVenue venue, double tolerance) throws Exception {
+                                  ReplayVenue venue, double tolerance,
+                                  List<ReplayVenue.RecordedFill> liveFills) throws Exception {
         List<ReplayFair.Tick> mine = readTicks(dir.resolve("replay.db").toString(), 0);
         java.util.Map<Long, ReplayFair.Tick> byTs = new java.util.HashMap<>();
         for (ReplayFair.Tick t : mine) {
@@ -218,6 +233,20 @@ public final class ReplayRunner {
             } else {
                 worstAsk = Math.max(worstAsk, da);
             }
+        }
+        // Прямая диагностика запаздывания: когда живой и повтор ЗАРЕГИСТРИРОВАЛИ
+        // каждое исполнение. Всё остальное — следствие этих моментов.
+        List<ReplayVenue.RecordedFill> mineFills =
+                readFills(dir.resolve("replay.db").toString(), 0);
+        log.warn("исполнений: у живого {}, у повтора {}", liveFills.size(), mineFills.size());
+        for (int i = 0; i < Math.min(10, Math.min(liveFills.size(), mineFills.size())); i++) {
+            long a = liveFills.get(i).tsMs();
+            long b = mineFills.get(i).tsMs();
+            log.warn("  #{} живой {} | повтор {} | сдвиг {} с | {} {} против {} {}",
+                    i + 1, java.time.Instant.ofEpochMilli(a), java.time.Instant.ofEpochMilli(b),
+                    (b - a) / 1000.0,
+                    liveFills.get(i).buy() ? "BUY" : "SELL", liveFills.get(i).qty(),
+                    mineFills.get(i).buy() ? "BUY" : "SELL", mineFills.get(i).qty());
         }
         log.warn("инвентарь совпал на {} тиках из {} ({}%), первое расхождение {}",
                 invMatch, compared, compared > 0 ? 100 * invMatch / compared : 0,

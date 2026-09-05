@@ -1523,6 +1523,7 @@ public final class QuoteLoop implements Runnable {
         }
     }
 
+
     private static String extract(String body) {
         Matcher matcher = VENUE_ID.matcher(body == null ? "" : body);
         return matcher.find() ? matcher.group(1) : null;

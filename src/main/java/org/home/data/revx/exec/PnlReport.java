@@ -158,8 +158,11 @@ public final class PnlReport {
             sb.append(String.format(Locale.ROOT, "%nВерсия запущена %s UTC (%d ч %d мин назад)%n",
                     STAMP.format(Instant.ofEpochMilli(boot.tsMs())), up.toHours(),
                     up.toMinutesPart()));
-            if (boot.detail() != null && !boot.detail().isBlank()) {
-                sb.append("  ").append(boot.detail()).append('\n');
+            // В detail после «|» едет машинная часть для повтора — человеку она
+            // не нужна и только загромождает ответ в чате.
+            String human = org.home.data.revx.replay.BootParams.human(boot.detail());
+            if (!human.isBlank()) {
+                sb.append("  ").append(human).append('\n');
             }
             sb.append("Сравнивать версии между собой — по строке «С ЗАПУСКА»: остальные\n");
             sb.append("окна вложенные и захватывают торговлю прежних версий.\n");
