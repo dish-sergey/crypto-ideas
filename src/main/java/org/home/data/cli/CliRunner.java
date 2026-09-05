@@ -203,7 +203,8 @@ public class CliRunner implements ApplicationRunner {
             if (args.containsOption("revx-forecast")) {
                 executor.getObject().forecast(firstOr(args, "journal", "state/exec.db"),
                         firstOr(args, "offsets", "10,14"),
-                        args.containsOption("share-cap"));
+                        args.containsOption("share-cap"),
+                        firstOr(args, "from", ""), firstOr(args, "to", ""));
             }
             if (args.containsOption("revx-ladder")) {
                 executor.getObject().ladder(firstOr(args, "journal", "state/exec.db"),

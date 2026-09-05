@@ -63,9 +63,14 @@ public final class ReplayRunner {
 
     /** Тики из журнала живого бота, начиная с последнего запуска процесса. */
     public static List<ReplayFair.Tick> readTicks(String journalPath, long fromMs) {
+        return readTicks(journalPath, fromMs, Long.MAX_VALUE);
+    }
+
+    /** То же, но с верхней границей окна: для прогона на выбранном отрезке. */
+    public static List<ReplayFair.Tick> readTicks(String journalPath, long fromMs, long toMs) {
         List<ReplayFair.Tick> out = new ArrayList<>();
         String sql = "SELECT ts_ms, fair, bid, ask, inventory, quotable, reason FROM exec_quote"
-                + " WHERE ts_ms >= " + fromMs + " ORDER BY ts_ms";
+                + " WHERE ts_ms >= " + fromMs + " AND ts_ms <= " + toMs + " ORDER BY ts_ms";
         try (Connection c = open(journalPath);
              Statement st = c.createStatement();
              ResultSet rs = st.executeQuery(sql)) {

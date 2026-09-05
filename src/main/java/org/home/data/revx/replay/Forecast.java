@@ -57,7 +57,7 @@ public final class Forecast {
     /** Что получилось у одного котировщика. */
     public record BotResult(String botId, double offsetBp, int fills, double realised,
                             double inventoryLots, long placements, long replaces,
-                            long placementCap) {
+                            long placementCap, double days) {
     }
 
     private Forecast() {
@@ -140,7 +140,8 @@ public final class Forecast {
 
             List<BotResult> out = new ArrayList<>();
             for (int i = 0; i < bots.size(); i++) {
-                out.add(measure(bots.get(i), journals.get(i), loops.get(i), base));
+                out.add(measure(bots.get(i), journals.get(i), loops.get(i), base,
+                        Math.max(1e-9, (end - start) / 86_400_000.0)));
             }
             return out;
         } finally {
@@ -150,7 +151,7 @@ public final class Forecast {
     }
 
     private static BotResult measure(BotSpec spec, ExecJournal journal,
-                                     QuoteLoop loop, BootParams base) {
+                                     QuoteLoop loop, BootParams base, double days) {
         FifoLedger ledger = new FifoLedger();
         int fills = 0;
         for (ExecJournal.FillRow f : journal.fills()) {
@@ -165,18 +166,24 @@ public final class Forecast {
                 ledger.tradingRealisedSince(0),
                 base.size() > 0 ? st.inventory() / base.size() : 0,
                 st.placements(), st.replaces(),
-                org.home.data.revx.exec.ExecLimits.maxPlacementsPerDay(spec.botId()));
+                org.home.data.revx.exec.ExecLimits.maxPlacementsPerDay(spec.botId()), days);
     }
 
     public static String render(String modelName, List<BotResult> results) {
         StringBuilder sb = new StringBuilder();
         sb.append("модель: ").append(modelName).append('\n');
-        sb.append("бот | отступ | исполнений | реализовано | инвентарь | постановок | замен\n");
+        // ⚠️ Постановки и замены приводятся К СУТКАМ, а лимиты у площадки тоже
+        // суточные. Прежде печаталось «634/300» — общее число за 5.4 суток
+        // против СУТОЧНОГО потолка, и это читалось как «пробил лимит», хотя на
+        // деле было 117 в сутки.
+        sb.append("бот | отступ | исполнений | реализовано | инвентарь"
+                + " | постановок/сут | замен/с\n");
         for (BotResult r : results) {
             sb.append(String.format(Locale.ROOT,
-                    "%-3s | %5.1f  | %10d | %+11.4f | %8.1f  | %4d/%-4d | %6d%n",
+                    "%-3s | %5.1f  | %10d | %+11.4f | %8.1f  | %6.0f/%-5d | %6.2f%n",
                     r.botId(), r.offsetBp(), r.fills(), r.realised(), r.inventoryLots(),
-                    r.placements(), r.placementCap(), r.replaces()));
+                    r.placements() / r.days(), r.placementCap(),
+                    r.replaces() / (r.days() * 86_400)));
         }
         return sb.toString();
     }

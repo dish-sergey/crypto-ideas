@@ -305,7 +305,8 @@ public class Executor {
      * Проверить прогноз записью нельзя по определению — такого бота не было, —
      * поэтому одно число здесь обманывает, а вилка нет.
      */
-    public void forecast(String journalPath, String offsets, boolean shareCap) {
+    public void forecast(String journalPath, String offsets, boolean shareCap,
+                         String from, String to) {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
@@ -316,10 +317,25 @@ public class Executor {
             if (bp == null) {
                 throw new IllegalStateException("в событии boot нет машинной части");
             }
-            var ticks = ReplayRunner.readTicks(journalPath, boot);
+            // Окно можно задать явно. Падающий отрезок лежит ГЛУБЖЕ последнего
+            // запуска — в журнале бота A 600 884 тика с 27.08, а не 61 593 с
+            // последнего boot, — и проверять поведение накопленного инвентаря
+            // надо именно там, где потолок связывает.
+            long fromMs = from == null || from.isBlank() ? boot
+                    : java.time.Instant.parse(from).toEpochMilli();
+            long toMs = to == null || to.isBlank() ? Long.MAX_VALUE
+                    : java.time.Instant.parse(to).toEpochMilli();
+            var ticks = ReplayRunner.readTicks(journalPath, fromMs, toMs);
             if (ticks.isEmpty()) {
-                throw new IllegalStateException("в журнале нет тиков после boot");
+                throw new IllegalStateException("в журнале нет тиков в этом окне");
             }
+            log.warn("окно: {} → {}, цена {} → {} ({}%)",
+                    java.time.Instant.ofEpochMilli(ticks.get(0).tsMs()),
+                    java.time.Instant.ofEpochMilli(ticks.get(ticks.size() - 1).tsMs()),
+                    Math.round(ticks.get(0).fair()),
+                    Math.round(ticks.get(ticks.size() - 1).fair()),
+                    Math.round((ticks.get(ticks.size() - 1).fair()
+                            / ticks.get(0).fair() - 1) * 10000) / 100.0);
             List<org.home.data.revx.replay.Forecast.BotSpec> bots = new java.util.ArrayList<>();
             String[] parts = offsets.split(",");
             for (int i = 0; i < parts.length; i++) {
