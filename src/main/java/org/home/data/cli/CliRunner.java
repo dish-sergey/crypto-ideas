@@ -204,6 +204,10 @@ public class CliRunner implements ApplicationRunner {
                 executor.getObject().forecast(firstOr(args, "journal", "state/exec.db"),
                         firstOr(args, "offsets", "10,14"));
             }
+            if (args.containsOption("revx-ladder")) {
+                executor.getObject().ladder(firstOr(args, "journal", "state/exec.db"),
+                        firstOr(args, "offsets", "8,9,10,11,12,13,14,15,16"));
+            }
             if (args.containsOption("revx-order-probe")) {
                 orderProbe.getObject().run();
             }

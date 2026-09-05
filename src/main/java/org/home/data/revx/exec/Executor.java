@@ -347,6 +347,94 @@ public class Executor {
         }
     }
 
+    /**
+     * {@code --revx-ladder --offsets=8,9,10,...}: лестница отступов.
+     *
+     * ⚠️ Каждая ступень гоняется ОТДЕЛЬНО, по одному боту. Прогнать всю лестницу
+     * разом было бы ответом на другой вопрос: боты отъели бы поток друг у друга
+     * (он конечен — 314 сделок за 17 часов), и «лучшим» вышел бы тот, кто просто
+     * стоял ближе к рынку. Вопрос «какой отступ лучше для ОДНОГО бота» требует,
+     * чтобы на каждой ступени бот был один.
+     *
+     * Отсюда же считается {@code κ}: частота исполнений падает с отступом как
+     * {@code λ(δ) = A·e^{−κδ}}, значит наклон {@code ln λ} по {@code δ} и есть
+     * {@code −κ}. Живьём эта величина не мерилась ни разу (док. 132 §5), а она
+     * задаёт {@code δ* = c + 1/κ} и весь выбор пар.
+     */
+    public void ladder(String journalPath, String offsets) {
+        try {
+            long boot = ReplayRunner.lastBoot(journalPath);
+            var bp = org.home.data.revx.replay.BootParams.parse(
+                    ReplayRunner.lastBootDetail(journalPath));
+            if (bp == null) {
+                throw new IllegalStateException("в событии boot нет машинной части");
+            }
+            var ticks = ReplayRunner.readTicks(journalPath, boot);
+            var market0 = org.home.data.revx.replay.MarketData.load(standDbPath, bp.symbol(),
+                    ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
+            log.warn("лестница {}: тиков {}, сделок на рынке {}, ступени {} б.п.",
+                    bp.symbol(), ticks.size(), market0.tradeCount(), offsets);
+
+            StringBuilder out = new StringBuilder();
+            for (String name : new String[]{"market", "touch"}) {
+                List<double[]> points = new java.util.ArrayList<>();
+                out.append(String.format("%n%-28s | исполнений | реализовано | инвентарь%n",
+                        "модель " + name + ", отступ"));
+                for (String p : offsets.split(",")) {
+                    double bpOffset = Double.parseDouble(p.trim());
+                    var market = org.home.data.revx.replay.MarketData.load(standDbPath,
+                            bp.symbol(), ticks.get(0).tsMs(),
+                            ticks.get(ticks.size() - 1).tsMs());
+                    org.home.data.revx.replay.FillModel model = "touch".equals(name)
+                            ? new org.home.data.revx.replay.TouchFillModel(market)
+                            : new org.home.data.revx.replay.MarketFillModel(market);
+                    var r = org.home.data.revx.replay.Forecast.run(ticks, model, bp,
+                            List.of(new org.home.data.revx.replay.Forecast.BotSpec(
+                                    "a", bpOffset / 10_000, bp.skewTarget())), cfg).get(0);
+                    out.append(String.format(java.util.Locale.ROOT,
+                            "%25.1f б.п. | %10d | %+11.4f | %8.1f%n",
+                            bpOffset, r.fills(), r.realised(), r.inventoryLots()));
+                    if (r.fills() > 0) {
+                        points.add(new double[]{bpOffset, Math.log(r.fills())});
+                    }
+                }
+                out.append(fitKappa(points));
+            }
+            log.info("\n=== Лестница отступов: каждая ступень отдельным ботом ==={}", out);
+        } catch (Exception e) {
+            log.error("лестница не прошла: {}", e.toString(), e);
+        }
+    }
+
+    /**
+     * Наклон {@code ln λ} по отступу. Это и есть {@code −κ} закона прихода.
+     *
+     * Меньше трёх точек — не считаем: по двум прямая проводится всегда, и число
+     * получится, а смысла в нём не будет.
+     */
+    private static String fitKappa(List<double[]> points) {
+        if (points.size() < 3) {
+            return "  κ не считаю: точек меньше трёх\n";
+        }
+        double n = points.size();
+        double sx = 0;
+        double sy = 0;
+        double sxx = 0;
+        double sxy = 0;
+        for (double[] p : points) {
+            sx += p[0];
+            sy += p[1];
+            sxx += p[0] * p[0];
+            sxy += p[0] * p[1];
+        }
+        double slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+        double kappa = -slope;
+        return String.format(java.util.Locale.ROOT,
+                "  κ = %.4f на б.п. по %d ступеням; 1/κ = %.1f б.п., δ* = c + %.1f б.п.%n",
+                kappa, points.size(), kappa > 0 ? 1 / kappa : Double.NaN,
+                kappa > 0 ? 1 / kappa : Double.NaN);
+    }
+
     private void runLive(QuoteLoop loop, ExecJournal journal, TradeClient client,
                          StandReader stand, AllocRegistry alloc) {
         log.warn("""
