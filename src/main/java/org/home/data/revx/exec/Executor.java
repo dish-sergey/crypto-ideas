@@ -473,6 +473,93 @@ public class Executor {
                 kappa > 0 ? 1 / kappa : Double.NaN);
     }
 
+    /**
+     * {@code --revx-pair-forecast --symbol=ETH/USDC}: прогон на ЛЮБОЙ паре, без
+     * журнала живого бота.
+     *
+     * Справедливая цена берётся не из записей бота, а считается из книг стенда
+     * тем же {@link FairPrice} — см. {@link org.home.data.revx.replay.StandFair}.
+     * Это снимает единственное ограничение прогноза: раньше считать можно было
+     * только пары, где бот уже работал.
+     *
+     * Настройки собираются из спецификации пары и лота в один доллар: у новой
+     * пары никакого события {@code boot} нет и быть не может.
+     */
+    public void pairForecast(String pairSymbol, String offsets, int levels,
+                             double levelStepBp, boolean innerFirst,
+                             String from, String to) {
+        try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
+                new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
+                        cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
+                cfg.fairMaxSkewMs())) {
+            StandReader.PairSpec ps = stand.spec(pairSymbol);
+            if (ps == null) {
+                throw new IllegalStateException("нет спецификации пары " + pairSymbol);
+            }
+            long fromMs = from == null || from.isBlank()
+                    ? System.currentTimeMillis() - 9L * 86_400_000
+                    : java.time.Instant.parse(from).toEpochMilli();
+            long toMs = to == null || to.isBlank()
+                    ? System.currentTimeMillis() : java.time.Instant.parse(to).toEpochMilli();
+
+            String pairBase = pairSymbol.substring(0, pairSymbol.indexOf('/'));
+            var fair = new org.home.data.revx.replay.StandFair(standDbPath, pairBase,
+                    new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
+                            cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
+                    cfg.memecoins(), cfg.fairMaxSkewMs(),
+                    org.home.data.revx.exec.Clock.system(), fromMs, toMs);
+            var ticks = fair.toTicks();
+            if (ticks.isEmpty()) {
+                throw new IllegalStateException("нет снимков книги для " + pairSymbol);
+            }
+            double price = ticks.get(ticks.size() / 2).fair();
+            // Лот в один доллар, округлённый к шагу количества пары. Потолок —
+            // двадцать лотов: отношение потолка к лоту ниже семи ступеней ломает
+            // конструкцию (измерено 05.09.2026).
+            double lot = ps.baseStep() > 0
+                    ? Math.max(ps.baseStep(), Math.round(1.0 / price / ps.baseStep()) * ps.baseStep())
+                    : 1.0 / price;
+            var bp = new org.home.data.revx.replay.BootParams(pairSymbol, "a", lot, lot * 20,
+                    0.0007, cfg.simSkewK(), 0.3, 1000, ps.minNotional(), ps.baseStep(),
+                    ps.quoteStep(), 0.10, -1, -1, 0, 0.02, 0.5, true,
+                    levels, levelStepBp / 10_000, innerFirst);
+
+            log.warn("прогноз {}: тиков {}, пар в расчёте курса {}, цена {}, лот {} (${})",
+                    pairSymbol, ticks.size(), fair.pairs(), Math.round(price),
+                    lot, Math.round(lot * price * 100) / 100.0);
+            long quotable = ticks.stream().filter(
+                    org.home.data.revx.replay.ReplayFair.Tick::quotable).count();
+            log.warn("тиков, где гейты разрешили котировать: {} из {} ({}%)",
+                    quotable, ticks.size(), 100 * quotable / Math.max(1, ticks.size()));
+
+            List<org.home.data.revx.replay.Forecast.BotSpec> bots = new java.util.ArrayList<>();
+            String[] parts = offsets.split(",");
+            for (int i = 0; i < parts.length; i++) {
+                bots.add(new org.home.data.revx.replay.Forecast.BotSpec(
+                        String.valueOf((char) ('a' + i)),
+                        Double.parseDouble(parts[i].trim()) / 10_000, 0.3,
+                        bp.inventoryCap() / parts.length, levels,
+                        levelStepBp / 10_000, lot, innerFirst));
+            }
+            StringBuilder out = new StringBuilder();
+            for (String name : new String[]{"market", "touch"}) {
+                var market = org.home.data.revx.replay.MarketData.load(standDbPath, pairSymbol,
+                        ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
+                org.home.data.revx.replay.FillModel model = "touch".equals(name)
+                        ? new org.home.data.revx.replay.TouchFillModel(market)
+                        : new org.home.data.revx.replay.MarketFillModel(market);
+                var results = org.home.data.revx.replay.Forecast.run(ticks, model, bp, bots, cfg);
+                out.append('\n').append(org.home.data.revx.replay.Forecast.render(
+                        model.describe(), results));
+                out.append(org.home.data.revx.replay.Forecast.renderDays(
+                        model.describe(), results));
+            }
+            log.info("\n=== Прогноз по паре {} ==={}", pairSymbol, out);
+        } catch (Exception e) {
+            log.error("прогноз по паре не прошёл: {}", e.toString(), e);
+        }
+    }
+
     private void runLive(QuoteLoop loop, ExecJournal journal, TradeClient client,
                          StandReader stand, AllocRegistry alloc) {
         log.warn("""

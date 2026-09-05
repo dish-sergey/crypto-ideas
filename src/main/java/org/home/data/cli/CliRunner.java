@@ -210,6 +210,14 @@ public class CliRunner implements ApplicationRunner {
                         Double.parseDouble(firstOr(args, "size-mult", "1")),
                         !args.containsOption("outer-first"));
             }
+            if (args.containsOption("revx-pair-forecast")) {
+                executor.getObject().pairForecast(firstOr(args, "symbol", "ETH/USDC"),
+                        firstOr(args, "offsets", "7"),
+                        Integer.parseInt(firstOr(args, "levels", "1")),
+                        Double.parseDouble(firstOr(args, "level-step", "0")),
+                        !args.containsOption("outer-first"),
+                        firstOr(args, "from", ""), firstOr(args, "to", ""));
+            }
             if (args.containsOption("revx-ladder")) {
                 executor.getObject().ladder(firstOr(args, "journal", "state/exec.db"),
                         firstOr(args, "offsets", "8,9,10,11,12,13,14,15,16"));
