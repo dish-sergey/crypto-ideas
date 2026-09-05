@@ -59,7 +59,7 @@ public final class Forecast {
     public record BotResult(String botId, double offsetBp, int fills, double realised,
                             double inventoryLots, long placements, long replaces,
                             long placementCap, double days, String state, long lossStops,
-                            double atCapShare, double lotSize) {
+                            double atCapShare, double lotNotional) {
     }
 
     private Forecast() {
@@ -188,7 +188,11 @@ public final class Forecast {
                 st.placements(), st.replaces(),
                 org.home.data.revx.exec.ExecLimits.maxPlacementsPerDay(spec.botId()), days,
                 st.state(), journal.countEvents("loss_stop"),
-                ticks > 0 ? atCap / ticks : 0, spec.size());
+                ticks > 0 ? atCap / ticks : 0,
+                // ⚠️ Номинал лота в валюте котировки, а НЕ размер в базовой.
+                // Зашитая цена биткойна здесь врала на SOL втрое: лот $1
+                // печатался как 788.
+                spec.size() * st.lastFair());
     }
 
     public static String render(String modelName, List<BotResult> results) {
@@ -211,7 +215,7 @@ public final class Forecast {
             sb.append(String.format(Locale.ROOT,
                     "%-3s | %5.1f  | %4.2f | %10d | %+11.4f | %8.1f  | %8.1f%% | %6.0f/%-5d "
                             + "| %6.2f%s%n",
-                    r.botId(), r.offsetBp(), r.lotSize() * 80_000, r.fills(), r.realised(),
+                    r.botId(), r.offsetBp(), r.lotNotional(), r.fills(), r.realised(),
                     r.inventoryLots(), 100 * r.atCapShare(),
                     r.placements() / r.days(), r.placementCap(),
                     r.replaces() / (r.days() * 86_400), state));
