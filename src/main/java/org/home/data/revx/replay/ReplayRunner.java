@@ -146,7 +146,8 @@ public final class ReplayRunner {
                              Quoter.Params params, QuotePolicy policy, String symbol,
                              long periodMs, double minNotional, String botId,
                              double baseStep, double parkDistance, double quoteStart,
-                             FillModel model,
+                             FillModel model, int levels, double levelStep,
+                             boolean innerFirst,
 
                              double tolerance) throws Exception {
         if (ticks.isEmpty()) {
@@ -175,7 +176,8 @@ public final class ReplayRunner {
 
             QuoteLoop loop = new QuoteLoop(venue, clock, fair, journal, params, symbol,
                     periodMs, minNotional, new BotTag(botId), policy, true,
-                    ticks.get(0).inventory(), baseStep, parkDistance, alloc);
+                    ticks.get(0).inventory(), baseStep, parkDistance, alloc,
+                    levels, levelStep, innerFirst);
             clock.stopAt(end, loop::shutdown);
             loop.startQuoting();
             loop.run();

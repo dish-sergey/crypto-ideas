@@ -3,6 +3,7 @@ package org.home.data.revx.replay;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -37,6 +38,28 @@ class BootParamsTest {
         assertEquals("a", p.botId());
         assertEquals(1000, p.periodMs());
         assertTrue(p.ownPosition());
+    }
+
+    @Test
+    void levelsTravelWithTheRecord() {
+        // ⚠️ Без уровней в записи повтор многоуровневого бота молча
+        // воспроизведёт его ОДНОУРОВНЕВЫМ, и сверка сравнит разные конструкции,
+        // ничего об этом не сказав. Ровно тот класс ошибки, что стоил дня на
+        // skew-target.
+        BootParams grid = BootParams.parse("x | {\"symbol\":\"BTC/USDC\",\"skewTarget\":0.3,"
+                + "\"levels\":3,\"levelStep\":0.0002,\"innerFirst\":false}");
+        assertEquals(3, grid.levels());
+        assertEquals(0.0002, grid.levelStep(), 1e-12);
+        assertFalse(grid.innerFirst(), "порядок раздачи тоже обязан ехать с записью");
+    }
+
+    @Test
+    void recordWithoutLevelsMeansOneLevel() {
+        // Записи 05.09.2026 до этой правки уровней не содержат. Одноуровневый
+        // бот — это levels=1, и подставлять единицу здесь ЗАКОННО: он таким и был.
+        BootParams p = BootParams.parse(REAL);
+        assertEquals(1, p.levels());
+        assertEquals(0, p.levelStep(), 1e-12);
     }
 
     @Test

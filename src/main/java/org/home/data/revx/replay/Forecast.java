@@ -59,7 +59,17 @@ public final class Forecast {
     public record BotResult(String botId, double offsetBp, int fills, double realised,
                             double inventoryLots, long placements, long replaces,
                             long placementCap, double days, String state, long lossStops,
-                            double atCapShare, double lotNotional, int buys, int sells) {
+                            double atCapShare, double lotNotional, int buys, int sells,
+                            java.util.List<Day> days_) {
+    }
+
+    /**
+     * Результат за одни сутки.
+     *
+     * Средний доход за окно скрывает главное: конструкция может выигрывать на
+     * росте и проваливаться на падении. «Универсальность» иначе не проверить.
+     */
+    public record Day(String label, double movePct, double realised, int fills) {
     }
 
     private Forecast() {
@@ -156,7 +166,7 @@ public final class Forecast {
             List<BotResult> out = new ArrayList<>();
             for (int i = 0; i < bots.size(); i++) {
                 out.add(measure(bots.get(i), journals.get(i), loops.get(i), base,
-                        Math.max(1e-9, (end - start) / 86_400_000.0)));
+                        Math.max(1e-9, (end - start) / 86_400_000.0), ticks));
             }
             return out;
         } finally {
@@ -166,7 +176,8 @@ public final class Forecast {
     }
 
     private static BotResult measure(BotSpec spec, ExecJournal journal,
-                                     QuoteLoop loop, BootParams base, double days) {
+                                     QuoteLoop loop, BootParams base, double days,
+                                     List<ReplayFair.Tick> ticks) {
         FifoLedger ledger = new FifoLedger();
         int fills = 0;
         int buys = 0;
@@ -187,10 +198,10 @@ public final class Forecast {
         // продаёт: покупать нечем, и половина конструкции простаивает. Без этого
         // числа «доход за окно» скрывает, какой ценой он получен.
         double atCap = 0;
-        int ticks = 0;
+        int tickCount = 0;
         for (ReplayFair.Tick t : ReplayRunner.readTicks(
                 journal.path(), 0, Long.MAX_VALUE)) {
-            ticks++;
+            tickCount++;
             if (spec.inventoryCap() > 0 && t.inventory() >= 0.9 * spec.inventoryCap()) {
                 atCap++;
             }
@@ -202,11 +213,77 @@ public final class Forecast {
                 st.placements(), st.replaces(),
                 org.home.data.revx.exec.ExecLimits.maxPlacementsPerDay(spec.botId()), days,
                 st.state(), journal.countEvents("loss_stop"),
-                ticks > 0 ? atCap / ticks : 0,
+                tickCount > 0 ? atCap / tickCount : 0,
                 // ⚠️ Номинал лота в валюте котировки, а НЕ размер в базовой.
                 // Зашитая цена биткойна здесь врала на SOL втрое: лот $1
                 // печатался как 788.
-                spec.size() * st.lastFair(), buys, sells);
+                spec.size() * st.lastFair(), buys, sells, byDay(ledger, ticks));
+    }
+
+    /**
+     * Разбивка результата по суткам, рядом с движением цены за эти сутки.
+     *
+     * Среднее за окно скрывает главное: конструкция может выигрывать на росте и
+     * проваливаться на падении, и тогда «универсальность» у неё только на бумаге.
+     * Реализация датируется моментом ЗАКРЫТИЯ пары, поэтому доход за сутки —
+     * разность накопленного на границах.
+     */
+    private static List<Day> byDay(FifoLedger ledger, List<ReplayFair.Tick> ticks) {
+        List<Day> out = new ArrayList<>();
+        if (ticks.isEmpty()) {
+            return out;
+        }
+        java.time.format.DateTimeFormatter fmt = java.time.format.DateTimeFormatter
+                .ofPattern("dd.MM").withZone(java.time.ZoneOffset.UTC);
+        long dayMs = 86_400_000L;
+        long first = ticks.get(0).tsMs() / dayMs * dayMs;
+        long last = ticks.get(ticks.size() - 1).tsMs();
+        for (long d = first; d <= last; d += dayMs) {
+            final long from = d;
+            final long to = d + dayMs;
+            double realised = ledger.tradingRealisedSince(from) - ledger.tradingRealisedSince(to);
+            int fills = ledger.tradingClosedSince(from) - ledger.tradingClosedSince(to);
+            Double open = null;
+            Double close = null;
+            for (ReplayFair.Tick t : ticks) {
+                if (t.tsMs() >= from && t.tsMs() < to && t.fair() > 0) {
+                    if (open == null) {
+                        open = t.fair();
+                    }
+                    close = t.fair();
+                }
+            }
+            if (open == null) {
+                continue;
+            }
+            out.add(new Day(fmt.format(java.time.Instant.ofEpochMilli(d)),
+                    (close / open - 1) * 100, realised, fills));
+        }
+        return out;
+    }
+
+    /** Разбивка по суткам: кто на каком рынке хорош. */
+    public static String renderDays(String modelName, List<BotResult> results) {
+        if (results.isEmpty() || results.get(0).days_().isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder("\nпо суткам (" + modelName + "), реализовано:\n");
+        sb.append(String.format("%-8s | %8s", "сутки", "цена"));
+        for (BotResult r : results) {
+            sb.append(String.format(" | %10s", "бот " + r.botId()));
+        }
+        sb.append('\n');
+        List<Day> ref = results.get(0).days_();
+        for (int i = 0; i < ref.size(); i++) {
+            sb.append(String.format(Locale.ROOT, "%-8s | %+7.2f%%", ref.get(i).label(),
+                    ref.get(i).movePct()));
+            for (BotResult r : results) {
+                sb.append(String.format(Locale.ROOT, " | %+10.4f",
+                        i < r.days_().size() ? r.days_().get(i).realised() : 0));
+            }
+            sb.append('\n');
+        }
+        return sb.toString();
     }
 
     public static String render(String modelName, List<BotResult> results) {

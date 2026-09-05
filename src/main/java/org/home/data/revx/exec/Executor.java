@@ -68,6 +68,9 @@ public class Executor {
     private final boolean ownPosition;
     private final double positionSeed;
     private final double parkDistance;
+    private final int levels;
+    private final double levelStep;
+    private final boolean innerFirst;
     private final Panic panic;
 
     public Executor(RevxConfig cfg,
@@ -89,6 +92,9 @@ public class Executor {
                     @Value("${revx.exec.own-position}") boolean ownPosition,
                     @Value("${revx.exec.position-seed}") double positionSeed,
                     @Value("${revx.exec.park-distance}") double parkDistance,
+                    @Value("${revx.exec.levels}") int levels,
+                    @Value("${revx.exec.level-step}") double levelStep,
+                    @Value("${revx.exec.inner-first}") boolean innerFirst,
                     Panic panic) {
         this.cfg = cfg;
         this.standDbPath = standDbPath;
@@ -109,6 +115,9 @@ public class Executor {
         this.ownPosition = ownPosition;
         this.positionSeed = positionSeed;
         this.parkDistance = parkDistance;
+        this.levels = levels;
+        this.levelStep = levelStep;
+        this.innerFirst = innerFirst;
         this.panic = panic;
     }
 
@@ -148,7 +157,7 @@ public class Executor {
         QuotePolicy policy = buildPolicy(params);
         QuoteLoop loop = new QuoteLoop(client, Clock.system(), stand, journal, params, symbol,
                 periodMs, minNotional(), tag, policy, ownPosition, positionSeed, spec.baseStep(),
-                parkDistance, alloc);
+                parkDistance, alloc, levels, levelStep, innerFirst);
         runLive(loop, journal, client, stand, alloc);
     }
 
@@ -168,11 +177,15 @@ public class Executor {
      */
     String bootDetail() {
         return String.format(java.util.Locale.ROOT,
-                "%s, лот %s, отступ %.1f б.п., скос k=%.4f, цель %.0f%% потолка | %s",
+                "%s, лот %s, отступ %.1f б.п.%s, скос k=%.4f, цель %.0f%% потолка | %s",
                 // valueOf, а не new BigDecimal(double): конструктор печатает
                 // точное двоичное разложение (0.0000125000000000000000108…).
                 symbol, java.math.BigDecimal.valueOf(size).stripTrailingZeros().toPlainString(),
-                offset * 10_000, cfg.simSkewK(), skewTarget * 100, bootJson());
+                offset * 10_000,
+                levels > 1 ? String.format(java.util.Locale.ROOT, " × %d уровня шагом %.1f (%s)",
+                        levels, levelStep * 10_000, innerFirst ? "от ближнего" : "от дальнего")
+                        : "",
+                cfg.simSkewK(), skewTarget * 100, bootJson());
     }
 
     private String bootJson() {
@@ -182,12 +195,14 @@ public class Executor {
                         + "\"minNotional\":%s,\"baseStep\":%s,\"quoteStep\":%s,"
                         + "\"parkDistance\":%s,\"costFloorMargin\":%s,\"anchorLeash\":%s,"
                         + "\"widening\":%s,\"wideningMaxStep\":%s,\"anchorWidening\":%s,"
-                        + "\"ownPosition\":%b}",
+                        + "\"ownPosition\":%b,\"levels\":%d,\"levelStep\":%s,"
+                        + "\"innerFirst\":%b}",
                 symbol, tag.id(), num(size), num(inventoryCap), num(offset),
                 num(cfg.simSkewK()), num(skewTarget), periodMs, num(minNotional()),
                 num(spec.baseStep()), num(quoteStep()), num(parkDistance),
                 num(costFloorMargin), num(anchorLeash), num(widening),
-                num(wideningMaxStep), num(anchorWidening), ownPosition);
+                num(wideningMaxStep), num(anchorWidening), ownPosition,
+                levels, num(levelStep), innerFirst);
     }
 
     private static String num(double v) {
@@ -286,7 +301,7 @@ public class Executor {
                     bp.symbol(), bp.periodMs(), bp.minNotional(), bp.botId(),
                     bp.baseStep(), bp.parkDistance(),
                     bp.inventoryCap() * 1.2 * ticks.get(0).fair(),
-                    model, 0);
+                    model, bp.levels(), bp.levelStep(), bp.innerFirst(), 0);
             log.info("\n{}", ReplayRunner.render(result));
         } catch (Exception e) {
             log.error("повтор не прошёл: {}", e.toString(), e);
@@ -359,6 +374,8 @@ public class Executor {
                         : new org.home.data.revx.replay.MarketFillModel(market);
                 var results = org.home.data.revx.replay.Forecast.run(ticks, model, bp, bots, cfg);
                 out.append('\n').append(org.home.data.revx.replay.Forecast.render(
+                        model.describe(), results));
+                out.append(org.home.data.revx.replay.Forecast.renderDays(
                         model.describe(), results));
             }
             log.info("\n=== Прогноз: вилка по двум моделям исполнения ==={}", out);

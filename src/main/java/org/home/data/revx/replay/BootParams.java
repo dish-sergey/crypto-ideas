@@ -28,7 +28,8 @@ public record BootParams(String symbol, String botId, double size, double invent
                          double minNotional, double baseStep, double quoteStep,
                          double parkDistance, double costFloorMargin, double anchorLeash,
                          double widening, double wideningMaxStep, double anchorWidening,
-                         boolean ownPosition) {
+                         boolean ownPosition, int levels, double levelStep,
+                         boolean innerFirst) {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -68,7 +69,13 @@ public record BootParams(String symbol, String botId, double size, double invent
                     n.path("widening").asDouble(),
                     n.path("wideningMaxStep").asDouble(),
                     n.path("anchorWidening").asDouble(),
-                    n.path("ownPosition").asBoolean(true));
+                    n.path("ownPosition").asBoolean(true),
+                    // Уровни ОБЯЗАНЫ ехать с записью. Без них повтор
+                    // многоуровневого бота молча воспроизведёт его
+                    // одноуровневым, и сверка сравнит разные конструкции.
+                    Math.max(1, n.path("levels").asInt(1)),
+                    n.path("levelStep").asDouble(0),
+                    n.path("innerFirst").asBoolean(true));
         } catch (Exception e) {
             return null;
         }
