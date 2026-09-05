@@ -52,7 +52,7 @@ public final class Forecast {
      */
     public record BotSpec(String botId, double offset, double skewTarget,
                           double inventoryCap, int levels, double levelStep,
-                          double size, boolean sellInnerFirst) {
+                          double size, boolean innerFirst) {
     }
 
     /** Что получилось у одного котировщика. */
@@ -114,7 +114,7 @@ public final class Forecast {
                                 base.anchorWidening(), base.widening(), base.wideningMaxStep(),
                                 spec.size(), spec.inventoryCap(), base.quoteStep()),
                         true, 0, base.baseStep(), base.parkDistance(), alloc,
-                        spec.levels(), spec.levelStep(), spec.sellInnerFirst());
+                        spec.levels(), spec.levelStep(), spec.innerFirst());
                 loops.add(loop);
             }
             for (int i = 1; i < loops.size(); i++) {

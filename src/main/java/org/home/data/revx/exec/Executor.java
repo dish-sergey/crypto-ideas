@@ -307,7 +307,7 @@ public class Executor {
      */
     public void forecast(String journalPath, String offsets, boolean shareCap,
                          String from, String to, int levels, double levelStepBp,
-                         double sizeMult, boolean sellInnerFirst) {
+                         double sizeMult, boolean innerFirst) {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
@@ -344,7 +344,7 @@ public class Executor {
                 bots.add(new org.home.data.revx.replay.Forecast.BotSpec(
                         String.valueOf((char) ('a' + i)), bpOffset / 10_000, bp.skewTarget(),
                         shareCap ? bp.inventoryCap() / parts.length : bp.inventoryCap(),
-                        levels, levelStepBp / 10_000, bp.size() * sizeMult, sellInnerFirst));
+                        levels, levelStepBp / 10_000, bp.size() * sizeMult, innerFirst));
             }
             log.warn("прогноз {}: тиков {}, ботов {}, отступы {} б.п.",
                     bp.symbol(), ticks.size(), bots.size(), offsets

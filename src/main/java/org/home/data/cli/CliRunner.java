@@ -208,7 +208,7 @@ public class CliRunner implements ApplicationRunner {
                         Integer.parseInt(firstOr(args, "levels", "1")),
                         Double.parseDouble(firstOr(args, "level-step", "0")),
                         Double.parseDouble(firstOr(args, "size-mult", "1")),
-                        !args.containsOption("sell-outer-first"));
+                        !args.containsOption("outer-first"));
             }
             if (args.containsOption("revx-ladder")) {
                 executor.getObject().ladder(firstOr(args, "journal", "state/exec.db"),

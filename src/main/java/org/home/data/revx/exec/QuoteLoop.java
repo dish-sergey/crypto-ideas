@@ -180,7 +180,7 @@ public final class QuoteLoop implements Runnable {
      * При {@code false} инвентарь достаётся ДАЛЬНИМ уровням первыми: продаём
      * настолько далеко от рынка, насколько хватает лотов.
      */
-    private final boolean sellInnerFirst;
+    private final boolean innerFirst;
 
     private volatile double inventory;
     private volatile double baseAvailable;
@@ -231,8 +231,8 @@ public final class QuoteLoop implements Runnable {
                      BotTag tag, org.home.data.revx.sim.QuotePolicy policy,
                      boolean ownPosition, double positionSeed, double baseStep,
                      double parkDistance, AllocRegistry alloc, int levels, double levelStep,
-                     boolean sellInnerFirst) {
-        this.sellInnerFirst = sellInnerFirst;
+                     boolean innerFirst) {
+        this.innerFirst = innerFirst;
         this.levels = Math.max(1, levels);
         this.levelStep = levelStep;
         for (int i = 0; i < this.levels; i++) {
@@ -556,24 +556,37 @@ public final class QuoteLoop implements Runnable {
         // нужно, она выпадает из правила распределения.
         //
         // При одном уровне пул целиком уходит ему, то есть поведение прежнее.
-        double buyPool = Double.MAX_VALUE;
-        for (int i = 0; i < levels; i++) {
-            Double bidPrice = levelPrice(Side.BUY, target.bid(), fair.price(), i);
-            buyPool -= syncSide(Side.BUY, bids.get(i),
-                    noCross(Side.BUY, bidPrice, fair), fair.price(), buyPool);
-        }
-        // ⚠️ Порядок раздачи инвентаря под продажу решает исход. Внутренними
-        // вперёд — значит один лот всегда уходит по ХУДШЕЙ доступной цене, тогда
-        // как покупки идут на всех уровнях, включая дальние и выгодные. Перекос
-        // систематический и стоил −0.3090 на падении против −0.1724 у одиночной
-        // котировки.
+        // ⚠️ Касса тоже РАЗДАЁТСЯ по уровням, а не достаётся каждому целиком.
+        // Иначе порядок обхода на покупках не значит ничего, и вопрос «с
+        // ближнего начинать или с дальнего» на половине конструкции просто не
+        // задан.
+        double buyCash = alloc != null
+                ? Math.max(0, alloc.own(tag.id(), quote)) : Double.MAX_VALUE;
         double sellPool = Math.max(0, inventory);
+        // ⚠️ ПОРЯДОК РАЗДАЧИ решает исход, и проверяются оба.
+        //
+        // Внутренними вперёд: если ресурса хватает на одну заявку, она встаёт
+        // ближе всех к рынку — исполнится скорее, но по худшей цене.
+        // Дальними вперёд: та же единственная заявка встаёт дальше всех —
+        // исполнится реже, но выгоднее.
+        //
+        // Первая реализация умела только первый вариант, и на продажах он давал
+        // систематический перекос: покупки шли на всех уровнях, включая дальние
+        // и выгодные, а продажи почти всегда уходили по ближней цене.
         for (int k = 0; k < levels; k++) {
-            int i = sellInnerFirst ? k : levels - 1 - k;
-            Double askPrice = levelPrice(Side.SELL, target.ask(), fair.price(), i);
-            sellPool -= syncSide(Side.SELL, asks.get(i),
-                    noCross(Side.SELL, askPrice, fair), fair.price(), sellPool);
-            sellPool = Math.max(0, sellPool);
+            int i = innerFirst ? k : levels - 1 - k;
+            Double bidPrice = noCross(Side.BUY,
+                    levelPrice(Side.BUY, target.bid(), fair.price(), i), fair);
+            Double askPrice = noCross(Side.SELL,
+                    levelPrice(Side.SELL, target.ask(), fair.price(), i), fair);
+
+            double cashCap = bidPrice != null && bidPrice > 0
+                    ? buyCash / bidPrice : Double.MAX_VALUE;
+            double bought = syncSide(Side.BUY, bids.get(i), bidPrice, fair.price(), cashCap);
+            buyCash = Math.max(0, buyCash - bought * (bidPrice == null ? 0 : bidPrice));
+
+            sellPool = Math.max(0,
+                    sellPool - syncSide(Side.SELL, asks.get(i), askPrice, fair.price(), sellPool));
         }
     }
 
