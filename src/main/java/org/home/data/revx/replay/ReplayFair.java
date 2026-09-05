@@ -39,7 +39,7 @@ public final class ReplayFair implements FairSource {
     }
 
     /** Тик, действующий на текущий момент часов. */
-    public Tick current() {
+    public synchronized Tick current() {
         long now = clock.now();
         while (cursor + 1 < ticks.size() && ticks.get(cursor + 1).tsMs() <= now) {
             cursor++;

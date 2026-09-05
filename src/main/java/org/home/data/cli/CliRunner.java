@@ -200,6 +200,10 @@ public class CliRunner implements ApplicationRunner {
                 executor.getObject().replay(firstOr(args, "journal", "state/exec.db"),
                         firstOr(args, "model", "recorded"));
             }
+            if (args.containsOption("revx-forecast")) {
+                executor.getObject().forecast(firstOr(args, "journal", "state/exec.db"),
+                        firstOr(args, "offsets", "10,14"));
+            }
             if (args.containsOption("revx-order-probe")) {
                 orderProbe.getObject().run();
             }

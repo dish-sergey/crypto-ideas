@@ -31,7 +31,7 @@ public final class SimClock implements Clock {
     }
 
     @Override
-    public long now() {
+    public synchronized long now() {
         return now;
     }
 
@@ -52,8 +52,75 @@ public final class SimClock implements Clock {
     private long[] schedule;
     private int cursor;
 
+    /**
+     * Сколько котировщиков идут по этим часам.
+     *
+     * <h2>Зачем барьер</h2>
+     *
+     * На счёте несколько ботов: A и C котируют одну BTC/USDC с отступами 10 и
+     * 14 б.п. и делят один поток — за 17 часов на паре прошло ВСЕГО 314 сделок.
+     * Стенд с одним котировщиком отдаст ему весь поток и завысит исполнения
+     * обоим. Значит гонять их надо ВМЕСТЕ, а раз каждый {@code QuoteLoop} — это
+     * свой поток исполнения, шагать они обязаны в ногу: иначе объём сделки
+     * достанется тому, кто успел первым, и прогон перестанет быть
+     * воспроизводимым.
+     *
+     * ⚠️ Для СВЕРКИ с записью барьер не годится и не нужен: у каждого бота своя
+     * записанная сетка тиков (сеть отвечает им по-разному), общей сетки у них
+     * не было. Сверка остаётся одиночной — она уже дала 99.92%. Барьер нужен
+     * для ПРОГНОЗА, где боты гипотетические и сетка у них общая по построению.
+     */
+    private int parties = 1;
+    private int arrived;
+    private long step;
+
+    /** Присоединить ещё один котировщик. Вызывать ДО запуска потоков. */
+    public synchronized void join() {
+        parties++;
+    }
+
+    /**
+     * Котировщик закончил. Без этого оставшиеся ждали бы его вечно.
+     */
+    public synchronized void leave() {
+        parties--;
+        if (parties > 0 && arrived >= parties) {
+            arrived = 0;
+            advanceOnce(0);
+        }
+        notifyAll();
+    }
+
     @Override
     public void sleep(long ms) {
+        if (parties <= 1) {
+            synchronized (this) {
+                advanceOnce(ms);
+            }
+            return;
+        }
+        synchronized (this) {
+            long mine = step;
+            arrived++;
+            if (arrived >= parties) {
+                arrived = 0;
+                advanceOnce(ms);
+                notifyAll();
+                return;
+            }
+            while (step == mine && parties > 1) {
+                try {
+                    wait(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
+    private void advanceOnce(long ms) {
+        step++;
         if (schedule != null) {
             while (cursor < schedule.length && schedule[cursor] <= now) {
                 cursor++;

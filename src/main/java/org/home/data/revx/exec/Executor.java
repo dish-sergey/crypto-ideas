@@ -1,5 +1,7 @@
 package org.home.data.revx.exec;
 
+import java.util.List;
+
 import org.home.data.revx.RevxConfig;
 import org.home.data.revx.replay.ReplayRunner;
 import org.home.data.revx.sim.FairPrice;
@@ -291,6 +293,60 @@ public class Executor {
         }
     }
 
+    /**
+     * {@code --revx-forecast --journal=<путь> --offsets=10,14}: что будет, если
+     * котировать с другими отступами.
+     *
+     * Все боты гоняются РАЗОМ по одной книге: поток на площадке конечен (за
+     * 17 часов на BTC/USDC прошло 314 сделок), и по одному их сравнивать
+     * бессмысленно — каждому достанется весь поток.
+     *
+     * ⚠️ Результат печатается по ДВУМ моделям: рабочей и заведомо завышенной.
+     * Проверить прогноз записью нельзя по определению — такого бота не было, —
+     * поэтому одно число здесь обманывает, а вилка нет.
+     */
+    public void forecast(String journalPath, String offsets) {
+        try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
+                new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
+                        cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
+                cfg.fairMaxSkewMs())) {
+            long boot = ReplayRunner.lastBoot(journalPath);
+            var bp = org.home.data.revx.replay.BootParams.parse(
+                    ReplayRunner.lastBootDetail(journalPath));
+            if (bp == null) {
+                throw new IllegalStateException("в событии boot нет машинной части");
+            }
+            var ticks = ReplayRunner.readTicks(journalPath, boot);
+            if (ticks.isEmpty()) {
+                throw new IllegalStateException("в журнале нет тиков после boot");
+            }
+            List<org.home.data.revx.replay.Forecast.BotSpec> bots = new java.util.ArrayList<>();
+            String[] parts = offsets.split(",");
+            for (int i = 0; i < parts.length; i++) {
+                double bpOffset = Double.parseDouble(parts[i].trim());
+                bots.add(new org.home.data.revx.replay.Forecast.BotSpec(
+                        String.valueOf((char) ('a' + i)), bpOffset / 10_000, bp.skewTarget()));
+            }
+            log.warn("прогноз {}: тиков {}, ботов {}, отступы {} б.п.",
+                    bp.symbol(), ticks.size(), bots.size(), offsets);
+
+            StringBuilder out = new StringBuilder();
+            for (String name : new String[]{"market", "touch"}) {
+                var market = org.home.data.revx.replay.MarketData.load(standDbPath, bp.symbol(),
+                        ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
+                org.home.data.revx.replay.FillModel model = "touch".equals(name)
+                        ? new org.home.data.revx.replay.TouchFillModel(market)
+                        : new org.home.data.revx.replay.MarketFillModel(market);
+                var results = org.home.data.revx.replay.Forecast.run(ticks, model, bp, bots, cfg);
+                out.append('\n').append(org.home.data.revx.replay.Forecast.render(
+                        model.describe(), results));
+            }
+            log.info("\n=== Прогноз: вилка по двум моделям исполнения ==={}", out);
+        } catch (Exception e) {
+            log.error("прогноз не прошёл: {}", e.toString(), e);
+        }
+    }
+
     private void runLive(QuoteLoop loop, ExecJournal journal, TradeClient client,
                          StandReader stand, AllocRegistry alloc) {
         log.warn("""
@@ -386,7 +442,7 @@ public class Executor {
      * настроек, записанных в журнале, и брать их из окружения он не имеет права:
      * именно так сверка однажды сравнила не логику бота, а две разные настройки.
      */
-    static QuotePolicy buildPolicy(Quoter.Params params, double costFloorMargin,
+    public static QuotePolicy buildPolicy(Quoter.Params params, double costFloorMargin,
                                    double anchorLeash, double anchorWidening,
                                    double widening, double wideningMaxStep,
                                    double size, double inventoryCap, double quoteStep) {

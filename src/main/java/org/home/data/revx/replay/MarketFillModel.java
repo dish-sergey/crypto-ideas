@@ -125,38 +125,63 @@ public final class MarketFillModel implements FillModel {
         if (resting.isEmpty() || trades.isEmpty()) {
             return out;
         }
+        // ⚠️ Обход идёт по СДЕЛКАМ, а не по заявкам, и объём каждой сделки
+        // тратится ОДИН раз. Наоборот было бы удобнее, но неверно: на счёте
+        // несколько ботов (A и C котируют одну BTC/USDC с отступами 10 и 14
+        // б.п.), их заявки стоят в книге одновременно, и обход по заявкам выдал
+        // бы им обоим исполнение об один и тот же принт. Поток на площадке
+        // конечен — за 17 часов на BTC/USDC прошло всего 314 сделок, — и делить
+        // его между своими же заявками надо честно, по приоритету цены.
+        Map<String, Double> left = new HashMap<>();
         for (Resting r : resting) {
-            Queue q = queues.get(r.id());
-            if (q == null) {
-                continue;
+            left.put(r.id(), r.size());
+        }
+        for (MarketTrade t : trades) {
+            if (t.aggressor() == null) {
+                continue;              // агрессор неизвестен — исполнения нет
             }
-            if (!q.visible) {
-                invisibleSkips++;
-                continue;
-            }
-            double left = r.size();
-            for (MarketTrade t : trades) {
-                if (left <= 1e-15 || t.aggressor() == null) {
+            boolean hitsBuys = t.aggressor() == Side.SELL;
+            List<Resting> queueAtTrade = new ArrayList<>();
+            for (Resting r : resting) {
+                if (r.buy() != hitsBuys) {
                     continue;
                 }
-                boolean hits = r.buy()
-                        ? t.aggressor() == Side.SELL && t.price() <= r.price()
-                        : t.aggressor() == Side.BUY && t.price() >= r.price();
-                if (!hits) {
+                boolean reached = r.buy() ? t.price() <= r.price() : t.price() >= r.price();
+                if (reached && left.getOrDefault(r.id(), 0.0) > 1e-15) {
+                    queueAtTrade.add(r);
+                }
+            }
+            // Приоритет цены: лучший бид (выше) и лучший аск (ниже) исполняются
+            // первыми, как и в настоящей книге.
+            queueAtTrade.sort((x, y) -> hitsBuys
+                    ? Double.compare(y.price(), x.price())
+                    : Double.compare(x.price(), y.price()));
+
+            double volume = t.qty();
+            for (Resting r : queueAtTrade) {
+                if (volume <= 1e-15) {
+                    break;
+                }
+                Queue q = queues.get(r.id());
+                if (q == null) {
+                    continue;
+                }
+                if (!q.visible) {
+                    invisibleSkips++;
                     continue;
                 }
                 // Сначала объём выбирает очередь перед нами и только потом нас.
-                double volume = t.qty();
                 if (q.ahead > 0) {
                     double eaten = Math.min(q.ahead, volume);
                     q.ahead -= eaten;
                     volume -= eaten;
                 }
                 if (volume <= 1e-15) {
-                    continue;
+                    break;
                 }
-                double qty = Math.min(left, volume);
-                left -= qty;
+                double qty = Math.min(left.get(r.id()), volume);
+                left.merge(r.id(), -qty, Double::sum);
+                volume -= qty;
                 boolean intercept = r.buy() ? t.price() < r.price() : t.price() > r.price();
                 if (intercept) {
                     interceptFills++;

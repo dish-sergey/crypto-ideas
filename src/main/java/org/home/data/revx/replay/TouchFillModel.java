@@ -51,21 +51,42 @@ public final class TouchFillModel implements FillModel {
         if (resting.isEmpty() || trades.isEmpty()) {
             return out;
         }
+        // Обход по СДЕЛКАМ: объём каждой тратится один раз и делится между
+        // нашими заявками по приоритету цены. Даже в заведомо оптимистичной
+        // модели двум ботам нельзя отдать один и тот же принт целиком каждому —
+        // это была бы не верхняя граница, а произвольно большое число.
+        java.util.Map<String, Double> left = new java.util.HashMap<>();
         for (Resting r : resting) {
-            double left = r.size();
-            for (MarketTrade t : trades) {
-                if (left <= 1e-15 || t.aggressor() == null) {
+            left.put(r.id(), r.size());
+        }
+        for (MarketTrade t : trades) {
+            if (t.aggressor() == null) {
+                continue;
+            }
+            // Покупку исполняет продавец, ударивший в бид не выше нашей цены.
+            boolean hitsBuys = t.aggressor() == org.home.data.revx.sim.Side.SELL;
+            List<Resting> queue = new ArrayList<>();
+            for (Resting r : resting) {
+                if (r.buy() != hitsBuys) {
                     continue;
                 }
-                // Покупку исполняет продавец, ударивший в бид не выше нашей цены.
-                boolean hits = r.buy()
-                        ? t.aggressor() == org.home.data.revx.sim.Side.SELL && t.price() <= r.price()
-                        : t.aggressor() == org.home.data.revx.sim.Side.BUY && t.price() >= r.price();
-                if (!hits) {
-                    continue;
+                boolean reached = r.buy() ? t.price() <= r.price() : t.price() >= r.price();
+                if (reached && left.getOrDefault(r.id(), 0.0) > 1e-15) {
+                    queue.add(r);
                 }
-                double qty = Math.min(left, t.qty());
-                left -= qty;
+            }
+            queue.sort((x, y) -> hitsBuys
+                    ? Double.compare(y.price(), x.price())
+                    : Double.compare(x.price(), y.price()));
+
+            double volume = t.qty();
+            for (Resting r : queue) {
+                if (volume <= 1e-15) {
+                    break;
+                }
+                double qty = Math.min(left.get(r.id()), volume);
+                left.merge(r.id(), -qty, Double::sum);
+                volume -= qty;
                 // Цена НАША, а не принта: лимитная заявка лучше своей цены не
                 // исполняется, а хуже — не может по определению.
                 out.add(new Filled(r.id(), qty, r.price()));
