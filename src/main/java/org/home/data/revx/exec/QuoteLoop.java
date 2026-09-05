@@ -149,8 +149,23 @@ public final class QuoteLoop implements Runnable {
     private final AtomicBoolean quoting = new AtomicBoolean(false);
     private volatile boolean alive = true;
 
-    private final Resting bid = new Resting();
-    private final Resting ask = new Resting();
+    /**
+     * Уровни котировки на каждой стороне, от ближнего к рынку к дальнему.
+     *
+     * ⚠️ Один уровень — это ЧАСТНЫЙ СЛУЧАЙ, а не отдельный режим: при
+     * {@code levels == 1} и {@code levelStep == 0} всё поведение прежнее, и это
+     * проверяется повтором живого журнала (бот A обязан по-прежнему давать
+     * 99.92% совпавших котировок). Живые боты работают именно так.
+     *
+     * Сетка измерена на стенде 05.09.2026 и даёт примерно вдвое больше
+     * одиночной котировки на трёх разных окнах (ровном, падающем и полном
+     * цикле), причём при РАВНОМ капитале и с меньшим остатком инвентаря.
+     */
+    private final java.util.List<Resting> bids = new java.util.ArrayList<>();
+    private final java.util.List<Resting> asks = new java.util.ArrayList<>();
+    private final int levels;
+    /** Расстояние между уровнями в долях цены. 0 при одном уровне. */
+    private final double levelStep;
 
     private volatile double inventory;
     private volatile double baseAvailable;
@@ -188,6 +203,25 @@ public final class QuoteLoop implements Runnable {
                      BotTag tag, org.home.data.revx.sim.QuotePolicy policy,
                      boolean ownPosition, double positionSeed, double baseStep,
                      double parkDistance, AllocRegistry alloc) {
+        this(client, clock, stand, journal, params, symbol, periodMs, minNotional, tag, policy,
+                ownPosition, positionSeed, baseStep, parkDistance, alloc, 1, 0);
+    }
+
+    /**
+     * @param levels    сколько заявок держать на каждой стороне
+     * @param levelStep расстояние между уровнями в долях цены
+     */
+    public QuoteLoop(Venue client, Clock clock, FairSource stand, ExecJournal journal,
+                     Quoter.Params params, String symbol, long periodMs, double minNotional,
+                     BotTag tag, org.home.data.revx.sim.QuotePolicy policy,
+                     boolean ownPosition, double positionSeed, double baseStep,
+                     double parkDistance, AllocRegistry alloc, int levels, double levelStep) {
+        this.levels = Math.max(1, levels);
+        this.levelStep = levelStep;
+        for (int i = 0; i < this.levels; i++) {
+            bids.add(new Resting());
+            asks.add(new Resting());
+        }
         this.alloc = alloc;
         this.client = client;
         this.clock = clock != null ? clock : Clock.system();
@@ -495,8 +529,41 @@ public final class QuoteLoop implements Runnable {
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
         journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null);
-        syncSide(Side.BUY, bid, noCross(Side.BUY, target.bid(), fair), fair.price());
-        syncSide(Side.SELL, ask, noCross(Side.SELL, target.ask(), fair), fair.price());
+
+        // ⚠️ Пул РАЗДЕЛЯЕТСЯ между уровнями, и внутренние забирают первыми.
+        //
+        // Отсюда и «сжатие» само собой: продавать можно только то, что есть, и
+        // инвентарь достаётся ближним к рынку уровням. Продали с ближнего —
+        // инвентаря стало на лот меньше, и на следующем тике дальний уровень
+        // получает цену ближнего. Никакой отдельной логики подтягивания не
+        // нужно, она выпадает из правила распределения.
+        //
+        // При одном уровне пул целиком уходит ему, то есть поведение прежнее.
+        double sellPool = Math.max(0, inventory);
+        double buyPool = Double.MAX_VALUE;
+        for (int i = 0; i < levels; i++) {
+            Double bidPrice = levelPrice(Side.BUY, target.bid(), fair.price(), i);
+            Double askPrice = levelPrice(Side.SELL, target.ask(), fair.price(), i);
+            buyPool -= syncSide(Side.BUY, bids.get(i),
+                    noCross(Side.BUY, bidPrice, fair), fair.price(), buyPool);
+            sellPool -= syncSide(Side.SELL, asks.get(i),
+                    noCross(Side.SELL, askPrice, fair), fair.price(), sellPool);
+            sellPool = Math.max(0, sellPool);
+        }
+    }
+
+    /**
+     * Цена уровня {@code i}: базовая котировка, отодвинутая ОТ РЫНКА на i шагов.
+     *
+     * Скос, гейты и политика считаются один раз для базовой цены — лесенка
+     * кладётся поверх. Так уровни не спорят с политикой, а продолжают её.
+     */
+    private Double levelPrice(Side side, Double base, double fair, int level) {
+        if (base == null || level == 0 || levelStep <= 0) {
+            return base;
+        }
+        double shift = level * levelStep * fair;
+        return side == Side.BUY ? base - shift : base + shift;
     }
 
     /** Приводит одну сторону к целевой цене: поставить, переставить или снять. */
@@ -548,14 +615,22 @@ public final class QuoteLoop implements Runnable {
         return targetPrice;
     }
 
-    private void syncSide(Side side, Resting resting, Double targetPrice, double fair) {
+    /**
+     * Приводит ОДИН уровень к целевой цене.
+     *
+     * @param pool сколько ресурса осталось после внутренних уровней
+     * @return сколько ресурса этот уровень занял
+     */
+    private double syncSide(Side side, Resting resting, Double targetPrice, double fair,
+                            double pool) {
         if (targetPrice == null) {
             if (resting.venueId != null) {
                 cancel(side, resting, "сторона не котируется");
             }
-            return;
+            return 0;
         }
-        double size = sizeFor(side, targetPrice, resting);
+        // Пул уже урезан внутренними уровнями: дальний получает только остаток.
+        double size = Math.min(sizeFor(side, targetPrice, resting), Math.max(0, pool));
         double notional = size * targetPrice;
         // Ниже минимума площадки заявка не встанет, а попытка потратит суточный
         // лимит постановок. Остаток от частичного исполнения бывает мельче
@@ -565,32 +640,35 @@ public final class QuoteLoop implements Runnable {
                 cancel(side, resting, "нечем котировать эту сторону");
             }
             warnNoFunds(side, resting);
-            return;
+            return 0;
         }
         if (!ExecLimits.orderAllowed(notional)) {
             log.error("заявка {} на {} USDC превышает предел {} — не ставлю", side, notional,
                     ExecLimits.MAX_ORDER_NOTIONAL_USDC);
             journal.event("limit_blocked", side + " нотионал " + notional);
-            return;
+            return 0;
         }
         if (!ExecLimits.exposureAllowed(exposure() + notional)) {
             log.error("экспозиция превысила бы предел {} — не ставлю",
                     ExecLimits.MAX_TOTAL_EXPOSURE_USDC);
             journal.event("limit_blocked", "экспозиция");
-            return;
+            return 0;
         }
 
         // Пауза после отказа площадки распространяется на ОБА действия. Отказ на
         // замене стоит четырёх запросов, и повторять его каждую секунду так же
         // вредно, как долбиться постановкой.
         if (clock.now() < resting.blockedUntilMs) {
-            return;
+            // Заявка не тронута, но ресурс под ней всё ещё занят: отдать его
+            // дальнему уровню значило бы продать один лот дважды.
+            return resting.venueId == null ? 0 : resting.size;
         }
         if (resting.venueId == null) {
             place(side, resting, targetPrice, size);
         } else if (quoter.shouldRequote(resting.price, targetPrice)) {
             replace(side, resting, targetPrice, size);
         }
+        return size;
     }
 
     /**
@@ -717,9 +795,16 @@ public final class QuoteLoop implements Runnable {
     }
 
     private double exposure() {
-        return inventory * lastFair
-                + (bid.venueId != null ? bid.price * bid.size : 0)
-                + (ask.venueId != null ? ask.price * ask.size : 0);
+        // Считаются ВСЕ уровни: предел экспозиции задан на бота, а не на заявку,
+        // и сетка из трёх уровней занимает втрое больше книги.
+        double resting = 0;
+        for (Resting r : bids) {
+            resting += r.venueId != null ? r.price * r.size : 0;
+        }
+        for (Resting r : asks) {
+            resting += r.venueId != null ? r.price * r.size : 0;
+        }
+        return inventory * lastFair + resting;
     }
 
     /**
@@ -872,20 +957,44 @@ public final class QuoteLoop implements Runnable {
             for (ActiveOrder order : orders) {
                 cancelStray(order, why);
             }
-            bid.venueId = null;
-            ask.venueId = null;
+            bids.forEach(r -> r.venueId = null);
+            asks.forEach(r -> r.venueId = null);
             return;
         }
-        adopt(Side.BUY, bid, orders, why);
-        adopt(Side.SELL, ask, orders, why);
+        adoptSide(Side.BUY, bids, orders, why);
+        adoptSide(Side.SELL, asks, orders, why);
     }
 
-    private void adopt(Side side, Resting resting, java.util.List<ActiveOrder> orders, String why) {
-        java.util.List<ActiveOrder> mine = orders.stream()
+    /**
+     * Сверка стороны с книгой при нескольких уровнях.
+     *
+     * Наши заявки раскладываются по уровням ПО ЦЕНЕ: лучшая достаётся ближнему
+     * к рынку уровню, следующая — второму и так далее. Привязать их к уровням
+     * иначе нечем — площадка о наших уровнях не знает, а порядок цен совпадает с
+     * порядком уровней по построению лесенки.
+     *
+     * При одном уровне это ровно прежнее поведение: единственная заявка идёт в
+     * единственный слот, всё лишнее снимается как бесхозное.
+     */
+    private void adoptSide(Side side, java.util.List<Resting> slots,
+                           java.util.List<ActiveOrder> orders, String why) {
+        java.util.List<ActiveOrder> mine = new java.util.ArrayList<>(orders.stream()
                 .filter(o -> o.side() == side)
-                .sorted(java.util.Comparator.comparingLong(ActiveOrder::createdMs).reversed())
-                .toList();
-        if (mine.isEmpty()) {
+                .toList());
+        mine.sort(side == Side.BUY
+                ? java.util.Comparator.comparingDouble(ActiveOrder::price).reversed()
+                : java.util.Comparator.comparingDouble(ActiveOrder::price));
+        for (int i = 0; i < slots.size(); i++) {
+            ActiveOrder found = i < mine.size() ? mine.get(i) : null;
+            adopt(side, slots.get(i), found, why);
+        }
+        for (int i = slots.size(); i < mine.size(); i++) {
+            cancelStray(mine.get(i), why);
+        }
+    }
+
+    private void adopt(Side side, Resting resting, ActiveOrder keep, String why) {
+        if (keep == null) {
             boolean fresh = clock.now() - resting.sinceMs < ADOPT_GRACE_MS;
             if (resting.venueId != null && !fresh) {
                 inspectGoneOrder(side, resting.venueId);
@@ -894,10 +1003,6 @@ public final class QuoteLoop implements Runnable {
             }
             return;
         }
-        ActiveOrder keep = mine.stream()
-                .filter(o -> o.id().equals(resting.venueId))
-                .findFirst()
-                .orElse(mine.get(0));
         if (!keep.id().equals(resting.venueId)) {
             log.warn("усыновляю заявку {} {} по {} ({})", side, keep.id(), keep.price(), why);
             journal.event("adopt", side + " " + keep.id() + " по " + fmt(keep.price())
@@ -910,11 +1015,6 @@ public final class QuoteLoop implements Runnable {
             // за него паузу не за что.
             resting.failures = 0;
             resting.blockedUntilMs = 0;
-        }
-        for (ActiveOrder extra : mine) {
-            if (!extra.id().equals(keep.id())) {
-                cancelStray(extra, why);
-            }
         }
     }
 
@@ -1068,8 +1168,8 @@ public final class QuoteLoop implements Runnable {
     }
 
     private void cancelAll(String why) {
-        cancel(Side.BUY, bid, why);
-        cancel(Side.SELL, ask, why);
+        bids.forEach(r -> cancel(Side.BUY, r, why));
+        asks.forEach(r -> cancel(Side.SELL, r, why));
     }
 
     /**
@@ -1111,8 +1211,13 @@ public final class QuoteLoop implements Runnable {
             cancelAll(why);
             return;
         }
-        parkSide(Side.BUY, bid, lastTrustedFair * (1 - parkDistance), why);
-        parkSide(Side.SELL, ask, lastTrustedFair * (1 + parkDistance), why);
+        // Отводятся ВСЕ уровни, и каждый на свою глубину: иначе они съедутся в
+        // одну цену и на возврате рынка перепутаются между слотами.
+        for (int i = 0; i < levels; i++) {
+            double away = parkDistance + i * levelStep;
+            parkSide(Side.BUY, bids.get(i), lastTrustedFair * (1 - away), why);
+            parkSide(Side.SELL, asks.get(i), lastTrustedFair * (1 + away), why);
+        }
     }
 
     private void parkSide(Side side, Resting resting, double price, String why) {
@@ -1497,7 +1602,11 @@ public final class QuoteLoop implements Runnable {
 
     /** Остаток счёта по базовой валюте — знаменатель для реестра. */
     private double baseTotal() {
-        return baseAvailable + (ask.venueId != null ? ask.size : 0);
+        double reserved = 0;
+        for (Resting r : asks) {
+            reserved += r.venueId != null ? r.size : 0;
+        }
+        return baseAvailable + reserved;
     }
 
     private void rollCounters() {

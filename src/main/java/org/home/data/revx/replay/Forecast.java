@@ -51,7 +51,7 @@ public final class Forecast {
      *                     на капитал — деление общего потолка между уровнями.
      */
     public record BotSpec(String botId, double offset, double skewTarget,
-                          double inventoryCap) {
+                          double inventoryCap, int levels, double levelStep) {
     }
 
     /** Что получилось у одного котировщика. */
@@ -111,7 +111,8 @@ public final class Forecast {
                         Executor.buildPolicy(params, base.costFloorMargin(), base.anchorLeash(),
                                 base.anchorWidening(), base.widening(), base.wideningMaxStep(),
                                 base.size(), spec.inventoryCap(), base.quoteStep()),
-                        true, 0, base.baseStep(), base.parkDistance(), alloc);
+                        true, 0, base.baseStep(), base.parkDistance(), alloc,
+                        spec.levels(), spec.levelStep());
                 loops.add(loop);
             }
             for (int i = 1; i < loops.size(); i++) {
