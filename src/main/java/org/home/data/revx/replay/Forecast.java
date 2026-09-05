@@ -57,7 +57,7 @@ public final class Forecast {
     /** Что получилось у одного котировщика. */
     public record BotResult(String botId, double offsetBp, int fills, double realised,
                             double inventoryLots, long placements, long replaces,
-                            long placementCap, double days) {
+                            long placementCap, double days, String state, long lossStops) {
     }
 
     private Forecast() {
@@ -124,7 +124,9 @@ public final class Forecast {
                 loop.startQuoting();
             }
             for (QuoteLoop loop : loops) {
+                final int slotIndex = threads.size();
                 Thread t = new Thread(() -> {
+                    clock.assignSlot(slotIndex);
                     try {
                         loop.run();
                     } finally {
@@ -166,7 +168,8 @@ public final class Forecast {
                 ledger.tradingRealisedSince(0),
                 base.size() > 0 ? st.inventory() / base.size() : 0,
                 st.placements(), st.replaces(),
-                org.home.data.revx.exec.ExecLimits.maxPlacementsPerDay(spec.botId()), days);
+                org.home.data.revx.exec.ExecLimits.maxPlacementsPerDay(spec.botId()), days,
+                st.state(), journal.countEvents("loss_stop"));
     }
 
     public static String render(String modelName, List<BotResult> results) {
@@ -177,13 +180,22 @@ public final class Forecast {
         // против СУТОЧНОГО потолка, и это читалось как «пробил лимит», хотя на
         // деле было 117 в сутки.
         sb.append("бот | отступ | исполнений | реализовано | инвентарь"
-                + " | постановок/сут | замен/с\n");
+                + " | постановок/сут | замен/с | состояние\n");
         for (BotResult r : results) {
+            // ⚠️ Состояние на конец прогона печатается не для полноты. Бот
+            // встаёт сам, когда торговый убыток против buy & hold превышает
+            // MAX_TRADING_LOSS_USDC = 1.0, а на многодневном окне с $20
+            // инвентаря и движением в 5% это обычное дело. Прогон, где бот
+            // простоял три четверти окна, внешне неотличим от честного, и
+            // сравнивать их между собой нельзя.
+            String state = r.lossStops() > 0
+                    ? "СТОП по убытку ×" + r.lossStops()
+                    : r.state();
             sb.append(String.format(Locale.ROOT,
-                    "%-3s | %5.1f  | %10d | %+11.4f | %8.1f  | %6.0f/%-5d | %6.2f%n",
+                    "%-3s | %5.1f  | %10d | %+11.4f | %8.1f  | %6.0f/%-5d | %6.2f  | %s%n",
                     r.botId(), r.offsetBp(), r.fills(), r.realised(), r.inventoryLots(),
                     r.placements() / r.days(), r.placementCap(),
-                    r.replaces() / (r.days() * 86_400)));
+                    r.replaces() / (r.days() * 86_400), state));
         }
         return sb.toString();
     }

@@ -39,6 +39,10 @@ import java.util.UUID;
  */
 public final class SimVenue implements Venue {
 
+    // ⚠️ Все точки входа synchronized: котировщиков в прогнозе несколько, каждый
+    // в своём потоке, а книга заявок и остатки здесь ОДНИ. Без этого гонка за
+    // объёмом сделки делала прогон невоспроизводимым (см. SimClock: очередь хода).
+
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final class Order {
@@ -151,7 +155,7 @@ public final class SimVenue implements Venue {
     }
 
     @Override
-    public Response activeOrders() {
+    public synchronized Response activeOrders() {
         advance();
         StringBuilder sb = new StringBuilder("{\"data\":[");
         boolean first = true;
@@ -172,7 +176,7 @@ public final class SimVenue implements Venue {
     }
 
     @Override
-    public Response balances() {
+    public synchronized Response balances() {
         advance();
         // ⚠️ Форма обязана совпадать с живой до символа: QuoteLoop разбирает её
         // жёсткой регуляркой без пробелов. available = total минус то, что
@@ -200,7 +204,7 @@ public final class SimVenue implements Venue {
     }
 
     @Override
-    public Response order(String id) {
+    public synchronized Response order(String id) {
         advance();
         double[] acc = done.get(id);
         double filled = acc == null ? 0 : acc[0];
@@ -216,7 +220,7 @@ public final class SimVenue implements Venue {
     }
 
     @Override
-    public Response place(String json) {
+    public synchronized Response place(String json) {
         advance();
         JsonNode n = read(json);
         if (n == null) {
@@ -240,7 +244,7 @@ public final class SimVenue implements Venue {
     }
 
     @Override
-    public Response replace(String id, String json) {
+    public synchronized Response replace(String id, String json) {
         advance();
         Order old = live.remove(id);
         if (old == null) {
@@ -277,7 +281,7 @@ public final class SimVenue implements Venue {
     }
 
     @Override
-    public Response cancel(String id) {
+    public synchronized Response cancel(String id) {
         advance();
         cancels++;
         if (live.remove(id) == null) {

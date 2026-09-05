@@ -317,6 +317,25 @@ public final class ExecJournal implements AutoCloseable {
         }
     }
 
+    /**
+     * Сколько раз случилось событие такого рода.
+     *
+     * Нужно прогнозу: без этого нельзя отличить «бот отработал окно» от «бот
+     * встал на предохранителе через час, а остальные три дня простоял». Такие
+     * прогоны сравнивать между собой нельзя, а выглядят они одинаково.
+     */
+    public synchronized long countEvents(String kind) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT COUNT(*) FROM exec_event WHERE kind = ?")) {
+            ps.setString(1, kind);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0;
+            }
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
     /** События уровня решений: запуск, остановка, паника, срабатывание лимита. */
     public synchronized void event(String kind, String detail) {
         try (PreparedStatement ps = connection.prepareStatement(
