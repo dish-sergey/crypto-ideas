@@ -43,7 +43,15 @@ public final class Forecast {
     private static final Logger log = LoggerFactory.getLogger(Forecast.class);
 
     /** Один котировщик в прогоне: чем отличается от базового. */
-    public record BotSpec(String botId, double offset, double skewTarget) {
+    /**
+     * @param inventoryCap потолок инвентаря ЭТОГО уровня. Отдельным полем не для
+     *                     красоты: сетка из N уровней с полным потолком у каждого
+     *                     занимает в N раз больше капитала, чем одиночная
+     *                     котировка, и сравнивать их «в лоб» нельзя. Нормировка
+     *                     на капитал — деление общего потолка между уровнями.
+     */
+    public record BotSpec(String botId, double offset, double skewTarget,
+                          double inventoryCap) {
     }
 
     /** Что получилось у одного котировщика. */
@@ -68,7 +76,8 @@ public final class Forecast {
         // Счёт ОБЩИЙ: боты делят и книгу, и деньги. Денег даём столько, чтобы
         // каждому хватило на полный потолок, иначе меряли бы не настройку, а
         // нехватку средств.
-        double quoteStart = base.inventoryCap() * ticks.get(0).fair() * bots.size() * 1.2;
+        double quoteStart = bots.stream().mapToDouble(BotSpec::inventoryCap).sum()
+                * ticks.get(0).fair() * 1.2;
         SimVenue venue = new SimVenue(clock, model, base.symbol(),
                 ticks.get(0).inventory(), quoteStart);
 
@@ -90,7 +99,7 @@ public final class Forecast {
                         quoteStart / bots.size(), quoteStart, ticks.get(0).fair(), start);
 
                 Quoter.Params params = new Quoter.Params(spec.offset(), base.size(),
-                        base.inventoryCap(), base.skewK(), spec.skewTarget(), cfg.simDriftBeta(),
+                        spec.inventoryCap(), base.skewK(), spec.skewTarget(), cfg.simDriftBeta(),
                         cfg.simBuySizeRatio(), cfg.simDriftWindowMs(), cfg.simSizeShapeEta(),
                         cfg.simDriftGateEr(), cfg.simErWindowMs(), cfg.simErSampleMs(),
                         cfg.simStopDrawdownPct(), Quoter.Sticky.OFF, Quoter.Frozen.OFF,
@@ -101,7 +110,7 @@ public final class Forecast {
                         new BotTag(spec.botId()),
                         Executor.buildPolicy(params, base.costFloorMargin(), base.anchorLeash(),
                                 base.anchorWidening(), base.widening(), base.wideningMaxStep(),
-                                base.size(), base.inventoryCap(), base.quoteStep()),
+                                base.size(), spec.inventoryCap(), base.quoteStep()),
                         true, 0, base.baseStep(), base.parkDistance(), alloc);
                 loops.add(loop);
             }

@@ -305,7 +305,7 @@ public class Executor {
      * Проверить прогноз записью нельзя по определению — такого бота не было, —
      * поэтому одно число здесь обманывает, а вилка нет.
      */
-    public void forecast(String journalPath, String offsets) {
+    public void forecast(String journalPath, String offsets, boolean shareCap) {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
@@ -325,10 +325,12 @@ public class Executor {
             for (int i = 0; i < parts.length; i++) {
                 double bpOffset = Double.parseDouble(parts[i].trim());
                 bots.add(new org.home.data.revx.replay.Forecast.BotSpec(
-                        String.valueOf((char) ('a' + i)), bpOffset / 10_000, bp.skewTarget()));
+                        String.valueOf((char) ('a' + i)), bpOffset / 10_000, bp.skewTarget(),
+                        shareCap ? bp.inventoryCap() / parts.length : bp.inventoryCap()));
             }
             log.warn("прогноз {}: тиков {}, ботов {}, отступы {} б.п.",
-                    bp.symbol(), ticks.size(), bots.size(), offsets);
+                    bp.symbol(), ticks.size(), bots.size(), offsets
+                            + (shareCap ? " (потолок ДЕЛИТСЯ: нормировка на капитал)" : ""));
 
             StringBuilder out = new StringBuilder();
             for (String name : new String[]{"market", "touch"}) {
@@ -390,7 +392,8 @@ public class Executor {
                             : new org.home.data.revx.replay.MarketFillModel(market);
                     var r = org.home.data.revx.replay.Forecast.run(ticks, model, bp,
                             List.of(new org.home.data.revx.replay.Forecast.BotSpec(
-                                    "a", bpOffset / 10_000, bp.skewTarget())), cfg).get(0);
+                                    "a", bpOffset / 10_000, bp.skewTarget(),
+                                    bp.inventoryCap())), cfg).get(0);
                     out.append(String.format(java.util.Locale.ROOT,
                             "%25.1f б.п. | %10d | %+11.4f | %8.1f%n",
                             bpOffset, r.fills(), r.realised(), r.inventoryLots()));
