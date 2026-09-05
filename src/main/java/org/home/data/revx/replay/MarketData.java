@@ -51,6 +51,17 @@ public final class MarketData {
         this.books = books;
     }
 
+    /**
+     * Тот же рынок с нуля: ряды общие, курсоры свои.
+     *
+     * ⚠️ Курсоры односторонние — второй прогон по одному объекту увидел бы
+     * пустую ленту и молча дал бы ноль исполнений. Обход вселенной гоняет одну
+     * пару по нескольким отступам и двум моделям, поэтому копия обязательна.
+     */
+    public MarketData fresh() {
+        return new MarketData(trades, bookTs, books);
+    }
+
     public int tradeCount() {
         return trades.size();
     }

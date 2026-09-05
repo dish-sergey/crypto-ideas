@@ -218,6 +218,15 @@ public class CliRunner implements ApplicationRunner {
                         !args.containsOption("outer-first"),
                         firstOr(args, "from", ""), firstOr(args, "to", ""));
             }
+            if (args.containsOption("revx-pair-sweep")) {
+                executor.getObject().pairSweep(
+                        firstOr(args, "from", "2026-08-20T00:00:00Z"),
+                        firstOr(args, "to", "2026-09-05T00:00:00Z"),
+                        firstOr(args, "offsets", "6,8,10,12"),
+                        Integer.parseInt(firstOr(args, "levels", "3")),
+                        Double.parseDouble(firstOr(args, "level-step", "2")),
+                        args.containsOption("inner-first"));
+            }
             if (args.containsOption("revx-ladder")) {
                 executor.getObject().ladder(firstOr(args, "journal", "state/exec.db"),
                         firstOr(args, "offsets", "8,9,10,11,12,13,14,15,16"));

@@ -80,9 +80,30 @@ public final class StandFair implements FairSource {
         return byPair.size();
     }
 
+    /**
+     * Какие пары есть в срезе — для обхода всей вселенной.
+     *
+     * Загрузка стоит дорого (46 ног за сутки), а курс всё равно считается по
+     * всем парам сразу. Поэтому обход берёт ОДИН срез и переспрашивает его про
+     * каждую пару, вместо того чтобы читать книги двадцать три раза подряд.
+     */
+    public java.util.Set<String> bases() {
+        return byPair.keySet();
+    }
+
+    /** Сколько снимков у пары: мера покрытия, у разных пар оно РАЗНОЕ. */
+    public int snapshots(String pair) {
+        List<Slice> l = byPair.get(pair);
+        return l == null ? 0 : l.size();
+    }
+
     /** Отметки времени, по которым имеет смысл тикать: снимки торгуемой пары. */
     public long[] schedule() {
-        List<Slice> own = byPair.get(base);
+        return schedule(base);
+    }
+
+    public long[] schedule(String forBase) {
+        List<Slice> own = byPair.get(forBase);
         if (own == null) {
             return new long[0];
         }
@@ -106,14 +127,18 @@ public final class StandFair implements FairSource {
      * ОДИН раз и до прогона.
      */
     public List<ReplayFair.Tick> toTicks() {
-        long[] when = schedule();
+        return toTicks(base);
+    }
+
+    public List<ReplayFair.Tick> toTicks(String forBase) {
+        long[] when = schedule(forBase);
         List<ReplayFair.Tick> out = new ArrayList<>(when.length);
         SimClock own = new SimClock(when.length > 0 ? when[0] : 0);
         Clock saved = replaceClock(own);
         try {
             for (long ts : when) {
                 own.moveTo(ts);
-                StandReader.Fair f = latest(base, 30_000);
+                StandReader.Fair f = latest(forBase, 30_000);
                 out.add(new ReplayFair.Tick(ts, f.price(), null, null, 0,
                         f.quotable() && f.price() > 0, f.pausedReason()));
             }

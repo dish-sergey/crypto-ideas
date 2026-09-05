@@ -474,6 +474,24 @@ public class Executor {
     }
 
     /**
+     * {@code --revx-pair-sweep}: все пары, все сутки записи, лестница отступов.
+     *
+     * Смысл — в выборе, куда тратить суточную тысячу постановок: лимит общий на
+     * счёт, а пар двадцать три. Подробности и оговорки — в
+     * {@link org.home.data.revx.replay.PairSweep}.
+     */
+    public void pairSweep(String from, String to, String offsets, int levels,
+                          double levelStepBp, boolean innerFirst) {
+        String[] parts = offsets.split(",");
+        double[] off = new double[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            off[i] = Double.parseDouble(parts[i].trim());
+        }
+        org.home.data.revx.replay.PairSweep.run(standDbPath, cfg, from, to,
+                levels, levelStepBp, innerFirst, off);
+    }
+
+    /**
      * {@code --revx-pair-forecast --symbol=ETH/USDC}: прогон на ЛЮБОЙ паре, без
      * журнала живого бота.
      *
