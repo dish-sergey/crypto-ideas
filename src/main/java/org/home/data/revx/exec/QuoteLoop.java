@@ -181,6 +181,42 @@ public final class QuoteLoop implements Runnable {
      * настолько далеко от рынка, насколько хватает лотов.
      */
     private final boolean innerFirst;
+    /**
+     * Потолок постановок для ПРОГНОЗА. Ноль — брать боевой из {@link ExecLimits}.
+     *
+     * ⚠️ Нужен потому, что при исчерпании лимита бот не пропускает постановку, а
+     * ВЫКЛЮЧАЕТСЯ совсем. Трёхуровневый режим жжёт постановки втрое быстрее
+     * одноуровневого, упирается в 300 посреди прогона и глохнет — и тогда стенд
+     * меряет скорость выгорания лимита, а не экономику конструкции. На живом
+     * боте переопределять НЕЛЬЗЯ: там лимит защищает общий суточный потолок
+     * аккаунта в 1000 постановок.
+     */
+    private int placementCapOverride;
+    /** Сколько тиков каждый уровень реально стоял в книге. Диагностика сетки. */
+    private long[] bidTicks;
+    private long[] askTicks;
+    private long levelTicks;
+
+    public String levelPresence() {
+        if (levelTicks == 0) {
+            return "нет данных";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < levels; i++) {
+            sb.append(String.format(java.util.Locale.ROOT, "  уровень %d: бид %.0f%%, аск %.0f%%%n",
+                    i, 100.0 * bidTicks[i] / levelTicks, 100.0 * askTicks[i] / levelTicks));
+        }
+        return sb.toString();
+    }
+
+    public void placementCap(int cap) {
+        this.placementCapOverride = cap;
+    }
+
+    private int placementCap() {
+        return placementCapOverride > 0
+                ? placementCapOverride : ExecLimits.maxPlacementsPerDay(tag.id());
+    }
 
     private volatile double inventory;
     private volatile double baseAvailable;
@@ -233,6 +269,8 @@ public final class QuoteLoop implements Runnable {
                      double parkDistance, AllocRegistry alloc, int levels, double levelStep,
                      boolean innerFirst) {
         this.innerFirst = innerFirst;
+        this.bidTicks = new long[Math.max(1, levels)];
+        this.askTicks = new long[Math.max(1, levels)];
         this.levels = Math.max(1, levels);
         this.levelStep = levelStep;
         for (int i = 0; i < this.levels; i++) {
@@ -563,6 +601,15 @@ public final class QuoteLoop implements Runnable {
         double buyCash = alloc != null
                 ? Math.max(0, alloc.own(tag.id(), quote)) : Double.MAX_VALUE;
         double sellPool = Math.max(0, inventory);
+        levelTicks++;
+        for (int i = 0; i < levels; i++) {
+            if (bids.get(i).venueId != null) {
+                bidTicks[i]++;
+            }
+            if (asks.get(i).venueId != null) {
+                askTicks[i]++;
+            }
+        }
         // ⚠️ ПОРЯДОК РАЗДАЧИ решает исход, и проверяются оба.
         //
         // Внутренними вперёд: если ресурса хватает на одну заявку, она встаёт
@@ -863,13 +910,13 @@ public final class QuoteLoop implements Runnable {
 
     private void place(Side side, Resting resting, double price, double size) {
         long used = placementsLastDay();
-        if (used >= ExecLimits.maxPlacementsPerDay(tag.id())) {
+        if (used >= placementCap()) {
             log.error("исчерпан суточный лимит постановок ({} из {} за 24 ч) — "
                             + "останавливаю котирование",
-                    used, ExecLimits.maxPlacementsPerDay(tag.id()));
+                    used, placementCap());
             journal.event("limit_blocked",
                     "постановки за сутки: " + used + " из "
-                            + ExecLimits.maxPlacementsPerDay(tag.id()));
+                            + placementCap());
             stopQuoting();
             return;
         }
@@ -1022,12 +1069,48 @@ public final class QuoteLoop implements Runnable {
         mine.sort(side == Side.BUY
                 ? java.util.Comparator.comparingDouble(ActiveOrder::price).reversed()
                 : java.util.Comparator.comparingDouble(ActiveOrder::price));
+
+        // ⚠️ СНАЧАЛА каждый слот ищет СВОЮ заявку по идентификатору, и только
+        // потом незанятые слоты разбирают остаток по цене.
+        //
+        // Раскладка чисто по рангу цены теряет исполнения. Исполнилась заявка
+        // ближнего уровня и исчезла — следующая по цене становится лучшей и
+        // занимает его слот. Бот видит «в слоте заявка есть» и об исполнении не
+        // узнаёт никогда: inspectGoneOrder не вызывается, инвентарь не растёт.
+        // Измерено 05.09.2026: три бида стояли в книге по 90% времени каждый, а
+        // покупок вышло 216 против 340 у ОДНОГО бида при 99% — то есть больше
+        // трети исполнений просто терялось.
+        java.util.Set<String> taken = new java.util.HashSet<>();
+        ActiveOrder[] byId = new ActiveOrder[slots.size()];
         for (int i = 0; i < slots.size(); i++) {
-            ActiveOrder found = i < mine.size() ? mine.get(i) : null;
+            String own = slots.get(i).venueId;
+            if (own == null) {
+                continue;
+            }
+            for (ActiveOrder o : mine) {
+                if (o.id().equals(own)) {
+                    byId[i] = o;
+                    taken.add(o.id());
+                    break;
+                }
+            }
+        }
+        java.util.List<ActiveOrder> rest = new java.util.ArrayList<>();
+        for (ActiveOrder o : mine) {
+            if (!taken.contains(o.id())) {
+                rest.add(o);
+            }
+        }
+        int next = 0;
+        for (int i = 0; i < slots.size(); i++) {
+            ActiveOrder found = byId[i];
+            if (found == null && next < rest.size()) {
+                found = rest.get(next++);
+            }
             adopt(side, slots.get(i), found, why);
         }
-        for (int i = slots.size(); i < mine.size(); i++) {
-            cancelStray(mine.get(i), why);
+        for (int i = next; i < rest.size(); i++) {
+            cancelStray(rest.get(i), why);
         }
     }
 

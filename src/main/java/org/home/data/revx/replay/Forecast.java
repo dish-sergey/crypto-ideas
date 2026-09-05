@@ -59,7 +59,7 @@ public final class Forecast {
     public record BotResult(String botId, double offsetBp, int fills, double realised,
                             double inventoryLots, long placements, long replaces,
                             long placementCap, double days, String state, long lossStops,
-                            double atCapShare, double lotNotional) {
+                            double atCapShare, double lotNotional, int buys, int sells) {
     }
 
     private Forecast() {
@@ -115,6 +115,10 @@ public final class Forecast {
                                 spec.size(), spec.inventoryCap(), base.quoteStep()),
                         true, 0, base.baseStep(), base.parkDistance(), alloc,
                         spec.levels(), spec.levelStep(), spec.innerFirst());
+                // Для прогноза лимит поднимается: иначе многоуровневый режим
+                // упирается в него и глохнет, и меряется не экономика, а
+                // скорость выгорания бюджета.
+                loop.placementCap(100_000);
                 loops.add(loop);
             }
             for (int i = 1; i < loops.size(); i++) {
@@ -146,6 +150,9 @@ public final class Forecast {
             log.warn("площадка исполнила заявок: {} (это НЕ то же, что заметил бот)",
                     venue.appliedFills());
             log.warn("присутствие в книге: {}", venue.presence());
+            for (QuoteLoop l : loops) {
+                log.warn("по уровням, бот {}:%n{}", l.botId(), l.levelPresence());
+            }
             List<BotResult> out = new ArrayList<>();
             for (int i = 0; i < bots.size(); i++) {
                 out.add(measure(bots.get(i), journals.get(i), loops.get(i), base,
@@ -162,11 +169,18 @@ public final class Forecast {
                                      QuoteLoop loop, BootParams base, double days) {
         FifoLedger ledger = new FifoLedger();
         int fills = 0;
+        int buys = 0;
+        int sells = 0;
         for (ExecJournal.FillRow f : journal.fills()) {
             if (f.handover()) {
                 continue;
             }
             fills++;
+            if (f.buy()) {
+                buys++;
+            } else {
+                sells++;
+            }
             ledger.add(f.tsMs(), f.buy(), f.qty(), f.price(), f.fee());
         }
         // Доля времени с ПОЛНЫМ инвентарём. Пока бот упёрт в потолок, он только
@@ -192,7 +206,7 @@ public final class Forecast {
                 // ⚠️ Номинал лота в валюте котировки, а НЕ размер в базовой.
                 // Зашитая цена биткойна здесь врала на SOL втрое: лот $1
                 // печатался как 788.
-                spec.size() * st.lastFair());
+                spec.size() * st.lastFair(), buys, sells);
     }
 
     public static String render(String modelName, List<BotResult> results) {
@@ -202,7 +216,10 @@ public final class Forecast {
         // суточные. Прежде печаталось «634/300» — общее число за 5.4 суток
         // против СУТОЧНОГО потолка, и это читалось как «пробил лимит», хотя на
         // деле было 117 в сутки.
-        sb.append("бот | отступ |  лот | исполнений | реализовано | инвентарь"
+        // ⚠️ Покупки и продажи РАЗДЕЛЬНО. Одно общее число исполнений скрывает
+        // главное: не набирает бот инвентарь или не может его сбыть. Это разные
+        // болезни с разными причинами, а выглядят они одинаково.
+        sb.append("бот | отступ |  лот | покупок | продаж | реализовано | инвентарь"
                 + " | в потолке | постановок/сут | замен/с\n");
         for (BotResult r : results) {
             // ⚠️ Состояние на конец прогона печатается не для полноты. Бот
@@ -213,9 +230,9 @@ public final class Forecast {
             // сравнивать их между собой нельзя.
             String state = r.lossStops() > 0 ? "  СТОП по убытку ×" + r.lossStops() : "";
             sb.append(String.format(Locale.ROOT,
-                    "%-3s | %5.1f  | %4.2f | %10d | %+11.4f | %8.1f  | %8.1f%% | %6.0f/%-5d "
-                            + "| %6.2f%s%n",
-                    r.botId(), r.offsetBp(), r.lotNotional(), r.fills(), r.realised(),
+                    "%-3s | %5.1f  | %4.2f | %7d | %6d | %+11.4f | %8.1f  | %8.1f%% "
+                            + "| %6.0f/%-5d | %6.2f%s%n",
+                    r.botId(), r.offsetBp(), r.lotNotional(), r.buys(), r.sells(), r.realised(),
                     r.inventoryLots(), 100 * r.atCapShare(),
                     r.placements() / r.days(), r.placementCap(),
                     r.replaces() / (r.days() * 86_400), state));
