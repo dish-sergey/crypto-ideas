@@ -481,14 +481,24 @@ public class Executor {
      * {@link org.home.data.revx.replay.PairSweep}.
      */
     public void pairSweep(String from, String to, String offsets, int levels,
-                          double levelStepBp, boolean innerFirst) {
+                          double levelStepBp, boolean innerFirst, String symbols, String lots) {
         String[] parts = offsets.split(",");
         double[] off = new double[parts.length];
         for (int i = 0; i < parts.length; i++) {
             off[i] = Double.parseDouble(parts[i].trim());
         }
+        String[] lp = lots.split(",");
+        double[] lotsUsd = new double[lp.length];
+        for (int i = 0; i < lp.length; i++) {
+            lotsUsd[i] = Double.parseDouble(lp[i].trim());
+        }
+        java.util.Set<String> only = symbols == null || symbols.isBlank() ? null
+                : new java.util.HashSet<>(java.util.Arrays.stream(symbols.split(","))
+                        .map(s -> s.trim().toUpperCase(java.util.Locale.ROOT))
+                        .map(s -> s.contains("/") ? s.substring(0, s.indexOf('/')) : s)
+                        .toList());
         org.home.data.revx.replay.PairSweep.run(standDbPath, cfg, from, to,
-                levels, levelStepBp, innerFirst, off);
+                levels, levelStepBp, innerFirst, off, only, lotsUsd);
     }
 
     /**

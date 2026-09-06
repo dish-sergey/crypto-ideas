@@ -57,8 +57,39 @@ public final class PairSweep {
     /** Меньше этого числа снимков за сутки — сбор стоял, сутки не в счёт. */
     private static final int MIN_SNAPSHOTS = 2_000;
 
-    /** Накопитель по одной паре и одному отступу. */
+    /**
+     * Ступень перебора: отступ И размер лота.
+     *
+     * Лот здесь не для полноты. Глубина у пар различается в шестьдесят раз
+     * (BTC $1.28 млн в сутки против PEPE $21 тыс.), а доход на постановку
+     * растёт с размером заявки — значит «лучшая пара» на лоте $1 и на лоте $25
+     * это, вообще говоря, разные пары.
+     */
+    private record Variant(double offBp, double lotUsd) implements Comparable<Variant> {
+        @Override
+        public int compareTo(Variant o) {
+            int c = Double.compare(lotUsd, o.lotUsd);
+            return c != 0 ? c : Double.compare(offBp, o.offBp);
+        }
+
+        String label() {
+            return lotUsd == 1 ? String.format(Locale.ROOT, "%.0f б.п.", offBp)
+                    : String.format(Locale.ROOT, "$%.0f/%.0f", lotUsd, offBp);
+        }
+    }
+
+    /** Накопитель по одной паре и одной ступени. */
     private static final class Cell {
+        /**
+         * Сделок на самой площадке за то же окно — знаменатель доли участия.
+         *
+         * ⚠️ Без него прогноз на тонкой паре нечем проверить на здравый смысл.
+         * У PEPE на площадке 34 сделки в сутки, и модель очереди легко выдаёт
+         * столько же исполнений: получается маркет-мейкер, забирающий всю
+         * ленту. Такого не бывает, и колонка это показывает сразу.
+         */
+        int marketTrades;
+        double lotUsd;
         double realisedMarket;
         double realisedTouch;
         int fills;
@@ -79,6 +110,26 @@ public final class PairSweep {
     public static void run(String standDbPath, RevxConfig cfg, String fromIso, String toIso,
                            int levels, double levelStepBp, boolean innerFirst,
                            double[] offsetsBp) {
+        run(standDbPath, cfg, fromIso, toIso, levels, levelStepBp, innerFirst, offsetsBp,
+                null, new double[]{1});
+    }
+
+    /**
+     * @param only только эти пары ({@code null} — вся вселенная). Нужно для
+     *             ДОСЧЁТА: первый обход упёрся ступенью оптимума в край
+     *             лестницы у восемнадцати пар из двадцати трёх, то есть показал
+     *             не оптимум, а границу перебора. Гонять ради этого всю
+     *             вселенную заново — восемь часов на одном ядре, которое делят
+     *             живые боты.
+     * @param lotsUsd размеры лота в долларах. Потолок инвентаря всегда двадцать
+     *             лотов, то есть с лотом растёт и вложенный капитал — поэтому
+     *             сравнивать ступени надо по ГОДОВЫМ на капитал, а не по доходу
+     *             за окно: доход за окно вырастет и от того, что денег стало
+     *             больше.
+     */
+    public static void run(String standDbPath, RevxConfig cfg, String fromIso, String toIso,
+                           int levels, double levelStepBp, boolean innerFirst,
+                           double[] offsetsBp, java.util.Set<String> only, double[] lotsUsd) {
         long from = java.time.Instant.parse(fromIso).toEpochMilli();
         long to = java.time.Instant.parse(toIso).toEpochMilli();
         FairPrice.Limits limits = new FairPrice.Limits(cfg.fairMinPairs(),
@@ -86,7 +137,7 @@ public final class PairSweep {
                 cfg.fairMaxResidualPct());
 
         // пара → отступ → накопитель
-        Map<String, Map<Double, Cell>> grid = new TreeMap<>();
+        Map<String, Map<Variant, Cell>> grid = new TreeMap<>();
         Map<String, StandReader.PairSpec> specs = new LinkedHashMap<>();
         Map<String, Integer> skipped = new TreeMap<>();
 
@@ -107,6 +158,9 @@ public final class PairSweep {
                         label, dayNo, (to - from) / DAY_MS, fair.pairs());
 
                 for (String base : new ArrayList<>(fair.bases())) {
+                    if (only != null && !only.contains(base)) {
+                        continue;
+                    }
                     String symbol = base + "/USDC";
                     if (fair.snapshots(base) < MIN_SNAPSHOTS) {
                         skipped.merge(base, 1, Integer::sum);
@@ -118,7 +172,7 @@ public final class PairSweep {
                     }
                     try {
                         oneDay(standDbPath, cfg, fair, base, symbol, ps, label, day,
-                                levels, levelStepBp, innerFirst, offsetsBp, grid);
+                                levels, levelStepBp, innerFirst, offsetsBp, lotsUsd, grid);
                     } catch (Exception e) {
                         log.warn("{} {}: прогон не прошёл — {}", label, symbol, e.toString());
                     }
@@ -129,14 +183,14 @@ public final class PairSweep {
             return;
         }
 
-        log.info("\n{}", render(grid, offsetsBp, levels, levelStepBp, innerFirst, skipped));
+        log.info("\n{}", render(grid, levels, levelStepBp, innerFirst, skipped));
     }
 
     private static void oneDay(String standDbPath, RevxConfig cfg, StandFair fair,
                                String base, String symbol, StandReader.PairSpec ps,
                                String label, long dayStart, int levels, double levelStepBp,
-                               boolean innerFirst, double[] offsetsBp,
-                               Map<String, Map<Double, Cell>> grid) throws Exception {
+                               boolean innerFirst, double[] offsetsBp, double[] lotsUsd,
+                               Map<String, Map<Variant, Cell>> grid) throws Exception {
         List<ReplayFair.Tick> ticks = fair.toTicks(base);
         if (ticks.size() < MIN_SNAPSHOTS) {
             return;
@@ -145,21 +199,23 @@ public final class PairSweep {
         if (!(price > 0)) {
             return;
         }
-        // Лот в один доллар, округлённый к шагу количества. У части пар шаг
+        MarketData market0 = MarketData.load(standDbPath, symbol,
+                ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
+
+        for (double lotUsd : lotsUsd) {
+        // Лот заданного размера, округлённый к шагу количества. У части пар шаг
         // грубый, и доллар в него не укладывается — тогда лот выходит больше,
         // и это видно в отчёте отдельной колонкой.
         double lot = ps.baseStep() > 0
-                ? Math.max(ps.baseStep(), Math.round(1.0 / price / ps.baseStep()) * ps.baseStep())
-                : 1.0 / price;
+                ? Math.max(ps.baseStep(),
+                        Math.round(lotUsd / price / ps.baseStep()) * ps.baseStep())
+                : lotUsd / price;
         double cap = lot * 20;
 
         var bp = new BootParams(symbol, "a", lot, cap, offsetsBp[0] / 10_000,
                 cfg.simSkewK(), 0.3, 1000, ps.minNotional(), ps.baseStep(),
                 ps.quoteStep(), 0.10, -1, -1, 0, 0.02, 0.5, true,
                 levels, levelStepBp / 10_000, innerFirst);
-
-        MarketData market0 = MarketData.load(standDbPath, symbol,
-                ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
 
         for (double offBp : offsetsBp) {
             var spec = new Forecast.BotSpec("a", offBp / 10_000, 0.3, cap,
@@ -175,7 +231,9 @@ public final class PairSweep {
             Forecast.BotResult t = touch.get(0);
 
             Cell cell = grid.computeIfAbsent(base, k -> new TreeMap<>())
-                    .computeIfAbsent(offBp, k -> new Cell());
+                    .computeIfAbsent(new Variant(offBp, lotUsd), k -> new Cell());
+            cell.marketTrades += market0.tradeCount();
+            cell.lotUsd = lotUsd;
             cell.realisedMarket += q.realised();
             cell.realisedTouch += t.realised();
             cell.fills += q.fills();
@@ -191,34 +249,46 @@ public final class PairSweep {
                     : q.days_().get(0).movePct();
             cell.byDay.add(new Forecast.Day(label, move, q.realised(), q.fills()));
         }
+        }
     }
 
-    private static String render(Map<String, Map<Double, Cell>> grid, double[] offsetsBp,
+    private static String render(Map<String, Map<Variant, Cell>> grid,
                                  int levels, double levelStepBp, boolean innerFirst,
                                  Map<String, Integer> skipped) {
         StringBuilder sb = new StringBuilder();
         sb.append("\n=== ОБХОД ВСЕЛЕННОЙ: ").append(levels).append(" уровня шагом ")
                 .append(String.format(Locale.ROOT, "%.0f", levelStepBp)).append(" б.п., ")
                 .append(innerFirst ? "от ближнего" : "от дальнего")
-                .append(", лот $1, потолок $20 ===\n");
+                .append(", потолок 20 лотов ===\n");
 
-        // Ступень лестницы, где пара заработала больше всего по РАБОЧЕЙ модели.
-        record Best(String base, double off, Cell cell) {
+        List<Variant> variants = grid.values().stream().flatMap(m -> m.keySet().stream())
+                .distinct().sorted().toList();
+
+        // Ступень лестницы, где пара дала лучшие ГОДОВЫЕ на капитал.
+        // ⚠️ Не доход за окно: потолок равен двадцати лотам, поэтому с лотом
+        // растёт и вложенный капитал, и лот $25 обгонит лот $1 просто потому,
+        // что денег в деле в двадцать пять раз больше.
+        record Best(String base, Variant v, Cell cell) {
+            double annual() {
+                double capital = cell.lot * cell.price * 20;
+                return capital > 0 && cell.days > 0
+                        ? cell.realisedMarket / cell.days * 365 / capital * 100 : 0;
+            }
         }
         List<Best> best = new ArrayList<>();
         for (var e : grid.entrySet()) {
             Best b = null;
             for (var o : e.getValue().entrySet()) {
-                if (b == null || o.getValue().realisedMarket > b.cell().realisedMarket) {
-                    b = new Best(e.getKey(), o.getKey(), o.getValue());
+                Best cand = new Best(e.getKey(), o.getKey(), o.getValue());
+                if (o.getValue().days > 0 && (b == null || cand.annual() > b.annual())) {
+                    b = cand;
                 }
             }
             if (b != null && b.cell().days > 0) {
                 best.add(b);
             }
         }
-        best.sort(Comparator.comparingDouble((Best b) ->
-                -b.cell().realisedMarket / Math.max(0.01, b.cell().days)));
+        best.sort(Comparator.comparingDouble((Best b) -> -b.annual()));
 
         // ⚠️ Покупки и продажи РАЗДЕЛЬНО, и обязательно рядом с инвентарём.
         // «Реализовано» — это ЗАКРЫТЫЕ пары FIFO: непроданный остаток в него не
@@ -226,45 +296,56 @@ public final class PairSweep {
         // внешне неотличима от той, где ничего не происходило, — хотя на деле
         // она потратила капитал и сидит с мешком. Средний остаток на конец суток
         // это и показывает.
-        sb.append("\nпара     |отступ| сут |покуп|прод |  очередь |  касание |  в сутки |")
-                .append(" годовых | ост.лотов | пост/сут | на пост. | лот $ | худшие сутки\n");
-        sb.append("---------+------+-----+-----+-----+----------+----------+----------+")
-                .append("---------+-----------+----------+----------+-------+-------------\n");
+        // ⚠️ ДОЛЯ УЧАСТИЯ — первая колонка, куда надо смотреть на тонкой паре.
+        // Это наши исполнения к числу сделок на самой площадке. Маркет-мейкер,
+        // который забирает 90% ленты, — не результат, а признак того, что модель
+        // очереди на этой паре сломалась: у PEPE на площадке 34 сделки в сутки,
+        // и «поймать» их все физически некому.
+        sb.append("\nпара     | ступень | сут |покуп|прод | доля |  очередь |  касание |")
+                .append("  в сутки | годовых | ост.лотов | пост/сут | на пост. | худшие сутки\n");
+        sb.append("---------+---------+-----+-----+-----+------+----------+----------+")
+                .append("----------+---------+-----------+----------+----------+-------------\n");
         for (Best b : best) {
             Cell c = b.cell();
             double perDay = c.realisedMarket / c.days;
-            double capital = c.lot * c.price * 20;
-            double annual = capital > 0 ? perDay * 365 / capital * 100 : 0;
             double perPlacement = c.placements > 0 ? c.realisedMarket / c.placements : 0;
+            double share = c.marketTrades > 0 ? 100.0 * c.fills / c.marketTrades : 0;
             Forecast.Day worst = c.byDay.stream()
                     .min(Comparator.comparingDouble(Forecast.Day::realised)).orElse(null);
             sb.append(String.format(Locale.ROOT,
-                    "%-8s | %4.0f |%4.0f |%4d |%4d |%+9.4f |%+9.4f |%+9.4f |%+7.1f%% "
-                            + "|%10.1f |%9.0f |%+9.6f |%6.2f | %s%n",
-                    b.base(), b.off(), c.days, c.buys, c.sells,
-                    c.realisedMarket, c.realisedTouch, perDay, annual,
+                    "%-8s | %7s |%4.0f |%4d |%4d |%4.0f%% |%+9.4f |%+9.4f |%+9.4f |%+7.1f%% "
+                            + "|%10.1f |%9.0f |%+9.6f | %s%n",
+                    b.base(), b.v().label(), c.days, c.buys, c.sells, share,
+                    c.realisedMarket, c.realisedTouch, perDay, b.annual(),
                     c.daysHeld > 0 ? c.inventoryLots / c.daysHeld : 0,
-                    c.placements / c.days, perPlacement, c.lot * c.price,
+                    c.placements / c.days, perPlacement,
                     worst == null ? "-" : String.format(Locale.ROOT, "%s %+.4f",
                             worst.label().substring(5), worst.realised())));
         }
 
-        sb.append("\n\n=== ЛЕСТНИЦА ОТСТУПОВ (доход за окно по рабочей модели) ===\n\n");
+        sb.append("\n\n=== ЛЕСТНИЦА: годовых на капитал / доля ленты ===\n\n");
         sb.append("пара     ");
-        for (double o : offsetsBp) {
-            sb.append(String.format(Locale.ROOT, "|%7.0f б.п.", o));
+        for (Variant v : variants) {
+            sb.append(String.format(Locale.ROOT, "|%13s", v.label()));
         }
         sb.append("\n---------");
-        for (int i = 0; i < offsetsBp.length; i++) {
-            sb.append("+-----------");
+        for (int i = 0; i < variants.size(); i++) {
+            sb.append("+-------------");
         }
         sb.append('\n');
         for (Best b : best) {
             sb.append(String.format(Locale.ROOT, "%-8s ", b.base()));
-            for (double o : offsetsBp) {
-                Cell c = grid.get(b.base()).get(o);
-                sb.append(c == null ? "|          -"
-                        : String.format(Locale.ROOT, "|%+10.4f", c.realisedMarket));
+            for (Variant v : variants) {
+                Cell c = grid.get(b.base()).get(v);
+                if (c == null || c.days <= 0) {
+                    sb.append("|            -");
+                    continue;
+                }
+                double capital = c.lot * c.price * 20;
+                double annual = capital > 0
+                        ? c.realisedMarket / c.days * 365 / capital * 100 : 0;
+                double share = c.marketTrades > 0 ? 100.0 * c.fills / c.marketTrades : 0;
+                sb.append(String.format(Locale.ROOT, "|%+8.0f%% %3.0f%%", annual, share));
             }
             sb.append('\n');
         }
@@ -281,7 +362,7 @@ public final class PairSweep {
         }
         sb.append("сутки     ");
         for (Best b : top) {
-            sb.append(String.format(Locale.ROOT, "|%16s", b.base() + " " + (int) b.off() + "бп"));
+            sb.append(String.format(Locale.ROOT, "|%16s", b.base() + " " + b.v().label()));
         }
         sb.append('\n');
         for (var e : byDate.entrySet()) {
