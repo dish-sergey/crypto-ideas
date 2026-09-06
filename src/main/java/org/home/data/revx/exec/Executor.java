@@ -481,7 +481,8 @@ public class Executor {
      * {@link org.home.data.revx.replay.PairSweep}.
      */
     public void pairSweep(String from, String to, String offsets, int levels,
-                          double levelStepBp, boolean innerFirst, String symbols, String lots) {
+                          double levelStepBp, boolean innerFirst, String symbols, String lots,
+                          int thin) {
         String[] parts = offsets.split(",");
         double[] off = new double[parts.length];
         for (int i = 0; i < parts.length; i++) {
@@ -498,7 +499,7 @@ public class Executor {
                         .map(s -> s.contains("/") ? s.substring(0, s.indexOf('/')) : s)
                         .toList());
         org.home.data.revx.replay.PairSweep.run(standDbPath, cfg, from, to,
-                levels, levelStepBp, innerFirst, off, only, lotsUsd);
+                levels, levelStepBp, innerFirst, off, only, lotsUsd, thin);
     }
 
     /**

@@ -111,7 +111,7 @@ public final class PairSweep {
                            int levels, double levelStepBp, boolean innerFirst,
                            double[] offsetsBp) {
         run(standDbPath, cfg, fromIso, toIso, levels, levelStepBp, innerFirst, offsetsBp,
-                null, new double[]{1});
+                null, new double[]{1}, 1);
     }
 
     /**
@@ -129,7 +129,8 @@ public final class PairSweep {
      */
     public static void run(String standDbPath, RevxConfig cfg, String fromIso, String toIso,
                            int levels, double levelStepBp, boolean innerFirst,
-                           double[] offsetsBp, java.util.Set<String> only, double[] lotsUsd) {
+                           double[] offsetsBp, java.util.Set<String> only, double[] lotsUsd,
+                           int thin) {
         long from = java.time.Instant.parse(fromIso).toEpochMilli();
         long to = java.time.Instant.parse(toIso).toEpochMilli();
         FairPrice.Limits limits = new FairPrice.Limits(cfg.fairMinPairs(),
@@ -172,7 +173,7 @@ public final class PairSweep {
                     }
                     try {
                         oneDay(standDbPath, cfg, fair, base, symbol, ps, label, day,
-                                levels, levelStepBp, innerFirst, offsetsBp, lotsUsd, grid);
+                                levels, levelStepBp, innerFirst, offsetsBp, lotsUsd, thin, grid);
                     } catch (Exception e) {
                         log.warn("{} {}: прогон не прошёл — {}", label, symbol, e.toString());
                     }
@@ -189,10 +190,23 @@ public final class PairSweep {
     private static void oneDay(String standDbPath, RevxConfig cfg, StandFair fair,
                                String base, String symbol, StandReader.PairSpec ps,
                                String label, long dayStart, int levels, double levelStepBp,
-                               boolean innerFirst, double[] offsetsBp, double[] lotsUsd,
+                               boolean innerFirst, double[] offsetsBp, double[] lotsUsd, int thin,
                                Map<String, Map<Variant, Cell>> grid) throws Exception {
         List<ReplayFair.Tick> ticks = fair.toTicks(base);
-        if (ticks.size() < MIN_SNAPSHOTS) {
+        // ⚠️ ПРОРЕЖИВАНИЕ. Оставляем каждый N-й тик, чтобы измерить цену
+        // редкого опроса: у BTC, ETH и SOL запись секундная, у остальных
+        // двадцати — раз в шесть секунд, и весь обход сравнивал пары, часть
+        // которых видит рынок вшестеро реже. Здесь тот же рынок и та же лента
+        // сделок — реже только МОМЕНТЫ, когда бот может переставить заявку.
+        // Это и есть разница между «опрашиваем раз в секунду» и «раз в шесть».
+        if (thin > 1) {
+            List<ReplayFair.Tick> kept = new ArrayList<>(ticks.size() / thin + 1);
+            for (int i = 0; i < ticks.size(); i += thin) {
+                kept.add(ticks.get(i));
+            }
+            ticks = kept;
+        }
+        if (ticks.size() < MIN_SNAPSHOTS / Math.max(1, thin)) {
             return;
         }
         double price = ticks.get(ticks.size() / 2).fair();
