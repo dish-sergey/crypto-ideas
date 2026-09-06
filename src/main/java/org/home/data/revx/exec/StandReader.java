@@ -75,12 +75,25 @@ public final class StandReader implements FairSource, AutoCloseable {
      * Измерено 03.09.2026: **139 из 217 отказов замены за 8 часов — именно эта
      * причина**, и каждый такой отказ стоит постановки из суточной тысячи.
      */
+    /**
+     * @param referenceSpreadPct ширина опорной книги в процентах. Это мера
+     *        неопределённости самой справедливой цены: середина книги шириной s
+     *        известна с точностью ±s/2. Бинарный гейт сравнивает её с порогом и
+     *        останавливает котирование; динамический отступ вместо этого
+     *        отодвигает заявку — см. {@code revx.exec.spread-to-offset}.
+     */
     public record Fair(double price, boolean quotable, String pausedReason,
-                       long asOfMs, int pairsUsed, double bookBid, double bookAsk) {
+                       long asOfMs, int pairsUsed, double bookBid, double bookAsk,
+                       double referenceSpreadPct) {
 
         public Fair(double price, boolean quotable, String pausedReason,
                     long asOfMs, int pairsUsed) {
-            this(price, quotable, pausedReason, asOfMs, pairsUsed, 0, 0);
+            this(price, quotable, pausedReason, asOfMs, pairsUsed, 0, 0, 0);
+        }
+
+        public Fair(double price, boolean quotable, String pausedReason,
+                    long asOfMs, int pairsUsed, double bookBid, double bookAsk) {
+            this(price, quotable, pausedReason, asOfMs, pairsUsed, bookBid, bookAsk, 0);
         }
     }
 
@@ -208,7 +221,8 @@ public final class StandReader implements FairSource, AutoCloseable {
         Leg own = ownBook.get(base);
         return new Fair(state.fairUsdc(), state.quotable(), state.pausedReason(),
                 asOf, quotes.size(),
-                own == null ? 0 : own.bid(), own == null ? 0 : own.ask());
+                own == null ? 0 : own.bid(), own == null ? 0 : own.ask(),
+                state.referenceSpreadPct());
     }
 
     /** Одна нога последнего снимка символа. */

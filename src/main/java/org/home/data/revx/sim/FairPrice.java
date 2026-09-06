@@ -40,7 +40,19 @@ public final class FairPrice {
     }
 
     /** Почему по паре нельзя котировать; null = можно. */
-    public record PairState(double fairUsdc, double impliedRate, double residualPct, String pausedReason) {
+    /**
+     * @param referenceSpreadPct ширина ОПОРНОЙ книги в процентах на момент расчёта.
+     *        Нужна не для отчёта: это мера неопределённости самой справедливой
+     *        цены (середина книги шириной s известна с точностью ±s/2), и на ней
+     *        стоит выбор между бинарным гейтом и динамическим отступом.
+     */
+    public record PairState(double fairUsdc, double impliedRate, double residualPct,
+                            String pausedReason, double referenceSpreadPct) {
+
+        public PairState(double fairUsdc, double impliedRate, double residualPct,
+                         String pausedReason) {
+            this(fairUsdc, impliedRate, residualPct, pausedReason, 0);
+        }
 
         public boolean quotable() {
             return pausedReason == null;
@@ -105,7 +117,8 @@ public final class FairPrice {
                 paused = "опора разошлась с рынком: остаток " + round(residualPct, 3)
                         + "% при пороге ±" + limits.maxResidualPct() + "%";
             }
-            pairs.put(q.base(), new PairState(fair, q.implied(), residualPct, paused));
+            pairs.put(q.base(), new PairState(fair, q.implied(), residualPct, paused,
+                    100.0 * q.spreadUsd()));
         }
 
         return new Result(rate, dispersionPct, implied.size(), reliable, unreliableReason, pairs);

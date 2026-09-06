@@ -111,7 +111,7 @@ public final class PairSweep {
                            int levels, double levelStepBp, boolean innerFirst,
                            double[] offsetsBp) {
         run(standDbPath, cfg, fromIso, toIso, levels, levelStepBp, innerFirst, offsetsBp,
-                null, new double[]{1}, 1);
+                null, new double[]{1}, 1, 0);
     }
 
     /**
@@ -130,7 +130,7 @@ public final class PairSweep {
     public static void run(String standDbPath, RevxConfig cfg, String fromIso, String toIso,
                            int levels, double levelStepBp, boolean innerFirst,
                            double[] offsetsBp, java.util.Set<String> only, double[] lotsUsd,
-                           int thin) {
+                           int thin, double dynK) {
         long from = java.time.Instant.parse(fromIso).toEpochMilli();
         long to = java.time.Instant.parse(toIso).toEpochMilli();
         FairPrice.Limits limits = new FairPrice.Limits(cfg.fairMinPairs(),
@@ -142,46 +142,72 @@ public final class PairSweep {
         Map<String, StandReader.PairSpec> specs = new LinkedHashMap<>();
         Map<String, Integer> skipped = new TreeMap<>();
 
+        // ⚠️ ПАРАЛЛЕЛЬНО ПО СУТКАМ, а не по парам. Дни независимы по построению:
+        // инвентарь и так обнуляется на границе суток, потому что один срез книг
+        // всей вселенной в память не помещается. Пары же внутри дня делят один
+        // срез справедливой цены, и растаскивать их по потокам значило бы читать
+        // книги по разу на пару.
+        //
+        // Потоков не больше числа ядер и не больше числа суток: каждый держит
+        // свой срез книг (~200 МБ на сутки), и лишние потоки покупают память без
+        // выигрыша.
+        int days = (int) ((to - from) / DAY_MS);
+        int threads = Math.max(1, Math.min(Runtime.getRuntime().availableProcessors(), days));
+        log.warn("обход: {} суток, {} потоков", days, threads);
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(), limits,
                 cfg.fairMaxSkewMs())) {
-            int dayNo = 0;
-            for (long day = from; day < to; day += DAY_MS) {
-                dayNo++;
-                String label = java.time.Instant.ofEpochMilli(day).toString().substring(0, 10);
-                var fair = new StandFair(standDbPath, null, limits, cfg.memecoins(),
-                        cfg.fairMaxSkewMs(), org.home.data.revx.exec.Clock.system(),
-                        day, day + DAY_MS - 1);
-                if (fair.pairs() == 0) {
-                    log.warn("{}: книг нет, сутки пропущены", label);
-                    continue;
-                }
-                log.warn("=== сутки {} ({} из {}), пар в срезе {} ===",
-                        label, dayNo, (to - from) / DAY_MS, fair.pairs());
-
-                for (String base : new ArrayList<>(fair.bases())) {
-                    if (only != null && !only.contains(base)) {
-                        continue;
+            List<java.util.concurrent.Future<?>> tasks = new ArrayList<>();
+            for (int d = 0; d < days; d++) {
+                final long day = from + (long) d * DAY_MS;
+                final int dayNo = d + 1;
+                tasks.add(pool.submit(() -> {
+                    String label = java.time.Instant.ofEpochMilli(day).toString().substring(0, 10);
+                    var fair = new StandFair(standDbPath, null, limits, cfg.memecoins(),
+                            cfg.fairMaxSkewMs(), org.home.data.revx.exec.Clock.system(),
+                            day, day + DAY_MS - 1);
+                    if (fair.pairs() == 0) {
+                        log.warn("{}: книг нет, сутки пропущены", label);
+                        return;
                     }
-                    String symbol = base + "/USDC";
-                    if (fair.snapshots(base) < MIN_SNAPSHOTS) {
-                        skipped.merge(base, 1, Integer::sum);
-                        continue;
+                    log.warn("=== сутки {} ({} из {}), пар в срезе {} ===",
+                            label, dayNo, days, fair.pairs());
+                    for (String base : new ArrayList<>(fair.bases())) {
+                        if (only != null && !only.contains(base)) {
+                            continue;
+                        }
+                        String symbol = base + "/USDC";
+                        if (fair.snapshots(base) < MIN_SNAPSHOTS) {
+                            synchronized (skipped) {
+                                skipped.merge(base, 1, Integer::sum);
+                            }
+                            continue;
+                        }
+                        StandReader.PairSpec ps;
+                        synchronized (specs) {
+                            ps = specs.computeIfAbsent(symbol, stand::spec);
+                        }
+                        if (ps == null) {
+                            continue;             // пара не торгуется — считать нечего
+                        }
+                        try {
+                            oneDay(standDbPath, cfg, fair, base, symbol, ps, label, day,
+                                    levels, levelStepBp, innerFirst, offsetsBp, lotsUsd, thin, dynK,
+                                    grid);
+                        } catch (Exception e) {
+                            log.warn("{} {}: прогон не прошёл — {}", label, symbol, e.toString());
+                        }
                     }
-                    StandReader.PairSpec ps = specs.computeIfAbsent(symbol, stand::spec);
-                    if (ps == null) {
-                        continue;                 // пара не торгуется — считать нечего
-                    }
-                    try {
-                        oneDay(standDbPath, cfg, fair, base, symbol, ps, label, day,
-                                levels, levelStepBp, innerFirst, offsetsBp, lotsUsd, thin, grid);
-                    } catch (Exception e) {
-                        log.warn("{} {}: прогон не прошёл — {}", label, symbol, e.toString());
-                    }
-                }
+                }));
+            }
+            for (var t : tasks) {
+                t.get();
             }
         } catch (Exception e) {
             log.error("обход вселенной не прошёл: {}", e.toString(), e);
             return;
+        } finally {
+            pool.shutdown();
         }
 
         log.info("\n{}", render(grid, levels, levelStepBp, innerFirst, skipped));
@@ -191,6 +217,7 @@ public final class PairSweep {
                                String base, String symbol, StandReader.PairSpec ps,
                                String label, long dayStart, int levels, double levelStepBp,
                                boolean innerFirst, double[] offsetsBp, double[] lotsUsd, int thin,
+                               double dynK,
                                Map<String, Map<Variant, Cell>> grid) throws Exception {
         List<ReplayFair.Tick> ticks = fair.toTicks(base);
         // ⚠️ ПРОРЕЖИВАНИЕ. Оставляем каждый N-й тик, чтобы измерить цену
@@ -233,7 +260,7 @@ public final class PairSweep {
 
         for (double offBp : offsetsBp) {
             var spec = new Forecast.BotSpec("a", offBp / 10_000, 0.3, cap,
-                    levels, levelStepBp / 10_000, lot, innerFirst);
+                    levels, levelStepBp / 10_000, lot, innerFirst, dynK);
             List<Forecast.BotSpec> one = List.of(spec);
 
             var queue = Forecast.run(ticks, new MarketFillModel(market0.fresh()), bp, one, cfg);
@@ -244,6 +271,11 @@ public final class PairSweep {
             Forecast.BotResult q = queue.get(0);
             Forecast.BotResult t = touch.get(0);
 
+            // ⚠️ Накопитель ОБЩИЙ на все потоки суток, а TreeMap не потокобезопасен.
+            // Без замка здесь обход тихо терял бы дни: конкурентная вставка в
+            // TreeMap не падает, а портит дерево, и часть суток просто исчезала бы
+            // из итога — ровно тот класс ошибки, который в отчёте не виден.
+            synchronized (grid) {
             Cell cell = grid.computeIfAbsent(base, k -> new TreeMap<>())
                     .computeIfAbsent(new Variant(offBp, lotUsd), k -> new Cell());
             cell.marketTrades += market0.tradeCount();
@@ -262,6 +294,7 @@ public final class PairSweep {
             double move = q.days_() == null || q.days_().isEmpty() ? 0
                     : q.days_().get(0).movePct();
             cell.byDay.add(new Forecast.Day(label, move, q.realised(), q.fills()));
+            }
         }
         }
     }

@@ -226,6 +226,42 @@ public final class QuoteLoop implements Runnable {
         this.placementCapOverride = cap;
     }
 
+    /**
+     * СТЕНД: поднять денежные пределы пропорционально размеру лота.
+     *
+     * Боевые пределы записаны в абсолютных долларах под лот $1. Прогон с лотом
+     * большего размера обязан получить их в том же масштабе, иначе он меряет не
+     * рынок, а наш предохранитель — и делает это молча, ровными нулями.
+     *
+     * ⚠️ Живой исполнитель не вызывает этот метод НИКОГДА. Пределы для реальных
+     * денег остаются в {@link ExecLimits}, то есть за пересборкой и выкаткой.
+     */
+    /**
+     * СТЕНД: включить динамический отступ вместо бинарного гейта по опоре.
+     *
+     * @param k       какую долю отступа отдаём неопределённости цены (1/3 —
+     *                разумная отправная точка; 0 выключает, и гейт остаётся
+     *                бинарным, как на живых ботах)
+     * @param maxPct  выше этой ширины опоры не котируем ни на каком отступе:
+     *                при сломанной опоре (1.18% у ETH 19.08.2026) заявка ушла бы
+     *                на абсурдное расстояние и всё равно не исполнялась бы
+     */
+    public void dynamicOffset(double k, double maxPct) {
+        this.spreadToOffset = k;
+        this.spreadToOffsetMaxPct = maxPct;
+    }
+
+    /** Причина паузы — именно ширина опоры, а не что-то другое из гейтов. */
+    private static boolean isReferenceSpreadReason(String reason) {
+        return reason != null && reason.startsWith("опорная книга широка");
+    }
+
+    public void scaleLimitsForLot(double lotUsd) {
+        double k = Math.max(1.0, lotUsd);
+        this.maxOrderNotional = ExecLimits.MAX_ORDER_NOTIONAL_USDC * k;
+        this.maxExposure = ExecLimits.MAX_TOTAL_EXPOSURE_USDC * k;
+    }
+
     private int placementCap() {
         return placementCapOverride > 0
                 ? placementCapOverride : ExecLimits.maxPlacementsPerDay(tag.id());
@@ -258,6 +294,30 @@ public final class QuoteLoop implements Runnable {
     /** Кому досталась единственная замена этого тика (см. chooseReplaceSlot). */
     private Side replaceSlotSide;
     private int replaceSlotLevel = -1;
+
+    /**
+     * Действующие денежные пределы. По умолчанию — боевые из {@link ExecLimits}.
+     *
+     * ⚠️ Переопределяются ТОЛЬКО стендом, через {@link #scaleLimitsForLot}, и
+     * только вверх пропорционально лоту. Причина в том, что боевые пределы
+     * заданы в АБСОЛЮТНЫХ долларах под лот $1: заявка не больше $10, экспозиция
+     * не больше $40. Прогон с лотом $10 упирается в них раньше, чем в рынок, и
+     * измеряет не ёмкость пары, а наш собственный предохранитель. Так и вышло
+     * 06.09.2026: лестница лотов дала ровные нули на $10 и $30 при живом рынке,
+     * а в логе лежало 15.5 млн строк «экспозиция превысила бы предел 30.0».
+     *
+     * Живой исполнитель этот метод НЕ ВЫЗЫВАЕТ, и пределы для него остаются там,
+     * где им положено быть по ТЗ §6 — в коде, за пересборкой.
+     */
+    /**
+     * Доля отступа, которую готовы отдать неопределённости цены (0 — выключено).
+     * Ставится только стендом: на живых ботах гейт пока бинарный.
+     */
+    private double spreadToOffset;
+    private double spreadToOffsetMaxPct = 1.0;
+
+    private double maxOrderNotional = ExecLimits.MAX_ORDER_NOTIONAL_USDC;
+    private double maxExposure = ExecLimits.MAX_TOTAL_EXPOSURE_USDC;
     private double totalFees;
     private double totalFilledNotional;
     private double startInventory;
@@ -577,7 +637,26 @@ public final class QuoteLoop implements Runnable {
             pausedReason = "не запущен";
             return;
         }
-        if (!fair.quotable() || !(fair.price() > 0)) {
+        // ⚠️ ДИНАМИЧЕСКИЙ ОТСТУП вместо бинарного гейта — опыт, а не умолчание.
+        //
+        // Гейт по ширине опорной книги останавливает котирование целиком, и у
+        // ENA это половина времени (62% проходимости за 16 суток, 45% на
+        // выходных). Но ширина опоры — это не «можно/нельзя», а мера
+        // неопределённости: середина книги шириной s известна с точностью ±s/2.
+        // Значит вместо остановки можно ОТОДВИНУТЬ заявку на ту же величину и
+        // продолжать торговать, только дальше от цены.
+        //
+        // Порог гейта при этом всё равно нужен: при совсем сломанной опоре
+        // (замер 19.08.2026 — 1.18% у ETH на движении 18%) отступ вырос бы до
+        // абсурда, и честнее не котировать вовсе. Поэтому отступ раздвигается
+        // до потолка, а дальше работает прежний гейт.
+        boolean widened = false;
+        if (spreadToOffset > 0 && !fair.quotable() && fair.price() > 0
+                && isReferenceSpreadReason(fair.pausedReason())
+                && fair.referenceSpreadPct() <= spreadToOffsetMaxPct) {
+            widened = true;
+        }
+        if ((!fair.quotable() && !widened) || !(fair.price() > 0)) {
             // Гейт ТЗ §4.1: опора сломана — уводим котировки из зоны исполнения.
             pausedReason = fair.pausedReason() == null ? "курс ненадёжен" : fair.pausedReason();
             journal.quote(fair.price(), null, null, inventory, false, pausedReason);
@@ -597,6 +676,16 @@ public final class QuoteLoop implements Runnable {
         // При выключенном гейте (порог 0) поведение прежнее.
         double drift = efficiency.open(params.driftGateEr()) ? drift() : 0;
         Quoter.Quotes target = policy.quotes(fair.price(), inventory, drift);
+        if (widened) {
+            // Неопределённость цены — ±s/2. Отодвигаем обе стороны на неё,
+            // делённую на долю, которую готовы ей отдать: при k = 1/3 половина
+            // спреда опоры стоит трёх таких же долей отступа.
+            double extra = fair.price() * (fair.referenceSpreadPct() / 100.0) / 2 / spreadToOffset;
+            target = new Quoter.Quotes(
+                    target.bid() == null ? null : target.bid() - extra,
+                    target.ask() == null ? null : target.ask() + extra);
+            pausedReason = null;
+        }
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
         journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null);
@@ -807,15 +896,15 @@ public final class QuoteLoop implements Runnable {
             warnNoFunds(side, resting);
             return 0;
         }
-        if (!ExecLimits.orderAllowed(notional)) {
+        if (!(notional > 0 && notional <= maxOrderNotional)) {
             log.error("заявка {} на {} USDC превышает предел {} — не ставлю", side, notional,
-                    ExecLimits.MAX_ORDER_NOTIONAL_USDC);
+                    maxOrderNotional);
             journal.event("limit_blocked", side + " нотионал " + notional);
             return 0;
         }
-        if (!ExecLimits.exposureAllowed(exposure() + notional)) {
+        if (exposure() + notional > maxExposure) {
             log.error("экспозиция превысила бы предел {} — не ставлю",
-                    ExecLimits.MAX_TOTAL_EXPOSURE_USDC);
+                    maxExposure);
             journal.event("limit_blocked", "экспозиция");
             return 0;
         }

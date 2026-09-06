@@ -50,9 +50,22 @@ public final class Forecast {
      *                     котировка, и сравнивать их «в лоб» нельзя. Нормировка
      *                     на капитал — деление общего потолка между уровнями.
      */
+    /**
+     * @param dynOffsetK доля отступа, отдаваемая неопределённости цены при
+     *                   ДИНАМИЧЕСКОМ отступе (0 — бинарный гейт, как на живых
+     *                   ботах). Поле здесь, а не в конфиге, потому что это ось
+     *                   сравнения: в одном прогоне нужны оба режима рядом.
+     */
     public record BotSpec(String botId, double offset, double skewTarget,
                           double inventoryCap, int levels, double levelStep,
-                          double size, boolean innerFirst) {
+                          double size, boolean innerFirst, double dynOffsetK) {
+
+        public BotSpec(String botId, double offset, double skewTarget,
+                       double inventoryCap, int levels, double levelStep,
+                       double size, boolean innerFirst) {
+            this(botId, offset, skewTarget, inventoryCap, levels, levelStep,
+                    size, innerFirst, 0);
+        }
     }
 
     /** Что получилось у одного котировщика. */
@@ -129,6 +142,17 @@ public final class Forecast {
                 // упирается в него и глохнет, и меряется не экономика, а
                 // скорость выгорания бюджета.
                 loop.placementCap(100_000);
+                // ⚠️ И денежные пределы — тоже в масштабе лота. Они записаны в
+                // абсолютных долларах под лот $1 (заявка ≤ $10, экспозиция ≤ $40),
+                // и прогон с лотом $10 упирался в них раньше, чем в рынок: 15.5
+                // млн отказов «экспозиция превысила предел» и ровные нули дохода
+                // при живом рынке (06.09.2026). Меряли предохранитель, не пару.
+                loop.scaleLimitsForLot(spec.size() * ticks.get(0).fair());
+                if (spec.dynOffsetK() > 0) {
+                    // Потолок 1% — выше опора считается сломанной (замер
+                    // 19.08.2026: 1.18% у ETH на движении 18%).
+                    loop.dynamicOffset(spec.dynOffsetK(), 1.0);
+                }
                 loops.add(loop);
             }
             for (int i = 1; i < loops.size(); i++) {

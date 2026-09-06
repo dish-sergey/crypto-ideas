@@ -232,7 +232,8 @@ public class CliRunner implements ApplicationRunner {
                         args.containsOption("inner-first"),
                         firstOr(args, "symbols", ""),
                         firstOr(args, "lots", "1"),
-                        Integer.parseInt(firstOr(args, "thin", "1")));
+                        Integer.parseInt(firstOr(args, "thin", "1")),
+                        Double.parseDouble(firstOr(args, "dyn-offset", "0")));
             }
             if (args.containsOption("revx-ladder")) {
                 executor.getObject().ladder(firstOr(args, "journal", "state/exec.db"),

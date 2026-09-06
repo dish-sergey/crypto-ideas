@@ -281,6 +281,7 @@ public final class StandFair implements FairSource {
         }
         return new StandReader.Fair(state.fairUsdc(), state.quotable(), state.pausedReason(),
                 asOf, quotes.size(),
-                own == null ? 0 : own.bid(), own == null ? 0 : own.ask());
+                own == null ? 0 : own.bid(), own == null ? 0 : own.ask(),
+                state.referenceSpreadPct());
     }
 }
