@@ -56,7 +56,7 @@ ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubunt
 # возобновлять торговлю. Котирование в любом случае стартует выключенным.
 SuccessExitStatus=143
 Restart=no
-TimeoutStopSec=60
+TimeoutStopSec=120
 
 [Install]
 WantedBy=multi-user.target

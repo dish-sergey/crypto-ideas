@@ -43,8 +43,21 @@ public final class QuoteLoop implements Runnable {
 
     private static final Logger log = LoggerFactory.getLogger(QuoteLoop.class);
 
-    /** Потолок паузы после отказа постановки. */
-    private static final long MAX_PLACE_BACKOFF_MS = 60_000L;
+    /**
+     * Потолок паузы после отказа площадки.
+     *
+     * С 06.09.2026 — 15 с вместо 60. Шестьдесят секунд задумывались против
+     * долбёжки неизвестной ошибкой, но на живых шести ботах превратились в
+     * другое: заявка выпадала из книги на минуту с лишним, и всё это время бот
+     * не торговал, хотя причина отказа (залп замен выше лимита площадки)
+     * проходила за секунды.
+     *
+     * ⚠️ Короткая пауза законна ТОЛЬКО вместе с потолком замен на тик
+     * ({@link #chooseReplaceSlot}). Без него бот возвращался бы в тот же залп,
+     * снова ловил 429 и удлинял наказание — короткий отход по сути означал бы
+     * «повторять чаще». Сначала перестали пробивать лимит, потом сократили паузу.
+     */
+    private static final long MAX_PLACE_BACKOFF_MS = 15_000L;
     /**
      * Сколько заявка считается «свежей». Список активных отстаёт от постановки,
      * и вывод «её там нет, значит исполнилась» на свежем id даёт дубль.
@@ -242,6 +255,9 @@ public final class QuoteLoop implements Runnable {
     private long minuteStartMs;
     private long lastReconcileMs;
     private int replacesThisMinute;
+    /** Кому досталась единственная замена этого тика (см. chooseReplaceSlot). */
+    private Side replaceSlotSide;
+    private int replaceSlotLevel = -1;
     private double totalFees;
     private double totalFilledNotional;
     private double startInventory;
@@ -620,6 +636,7 @@ public final class QuoteLoop implements Runnable {
         // Первая реализация умела только первый вариант, и на продажах он давал
         // систематический перекос: покупки шли на всех уровнях, включая дальние
         // и выгодные, а продажи почти всегда уходили по ближней цене.
+        chooseReplaceSlot(target, fair);
         for (int k = 0; k < levels; k++) {
             int i = innerFirst ? k : levels - 1 - k;
             Double bidPrice = noCross(Side.BUY,
@@ -629,12 +646,75 @@ public final class QuoteLoop implements Runnable {
 
             double cashCap = bidPrice != null && bidPrice > 0
                     ? buyCash / bidPrice : Double.MAX_VALUE;
-            double bought = syncSide(Side.BUY, bids.get(i), bidPrice, fair.price(), cashCap);
+            double bought = syncSide(Side.BUY, i, bids.get(i), bidPrice, fair.price(), cashCap);
             buyCash = Math.max(0, buyCash - bought * (bidPrice == null ? 0 : bidPrice));
 
             sellPool = Math.max(0,
-                    sellPool - syncSide(Side.SELL, asks.get(i), askPrice, fair.price(), sellPool));
+                    sellPool - syncSide(Side.SELL, i, asks.get(i), askPrice, fair.price(), sellPool));
         }
+    }
+
+    /**
+     * Какая ОДНА заявка имеет право на замену в этот тик.
+     *
+     * <h2>Почему потолок нужен</h2>
+     *
+     * Замена стоит запроса, а площадка даёт их 10 в секунду НА ВЕСЬ СЧЁТ. У бота
+     * до шести заявок (три уровня × две стороны), ботов шесть, и на общее
+     * движение цены они реагируют в одну и ту же секунду. Замерено 06.09.2026:
+     * в среднем 4.3 замены в секунду — вроде бы вдвое ниже лимита, — но 68
+     * секунд из 415 пробили десятку, пик 24. За пробой площадка наказывает
+     * ответом 429 с {@code retry-after} до полутора минут, и всё это время бот
+     * стоит со старой ценой. То есть залпы стоили нам ровно того, ради чего
+     * замены и делаются.
+     *
+     * <h2>Почему одна, а не «первая освободившаяся»</h2>
+     *
+     * Одна замена на тик у шести ботов даёт 6 запросов в секунду при лимите 10 —
+     * граница доказуемая, а не средняя. Платы за это почти нет: измеренный спрос
+     * 0.72 замены на бота в секунду, то есть потолок срезает не поток, а пики.
+     *
+     * ⚠️ Право отдаётся заявке с НАИБОЛЬШИМ относительным расхождением, а не
+     * первой по порядку обхода. Порядок обхода задан раздачей капитала (от
+     * дальнего уровня к ближнему), и отдать замену по нему значило бы обновлять
+     * дальние заявки, которые почти не двигаются, пока ближняя — та, что и
+     * приносит исполнения, — висит по устаревшей цене.
+     */
+    private void chooseReplaceSlot(Quoter.Quotes target, StandReader.Fair fair) {
+        replaceSlotSide = null;
+        replaceSlotLevel = -1;
+        double best = 0;
+        for (int i = 0; i < levels; i++) {
+            best = considerSlot(Side.BUY, i, bids.get(i),
+                    noCross(Side.BUY, levelPrice(Side.BUY, target.bid(), fair.price(), i), fair),
+                    best);
+            best = considerSlot(Side.SELL, i, asks.get(i),
+                    noCross(Side.SELL, levelPrice(Side.SELL, target.ask(), fair.price(), i), fair),
+                    best);
+        }
+    }
+
+    /** Претендент на замену: годится ли и насколько он разошёлся с целью. */
+    private double considerSlot(Side side, int level, Resting resting, Double targetPrice,
+                                double best) {
+        if (resting.venueId == null || targetPrice == null || !(resting.price > 0)) {
+            return best;                 // нечего заменять: заявки нет
+        }
+        if (clock.now() < resting.blockedUntilMs || !quoter.shouldRequote(resting.price, targetPrice)) {
+            return best;                 // под наказанием или цена и так годная
+        }
+        double divergence = Math.abs(targetPrice - resting.price) / resting.price;
+        if (divergence <= best) {
+            return best;
+        }
+        replaceSlotSide = side;
+        replaceSlotLevel = level;
+        return divergence;
+    }
+
+    /** Досталось ли этой заявке право на замену в текущем тике. */
+    private boolean mayReplace(Side side, int level) {
+        return replaceSlotSide == side && replaceSlotLevel == level;
     }
 
     /**
@@ -706,7 +786,7 @@ public final class QuoteLoop implements Runnable {
      * @param pool сколько ресурса осталось после внутренних уровней
      * @return сколько ресурса этот уровень занял
      */
-    private double syncSide(Side side, Resting resting, Double targetPrice, double fair,
+    private double syncSide(Side side, int level, Resting resting, Double targetPrice, double fair,
                             double pool) {
         if (targetPrice == null) {
             if (resting.venueId != null) {
@@ -749,8 +829,11 @@ public final class QuoteLoop implements Runnable {
             return resting.venueId == null ? 0 : resting.size;
         }
         if (resting.venueId == null) {
+            // ⚠️ ПОСТАНОВКА потолком тика НЕ ограничена, и намеренно: заявки в
+            // книге нет вовсе, а это состояние дороже устаревшей цены. Постановок
+            // и так мало — их сдерживает суточный лимит в тысячу на счёт.
             place(side, resting, targetPrice, size);
-        } else if (quoter.shouldRequote(resting.price, targetPrice)) {
+        } else if (quoter.shouldRequote(resting.price, targetPrice) && mayReplace(side, level)) {
             replace(side, resting, targetPrice, size);
         }
         return size;

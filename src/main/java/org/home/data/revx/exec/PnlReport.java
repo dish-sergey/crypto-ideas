@@ -99,7 +99,8 @@ public final class PnlReport {
      * Единственная книга партий: затравка, передачи и сделки в одном порядке.
      * Затравка и передачи помечены — по этой метке отчёт и разделяет пары.
      */
-    private static FifoLedger build(ExecJournal journal) {
+    /** Книга партий из журнала. Публичная: ею пользуется и сводный бот. */
+    public static FifoLedger build(ExecJournal journal) {
         FifoLedger ledger = new FifoLedger();
         ExecJournal.FillRow seed = journal.seed();
         if (seed != null) {

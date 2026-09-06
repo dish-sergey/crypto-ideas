@@ -68,7 +68,7 @@ ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubunt
 
 SuccessExitStatus=143
 Restart=no
-TimeoutStopSec=60
+TimeoutStopSec=120
 
 [Install]
 WantedBy=multi-user.target

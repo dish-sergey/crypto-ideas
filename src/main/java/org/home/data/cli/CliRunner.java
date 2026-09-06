@@ -83,6 +83,8 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.ExecReport> execReport;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
+    /** Кого наблюдает сводный бот: метка:пара:путь. */
+    private final List<String> infoBots;
 
     public CliRunner(ConfigurableApplicationContext context, CliMode mode,
                      List<Collector> collectors, OhlcvCollector ohlcv, FundingCollector funding,
@@ -101,7 +103,8 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.Executor> executor,
                      ObjectProvider<org.home.data.revx.exec.ExecReport> execReport,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
-                     @Value("${collectors.symbols}") List<String> defaultSymbols) {
+                     @Value("${collectors.symbols}") List<String> defaultSymbols,
+                     @Value("${revx.info.bots}") List<String> infoBots) {
         this.context = context;
         this.mode = mode;
         this.collectors = collectors;
@@ -129,6 +132,7 @@ public class CliRunner implements ApplicationRunner {
         this.execReport = execReport;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
+        this.infoBots = infoBots;
     }
 
     @Override
@@ -242,6 +246,24 @@ public class CliRunner implements ApplicationRunner {
             }
             if (args.containsOption("revx-exec")) {
                 executor.getObject().run();          // блокирует: демон микро-live
+            }
+            if (args.containsOption("revx-info")) {
+                // Сводный бот: смотрит журналы шести исполнителей и ничего не
+                // пишет. Токен обязан быть свой — два потребителя getUpdates на
+                // одном дают 409 и отбирают управление друг у друга.
+                var watched = org.home.data.revx.exec.InfoBot.parse(infoBots);
+                if (watched.isEmpty()) {
+                    log.error("revx.info.bots пуст — сводке не за чем наблюдать");
+                    SpringApplication.exit(context, () -> 2);
+                    return;
+                }
+                var bot = org.home.data.revx.exec.InfoBot.fromEnvironment(watched);
+                if (bot == null) {
+                    SpringApplication.exit(context, () -> 2);
+                    return;
+                }
+                Runtime.getRuntime().addShutdownHook(new Thread(bot::stop));
+                bot.run();                           // блокирует: демон сводки
             }
             if (args.containsOption("revx-flow")) {
                 revx.getObject().flow(

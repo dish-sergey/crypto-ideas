@@ -97,7 +97,37 @@ public final class ExecJournal implements AutoCloseable {
         this.clock = clock != null ? clock : Clock.system();
     }
 
+    /**
+     * Журнал ЧУЖОГО бота, только на чтение.
+     *
+     * ⚠️ Обычный конструктор открывает базу на запись и досоздаёт схему. Для
+     * сводного бота это недопустимо вдвойне: он смотрит в журналы шести живых
+     * исполнителей, и второй писатель в базу работающего бота — это блокировки
+     * на его горячем пути ради отчёта. Здесь только {@code mode=ro}, никакого
+     * DDL и никаких PRAGMA.
+     *
+     * Записывающие методы на таком журнале упадут — и правильно: сводный бот
+     * ничего не пишет по построению.
+     */
+    public static ExecJournal readOnly(String path) {
+        return new ExecJournal(path, true);
+    }
+
     public ExecJournal(String path) {
+        this(path, false);
+    }
+
+    private ExecJournal(String path, boolean readOnly) {
+        if (readOnly) {
+            try {
+                this.path = path;
+                connection = DriverManager.getConnection(
+                        "jdbc:sqlite:file:" + path + "?mode=ro");
+            } catch (Exception e) {
+                throw new IllegalStateException("не открыть журнал на чтение " + path, e);
+            }
+            return;
+        }
         try {
             Path file = Path.of(path);
             if (file.getParent() != null) {
@@ -392,6 +422,50 @@ public final class ExecJournal implements AutoCloseable {
             // а не разрешать её.
             log.error("не удалось посчитать постановки за окно: {}", e.getMessage());
             return Long.MAX_VALUE;
+        }
+    }
+
+    /**
+     * Включено ли котирование — по ПОСЛЕДНЕМУ из событий start/stop.
+     *
+     * ⚠️ Именно последнему по времени, а не «встречался ли start». Остановленный
+     * командой бот хранит в журнале оба события, и проверка на наличие показала
+     * бы его работающим.
+     */
+    public synchronized boolean quotingOn() {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT kind FROM exec_event WHERE kind IN ('start','stop') "
+                        + "ORDER BY ts_ms DESC LIMIT 1");
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() && "start".equals(rs.getString(1));
+        } catch (Exception e) {
+            log.warn("не прочитал состояние котирования: {}", e.toString());
+            return false;
+        }
+    }
+
+    /** Время последнего тика котировки: мера того, жив ли бот вообще. */
+    public synchronized long lastQuoteMs() {
+        return queryLong("SELECT MAX(ts_ms) FROM exec_quote");
+    }
+
+    /** Последняя справедливая цена — ею оценивается непроданный остаток. */
+    public synchronized double lastFair() {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT fair FROM exec_quote WHERE fair > 0 ORDER BY ts_ms DESC LIMIT 1");
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? rs.getDouble(1) : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private long queryLong(String sql) {
+        try (PreparedStatement ps = connection.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? rs.getLong(1) : 0;
+        } catch (Exception e) {
+            return 0;
         }
     }
 
