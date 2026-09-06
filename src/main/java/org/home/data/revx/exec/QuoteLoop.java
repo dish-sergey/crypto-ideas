@@ -1428,8 +1428,8 @@ public final class QuoteLoop implements Runnable {
         if (resting.venueId == null) {
             return;                       // отводить нечего
         }
-        if (!quoter.shouldRequote(resting.price, price)) {
-            return;                       // уже отведена
+        if (alreadyParked(side, resting, price)) {
+            return;                       // уже стоит в стороне — не трогаем
         }
         int failuresBefore = resting.failures;
         replace(side, resting, price, resting.size);
@@ -1444,6 +1444,33 @@ public final class QuoteLoop implements Runnable {
             return;
         }
         journal.event("park", side + " отведена на " + fmt(price) + " (" + why + ")");
+    }
+
+    /**
+     * Стоит ли заявка уже достаточно далеко, чтобы её не трогать.
+     *
+     * ⚠️ Раньше здесь стоял обычный {@link Quoter#shouldRequote}, и отведённая
+     * заявка ГНАЛАСЬ ЗА ЦЕНОЙ. Цена отвода считается от {@code lastTrustedFair},
+     * а та продолжает шевелиться, пока гейт открывается и закрывается; порог
+     * перевыставления — доли базисного пункта, отвод — целые проценты, так что
+     * условие срабатывало почти на каждом тике. Измерено на живом боте E
+     * 06.09.2026: 438 отводов за час, 51 отмена и 60 постановок из суточных 80 —
+     * бот сжёг три четверти бюджета, ни разу не поторговав.
+     *
+     * Смысл отведённой заявки — стоять в стороне, а не в точной точке. Поэтому
+     * достаточно проверить, что она ещё хотя бы вполовину так далеко, как
+     * задумано. Половина — не произвол: если рынок съел половину отвода, это уже
+     * настоящее движение, и переставить заявку стоит.
+     */
+    private boolean alreadyParked(Side side, Resting resting, double parkPrice) {
+        if (!(lastTrustedFair > 0) || !(resting.price > 0)) {
+            return false;
+        }
+        double want = Math.abs(parkPrice - lastTrustedFair) / lastTrustedFair;
+        double have = side == Side.BUY
+                ? (lastTrustedFair - resting.price) / lastTrustedFair
+                : (resting.price - lastTrustedFair) / lastTrustedFair;
+        return have >= want * 0.5;
     }
 
     /**

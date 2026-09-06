@@ -469,6 +469,44 @@ public final class ExecJournal implements AutoCloseable {
         }
     }
 
+    /** Последний тик котировки: разрешили ли гейты и, если нет, почему. */
+    public record LastQuote(long tsMs, boolean quotable, String reason) {
+    }
+
+    /**
+     * Чем бот занят прямо сейчас.
+     *
+     * ⚠️ «Котирование включено» и «бот торгует» — РАЗНЫЕ вещи, и путать их
+     * дорого. Бот E 06.09.2026 час стоял с включённым котированием и не
+     * торговал вовсе: гейт по ширине опорной книги закрывался, заявки уходили в
+     * отвод, а по сводке он выглядел работающим.
+     */
+    public synchronized LastQuote lastQuote() {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT ts_ms, quotable, reason FROM exec_quote ORDER BY ts_ms DESC LIMIT 1");
+             ResultSet rs = ps.executeQuery()) {
+            if (rs.next()) {
+                return new LastQuote(rs.getLong(1), rs.getInt(2) != 0, rs.getString(3));
+            }
+        } catch (Exception e) {
+            log.warn("не прочитал последнюю котировку: {}", e.toString());
+        }
+        return new LastQuote(0, false, null);
+    }
+
+    /** Сколько раз бот отводил заявки за окно — прямой признак закрытого гейта. */
+    public synchronized long parksSince(long fromMs) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT COUNT(*) FROM exec_event WHERE kind = 'park' AND ts_ms > ?")) {
+            ps.setLong(1, fromMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0;
+            }
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     public synchronized long countRequests() {
         try (Statement st = connection.createStatement();
              ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM exec_request")) {

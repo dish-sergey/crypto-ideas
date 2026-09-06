@@ -154,7 +154,8 @@ public final class InfoBot implements Runnable {
     }
 
     /** Состояние одного исполнителя, собранное из его журнала. */
-    private record Snapshot(String botId, String symbol, boolean quoting, long lastEventMs,
+    private record Snapshot(String botId, String symbol, boolean quoting, boolean trading,
+                            String pausedReason, long parks1h, long lastEventMs,
                             double position, double fair, int fills24, double realised24,
                             long placements24, long cap, String note) {
     }
@@ -163,12 +164,16 @@ public final class InfoBot implements Runnable {
         long now = System.currentTimeMillis();
         try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
             boolean quoting = j.quotingOn();
-            long lastEvent = j.lastQuoteMs();
+            ExecJournal.LastQuote q = j.lastQuote();
             Double pos = j.getState("position");
-            double fair = j.lastFair();
             FifoLedger ledger = PnlReport.build(j);
-            return new Snapshot(w.botId(), w.symbol(), quoting, lastEvent,
-                    pos == null ? 0 : pos, fair,
+            // ⚠️ «Торгует» = котирование включено И гейты разрешают. Это разные
+            // вещи: бот с включённым котированием может час стоять в отводе,
+            // потому что опорная книга широка, и по сводке выглядеть рабочим.
+            boolean trading = quoting && q.quotable();
+            return new Snapshot(w.botId(), w.symbol(), quoting, trading,
+                    q.reason(), j.parksSince(now - 3_600_000L), q.tsMs(),
+                    pos == null ? 0 : pos, j.lastFair(),
                     ledger.tradingClosedSince(now - 86_400_000L),
                     ledger.tradingRealisedSince(now - 86_400_000L),
                     j.placementsSince(now - 86_400_000L),
@@ -176,7 +181,7 @@ public final class InfoBot implements Runnable {
         } catch (Exception e) {
             // Недоступный журнал — это САМ ПО СЕБЕ результат: бот не запускался
             // или упал так, что файла нет. Молчать об этом нельзя.
-            return new Snapshot(w.botId(), w.symbol(), false, 0, 0, 0, 0, 0, 0,
+            return new Snapshot(w.botId(), w.symbol(), false, false, null, 0, 0, 0, 0, 0, 0, 0,
                     ExecLimits.maxPlacementsPerDay(w.botId()), "журнал недоступен");
         }
     }
@@ -195,12 +200,24 @@ public final class InfoBot implements Runnable {
             totalCap += s.cap();
             String age = s.lastEventMs() > 0
                     ? ago(System.currentTimeMillis() - s.lastEventMs()) : "нет тиков";
+            // ⚠️ Три состояния, а не два. ⚪ выключен — так и задумано. 🟢 торгует.
+            // 🟡 включён, но НЕ торгует: гейт закрыт, заявки в отводе. Именно это
+            // состояние прежде выглядело рабочим и стоило боту E трёх четвертей
+            // суточного бюджета постановок за час.
+            String mark = !s.quoting() ? "⚪" : s.trading() ? "🟢" : "🟡";
+            String what = !s.quoting() ? "выключен"
+                    : s.trading() ? "торгует"
+                    : "НЕ ТОРГУЕТ: " + (s.pausedReason() == null ? "гейт закрыт" : s.pausedReason());
+            // Доля бюджета важнее самого числа: у ботов разные потолки, и «60»
+            // у одного благополучно, а у другого три четверти суток.
+            long pct = s.cap() > 0 ? 100 * s.placements24() / s.cap() : 0;
             sb.append(String.format(Locale.ROOT,
-                    "%s %s  %s%n  сделок 24ч %d, доход %+.4f USDC%n"
-                            + "  инвентарь %.2f USDC, постановок %d из %d%n  тик %s%s%n%n",
-                    s.quoting() ? "🟢" : "⚪", s.botId().toUpperCase(Locale.ROOT), s.symbol(),
+                    "%s %s  %s — %s%n  сделок 24ч %d, доход %+.4f USDC%n"
+                            + "  инвентарь %.2f USDC, постановок %d из %d (%d%%)%n"
+                            + "  отводов за час %d, тик %s%s%n%n",
+                    mark, s.botId().toUpperCase(Locale.ROOT), s.symbol(), what,
                     s.fills24(), s.realised24(), s.position() * s.fair(),
-                    s.placements24(), s.cap(), age,
+                    s.placements24(), s.cap(), pct, s.parks1h(), age,
                     s.note() == null ? "" : "\n  ⚠️ " + s.note()));
         }
         sb.append(String.format(Locale.ROOT,
