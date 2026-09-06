@@ -1,0 +1,67 @@
+[Unit]
+Description=Revolut X micro-live BOT F (REAL orders) — PEPE/USDC
+After=network-online.target revx-collect.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx-exec-f
+EnvironmentFile=/etc/revx-exec-f.env
+
+# Профиль F — PEPE/USDC, ТРЕТЬЯ по доходу пара обхода вселенной (06.09.2026).
+#
+# +3.4067 USDC за 16 суток при отступе 20 б.п., доход на постановку +0.005594 —
+# второй после ENA. Расход 38 постановок в сутки.
+#
+# ⚠️ САМАЯ СОМНИТЕЛЬНАЯ ПАРА НАБОРА, и запускается она именно поэтому.
+#
+# 1. Доля ленты 96%. На площадке 34 сделки в сутки (оборот $21 402, самый
+#    тонкий рынок из шести), а стенд обещает боту 521 исполнение при 544
+#    сделках за окно. Забрать всю ленту физически некому — там уже стоят
+#    другие. Значит модель очереди на PEPE сломана, и вопрос лишь в том,
+#    насколько.
+#
+# 2. Если настоящая доля впятеро меньше, за неделю наберётся около 45 сделок —
+#    на грани различимости. Бот B на 13 б.п. давал 9 исполнений за 17 часов, и
+#    его сняли ровно потому, что он перестал что-либо показывать.
+#
+# 3. Четверо суток из шестнадцати дали РОВНО НОЛЬ: ни одной закрытой пары.
+#    Выброс двух крайних суток роняет доход на 20%, треть принесли одни сутки
+#    21.08 (+1.0187 при движении +29.65%).
+#
+# 4. Оптимум упёрся в край перебора: 14 → +3.0973, 16 → +3.1802, 18 → +3.2489,
+#    20 → +3.4067, всё ещё растёт.
+#
+# Ценность запуска не в деньгах, а в проверке модели очереди на тонком рынке:
+# это единственная гипотеза обхода, которую нельзя закрыть счётом.
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-exec-f/app.jar --revx-exec \
+  --revx.exec.bot-id=f \
+  --revx.exec.symbol=PEPE/USDC \
+  --revx.exec.journal=state/exec-f-pepe.db \
+  --revx.exec.size=279330 \
+  --revx.exec.inventory-cap=5586590 \
+  --revx.exec.offset=0.0020 \
+  --revx.exec.skew-target=0.3 \
+  --revx.exec.cost-floor-margin=-1 \
+  --revx.exec.anchor-leash=-1 \
+  --revx.exec.own-position=true \
+  --revx.exec.position-seed=0 \
+  --revx.exec.park-distance=0.10 \
+  --revx.exec.levels=3 \
+  --revx.exec.level-step=0.0002 \
+  --revx.exec.inner-first=false
+
+# Размеры под цену PEPE 3.58e-06 на 06.09.2026: лот $1 = 279 330 PEPE,
+# потолок $20 = 5 586 590 PEPE. Шаг количества здесь 10 монет (= $0.0000358),
+# оба значения на нём лежат. Шаг цены 1e-10 = 0.28 б.п. — сетка в 2 б.п. это
+# семь тиков, вырождения как у ENA нет.
+
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-f/app.jar --revx-panic --revx.exec.bot-id=f --revx.exec.symbol=PEPE/USDC --revx.exec.journal=state/exec-f-pepe.db || true'
+
+SuccessExitStatus=143
+Restart=no
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

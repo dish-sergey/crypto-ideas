@@ -1,0 +1,70 @@
+[Unit]
+Description=Revolut X micro-live BOT E (REAL orders) — ENA/USDC
+After=network-online.target revx-collect.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx-exec-e
+EnvironmentFile=/etc/revx-exec-e.env
+
+# Профиль E — ENA/USDC, ВТОРАЯ по доходу пара обхода вселенной (06.09.2026).
+#
+# +3.8788 USDC за 16 суток при отступе 20 б.п., и лучший в наборе доход на
+# постановку: +0.005859 против +0.00054 у биткойна, то есть в одиннадцать раз.
+# Расходует всего 41 постановку в сутки — самый экономный способ тратить
+# дефицитный ресурс площадки.
+#
+# Устойчивость хорошая: выброс двух крайних суток НЕ ухудшает результат (+2%).
+#
+# ⚠️ ТРИ ПРИЧИНЫ НЕ ДОВЕРЯТЬ ЭТОМУ ЧИСЛУ ПОЛНОСТЬЮ.
+#
+# 1. Доля ленты. Стенд приписывает боту 595 исполнений при 1408 сделках на всей
+#    площадке за то же окно — 42%. Маркет-мейкер с такой долей не бывает, значит
+#    модель очереди на тонкой паре завышает. Живая неделя меряет именно это.
+#
+# 2. Оптимум упёрся в край перебора. 14 → +3.5696, 16 → +3.5805, 18 → +3.5876,
+#    20 → +3.8788: доход всё ещё растёт на последней ступени. Настоящий оптимум
+#    может быть дальше 20 (досчитывается отдельно).
+#
+# 3. Поправки на волатильность нет: ENA в дневных свечах не собирается, базовую
+#    частоту крупных движений взять неоткуда.
+#
+# ⚠️ СЕТКА ЗДЕСЬ ВЫРОЖДЕНА, и подпись «20/22/24» была бы ложью. Шаг цены пары
+# 0.0001 при цене 0.1726 — это 5.8 б.п., грубее шага сетки в 2 б.п. почти втрое.
+# Уровни 20/22/24 в тиках дают 3.45 / 3.80 / 4.14, а округление от рынка
+# (Quoter.round: бид вниз, аск вверх) сводит их к тикам 4, 4, 5 — то есть к ДВУМ
+# ценам, где на ближней стоят две заявки из трёх.
+#
+# Настройка при этом оставлена как есть: обход считал с тем же шагом цены, и
+# +3.8788 измерено ИМЕННО с этим вырождением. Поменять шаг сетки на кратный тику
+# (например 20/26/32) значит запустить неизмеренную конфигурацию.
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-exec-e/app.jar --revx-exec \
+  --revx.exec.bot-id=e \
+  --revx.exec.symbol=ENA/USDC \
+  --revx.exec.journal=state/exec-e-ena.db \
+  --revx.exec.size=5.7937 \
+  --revx.exec.inventory-cap=115.8749 \
+  --revx.exec.offset=0.0020 \
+  --revx.exec.skew-target=0.3 \
+  --revx.exec.cost-floor-margin=-1 \
+  --revx.exec.anchor-leash=-1 \
+  --revx.exec.own-position=true \
+  --revx.exec.position-seed=0 \
+  --revx.exec.park-distance=0.10 \
+  --revx.exec.levels=3 \
+  --revx.exec.level-step=0.0002 \
+  --revx.exec.inner-first=false
+
+# Размеры под цену ENA 0.1726 на 06.09.2026: лот $1 = 5.7937 ENA, потолок
+# $20 = 115.8749 ENA. Шаг количества 0.0001 — оба значения на нём лежат.
+
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-e/app.jar --revx-panic --revx.exec.bot-id=e --revx.exec.symbol=ENA/USDC --revx.exec.journal=state/exec-e-ena.db || true'
+
+SuccessExitStatus=143
+Restart=no
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

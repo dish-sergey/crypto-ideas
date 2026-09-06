@@ -1,0 +1,62 @@
+[Unit]
+Description=Revolut X micro-live BOT D (REAL orders) — ADA/USDC
+After=network-online.target revx-collect.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx-exec-d
+EnvironmentFile=/etc/revx-exec-d.env
+
+# Профиль D — ADA/USDC, ПЯТАЯ по доходу пара обхода вселенной (06.09.2026).
+#
+# Обход 23 пар за 16 суток (20.08-04.09) на сетке из трёх уровней шагом 2 б.п.
+# от дальнего, лот $1, потолок $20. ADA дала +2.9027 USDC при отступе 14 б.п.
+#
+# Лестница отступов: 6 → +2.0096, 8 → +2.4446, 10 → +2.6706, 12 → +2.7892,
+# 14 → +2.9027, 16 → +2.7178, 18 → +2.4096, 20 → +2.2554. Вершина внутри
+# перебора, а не на его краю — это настоящий оптимум.
+#
+# ⚠️ САМАЯ ХРУПКАЯ ПАРА НАБОРА. Если выбросить двое суток с наибольшим ростом и
+# наибольшим падением, доход в сутки падает на 31% (+0.1814 → +0.1255) — больше,
+# чем у любой другой из шести. Треть всего дохода принесли одни сутки 21.08
+# (+1.1456 при движении +14.78%), а 30.08 пара потеряла разом −0.3915.
+#
+# Волатильность окна для ADA была близка к норме (среднее движение 3.97% против
+# базовых 3.31% за два года, отношение 1.20), так что хрупкость — свойство пары,
+# а не окна.
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-exec-d/app.jar --revx-exec \
+  --revx.exec.bot-id=d \
+  --revx.exec.symbol=ADA/USDC \
+  --revx.exec.journal=state/exec-d-ada.db \
+  --revx.exec.size=4.5981 \
+  --revx.exec.inventory-cap=91.9625 \
+  --revx.exec.offset=0.0014 \
+  --revx.exec.skew-target=0.3 \
+  --revx.exec.cost-floor-margin=-1 \
+  --revx.exec.anchor-leash=-1 \
+  --revx.exec.own-position=true \
+  --revx.exec.position-seed=0 \
+  --revx.exec.park-distance=0.10 \
+  --revx.exec.levels=3 \
+  --revx.exec.level-step=0.0002 \
+  --revx.exec.inner-first=false
+
+# Размеры под цену ADA 0.21748 на 06.09.2026: лот $1 = 4.5981 ADA, потолок
+# $20 = 91.9625 ADA. Шаг количества 0.0001 — оба значения на нём лежат.
+# Шаг цены 0.00001 = 0.46 б.п., то есть шаг сетки в 2 б.п. это 4.3 тика:
+# три уровня действительно встают на три разные цены.
+
+# Добивает ТОЛЬКО свои заявки: panic-all по умолчанию false, иначе остановка
+# одного бота снимала бы живые заявки остальных пяти.
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-d/app.jar --revx-panic --revx.exec.bot-id=d --revx.exec.symbol=ADA/USDC --revx.exec.journal=state/exec-d-ada.db || true'
+
+# Намеренно НЕТ автоперезапуска: перезапуск после падения не должен сам
+# возобновлять торговлю. Котирование в любом случае стартует выключенным.
+SuccessExitStatus=143
+Restart=no
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
