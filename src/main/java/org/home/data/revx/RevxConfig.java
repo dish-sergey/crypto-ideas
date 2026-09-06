@@ -38,6 +38,7 @@ public class RevxConfig {
     private final List<String> priority;
     private final int tradesPageLimit;
 
+    private final List<String> collectOnly;
     private final List<String> fastPairs;
     private final long fastBookPeriodMs;
     private final List<String> tier1;
@@ -163,6 +164,7 @@ public class RevxConfig {
             @Value("${revx.memecoins}") List<String> memecoins,
             @Value("${revx.priority}") List<String> priority,
             @Value("${revx.trades-page-limit}") int tradesPageLimit,
+            @Value("${revx.collect-only}") List<String> collectOnly,
             @Value("${revx.fast-pairs}") List<String> fastPairs,
             @Value("${revx.fast-book-period-ms}") long fastBookPeriodMs,
             @Value("${revx.tier1}") List<String> tier1,
@@ -283,6 +285,7 @@ public class RevxConfig {
         this.memecoins = memecoins;
         this.priority = priority;
         this.tradesPageLimit = tradesPageLimit;
+        this.collectOnly = collectOnly;
         this.fastPairs = fastPairs;
         this.fastBookPeriodMs = fastBookPeriodMs;
         this.tier1 = tier1;
@@ -497,6 +500,25 @@ public class RevxConfig {
      */
     public List<String> fastPairs() {
         return fastPairs;
+    }
+
+    /**
+     * Какие пары собирает ЭТОТ инстанс (пусто — всю вселенную).
+     *
+     * Нужно, чтобы разделить сбор между машинами. Бюджет запросов с ключом
+     * жёсткий: секундный опрос одной пары стоит 2 req/s (две ноги), потолок
+     * площадки 1000/мин, и на торгуемые пары его едва хватает. Хвост вселенной
+     * торговле не нужен вовсе — он идёт только в корзину курса, — поэтому его
+     * можно снимать вторым инстансом по ПУБЛИЧНОМУ пути, где ключ не нужен, с
+     * другого IP и в свою базу.
+     *
+     * ⚠️ Корзина справедливой цены требует минимум {@code revx.fair.min-pairs}
+     * СВЕЖИХ пар (окно 30 с) в базе, из которой читает бот. Урезав список до
+     * одних торгуемых, легко оказаться на границе: две запоздавшие пары — и
+     * котирование встаёт. Оставлять запас надо здесь, а не в чужой базе.
+     */
+    public List<String> collectOnly() {
+        return collectOnly;
     }
 
     public long fastBookPeriodMs() {

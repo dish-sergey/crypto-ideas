@@ -91,9 +91,38 @@ public class RevxCollectorDaemon {
         }
     }
 
+    /**
+     * Оставить только пары этого инстанса ({@code revx.collect-only}).
+     *
+     * Пустой список — вся вселенная, как было. Список из неизвестных имён
+     * оставил бы сбор совсем без пар и выглядел бы как «площадка молчит»,
+     * поэтому такое состояние отдельно кричит в лог.
+     */
+    private List<PairsCatalog.Leg> restrict(List<PairsCatalog.Leg> all) {
+        List<String> only = cfg.collectOnly();
+        if (only == null || only.isEmpty()) {
+            return all;
+        }
+        java.util.Set<String> wanted = new java.util.HashSet<>(only);
+        List<PairsCatalog.Leg> kept = new ArrayList<>();
+        for (PairsCatalog.Leg leg : all) {
+            if (wanted.contains(leg.base())) {
+                kept.add(leg);
+            }
+        }
+        if (kept.isEmpty()) {
+            log.error("revx.collect-only={} не совпал НИ С ОДНОЙ парой вселенной ({}) — "
+                    + "собирать нечего", only, all.size());
+        } else {
+            log.warn("сбор ограничен списком этого инстанса: {} пар из {} ({})",
+                    kept.size(), all.size(), only);
+        }
+        return kept;
+    }
+
     /** Разовый обход всей вселенной: книги по всем парам + сделки. Для проверки. */
     public void collectOnce() {
-        List<PairsCatalog.Leg> universe = catalog.universe();
+        List<PairsCatalog.Leg> universe = restrict(catalog.universe());
         log.info("разовый сбор: {} пар", universe.size());
         for (PairsCatalog.Leg pair : universe) {
             safely("book " + pair.quoted().symbol(), () -> {
@@ -201,7 +230,7 @@ public class RevxCollectorDaemon {
      */
     private PriorityQueue<Task> buildTasks() {
         Map<String, PairSpec> specs = catalog.refresh();
-        List<PairsCatalog.Leg> universe = catalog.universe(specs);
+        List<PairsCatalog.Leg> universe = restrict(catalog.universe(specs));
         PriorityQueue<Task> queue = new PriorityQueue<>();
         long now = System.currentTimeMillis();
 
