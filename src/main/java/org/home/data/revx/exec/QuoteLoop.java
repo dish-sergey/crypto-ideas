@@ -275,8 +275,26 @@ public final class QuoteLoop implements Runnable {
         return Math.abs(price - trustedFair) / trustedFair >= minPct;
     }
 
+    /**
+     * ⚠️ На СТАРТЕ своей цены ещё нет: сверка идёт раньше первого тика, и
+     * {@code lastTrustedFair} с {@code lastFair} оба нули. Первая же выкатка
+     * 07.09.2026 на этом и споткнулась — бот аккуратно припарковал три заявки
+     * при остановке и тут же снял их при запуске, потому что «цены не знаем —
+     * считаем торгующей». Поэтому здесь третьим шагом спрашиваем стенд: он
+     * отвечает сразу, ещё до того, как цикл сделает первый оборот.
+     */
     private boolean isParked(double price) {
         double reference = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
+        if (!(reference > 0)) {
+            try {
+                StandReader.Fair fresh = stand.latest(base, 300_000);
+                if (fresh != null && fresh.price() > 0) {
+                    reference = fresh.price();
+                }
+            } catch (Exception e) {
+                log.warn("стенд не отдал цену для разбора припаркованных: {}", e.getMessage());
+            }
+        }
         return isParked(price, reference, PARKED_MIN_PCT);
     }
 
@@ -651,14 +669,104 @@ public final class QuoteLoop implements Runnable {
         return quoting.get();
     }
 
+    /**
+     * Расстояние парковки при выключении процесса. Совпадает с {@link Park}.
+     *
+     * ⚠️ Обязано оставаться заметно выше {@link #PARKED_MIN_PCT}, иначе
+     * стартующий бот не признает свои же заявки припаркованными и снимет их.
+     */
+    static final double SHUTDOWN_PARK_PCT = 0.05;
+
+    /**
+     * Завершение ПРОЦЕССА отводит заявки, а не снимает их.
+     *
+     * Отмена бесплатна, а восстановление после неё стоит постановок — 3-6 на
+     * бота, замер 07.09.2026, при ровном расходе SOL в 0.2 постановки за пять
+     * минут. Оставленная в книге заявка возвращается в работу заменой, у которой
+     * суточного лимита нет вовсе.
+     *
+     * ⚠️ Парковать надо ЗДЕСЬ, а не только в {@link Park}. Первая выкатка
+     * 07.09.2026 это показала: хук systemd отработал правильно, но бот к тому
+     * моменту уже снял свои заявки сам, и парковать было нечего. Внешний Park
+     * остаётся вторым рубежом — он подберёт то, чего не знал цикл.
+     *
+     * ⚠️ {@code /stop} по-прежнему СНИМАЕТ: это осознанный выход человека, а не
+     * перезапуск, и оставлять заявки в книге при нём нельзя.
+     */
     public void shutdown() {
         alive = false;
         // Сначала снимаем флаг: сверка при включённом котировании усыновила бы
-        // заявки обратно вместо того, чтобы их снять.
+        // заявки обратно вместо того, чтобы их отвести.
         quoting.set(false);
-        cancelAll("выключение процесса");
+        parkAll("выключение процесса");
+        // Сверка добьёт то, что не удалось отвести, и всё чужое нашей метки:
+        // при выключенном котировании она оставляет только припаркованное.
         reconcile("выключение процесса");
     }
+
+    /** Отвести все свои заявки от цены; что не отвелось — снять. */
+    private void parkAll(String why) {
+        double reference = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
+        if (!(reference > 0)) {
+            log.warn("цены нет — отводить не от чего, снимаю заявки");
+            cancelAll(why);
+            return;
+        }
+        int parked = 0;
+        int cancelled = 0;
+        for (int i = 0; i < levels; i++) {
+            for (Side side : Side.values()) {
+                Resting resting = side == Side.BUY ? bids.get(i) : asks.get(i);
+                if (resting.venueId == null) {
+                    continue;
+                }
+                double target = side == Side.BUY
+                        ? reference * (1 - SHUTDOWN_PARK_PCT)
+                        : reference * (1 + SHUTDOWN_PARK_PCT);
+                // Округляем В СТОРОНУ ОТ РЫНКА: округление к ближайшему могло бы
+                // подтянуть заявку обратно на полшага, а весь смысл в том, чтобы
+                // она гарантированно стояла дальше.
+                double price = roundAway(target, side == Side.SELL);
+                String body = """
+                        {"client_order_id":"%s","base_size":"%s","price":"%s",
+                         "execution_instructions":["post_only"]}"""
+                        .formatted(tag.newClientOrderId(), fmt(resting.size), fmt(price))
+                        .replaceAll("\\s*\\n\\s*", "");
+                Venue.Response response = client.replace(resting.venueId, body);
+                if (response.ok()) {
+                    resting.venueId = extract(response.body());
+                    resting.price = price;
+                    parked++;
+                } else {
+                    // Не отвелась — снимаем. Оставить её на рабочем месте у
+                    // неработающего бота хуже, чем заплатить постановкой потом.
+                    journal.event("park_cancel", side + " " + resting.venueId
+                            + " не отвелась (" + response.status() + ") → "
+                            + client.cancel(resting.venueId).status());
+                    resting.venueId = null;
+                    cancelled++;
+                }
+            }
+        }
+        log.warn("отведено {} заявок, снято {} ({})", parked, cancelled, why);
+        journal.event("park", "отведено " + parked + ", снято " + cancelled + " (" + why + ")");
+    }
+
+    /** Округление к допустимому тику в сторону от рынка; шага не знаем — как есть. */
+    private double roundAway(double price, boolean up) {
+        if (!(quoteStep > 0)) {
+            return price;
+        }
+        double units = price / quoteStep;
+        return (up ? Math.ceil(units) : Math.floor(units)) * quoteStep;
+    }
+
+    /** Шаг цены пары: нужен, чтобы отведённая заявка легла на допустимый тик. */
+    public void quoteStep(double step) {
+        this.quoteStep = step;
+    }
+
+    private double quoteStep;
 
     /** Метка бота: суточный лимит постановок у каждого свой (см. {@link ExecLimits}). */
     public String botId() {
