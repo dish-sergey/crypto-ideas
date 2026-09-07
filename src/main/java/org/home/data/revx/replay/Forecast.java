@@ -111,11 +111,18 @@ public final class Forecast {
         List<QuoteLoop> loops = new ArrayList<>();
         List<Thread> threads = new ArrayList<>();
         AllocRegistry alloc = new AllocRegistry(dir.resolve("alloc.db").toString());
+        // В прогоне процесс один: терять претензию некому, а продление стоило
+        // 23 тысяч записей на бота (модельная минута пролетает мгновенно).
+        alloc.heartbeatOff();
         try {
             for (BotSpec spec : bots) {
                 ExecJournal journal = new ExecJournal(
                         dir.resolve("bot-" + spec.botId() + ".db").toString());
                 journal.clock(clock);
+                // Котировки в базу не пишем: единственное, ради чего они писались,
+                // теперь считается в памяти. Живому боту так делать НЕЛЬЗЯ —
+                // у него по ним восстанавливаются захват и markout.
+                journal.quotesOff();
                 journals.add(journal);
 
                 alloc.claim(spec.botId(), base.symbol().substring(0, base.symbol().indexOf('/')),
@@ -153,6 +160,9 @@ public final class Forecast {
                     // 19.08.2026: 1.18% у ETH на движении 18%).
                     loop.dynamicOffset(spec.dynOffsetK(), 1.0);
                 }
+                // Потолок нужен счётчику «доля времени в потолке» — раньше его
+                // считали, перечитывая журнал.
+                loop.statsInventoryCap(spec.inventoryCap());
                 loops.add(loop);
             }
             for (int i = 1; i < loops.size(); i++) {
@@ -195,6 +205,12 @@ public final class Forecast {
             return out;
         } finally {
             journals.forEach(ExecJournal::close);
+            // ⚠️ Реестр закрывать ОБЯЗАТЕЛЬНО, иначе на Windows файл alloc.db
+            // остаётся заблокированным, удаление каталога молча не проходит, и
+            // временные каталоги копятся: к 07.09.2026 их набралось 4861 штука
+            // примерно на 19 ГБ. Уборка была написана, но её нечем было
+            // выполнить — открытое соединение держало файл.
+            alloc.close();
             delete(dir);
         }
     }
@@ -221,16 +237,13 @@ public final class Forecast {
         // Доля времени с ПОЛНЫМ инвентарём. Пока бот упёрт в потолок, он только
         // продаёт: покупать нечем, и половина конструкции простаивает. Без этого
         // числа «доход за окно» скрывает, какой ценой он получен.
-        double atCap = 0;
-        int tickCount = 0;
-        for (ReplayFair.Tick t : ReplayRunner.readTicks(
-                journal.path(), 0, Long.MAX_VALUE)) {
-            tickCount++;
-            if (spec.inventoryCap() > 0 && t.inventory() >= 0.9 * spec.inventoryCap()) {
-                atCap++;
-            }
-        }
+        // Считаем ПО СЧЁТЧИКАМ ЦИКЛА, а не перечитыванием журнала: ради этого
+        // одного числа на каждый тик писалась строка в SQLite. Замер 07.09.2026
+        // дал 39 МБ/с записи и 666 операций в секунду при чтении 0.4 МБ/с —
+        // обход упирался в собственный журнал, а не в данные.
         QuoteLoop.Stats st = loop.stats();
+        long tickCount = st.ticks();
+        double atCap = st.ticksAtCap();
         return new BotResult(spec.botId(), spec.offset() * 10_000, fills,
                 ledger.tradingRealisedSince(0),
                 spec.size() > 0 ? st.inventory() / spec.size() : 0,

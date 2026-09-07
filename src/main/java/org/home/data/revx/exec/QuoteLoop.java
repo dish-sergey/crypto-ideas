@@ -123,7 +123,8 @@ public final class QuoteLoop implements Runnable {
     }
 
     public record Stats(long placements, long replaces, long cancels, long fills,
-                        double inventory, double lastFair, String state, String pausedReason) {
+                        double inventory, double lastFair, String state, String pausedReason,
+                        long ticks, long ticksAtCap) {
     }
 
     private final Venue client;
@@ -456,6 +457,31 @@ public final class QuoteLoop implements Runnable {
     private double maxTradingLoss = ExecLimits.MAX_TRADING_LOSS_USDC;
     private PlacementBudget budget;
     /**
+     * Счётчики тиков — В ПАМЯТИ, а не через журнал.
+     *
+     * Стенду нужна одна величина: доля времени с полным инвентарём. Раньше ради
+     * неё на КАЖДЫЙ тик писалась строка в SQLite, а потом весь журнал читался
+     * обратно. Замер 07.09.2026 показал, во что это обходится: 39 МБ/с записи и
+     * 666 операций в секунду при чтении 0.4 МБ/с — то есть обход упирался в
+     * запись собственного журнала, который нужен ради одного числа. Плюс 4861
+     * забытый каталог во временной папке, около 19 ГБ.
+     */
+    private long ticks;
+    private long ticksAtCap;
+    private double statsCap;
+
+    /** Потолок инвентаря для счётчика «доля времени в потолке». */
+    public void statsInventoryCap(double cap) {
+        this.statsCap = cap;
+    }
+
+    private void countTick() {
+        ticks++;
+        if (statsCap > 0 && inventory >= 0.9 * statsCap) {
+            ticksAtCap++;
+        }
+    }
+    /**
      * Насколько туго с общим бюджетом, 0…1. Перечитывается раз в минуту, а не
      * каждый тик: ведро наполняется одним токеном за сто секунд, так что чаще
      * незачем, а шесть процессов, дёргающих общую базу по десять раз в секунду,
@@ -764,7 +790,7 @@ public final class QuoteLoop implements Runnable {
 
     public Stats stats() {
         return new Stats(placements, replaces, cancels, fills, inventory, lastFair,
-                quoting.get() ? "котирует" : "остановлен", pausedReason);
+                quoting.get() ? "котирует" : "остановлен", pausedReason, ticks, ticksAtCap);
     }
 
     @Override
@@ -827,6 +853,7 @@ public final class QuoteLoop implements Runnable {
         if ((!fair.quotable() && !widened) || !(fair.price() > 0)) {
             // Гейт ТЗ §4.1: опора сломана — уводим котировки из зоны исполнения.
             pausedReason = fair.pausedReason() == null ? "курс ненадёжен" : fair.pausedReason();
+            countTick();
             journal.quote(fair.price(), null, null, inventory, false, pausedReason);
             standAside(pausedReason);
             return;
@@ -857,6 +884,7 @@ public final class QuoteLoop implements Runnable {
         target = widenForBudget(target, fair.price(), budgetPressure);
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
+        countTick();
         journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null);
 
         // ⚠️ Пул РАЗДЕЛЯЕТСЯ между уровнями, и внутренние забирают первыми.

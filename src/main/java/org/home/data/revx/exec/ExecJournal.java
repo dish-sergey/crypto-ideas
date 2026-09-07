@@ -218,8 +218,28 @@ public final class ExecJournal implements AutoCloseable {
      * В ТОТ МОМЕНТ. Восстановить его задним числом из базы стенда можно лишь
      * приблизительно, а цена за секунду уходит на пару базисных пунктов.
      */
+    /**
+     * Стенду котировки в базе НЕ НУЖНЫ.
+     *
+     * Единственное, ради чего они писались, — доля времени с полным инвентарём,
+     * и она теперь считается в памяти ({ QuoteLoop.Stats.ticksAtCap}).
+     * Запись же стоила дорого: замер 07.09.2026 дал 39 МБ/с и 666 операций в
+     * секунду при чтении 0.4 МБ/с, то есть обход упирался в собственный журнал.
+     *
+     * ⚠️ У ЖИВОГО бота выключать это нельзя: захват и markout восстанавливаются
+     * только по справедливой цене в момент котировки, а её больше взять неоткуда.
+     */
+    public void quotesOff() {
+        this.quotesOff = true;
+    }
+
+    private boolean quotesOff;
+
     public synchronized void quote(double fair, Double bid, Double ask, double inventory,
                                    boolean quotable, String reason) {
+        if (quotesOff) {
+            return;
+        }
         try (PreparedStatement ps = connection.prepareStatement(
                 "INSERT INTO exec_quote(ts_ms, fair, bid, ask, inventory, quotable, reason)"
                         + " VALUES (?,?,?,?,?,?,?)")) {

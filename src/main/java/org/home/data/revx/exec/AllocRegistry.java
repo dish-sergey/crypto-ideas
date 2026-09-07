@@ -233,7 +233,26 @@ public final class AllocRegistry implements AutoCloseable {
      *
      * Зовётся, пока жив процесс, независимо от того, идёт ли котирование.
      */
+    /**
+     * СТЕНД: не продлевать аренду.
+     *
+     * Аренда сторожит один случай — процесс бота умер, а его инвентарь числится
+     * за ним. В прогоне процесс один, соседей нет, и терять претензию некому.
+     * Зато цена продления настоящая: сердцебиение идёт раз в минуту МОДЕЛЬНОГО
+     * времени, а модельные часы проходят шестнадцать суток за минуту живого —
+     * это 23 тысячи записей в SQLite на бота. Замер 07.09.2026: после снятия
+     * записи котировок именно alloc.db-wal остался главным писателем.
+     */
+    public void heartbeatOff() {
+        this.heartbeatOff = true;
+    }
+
+    private boolean heartbeatOff;
+
     public synchronized void heartbeat(String botId, long nowMs) {
+        if (heartbeatOff) {
+            return;
+        }
         try (PreparedStatement ps = connection.prepareStatement(
                 "UPDATE claim SET heartbeat_ms = ? WHERE bot_id = ?")) {
             ps.setLong(1, nowMs);

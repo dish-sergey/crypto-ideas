@@ -64,9 +64,22 @@ public final class StandDb {
     private StandDb() {
     }
 
+    /**
+     * Выключатель настроек — только для ЗАМЕРА самих настроек.
+     *
+     * Сравнивать две сборки нельзя: между ними неизбежно проедет что-нибудь ещё,
+     * и разницу спишут не на то. Одна сборка с ключом
+     * {@code -Drevx.stand.tuned=false} даёт честные две руки опыта.
+     */
+    private static final boolean TUNED =
+            !"false".equalsIgnoreCase(System.getProperty("revx.stand.tuned", "true"));
+
     /** Соединение только на чтение, настроенное под потоковое чтение таблиц. */
     public static Connection open(String path) throws Exception {
         Connection c = DriverManager.getConnection("jdbc:sqlite:file:" + path + "?mode=ro");
+        if (!TUNED) {
+            return c;
+        }
         try (Statement st = c.createStatement()) {
             st.execute("PRAGMA mmap_size=" + MMAP_BYTES);
             st.execute("PRAGMA cache_size=-65536");
