@@ -118,6 +118,19 @@ public class Park {
                 if (park(client, journal, order, spec)) {
                     parked++;
                 } else {
+                    // ⚠️ СНАЧАЛА ЗАПИСАТЬ ИСПОЛНЕНИЕ, и только потом снимать.
+                    //
+                    // Замена отвечает 422 «not in the NEW state» ровно тогда,
+                    // когда заявка ЧАСТИЧНО ИСПОЛНЕНА. Первая версия просто
+                    // снимала такую заявку, и исполнение пропадало: у бота F
+                    // 07.09.2026 так потерялись 76 550 PEPE из лота в 279 330.
+                    // Позиция бота осталась прежней, остаток счёта уменьшился,
+                    // и бот пошёл продавать то, чего у него нет.
+                    //
+                    // Журнал — первоисточник позиции, поэтому дыра в нём сама не
+                    // затягивается: перезапуск считает позицию по тем же записям
+                    // и повторяет ошибку.
+                    recordFill(client, journal, order);
                     // Отодвинуть не вышло — заявка осталась на рабочем месте, а
                     // хозяина у неё сейчас не будет. Снимаем.
                     Venue.Response cancelled = client.cancel(order.id());
@@ -134,6 +147,57 @@ public class Park {
         } catch (Exception e) {
             log.error("парковка не прошла: {}", e.toString(), e);
         }
+    }
+
+    /**
+     * Записать в журнал то, что успело исполниться по этой заявке.
+     *
+     * Читается так же, как это делает цикл в {@code inspectGoneOrder}: поля
+     * площадки {@code filled_quantity} и {@code average_fill_price}. Ничего не
+     * исполнилось — ничего и не пишем.
+     *
+     * ⚠️ Справедливая цена здесь недоступна: парковка идёт отдельным процессом,
+     * без стенда в памяти. В поле {@code fair} уходит цена исполнения. Это
+     * портит расчёт захвата ровно для одной сделки, но сохраняет позицию —
+     * а неверная позиция дороже, потому что по ней бот торгует дальше.
+     */
+    private void recordFill(TradeClient client, ExecJournal journal, ActiveOrder order) {
+        Venue.Response state = client.order(order.id());
+        if (!state.ok() || state.body() == null) {
+            journal.event("park_lost", order.id()
+                    + ": состояние не прочитано, исполнение могло потеряться");
+            log.error("заявка {} не отдала состояние — исполнение могло потеряться",
+                    order.id());
+            return;
+        }
+        double filled = num(state.body(), "filled_quantity");
+        if (!(filled > 0)) {
+            return;
+        }
+        double price = num(state.body(), "average_fill_price");
+        double at = price > 0 ? price : order.price();
+        journal.fill(order.id(), order.side().name(), filled, at, at,
+                num(state.body(), "total_fee"), str(state.body(), "fee_currency"), "filled");
+        journal.event("park_fill", order.side() + " " + order.id() + " исполнено "
+                + fmt(filled) + " по " + fmt(at) + " — записано при парковке");
+        log.warn("при парковке найдено исполнение: {} {} по {}",
+                order.side(), fmt(filled), fmt(at));
+    }
+
+    private static double num(String body, String field) {
+        var m = java.util.regex.Pattern
+                .compile("\"" + field + "\"\\s*:\\s*\"?([0-9.eE+-]+)\"?").matcher(body);
+        try {
+            return m.find() ? Double.parseDouble(m.group(1)) : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private static String str(String body, String field) {
+        var m = java.util.regex.Pattern
+                .compile("\"" + field + "\"\\s*:\\s*\"([^\"]*)\"").matcher(body);
+        return m.find() ? m.group(1) : null;
     }
 
     private boolean park(TradeClient client, ExecJournal journal,
