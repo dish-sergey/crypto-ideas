@@ -256,6 +256,63 @@ public final class QuoteLoop implements Runnable {
         return reason != null && reason.startsWith("опорная книга широка");
     }
 
+    /**
+     * Раздвигать ли отступ вместо остановки котирования.
+     *
+     * ⚠️ Раздвигается ТОЛЬКО ширина опорной книги. Остальные гейты остаются
+     * бинарными, и это не осторожность, а разная природа: ширина книги — мера
+     * неопределённости цены, её можно оплатить расстоянием. А «опора разошлась с
+     * рынком» или «разброс implied выше порога» означают, что справедливая цена
+     * посчитана НЕВЕРНО, и отодвигать заявку от неверной цены бессмысленно —
+     * дальше от чего? У живой ENA за сутки таких тиков 1076 из 17081, то есть
+     * различать эти случаи приходится на самом деле, а не теоретически.
+     *
+     * @param k       доля отступа, отдаваемая неопределённости; 0 выключает
+     * @param maxPct  выше этой ширины опоры не котируем ни на каком отступе
+     */
+    static boolean gateWidens(boolean quotable, String reason, double price,
+                              double referenceSpreadPct, double k, double maxPct) {
+        return k > 0 && !quotable && price > 0
+                && isReferenceSpreadReason(reason)
+                && referenceSpreadPct <= maxPct;
+    }
+
+    /**
+     * Отодвинуть обе стороны на неопределённость цены.
+     *
+     * Середина книги шириной s известна с точностью ±s/2, поэтому заявка уходит
+     * на s/2, делённое на долю k, которую мы готовы отдать неопределённости: при
+     * k = 1/3 половина спреда опоры стоит трёх таких же долей отступа.
+     */
+    static Quoter.Quotes widenForSpread(Quoter.Quotes target, double price,
+                                        double referenceSpreadPct, double k) {
+        if (!(k > 0) || !(price > 0) || !(referenceSpreadPct > 0)) {
+            return target;
+        }
+        double extra = price * (referenceSpreadPct / 100.0) / 2 / k;
+        return new Quoter.Quotes(
+                target.bid() == null ? null : target.bid() - extra,
+                target.ask() == null ? null : target.ask() + extra);
+    }
+
+    /**
+     * Отодвинуть обе стороны пропорционально дефициту постановок.
+     *
+     * Раздвигается ИМЕННО ОТСТУП, а не абсолютная величина: заявка отходит на
+     * долю своего же расстояния до справедливой цены. Иначе тонкая пара с
+     * отступом в 30 б.п. и биткойн с десятью получили бы одинаковую прибавку в
+     * долларах, то есть совершенно разное наказание.
+     */
+    static Quoter.Quotes widenForBudget(Quoter.Quotes target, double price, double pressure) {
+        if (!(pressure > 0) || !(price > 0)) {
+            return target;
+        }
+        double m = BUDGET_WIDEN * Math.min(1.0, pressure);
+        return new Quoter.Quotes(
+                target.bid() == null ? null : target.bid() - (price - target.bid()) * m,
+                target.ask() == null ? null : target.ask() + (target.ask() - price) * m);
+    }
+
     public void scaleLimitsForLot(double lotUsd) {
         double k = Math.max(1.0, lotUsd);
         this.maxOrderNotional = ExecLimits.MAX_ORDER_NOTIONAL_USDC * k;
@@ -695,12 +752,8 @@ public final class QuoteLoop implements Runnable {
         // (замер 19.08.2026 — 1.18% у ETH на движении 18%) отступ вырос бы до
         // абсурда, и честнее не котировать вовсе. Поэтому отступ раздвигается
         // до потолка, а дальше работает прежний гейт.
-        boolean widened = false;
-        if (spreadToOffset > 0 && !fair.quotable() && fair.price() > 0
-                && isReferenceSpreadReason(fair.pausedReason())
-                && fair.referenceSpreadPct() <= spreadToOffsetMaxPct) {
-            widened = true;
-        }
+        boolean widened = gateWidens(fair.quotable(), fair.pausedReason(), fair.price(),
+                fair.referenceSpreadPct(), spreadToOffset, spreadToOffsetMaxPct);
         if ((!fair.quotable() && !widened) || !(fair.price() > 0)) {
             // Гейт ТЗ §4.1: опора сломана — уводим котировки из зоны исполнения.
             pausedReason = fair.pausedReason() == null ? "курс ненадёжен" : fair.pausedReason();
@@ -722,13 +775,8 @@ public final class QuoteLoop implements Runnable {
         double drift = efficiency.open(params.driftGateEr()) ? drift() : 0;
         Quoter.Quotes target = policy.quotes(fair.price(), inventory, drift);
         if (widened) {
-            // Неопределённость цены — ±s/2. Отодвигаем обе стороны на неё,
-            // делённую на долю, которую готовы ей отдать: при k = 1/3 половина
-            // спреда опоры стоит трёх таких же долей отступа.
-            double extra = fair.price() * (fair.referenceSpreadPct() / 100.0) / 2 / spreadToOffset;
-            target = new Quoter.Quotes(
-                    target.bid() == null ? null : target.bid() - extra,
-                    target.ask() == null ? null : target.ask() + extra);
+            target = widenForSpread(target, fair.price(), fair.referenceSpreadPct(),
+                    spreadToOffset);
             pausedReason = null;
         }
         // ДЕФИЦИТ ПОСТАНОВОК раздвигает отступ тем же приёмом, что и широкая
@@ -736,15 +784,7 @@ public final class QuoteLoop implements Runnable {
         // ADA простояла так 11 часов, а PEPE 7, и вернуть их мог только человек.
         // Теперь бот вместо остановки отходит от цены, реже исполняется и
         // тратит меньше — то есть подстраивается под остаток сам.
-        double pressure = budgetPressure;
-        if (pressure > 0 && fair.price() > 0) {
-            double m = BUDGET_WIDEN * pressure;
-            target = new Quoter.Quotes(
-                    target.bid() == null ? null
-                            : target.bid() - (fair.price() - target.bid()) * m,
-                    target.ask() == null ? null
-                            : target.ask() + (target.ask() - fair.price()) * m);
-        }
+        target = widenForBudget(target, fair.price(), budgetPressure);
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
         journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null);

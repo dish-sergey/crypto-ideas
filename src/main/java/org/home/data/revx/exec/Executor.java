@@ -68,6 +68,8 @@ public class Executor {
     private final boolean ownPosition;
     private final double positionSeed;
     private final double parkDistance;
+    private final double dynOffsetK;
+    private final double dynOffsetMaxPct;
     private final int levels;
     private final double levelStep;
     private final boolean innerFirst;
@@ -92,6 +94,8 @@ public class Executor {
                     @Value("${revx.exec.own-position}") boolean ownPosition,
                     @Value("${revx.exec.position-seed}") double positionSeed,
                     @Value("${revx.exec.park-distance}") double parkDistance,
+                    @Value("${revx.exec.dyn-offset}") double dynOffsetK,
+                    @Value("${revx.exec.dyn-offset-max-pct}") double dynOffsetMaxPct,
                     @Value("${revx.exec.levels}") int levels,
                     @Value("${revx.exec.level-step}") double levelStep,
                     @Value("${revx.exec.inner-first}") boolean innerFirst,
@@ -115,6 +119,8 @@ public class Executor {
         this.ownPosition = ownPosition;
         this.positionSeed = positionSeed;
         this.parkDistance = parkDistance;
+        this.dynOffsetK = dynOffsetK;
+        this.dynOffsetMaxPct = dynOffsetMaxPct;
         this.levels = levels;
         this.levelStep = levelStep;
         this.innerFirst = innerFirst;
@@ -162,6 +168,30 @@ public class Executor {
         // же причине: суточный лимит у площадки один на аккаунт, а процессов
         // шесть. Общий файл — единственное место, где они могут договориться.
         loop.placementBudget(new PlacementBudget(allocPath, ExecLimits.BOTS_SHARING_ACCOUNT));
+
+        // ГЕЙТ ПО ШИРИНЕ ОПОРЫ РАЗДВИГАЕТ ОТСТУП, А НЕ ВЫКЛЮЧАЕТ КОТИРОВАНИЕ.
+        //
+        // Ширина опорной книги — это не «можно/нельзя», а мера неопределённости:
+        // середина книги шириной s известна с точностью ±s/2. Значит вместо
+        // остановки заявку можно отодвинуть на ту же величину и продолжать
+        // торговать, только дальше от цены.
+        //
+        // Измерено на стенде за 16 суток: у ENA бинарный гейт даёт +2.81 USDC, а
+        // динамический отступ при k = 1/3 — +5.38, то есть в 1.91 раза больше.
+        // Весь выигрыш приходится на дни широкой книги, которые гейт выбрасывал
+        // целиком: 20.08 (+24.9% хода) +1.00 против +0.09, 21.08 (+22.3%) +0.92
+        // против +0.12. Доля четырёх лучших суток у обоих одинакова (78.5% и
+        // 78.6%), убыточных суток поровну — то есть это не один удачный день.
+        //
+        // ⚠️ Платим глубиной просадки: худшие сутки −0.44 против −0.18.
+        // ⚠️ Потолок всё равно нужен: при совсем сломанной опоре (1.18% у ETH
+        // 19.08.2026) отступ вырос бы до абсурда, и честнее не котировать вовсе.
+        if (dynOffsetK > 0) {
+            loop.dynamicOffset(dynOffsetK, dynOffsetMaxPct);
+            log.warn("гейт по опоре РАЗДВИГАЕТ отступ: k={}, потолок ширины {}%",
+                    dynOffsetK, dynOffsetMaxPct);
+            journal.event("dyn_offset", "k=" + dynOffsetK + " потолок " + dynOffsetMaxPct + "%");
+        }
         runLive(loop, journal, client, stand, alloc);
     }
 
