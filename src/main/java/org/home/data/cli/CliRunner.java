@@ -222,6 +222,11 @@ public class CliRunner implements ApplicationRunner {
                         !args.containsOption("outer-first"),
                         firstOr(args, "from", ""), firstOr(args, "to", ""));
             }
+            if (args.containsOption("revx-assemble")) {
+                org.home.data.revx.replay.StandAssembler.assemble(
+                        firstOr(args, "from-dir", "/d/revx-data"),
+                        firstOr(args, "out", "/d/revx-data/revx.db"));
+            }
             if (args.containsOption("revx-pair-sweep")) {
                 executor.getObject().pairSweep(
                         firstOr(args, "from", "2026-08-20T00:00:00Z"),

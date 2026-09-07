@@ -260,6 +260,12 @@ public final class QuoteLoop implements Runnable {
         double k = Math.max(1.0, lotUsd);
         this.maxOrderNotional = ExecLimits.MAX_ORDER_NOTIONAL_USDC * k;
         this.maxExposure = ExecLimits.MAX_TOTAL_EXPOSURE_USDC * k;
+        // Порог остановки по убытку задан под лот $1, и забыть про него мало: он
+        // не режет отдельную заявку, а ГЛУШИТ котирование до конца суток. При
+        // лоте $30 доллар убытка — 3% лота, то есть шум одной сделки. Первая
+        // лестница лотов 06.09.2026 словила 195 таких остановок, все на верхних
+        // ступенях, и занизила их ровно там, где мерилась ёмкость.
+        this.maxTradingLoss = ExecLimits.MAX_TRADING_LOSS_USDC * k;
     }
 
     private int placementCap() {
@@ -318,6 +324,7 @@ public final class QuoteLoop implements Runnable {
 
     private double maxOrderNotional = ExecLimits.MAX_ORDER_NOTIONAL_USDC;
     private double maxExposure = ExecLimits.MAX_TOTAL_EXPOSURE_USDC;
+    private double maxTradingLoss = ExecLimits.MAX_TRADING_LOSS_USDC;
     private double totalFees;
     private double totalFilledNotional;
     private double startInventory;
@@ -1391,10 +1398,10 @@ public final class QuoteLoop implements Runnable {
         double pnl = ownPosition
                 ? tradingPnl(ownCash, seedCash, inventory, seedPosition, lastFair)
                 : tradingPnl(quoteTotal, startQuote, inventory, startInventory, lastFair);
-        if (pnl < -ExecLimits.MAX_TRADING_LOSS_USDC) {
+        if (pnl < -maxTradingLoss) {
             String message = ("ОСТАНОВКА: торговый убыток %s USDC против buy & hold превысил "
                     + "предел %s. Котирование выключено, заявки сняты.")
-                    .formatted(fmt(pnl), fmt(-ExecLimits.MAX_TRADING_LOSS_USDC));
+                    .formatted(fmt(pnl), fmt(-maxTradingLoss));
             log.error(message);
             journal.event("loss_stop", message);
             alert.accept(message);
