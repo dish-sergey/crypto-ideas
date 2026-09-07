@@ -897,10 +897,10 @@ public final class QuoteLoop implements Runnable {
         chooseReplaceSlot(target, fair);
         for (int k = 0; k < levels; k++) {
             int i = innerFirst ? k : levels - 1 - k;
-            Double bidPrice = noCross(Side.BUY,
-                    levelPrice(Side.BUY, target.bid(), fair.price(), i), fair);
-            Double askPrice = noCross(Side.SELL,
-                    levelPrice(Side.SELL, target.ask(), fair.price(), i), fair);
+            Double bidPrice = onTick(Side.BUY, noCross(Side.BUY,
+                    levelPrice(Side.BUY, target.bid(), fair.price(), i), fair));
+            Double askPrice = onTick(Side.SELL, noCross(Side.SELL,
+                    levelPrice(Side.SELL, target.ask(), fair.price(), i), fair));
 
             double cashCap = bidPrice != null && bidPrice > 0
                     ? buyCash / bidPrice : Double.MAX_VALUE;
@@ -944,10 +944,12 @@ public final class QuoteLoop implements Runnable {
         double best = 0;
         for (int i = 0; i < levels; i++) {
             best = considerSlot(Side.BUY, i, bids.get(i),
-                    noCross(Side.BUY, levelPrice(Side.BUY, target.bid(), fair.price(), i), fair),
+                    onTick(Side.BUY, noCross(Side.BUY,
+                            levelPrice(Side.BUY, target.bid(), fair.price(), i), fair)),
                     best);
             best = considerSlot(Side.SELL, i, asks.get(i),
-                    noCross(Side.SELL, levelPrice(Side.SELL, target.ask(), fair.price(), i), fair),
+                    onTick(Side.SELL, noCross(Side.SELL,
+                            levelPrice(Side.SELL, target.ask(), fair.price(), i), fair)),
                     best);
         }
     }
@@ -987,6 +989,45 @@ public final class QuoteLoop implements Runnable {
         }
         double shift = level * levelStep * fair;
         return side == Side.BUY ? base - shift : base + shift;
+    }
+
+    /**
+     * Приводит цену к допустимому тику: покупку ВНИЗ, продажу ВВЕРХ.
+     *
+     * <h2>Зачем это здесь, а не «площадка сама округлит»</h2>
+     *
+     * Она и округляла — молча, и из-за этого мы почти сутки считали, что у ENA
+     * работает сетка из трёх уровней. Шаг цены ENA — 0.0001, то есть 6.01 б.п.
+     * при её цене, а шаг сетки задан в 2 б.п.: три уровня арифметически
+     * различаются, но ложатся на один тик. 07.09.2026 в книге стояли три аска по
+     * одной цене (65.4 б.п. от справедливой) и два бида по одной.
+     *
+     * Хуже, что этого не знал СТЕНД: {@code SimVenue} цену не округляет вовсе,
+     * поэтому измерение ENA — и +546% динамического отступа, и +321% гейта —
+     * считалось на сетке из трёх различимых цен, которой живьём не бывает.
+     * Округление здесь чинит обе стороны разом: живое и стенд считает один и тот
+     * же {@code QuoteLoop}, значит и вырождение сетки теперь видно в прогоне.
+     *
+     * <h2>Почему от рынка, а не к ближайшему</h2>
+     *
+     * Округление к ближайшему может подтянуть заявку на полтика ВНУТРЬ, к цене,
+     * и превратить её в пересекающую — ровно то, от чего стоит {@code noCross}.
+     * Округление наружу этого не может по построению. Плата — меньше полутика
+     * отступа, у самой грубой пары это 3 б.п., у остальных сотые доли.
+     *
+     * ⚠️ Снапить надо ДО сравнения с уже стоящей заявкой. Иначе цель
+     * неокруглённая, стоящая заявка округлённая, {@code shouldRequote} видит
+     * разницу всегда, и бот перевыставляется каждый тик — 10 замен в секунду на
+     * пустом месте.
+     */
+    private Double onTick(Side side, Double price) {
+        double step = params.quoteStep();
+        if (price == null || !(step > 0) || !(price > 0)) {
+            return price;
+        }
+        double units = price / step;
+        double snapped = (side == Side.BUY ? Math.floor(units) : Math.ceil(units)) * step;
+        return snapped > 0 ? snapped : price;
     }
 
     /** Приводит одну сторону к целевой цене: поставить, переставить или снять. */

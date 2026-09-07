@@ -110,8 +110,7 @@ public final class MarketData {
         List<MarketTrade> trades = new ArrayList<>();
         List<Long> ts = new ArrayList<>();
         List<BookView> books = new ArrayList<>();
-        String url = "jdbc:sqlite:file:" + standDbPath + "?mode=ro";
-        try (Connection c = DriverManager.getConnection(url);
+        try (Connection c = StandDb.open(standDbPath);
              Statement st = c.createStatement()) {
             try (ResultSet rs = st.executeQuery(
                     "SELECT ts_ms, price, qty, side FROM revx_trade WHERE symbol = '" + symbol

@@ -159,8 +159,7 @@ public final class StandFair implements FairSource {
     }
 
     private void load(String path, long fromMs, long toMs) {
-        String url = "jdbc:sqlite:file:" + path + "?mode=ro";
-        try (Connection c = DriverManager.getConnection(url)) {
+        try (Connection c = StandDb.open(path)) {
             List<String> bases = new ArrayList<>();
             try (Statement st = c.createStatement();
                  ResultSet rs = st.executeQuery(
