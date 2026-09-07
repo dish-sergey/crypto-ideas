@@ -426,15 +426,23 @@ public final class ExecJournal implements AutoCloseable {
     }
 
     /**
-     * Включено ли котирование — по ПОСЛЕДНЕМУ из событий start/stop.
+     * Включено ли котирование — по ПОСЛЕДНЕМУ из событий start/stop/boot.
      *
      * ⚠️ Именно последнему по времени, а не «встречался ли start». Остановленный
      * командой бот хранит в журнале оба события, и проверка на наличие показала
      * бы его работающим.
+     *
+     * ⚠️ <b>{@code boot} считается выключением, и это не мелочь.</b> Перезапуск
+     * процесса гасит котирование МОЛЧА: событие {@code stop} пишет только
+     * команда человека, а поднявшийся бот просто стартует с выключенным флагом.
+     * Без {@code boot} в этом запросе последним в журнале остаётся давнишний
+     * {@code start}, и сводный бот бодро показывает «торгует» у всех шести,
+     * которые на самом деле стоят. Замечено 07.09.2026 после выкатки: последний
+     * start в 15:04, за ним два boot, а в сводке — шесть зелёных строк.
      */
     public synchronized boolean quotingOn() {
         try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT kind FROM exec_event WHERE kind IN ('start','stop') "
+                "SELECT kind FROM exec_event WHERE kind IN ('start','stop','boot') "
                         + "ORDER BY ts_ms DESC LIMIT 1");
              ResultSet rs = ps.executeQuery()) {
             return rs.next() && "start".equals(rs.getString(1));
