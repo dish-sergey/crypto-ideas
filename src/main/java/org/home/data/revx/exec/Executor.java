@@ -158,6 +158,10 @@ public class Executor {
         QuoteLoop loop = new QuoteLoop(client, Clock.system(), stand, journal, params, symbol,
                 periodMs, minNotional(), tag, policy, ownPosition, positionSeed, spec.baseStep(),
                 parkDistance, alloc, levels, levelStep, innerFirst);
+        // Ведро постановок живёт в том же файле, что и реестр владения, и по той
+        // же причине: суточный лимит у площадки один на аккаунт, а процессов
+        // шесть. Общий файл — единственное место, где они могут договориться.
+        loop.placementBudget(new PlacementBudget(allocPath, ExecLimits.BOTS_SHARING_ACCOUNT));
         runLive(loop, journal, client, stand, alloc);
     }
 

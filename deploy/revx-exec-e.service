@@ -60,7 +60,8 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-ex
 # Размеры под цену ENA 0.1726 на 06.09.2026: лот $1 = 5.7937 ENA, потолок
 # $20 = 115.8749 ENA. Шаг количества 0.0001 — оба значения на нём лежат.
 
-ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-e/app.jar --revx-panic --revx.exec.bot-id=e --revx.exec.symbol=ENA/USDC --revx.exec.journal=state/exec-e-ena.db || true'
+# ПЛАНОВАЯ остановка ПАРКУЕТ заявки, а не снимает их: восстановление после# отмены стоит 3-6 постановок (замер 07.09.2026), а оставленную заявку# вернувшийся бот усыновляет по метке и двигает через PUT — бесплатно.# ⚠️ Аварийная остановка по-прежнему снимает всё: --revx-panic на кнопке в боте# и на ручном запуске (ТЗ §6). Трогает ТОЛЬКО свои заявки.
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-e/app.jar --revx-park --revx.exec.bot-id=e --revx.exec.symbol=ENA/USDC --revx.exec.journal=state/exec-e-ena.db || true'
 
 SuccessExitStatus=143
 Restart=no

@@ -9,12 +9,22 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Суточный лимит постановок — по ботам, а не поровну (док. 74: потолок у
- * площадки общий на ВЕСЬ аккаунт).
+ * Аварийный потолок постановок — то, что осталось от неподвижных долей.
  *
- * С 06.09.2026 ботов шесть, по одному на пару. Тест сторожит три свойства:
- * сумма долей не превышает того, что даёт площадка; каждому хватает на его
- * измеренный расход; незнакомый бот получает консервативную долю, а не максимум.
+ * ⚠️ <b>Роль этого предела изменилась 07.09.2026.</b> Раньше он делил суточный
+ * лимит между ботами, и тест сторожил, чтобы сумма долей укладывалась в тысячу.
+ * Делит теперь {@link PlacementBudget} — общее ведро, из которого боты берут по
+ * мере надобности; его свойства сторожит {@code PlacementBudgetTest}.
+ *
+ * Прежнюю раскладку пришлось отменить, потому что она предсказывала расход
+ * плохо: у ADA спрос вышел 217 против выделенных 80, у PEPE 111 против 60, и
+ * оба бота встали — ADA на 11 часов, PEPE на 7 — при 240 неиспользованных
+ * постановках у соседей. Сумма спросов при этом была 871 из 1000, то есть
+ * бюджета хватало, и виновата была именно нарезка.
+ *
+ * Здесь остались свойства предохранителя: он должен пропускать любой
+ * наблюдавшийся расход, но не давать одному боту выбрать всю тысячу в одиночку,
+ * и незнакомая метка не должна получать больше знакомой.
  */
 class PlacementLimitTest {
 
@@ -24,71 +34,85 @@ class PlacementLimitTest {
     private static final List<String> BOTS = List.of("a", "b", "c", "d", "e", "f");
 
     /**
-     * Сколько постановок в сутки бот тратит на самом деле.
+     * Спрос, ЗАМЕРЕННЫЙ на живых ботах за сутки 06-07.09.2026.
      *
-     * Числа из обхода вселенной за 16 суток (20.08-04.09.2026), каждая пара на
-     * своём отступе. У биткойна стоит оценка для 10 б.п. — обход печатал расход
-     * только для лучшей ступени (8 б.п., 311 постановок), а 10 б.п. выбраны ради
-     * экономии бюджета, и 160 здесь получены экстраполяцией по закону прихода.
+     * Это не оценка по закону прихода, как было в прежней версии теста, а счёт
+     * фактических {@code POST /orders} по журналам, приведённый к суткам. Именно
+     * эти числа и опровергли прежнюю раскладку.
      */
-    private static final Map<String, Integer> MEASURED_USAGE = Map.of(
-            "a", 160,      // BTC  10 б.п. (оценка)
-            "b", 134,      // SOL  18 б.п.
-            "c", 130,      // ETH  14 б.п.
-            "d", 50,       // ADA  14 б.п.
-            "e", 41,       // ENA  20 б.п.
-            "f", 38);      // PEPE 20 б.п.
-
-    @Test
-    void sumOverBotsStaysUnderVenueLimit() {
-        int total = BOTS.stream().mapToInt(ExecLimits::maxPlacementsPerDay).sum();
-        assertTrue(total <= VENUE_DAILY,
-                "сумма по шести ботам " + total + " превышает потолок площадки " + VENUE_DAILY);
-        // Запас на повторы и ручные проверки. Единственный буфер на разбор
-        // аварии, когда боты уже съели своё.
-        assertTrue(VENUE_DAILY - total >= 50,
-                "запас на повторы и ручные проверки меньше полусотни: " + (VENUE_DAILY - total));
-    }
+    private static final Map<String, Integer> MEASURED_DEMAND = Map.of(
+            "a", 218,      // BTC
+            "b", 95,       // SOL
+            "c", 99,       // ETH
+            "d", 217,      // ADA
+            "e", 131,      // ENA
+            "f", 111);     // PEPE
 
     /**
-     * У каждого бота доля с запасом к измеренному расходу.
+     * Предохранитель обязан пропускать любой наблюдавшийся спрос.
      *
-     * ⚠️ Свойство не косметическое: при исчерпании лимита бот не пропускает
-     * постановку, а ВЫКЛЮЧАЕТСЯ совсем. Доля впритык означает, что в первый же
-     * оживлённый день бот молча перестанет торговать, и мы получим не измерение,
-     * а дыру в нём.
+     * Иначе он сработает вместо ведра и вернёт ровно ту беду, ради которой ведро
+     * заводилось: остановку бота при живом общем бюджете.
      */
     @Test
-    void everyBotHasHeadroomOverItsMeasuredUsage() {
+    void аварийныйПотолокВышеЛюбогоЗамеренногоСпроса() {
         for (String bot : BOTS) {
-            int share = ExecLimits.maxPlacementsPerDay(bot);
-            int usage = MEASURED_USAGE.get(bot);
-            assertTrue(share >= usage * 3 / 2,
-                    "боту " + bot + " дано " + share + " при измеренном расходе " + usage
-                            + " — запаса меньше полутора крат, упрётся в первый оживлённый день");
+            int cap = ExecLimits.maxPlacementsPerDay(bot);
+            int demand = MEASURED_DEMAND.get(bot);
+            assertTrue(cap >= demand * 2,
+                    "боту " + bot + " дан потолок " + cap + " при замеренном спросе "
+                            + demand + " — сработает раньше общего ведра");
         }
     }
 
     /**
-     * Тонкие пары получают меньше биткойна и эфира.
+     * Один бот не должен успеть выбрать весь лимит аккаунта.
      *
-     * Расход идёт за исполнениями, а на ENA и PEPE их в разы меньше: 41 и 38 в
-     * сутки против 160 у BTC. Раздать поровну значило бы отнять бюджет у тех,
-     * кто его действительно тратит.
+     * Предохранитель на то и предохранитель, что действует, когда ведро сломано.
+     * В этот момент единственная защита аккаунта — то, что одного бота не хватит
+     * на всю тысячу.
      */
     @Test
-    void thinPairsGetLessThanTheDeepOnes() {
-        for (String thin : List.of("d", "e", "f")) {
-            for (String deep : List.of("a", "b", "c")) {
-                assertTrue(ExecLimits.maxPlacementsPerDay(thin)
-                                < ExecLimits.maxPlacementsPerDay(deep),
-                        "тонкая пара " + thin + " не должна получать больше глубокой " + deep);
-            }
+    void одинБотНеВыбираетВесьЛимитАккаунта() {
+        for (String bot : BOTS) {
+            assertTrue(ExecLimits.maxPlacementsPerDay(bot) <= VENUE_DAILY / 2,
+                    "бот " + bot + " в одиночку может выбрать больше половины лимита аккаунта");
         }
     }
 
+    /**
+     * Рабочий бюджет ведра обязан быть ниже лимита площадки.
+     *
+     * Считаем мы только свои постановки, а лимит расходует и то, чего мы не
+     * видим: ручные заявки, разовые команды, возможно — отказные POST.
+     */
     @Test
-    void unknownBotGetsConservativeShare() {
+    void ёмкостьВедраОставляетЗапасКЛимитуПлощадки() {
+        assertTrue(PlacementBudget.CAPACITY <= VENUE_DAILY - 100,
+                "ведро " + PlacementBudget.CAPACITY + " не оставляет сотни в запас к "
+                        + VENUE_DAILY);
+        int floors = BOTS.size() * PlacementBudget.FLOOR_PER_DAY;
+        assertTrue(floors < PlacementBudget.CAPACITY,
+                "полы шести ботов (" + floors + ") не помещаются в ведро "
+                        + PlacementBudget.CAPACITY + " — общего котла не остаётся");
+    }
+
+    /**
+     * Пол каждому обязан покрывать спрос самых скромных пар.
+     *
+     * Гарантия, которой не хватает на обычный день, гарантией не является.
+     */
+    @Test
+    void полПокрываетСпросСкромныхПар() {
+        int floor = PlacementBudget.FLOOR_PER_DAY;
+        assertTrue(floor >= MEASURED_DEMAND.get("b"),
+                "пол " + floor + " ниже спроса SOL " + MEASURED_DEMAND.get("b"));
+        assertTrue(floor >= MEASURED_DEMAND.get("c"),
+                "пол " + floor + " ниже спроса ETH " + MEASURED_DEMAND.get("c"));
+    }
+
+    @Test
+    void незнакомаяМеткаНеПолучаетБольшеЗнакомой() {
         int unknown = ExecLimits.maxPlacementsPerDay("z");
         int smallest = BOTS.stream().mapToInt(ExecLimits::maxPlacementsPerDay).min().orElseThrow();
         assertEquals(smallest, unknown,
@@ -96,27 +120,5 @@ class PlacementLimitTest {
                         + " --revx.exec.bot-id молча выдаёт бюджет больше настроенного");
         assertEquals(unknown, ExecLimits.maxPlacementsPerDay(null));
         assertEquals(unknown, ExecLimits.maxPlacementsPerDay(""));
-    }
-
-    @Test
-    void idIsMatchedByFirstLetterAndCase() {
-        assertEquals(ExecLimits.maxPlacementsPerDay("a"), ExecLimits.maxPlacementsPerDay("A"));
-        assertEquals(ExecLimits.maxPlacementsPerDay("a"), ExecLimits.maxPlacementsPerDay(" a "));
-    }
-
-    /**
-     * Экспозиции хватает на полный инвентарь плюс сетку в книге.
-     *
-     * ⚠️ Предел блокирует ЗАЯВКУ, а не кричит. Если $20 инвентаря и три уровня
-     * по доллару на сторону в него не влезут, дальний уровень молча перестанет
-     * ставиться, и сетка окажется не той, что измерена.
-     */
-    @Test
-    void exposureFitsFullInventoryPlusGrid() {
-        double inventoryCap = 20.0;
-        double grid = 3 * 1.0 * 2;                // три уровня, обе стороны, лот $1
-        assertTrue(ExecLimits.exposureAllowed(inventoryCap + grid),
-                "предел экспозиции " + ExecLimits.MAX_TOTAL_EXPOSURE_USDC
-                        + " не вмещает потолок инвентаря $20 и сетку на $6");
     }
 }

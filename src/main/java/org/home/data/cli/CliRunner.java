@@ -78,6 +78,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck;
     private final ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe;
     private final ObjectProvider<org.home.data.revx.exec.Panic> panic;
+    private final ObjectProvider<org.home.data.revx.exec.Park> park;
     private final ObjectProvider<org.home.data.revx.sim.RegimeFrequencyReport> regimeReport;
     private final ObjectProvider<org.home.data.revx.exec.Executor> executor;
     private final ObjectProvider<org.home.data.revx.exec.ExecReport> execReport;
@@ -99,6 +100,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck,
                      ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe,
                      ObjectProvider<org.home.data.revx.exec.Panic> panic,
+                     ObjectProvider<org.home.data.revx.exec.Park> park,
                      ObjectProvider<org.home.data.revx.sim.RegimeFrequencyReport> regimeReport,
                      ObjectProvider<org.home.data.revx.exec.Executor> executor,
                      ObjectProvider<org.home.data.revx.exec.ExecReport> execReport,
@@ -127,6 +129,7 @@ public class CliRunner implements ApplicationRunner {
         this.tradeCheck = tradeCheck;
         this.orderProbe = orderProbe;
         this.panic = panic;
+        this.park = park;
         this.regimeReport = regimeReport;
         this.executor = executor;
         this.execReport = execReport;
@@ -249,6 +252,9 @@ public class CliRunner implements ApplicationRunner {
             }
             if (args.containsOption("revx-panic")) {
                 panic.getObject().run();
+            }
+            if (args.containsOption("revx-park")) {
+                park.getObject().run();
             }
             if (args.containsOption("revx-exec")) {
                 executor.getObject().run();          // блокирует: демон микро-live

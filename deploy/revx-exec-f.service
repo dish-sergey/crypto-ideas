@@ -57,7 +57,8 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-ex
 # оба значения на нём лежат. Шаг цены 1e-10 = 0.28 б.п. — сетка в 2 б.п. это
 # семь тиков, вырождения как у ENA нет.
 
-ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-f/app.jar --revx-panic --revx.exec.bot-id=f --revx.exec.symbol=PEPE/USDC --revx.exec.journal=state/exec-f-pepe.db || true'
+# ПЛАНОВАЯ остановка ПАРКУЕТ заявки, а не снимает их: восстановление после# отмены стоит 3-6 постановок (замер 07.09.2026), а оставленную заявку# вернувшийся бот усыновляет по метке и двигает через PUT — бесплатно.# ⚠️ Аварийная остановка по-прежнему снимает всё: --revx-panic на кнопке в боте# и на ручном запуске (ТЗ §6). Трогает ТОЛЬКО свои заявки.
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-f/app.jar --revx-park --revx.exec.bot-id=f --revx.exec.symbol=PEPE/USDC --revx.exec.journal=state/exec-f-pepe.db || true'
 
 SuccessExitStatus=143
 Restart=no

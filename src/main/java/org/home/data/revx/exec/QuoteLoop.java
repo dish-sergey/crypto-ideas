@@ -273,6 +273,36 @@ public final class QuoteLoop implements Runnable {
                 ? placementCapOverride : ExecLimits.maxPlacementsPerDay(tag.id());
     }
 
+    /**
+     * Общее ведро постановок на весь аккаунт. Без него бот работает по прежнему
+     * неподвижному потолку из {@link ExecLimits} — так ходит стенд, которому
+     * делить ни с кем нечего.
+     */
+    public void placementBudget(PlacementBudget budget) {
+        this.budget = budget;
+        if (budget != null) {
+            // Считать сразу, а не ждать первой минуты: перезапуск при пустом
+            // ведре иначе успел бы отторговать минуту в тесном отступе — ровно
+            // тогда, когда бюджета нет.
+            budgetPressure = budget.state(tag.id(), clock.now()).pressure();
+        }
+    }
+
+    /**
+     * Во сколько раз раздвинуть отступ при полностью выбранном бюджете.
+     *
+     * Смысл в том, что дефицит постановок лечится не остановкой, а РЕДКОСТЬЮ
+     * исполнений: чем дальше заявка от цены, тем реже она исполняется, а
+     * постановка тратится только после исполнения. Вдвое — потому что закон
+     * прихода λ(δ) = A·e^{−κδ} при κ ≈ 0.3…0.45 на б.п. даёт на удвоении
+     * десятибазисного отступа примерно двадцатикратное падение частоты; этого
+     * с запасом хватает, чтобы расход упал ниже пополнения.
+     *
+     * Заявки при этом продолжают жить: перестановка идёт через PUT, у которого
+     * суточного лимита нет вовсе.
+     */
+    private static final double BUDGET_WIDEN = 1.0;
+
     private volatile double inventory;
     private volatile double baseAvailable;
     private volatile double quoteBalance;
@@ -325,6 +355,14 @@ public final class QuoteLoop implements Runnable {
     private double maxOrderNotional = ExecLimits.MAX_ORDER_NOTIONAL_USDC;
     private double maxExposure = ExecLimits.MAX_TOTAL_EXPOSURE_USDC;
     private double maxTradingLoss = ExecLimits.MAX_TRADING_LOSS_USDC;
+    private PlacementBudget budget;
+    /**
+     * Насколько туго с общим бюджетом, 0…1. Перечитывается раз в минуту, а не
+     * каждый тик: ведро наполняется одним токеном за сто секунд, так что чаще
+     * незачем, а шесть процессов, дёргающих общую базу по десять раз в секунду,
+     * стоили бы дороже самой экономии.
+     */
+    private volatile double budgetPressure;
     private double totalFees;
     private double totalFilledNotional;
     private double startInventory;
@@ -692,6 +730,20 @@ public final class QuoteLoop implements Runnable {
                     target.bid() == null ? null : target.bid() - extra,
                     target.ask() == null ? null : target.ask() + extra);
             pausedReason = null;
+        }
+        // ДЕФИЦИТ ПОСТАНОВОК раздвигает отступ тем же приёмом, что и широкая
+        // опора. Прежде исчерпание бюджета просто выключало бота: 07.09.2026
+        // ADA простояла так 11 часов, а PEPE 7, и вернуть их мог только человек.
+        // Теперь бот вместо остановки отходит от цены, реже исполняется и
+        // тратит меньше — то есть подстраивается под остаток сам.
+        double pressure = budgetPressure;
+        if (pressure > 0 && fair.price() > 0) {
+            double m = BUDGET_WIDEN * pressure;
+            target = new Quoter.Quotes(
+                    target.bid() == null ? null
+                            : target.bid() - (fair.price() - target.bid()) * m,
+                    target.ask() == null ? null
+                            : target.ask() + (target.ask() - fair.price()) * m);
         }
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
@@ -1082,15 +1134,31 @@ public final class QuoteLoop implements Runnable {
      * неизвестен: за всю историю ни одного отказа по лимиту не приходило.
      * «Не более N за любые 24 часа» безопасно и при обнулении в полночь, и при
      * скользящем окне у них; обратное неверно.
+     *
+     * ⚠️ Это АВАРИЙНЫЙ потолок, а не рабочий. Делит бюджет между ботами теперь
+     * {@link PlacementBudget}; здесь остался предохранитель на случай, когда
+     * ведро недоступно или ошибочно щедро.
      */
     public long placementsLastDay() {
         return journal.placementsSince(clock.now() - 86_400_000L);
     }
 
     private void place(Side side, Resting resting, double price, double size) {
+        // Сначала общее ведро: оно и есть настоящий предел аккаунта.
+        //
+        // ⚠️ Отказ НЕ выключает бота. Прежде выключал, и 07.09.2026 это стоило
+        // 11 часов простоя ADA и 7 часов PEPE — при том, что у SOL и ETH в те же
+        // сутки пустовало 240 постановок. Пропущенная постановка обратима сама
+        // собой: ведро пополнится, отступ сузится обратно. Выключенный бот сам
+        // не возвращается.
+        if (budget != null && !budget.tryAcquire(tag.id(), clock.now())) {
+            journal.event("budget_denied", side + " по " + fmt(price)
+                    + ": общий бюджет постановок исчерпан, отхожу от цены");
+            return;
+        }
         long used = placementsLastDay();
         if (used >= placementCap()) {
-            log.error("исчерпан суточный лимит постановок ({} из {} за 24 ч) — "
+            log.error("исчерпан АВАРИЙНЫЙ потолок постановок ({} из {} за 24 ч) — "
                             + "останавливаю котирование",
                     used, placementCap());
             journal.event("limit_blocked",
@@ -1948,6 +2016,19 @@ public final class QuoteLoop implements Runnable {
             }
             // Остатки перечитываются раз в минуту: исполнение могло случиться молча.
             refreshBalances();
+            if (budget != null) {
+                PlacementBudget.State state = budget.state(tag.id(), now);
+                double was = budgetPressure;
+                budgetPressure = state.pressure();
+                if (Math.abs(budgetPressure - was) > 0.05) {
+                    log.warn("бюджет постановок: {} токенов, свой расход {} за сутки, "
+                                    + "по аккаунту {} — отступ раздвинут на {}%",
+                            Math.round(state.tokens()), state.ownSpendDay(),
+                            state.totalSpendDay(),
+                            Math.round(BUDGET_WIDEN * budgetPressure * 100));
+                }
+                budget.prune(now);
+            }
         }
         // Суточный счётчик постановок БОЛЬШЕ НЕ ОБНУЛЯЕТСЯ здесь: он считается
         // по журналу скользящим окном (placementsLastDay). Прежнее обнуление было

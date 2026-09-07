@@ -57,7 +57,8 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-ex
 # FIFO сложил бы их в одну позицию, и P&L перестал бы что-либо значить. Старый
 # журнал остаётся на месте как история BTC-периода.
 
-ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-c/app.jar --revx-panic --revx.exec.bot-id=c --revx.exec.symbol=ETH/USDC --revx.exec.journal=state/exec-c-eth.db || true'
+# ПЛАНОВАЯ остановка ПАРКУЕТ заявки, а не снимает их: восстановление после# отмены стоит 3-6 постановок (замер 07.09.2026), а оставленную заявку# вернувшийся бот усыновляет по метке и двигает через PUT — бесплатно.# ⚠️ Аварийная остановка по-прежнему снимает всё: --revx-panic на кнопке в боте# и на ручном запуске (ТЗ §6). Трогает ТОЛЬКО свои заявки.
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-c/app.jar --revx-park --revx.exec.bot-id=c --revx.exec.symbol=ETH/USDC --revx.exec.journal=state/exec-c-eth.db || true'
 
 SuccessExitStatus=143
 Restart=no

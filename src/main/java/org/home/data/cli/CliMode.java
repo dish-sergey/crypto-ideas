@@ -32,7 +32,7 @@ public class CliMode {
             "s5-dry-run", "s5-kraken-check", "s5-demo", "s5-live",
             "revx-pairs", "revx-probe-limits", "revx-collect", "revx-basis",
             "revx-sim", "revx-flow", "revx-screen", "revx-exec-report", "revx-perp-basis", "revx-mirror",
-            "revx-trade-check", "revx-order-probe", "revx-panic", "revx-exec", "revx-regimes",
+            "revx-trade-check", "revx-order-probe", "revx-panic", "revx-park", "revx-exec", "revx-regimes",
             "revx-replay", "revx-forecast", "revx-ladder", "revx-pair-forecast",
             "revx-pair-sweep", "revx-info", "revx-assemble");
 

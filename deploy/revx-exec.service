@@ -75,7 +75,8 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-ex
 # процесс, и оставлять их там нельзя. Хук в приложении снимает их сам, но если
 # оно не успело — добиваем отдельной командой. Только СВОИ заявки: panic-all по
 # умолчанию false, иначе остановка A снимала бы заявки пяти остальных.
-ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec/app.jar --revx-panic --revx.exec.bot-id=a --revx.exec.symbol=BTC/USDC --revx.exec.journal=state/exec.db || true'
+# ПЛАНОВАЯ остановка ПАРКУЕТ заявки, а не снимает их: восстановление после# отмены стоит 3-6 постановок (замер 07.09.2026), а оставленную заявку# вернувшийся бот усыновляет по метке и двигает через PUT — бесплатно.# ⚠️ Аварийная остановка по-прежнему снимает всё: --revx-panic на кнопке в боте# и на ручном запуске (ТЗ §6). Трогает ТОЛЬКО свои заявки.
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec/app.jar --revx-park --revx.exec.bot-id=a --revx.exec.symbol=BTC/USDC --revx.exec.journal=state/exec.db || true'
 
 # ⚠️ Restart=no НАМЕРЕННО. Перезапуск после падения не должен сам возобновлять
 # торговлю: сначала человек смотрит, почему упало. Котирование в любом случае
