@@ -86,7 +86,7 @@ public class Park {
             TradeClient client = new TradeClient(cfg.baseUrl(), auth, journal);
             journal.event("park", "плановая остановка: увожу заявки от цены");
 
-            double quoteStep = quoteStep();
+            Spec spec = spec();
             Venue.Response active = client.activeOrders();
             if (!active.ok() || active.body() == null) {
                 log.error("не прочитать активные заявки ({}) — на всякий случай снимаю всё",
@@ -102,10 +102,20 @@ public class Park {
                 log.info("своих заявок в книге нет — парковать нечего");
                 return;
             }
-            log.warn("своих заявок: {} — отвожу на {}%", mine.size(), (int) (PARK_PCT * 100));
+            log.warn("своих заявок: {} — отвожу на {}% от цены {}",
+                    mine.size(), (int) (PARK_PCT * 100), spec.fair);
             int parked = 0;
+            int already = 0;
             for (ActiveOrder order : mine) {
-                if (park(client, journal, order, quoteStep)) {
+                // ⚠️ Уже отведённую НЕ ТРОГАЕМ. Отвод считался от цены самой
+                // заявки, поэтому каждая выкатка добавляла ещё пять процентов:
+                // у бота C за три перезапуска 07.09.2026 заявки уехали на −14%
+                // и +16%. Такую заявку не жалко, но и смысла в ней нет.
+                if (QuoteLoop.isParked(order.price(), spec.fair, QuoteLoop.PARKED_MIN_PCT)) {
+                    already++;
+                    continue;
+                }
+                if (park(client, journal, order, spec)) {
                     parked++;
                 } else {
                     // Отодвинуть не вышло — заявка осталась на рабочем месте, а
@@ -117,22 +127,27 @@ public class Park {
                             order.id(), cancelled.status());
                 }
             }
-            log.warn("припарковано {} из {}", parked, mine.size());
-            journal.event("park_done", "припарковано " + parked + " из " + mine.size());
+            log.warn("припарковано {} из {} (уже стояли отведёнными {})",
+                    parked, mine.size(), already);
+            journal.event("park_done", "припарковано " + parked + " из " + mine.size()
+                    + ", уже отведены " + already);
         } catch (Exception e) {
             log.error("парковка не прошла: {}", e.toString(), e);
         }
     }
 
     private boolean park(TradeClient client, ExecJournal journal,
-                         ActiveOrder order, double quoteStep) {
+                         ActiveOrder order, Spec spec) {
+        // Отвод считается ОТ СПРАВЕДЛИВОЙ ЦЕНЫ, а не от цены заявки: иначе
+        // каждая следующая выкатка отодвигала бы её ещё на пять процентов.
+        double base = spec.fair > 0 ? spec.fair : order.price();
         double target = order.side() == Side.BUY
-                ? order.price() * (1 - PARK_PCT)
-                : order.price() * (1 + PARK_PCT);
+                ? base * (1 - PARK_PCT)
+                : base * (1 + PARK_PCT);
         // Округляем В СТОРОНУ ОТ РЫНКА: покупку вниз, продажу вверх. Округление
         // «к ближайшему» может подтянуть заявку обратно на полшага, а весь смысл
         // парковки в том, чтобы она гарантированно стояла дальше, чем стояла.
-        double price = round(target, quoteStep, order.side() == Side.SELL);
+        double price = round(target, spec.quoteStep, order.side() == Side.SELL);
         String body = """
                 {"client_order_id":"%s","base_size":"%s","price":"%s",
                  "execution_instructions":["post_only"]}"""
@@ -177,18 +192,31 @@ public class Park {
         }
     }
 
-    /** Шаг цены берём у площадки через каталог стенда; нет каталога — нет парковки. */
-    private double quoteStep() {
+    /** Шаг цены и справедливая цена — обоих даёт каталог стенда. */
+    private record Spec(double quoteStep, double fair) { }
+
+    private Spec spec() {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new org.home.data.revx.sim.FairPrice.Limits(cfg.fairMinPairs(),
                         cfg.fairMaxDispersionPct(), cfg.fairMaxReferenceSpreadPct(),
                         cfg.fairMaxResidualPct()),
                 cfg.fairMaxSkewMs())) {
-            var spec = stand.spec(symbol);
-            return spec != null && spec.quoteStep() > 0 ? spec.quoteStep() : 0;
+            var pair = stand.spec(symbol);
+            double step = pair != null && pair.quoteStep() > 0 ? pair.quoteStep() : 0;
+            // Цена нужна и как основание отвода, и чтобы отличить уже
+            // отведённую заявку от рабочей. Окно широкое: для выбора между
+            // «5%» и «0.2%» пятиминутная давность роли не играет.
+            double fair = 0;
+            try {
+                var latest = stand.latest(symbol.substring(0, symbol.indexOf('/')), 300_000);
+                fair = latest != null ? latest.price() : 0;
+            } catch (Exception e) {
+                log.warn("справедливая цена не прочитана: {}", e.getMessage());
+            }
+            return new Spec(step, fair);
         } catch (Exception e) {
-            log.warn("шаг цены не прочитан ({}) — округляю по цене заявки", e.getMessage());
-            return 0;
+            log.warn("каталог стенда не прочитан ({}) — отвожу от цены заявки", e.getMessage());
+            return new Spec(0, 0);
         }
     }
 
