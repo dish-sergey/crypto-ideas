@@ -1,0 +1,57 @@
+[Unit]
+Description=Revolut X — сбор ХВОСТА вселенной (12 пар, публичный путь, без ключа)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx
+
+# ЗАЧЕМ ОТДЕЛЬНАЯ МАШИНА
+#
+# Лимит публичного пути Revolut X — ПО IP, а не по ключу, и ограничен там
+# минимальный интервал между запросами (~1 с), а не средний темп. Значит второй
+# адрес даёт вторую квоту целиком, и хвост вселенной можно собирать, вообще не
+# трогая ни торговый сервер, ни лимит 1000/мин авторизованного ключа, из
+# которого уже платят шесть живых ботов.
+#
+# Собираются 12 пар, не покрытые основным сбором: bot-arm держит BTC, ETH, SOL,
+# ADA, ENA, PEPE (торгуются) и XRP, LINK, BNB, LTC, XLM (кандидаты). Здесь —
+# остальные из 23 USDC-пар площадки. Среди них HBAR и BCH, у которых в обходе
+# вселенной были приличные оптимумы (22 б.п. у обоих), так что это не мусор.
+#
+# РАСКЛАД НАГРУЗКИ. 12 пар = 24 ноги (X/USDC и X/USD: вторая нужна для курса
+# USDC/USD). Все в первом ярусе с периодом 60 с:
+#   книги   24 ноги / 60 с = 24/мин = 0.40 req/s
+#   сделки  12 пар  / 900 с ≈ 0.8/мин
+#   ИТОГО ≈ 0.41 req/s при нашем потолке 0.8 и наблюдённом пределе ~1.0.
+# Запас двукратный: минутные всплески и ретраи в него укладываются.
+#
+# ⚠️ Ключей здесь НЕТ и быть не должно. Без них приложение молча остаётся на
+# публичном пути, и это ровно то, что нужно: авторизованный путь ходил бы в
+# ту же тысячу в минуту, что и торговые боты, то есть смысл второй машины
+# пропал бы целиком.
+Environment=JAVA_TOOL_OPTIONS=-Xms64m -Xmx256m
+ExecStart=/home/ubuntu/jre25/bin/java -jar /home/ubuntu/revx/app.jar --revx-collect \
+  --revx.db-path=data/revx.db \
+  --revx.collect-only=AVAX,BCH,BONK,DOGE,DOT,HBAR,JUP,SHIB,SUI,TON,TRUMP,TRX \
+  --revx.tier1=AVAX,BCH,BONK,DOGE,DOT,HBAR,JUP,SHIB,SUI,TON,TRUMP,TRX \
+  --revx.tier2= \
+  --revx.book-period-tier1-seconds=60 \
+  --revx.book-period-tier2-seconds=600 \
+  --revx.book-period-tier3-seconds=600 \
+  --revx.trades-period-tier1-seconds=900 \
+  --revx.trades-period-other-seconds=900 \
+  --revx.fast-pairs= \
+  --revx.max-requests-per-second=0.8 \
+  --revx.burst-capacity=1
+
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=30
+SuccessExitStatus=143
+
+[Install]
+WantedBy=multi-user.target
