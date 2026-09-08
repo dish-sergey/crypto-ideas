@@ -1637,9 +1637,26 @@ public final class QuoteLoop implements Runnable {
         replaces++;
         replacesThisMinute++;
         if (response.ok()) {
-            // Замена создаёт ДРУГУЮ заявку: новый id обязателен к перечитыванию.
+            // ⚠️ ПРЕДШЕСТВЕННИКА НАДО ДОПРОСИТЬ, ПОКА ЕГО ЕЩЁ ЕСТЬ О ЧЁМ
+            // СПРОСИТЬ. Замена создаёт другую заявку, старый идентификатор
+            // умирает, и если по нему что-то исполнилось частично, узнать об
+            // этом больше неоткуда: единственный путь бота к сделке — заявка,
+            // которой не стало, а частично исполненная из книги не исчезает.
+            //
+            // При лоте $1 это не срабатывает никогда: все 390 живых сделок за
+            // сутки ровно в один лот, принты крупнее нашей заявки. При лоте $3
+            // на стенде так терялось 30% объёма (08.09.2026) — и боевой бот на
+            // крупном лоте терял бы столько же молча.
+            //
+            // Цена — один GET на замену. При измеренных 2.77 замены в секунду на
+            // весь счёт это ~166 запросов в минуту при лимите 1000/мин, то есть
+            // укладывается, но это не бесплатно.
+            String oldId = resting.venueId;
             String newId = extract(response.body());
             resting.venueId = newId != null ? newId : resting.venueId;
+            if (oldId != null && !oldId.equals(resting.venueId)) {
+                inspectGoneOrder(side, oldId);
+            }
             resting.price = price;
             resting.size = size;
             resting.sinceMs = clock.now();
@@ -1813,6 +1830,31 @@ public final class QuoteLoop implements Runnable {
         }
     }
 
+    /**
+     * Сколько по каждой заявке уже записано. Ключ живёт до вытеснения.
+     *
+     * <h2>Зачем помнить</h2>
+     *
+     * {@code filled_quantity} площадки НАКОПИТЕЛЬНЫЙ, а спрашиваем мы его не
+     * один раз: заявка может исполниться частично, потом ещё, и только потом
+     * исчезнуть. Записывать надо РАЗНИЦУ, иначе первый объём попадёт в журнал
+     * дважды.
+     *
+     * Это не теория: 08.09.2026 в живом журнале бота D нашлось исполнение ADA,
+     * записанное дважды (тот же {@code venue_id}, 10 с спустя, 4.5981 оба раза).
+     * Поймано сверкой суммы записей с фактическим изменением остатка на счёте —
+     * BTC и ETH сошлись до знака, ADA разошлась ровно на лот. Инвентарь бота от
+     * такой записи смещается навсегда.
+     */
+    private final java.util.Map<String, Double> bookedByOrder =
+            new java.util.LinkedHashMap<>() {
+                @Override
+                protected boolean removeEldestEntry(
+                        java.util.Map.Entry<String, Double> eldest) {
+                    return size() > 512;
+                }
+            };
+
     private void adopt(Side side, Resting resting, ActiveOrder keep, String why) {
         if (keep == null) {
             boolean fresh = clock.now() - resting.sinceMs < ADOPT_GRACE_MS;
@@ -1823,19 +1865,42 @@ public final class QuoteLoop implements Runnable {
             }
             return;
         }
-        if (!keep.id().equals(resting.venueId)) {
-            log.warn("усыновляю заявку {} {} по {} ({})", side, keep.id(), keep.price(), why);
-            journal.event("adopt", side + " " + keep.id() + " по " + fmt(keep.price())
-                    + " (" + why + ")");
-            resting.venueId = keep.id();
-            resting.price = keep.price();
-            resting.size = keep.size();
-            resting.sinceMs = clock.now();
-            // Наследник найден — значит предыдущий отказ был мнимым, и держать
-            // за него паузу не за что.
-            resting.failures = 0;
-            resting.blockedUntilMs = 0;
+        if (keep.id().equals(resting.venueId)) {
+            // ⚠️ ЗАЯВКА НА МЕСТЕ, НО ПОХУДЕЛА — значит её частично исполнили.
+            //
+            // Единственный путь, которым бот узнаёт о сделке, — исчезнувшая
+            // заявка. Частично исполненная не исчезает: она остаётся в книге с
+            // меньшим leaves_quantity, бот её ЗАМЕНЯЕТ, наследник получает новый
+            // идентификатор, и запись об исполнении не появляется нигде.
+            //
+            // При лоте $1 этого не случается вовсе — все 390 живых сделок за
+            // сутки ровно в один лот, принты крупнее нашей заявки. Но на стенде
+            // с лотом $3 так терялось 33% объёма (08.09.2026), и при переходе
+            // на крупный лот боевой бот начал бы терять сделки молча.
+            if (keep.size() < resting.size - 1e-12) {
+                inspectGoneOrder(side, resting.venueId);
+                resting.size = keep.size();
+            }
+            return;
         }
+        // ⚠️ Прежний хозяин слота уходит вместе со своим идентификатором, и
+        // спросить о нём после усыновления будет уже некому. Спрашиваем сейчас:
+        // если он исполнился, запись должна появиться. Повторного счёта нет —
+        // {@link #bookedByOrder} помнит, сколько по нему уже записано.
+        if (resting.venueId != null) {
+            inspectGoneOrder(side, resting.venueId);
+        }
+        log.warn("усыновляю заявку {} {} по {} ({})", side, keep.id(), keep.price(), why);
+        journal.event("adopt", side + " " + keep.id() + " по " + fmt(keep.price())
+                + " (" + why + ")");
+        resting.venueId = keep.id();
+        resting.price = keep.price();
+        resting.size = keep.size();
+        resting.sinceMs = clock.now();
+        // Наследник найден — значит предыдущий отказ был мнимым, и держать
+        // за него паузу не за что.
+        resting.failures = 0;
+        resting.blockedUntilMs = 0;
     }
 
     private void cancelStray(ActiveOrder order, String why) {
@@ -1864,12 +1929,17 @@ public final class QuoteLoop implements Runnable {
             return;
         }
         String status = field(order.body(), "status");
-        double filled = number(order.body(), "filled_quantity");
+        double total = number(order.body(), "filled_quantity");
         double price = number(order.body(), "average_fill_price");
         double fee = number(order.body(), "total_fee");
         String feeCurrency = field(order.body(), "fee_currency");
 
-        if (filled > 0) {
+        // ⚠️ filled_quantity НАКОПИТЕЛЬНЫЙ, а спрашиваем мы не по разу: заявку
+        // проверяют и при частичном исполнении, и при усыновлении наследника, и
+        // когда она исчезла. Записывать надо разницу — см. bookedByOrder.
+        double filled = total - bookedByOrder.getOrDefault(venueId, 0.0);
+        if (filled > 1e-12) {
+            bookedByOrder.put(venueId, total);
             fills++;
             totalFilledNotional += filled * price;
             journal.fill(venueId, side.name(), filled, price, lastFair, fee, feeCurrency, status);

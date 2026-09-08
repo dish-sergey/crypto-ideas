@@ -111,7 +111,7 @@ public final class PairSweep {
                            int levels, double levelStepBp, boolean innerFirst,
                            double[] offsetsBp) {
         run(standDbPath, cfg, fromIso, toIso, levels, levelStepBp, innerFirst, offsetsBp,
-                null, new double[]{1}, 1, 0);
+                null, new double[]{1}, 1, 0, 0);
     }
 
     /**
@@ -130,7 +130,7 @@ public final class PairSweep {
     public static void run(String standDbPath, RevxConfig cfg, String fromIso, String toIso,
                            int levels, double levelStepBp, boolean innerFirst,
                            double[] offsetsBp, java.util.Set<String> only, double[] lotsUsd,
-                           int thin, double dynK) {
+                           int thin, double dynK, double capUsd) {
         long from = java.time.Instant.parse(fromIso).toEpochMilli();
         long to = java.time.Instant.parse(toIso).toEpochMilli();
         FairPrice.Limits limits = new FairPrice.Limits(cfg.fairMinPairs(),
@@ -193,7 +193,7 @@ public final class PairSweep {
                         try {
                             oneDay(standDbPath, cfg, fair, base, symbol, ps, label, day,
                                     levels, levelStepBp, innerFirst, offsetsBp, lotsUsd, thin, dynK,
-                                    grid);
+                                    capUsd, grid);
                         } catch (Exception e) {
                             log.warn("{} {}: прогон не прошёл — {}", label, symbol, e.toString());
                         }
@@ -217,7 +217,7 @@ public final class PairSweep {
                                String base, String symbol, StandReader.PairSpec ps,
                                String label, long dayStart, int levels, double levelStepBp,
                                boolean innerFirst, double[] offsetsBp, double[] lotsUsd, int thin,
-                               double dynK,
+                               double dynK, double capUsd,
                                Map<String, Map<Variant, Cell>> grid) throws Exception {
         List<ReplayFair.Tick> ticks = fair.toTicks(base);
         // ⚠️ ПРОРЕЖИВАНИЕ. Оставляем каждый N-й тик, чтобы измерить цену
@@ -251,7 +251,17 @@ public final class PairSweep {
                 ? Math.max(ps.baseStep(),
                         Math.round(lotUsd / price / ps.baseStep()) * ps.baseStep())
                 : lotUsd / price;
-        double cap = lot * 20;
+        // ⚠️ Потолок инвентаря по умолчанию идёт ЗА лотом (двадцать лотов), и это
+        // верно, когда меряют ёмкость: с лотом растёт и вложенный капитал. Но при
+        // сравнении ФОРМЫ сетки — один уровень по $3 против трёх по $1 — тот же
+        // порядок дал бы одноуровневой втрое больший потолок, и сравнивалась бы не
+        // форма, а размер позиции. --cap-usd держит потолок постоянным.
+        double cap = capUsd > 0
+                ? (ps.baseStep() > 0
+                        ? Math.max(ps.baseStep(),
+                                Math.round(capUsd / price / ps.baseStep()) * ps.baseStep())
+                        : capUsd / price)
+                : lot * 20;
 
         var bp = new BootParams(symbol, "a", lot, cap, offsetsBp[0] / 10_000,
                 cfg.simSkewK(), 0.3, 1000, ps.minNotional(), ps.baseStep(),

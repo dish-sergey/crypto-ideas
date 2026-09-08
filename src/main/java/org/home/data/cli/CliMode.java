@@ -47,7 +47,7 @@ public class CliMode {
     private static final Set<String> PARAMS = Set.of(
             "symbol", "symbols", "hours", "from", "to", "interval",
             "out", "table", "bucket-seconds", "days", "edge", "up", "down", "flat",
-            "journal", "offset", "model", "offsets", "share-cap", "levels", "level-step", "size-mult", "outer-first", "inner-first", "lots", "thin", "dyn-offset", "from-dir");
+            "journal", "offset", "model", "offsets", "share-cap", "levels", "level-step", "size-mult", "outer-first", "inner-first", "lots", "thin", "dyn-offset", "cap-usd", "from-dir");
 
     private final boolean scheduleMode;
     private final Set<String> unknownOptions;
