@@ -68,11 +68,34 @@ public final class Modules {
         String layoutName = parts[0];
         String placerName = parts.length > 1 ? parts[1] : "real";
 
+        // «v2:30» — шаг сетки 30% отступа; «v2:30x2» — то же, но не ближе двух
+        // тиков друг к другу. Пол по тикам нужен, потому что доля отступа бывает
+        // мельче шага цены: у ENA тик 6.01 б.п., и 20% от отступа в 26 — это
+        // 5.2 б.п., то есть три уровня лягут на одну цену.
+        double stepPct = 0.3;
+        int minTicks = 1;
+        if (layoutName.startsWith("v2:") || layoutName.startsWith("v3:")) {
+            String kind = layoutName.substring(0, 2);
+            String spec2 = layoutName.substring(3);
+            int x = spec2.indexOf('x');
+            if (x > 0) {
+                minTicks = Integer.parseInt(spec2.substring(x + 1));
+                spec2 = spec2.substring(0, x);
+            }
+            stepPct = Integer.parseInt(spec2) / 100.0;
+            layoutName = kind;
+        }
+        final double pct = stepPct;
+        final int ticks = minTicks;
         OrderLayout layout = switch (layoutName) {
             case "v1" -> new LayoutV1(params, policy, levels, levelStep, innerFirst,
                     spreadToK, spreadMaxPct, budgetWiden);
-            default -> throw new IllegalArgumentException(
-                    "неизвестная расстановка: " + layoutName + " (есть: v1)");
+            case "v2" -> new LayoutV2(params, policy, levels, pct, ticks, innerFirst,
+                    spreadToK, spreadMaxPct, budgetWiden);
+            case "v3" -> new LayoutV3(params, policy, levels, pct, ticks, innerFirst,
+                    spreadToK, spreadMaxPct, budgetWiden);
+            default -> throw new IllegalArgumentException("неизвестная расстановка: "
+                    + layoutName + " (есть: v1, v2:N[xM], v3:N[xM])");
         };
         // «real:3» — три замены за тик. Число нужно затем, что потолок в одну
         // замену и есть главное ограничение: при периоде тика в секунду шесть
