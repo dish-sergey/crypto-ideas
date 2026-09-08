@@ -82,7 +82,7 @@ public final class RateLimitedPlacer implements Placer {
      */
     @Override
     public List<Action> plan(List<DesiredOrder> desired, List<RestingOrder> resting, long nowMs) {
-        RestingOrder winner = pickWinner(desired, resting, nowMs);
+        var winners = pickWinners(desired, resting, nowMs);
         List<Action> plan = new ArrayList<>();
         for (RestingOrder r : resting) {
             DesiredOrder want = find(desired, r.side(), r.level());
@@ -100,12 +100,57 @@ public final class RateLimitedPlacer implements Placer {
                 // действия выполняются подряд и каждое видит остаток средств
                 // после предыдущего.
                 plan.add(Action.place(want.side(), want.level(), want.price(), want.size()));
-            } else if (r == winner) {
+            } else if (winners.contains(r)) {
                 plan.add(Action.replace(want.side(), want.level(),
                         want.price(), want.size(), r.venueId()));
             }
         }
         return plan;
+    }
+
+    /**
+     * Кому достанутся замены: по уровням снизу вверх, самым отставшим.
+     *
+     * При потолке в одну заявку это ровно прежнее поведение. При большем —
+     * отбираются {@code replacesPerTick} слотов с наибольшим расхождением, и
+     * порядок обхода при равенстве по-прежнему решает спор в пользу уровня
+     * ближе к рынку.
+     */
+    private java.util.Set<RestingOrder> pickWinners(List<DesiredOrder> desired,
+                                                    List<RestingOrder> resting, long nowMs) {
+        record Candidate(RestingOrder slot, double divergence, int order) { }
+        List<Candidate> candidates = new ArrayList<>();
+        List<RestingOrder> byLevel = new ArrayList<>(resting);
+        byLevel.sort((x, y) -> x.level() != y.level()
+                ? Integer.compare(x.level(), y.level())
+                : Integer.compare(order(x.side()), order(y.side())));
+        int n = 0;
+        for (RestingOrder r : byLevel) {
+            if (r.empty() || nowMs < r.blockedTill() || !(r.price() > 0)) {
+                n++;
+                continue;
+            }
+            DesiredOrder want = find(desired, r.side(), r.level());
+            if (want == null) {
+                n++;
+                continue;
+            }
+            double divergence = Math.abs(want.price() - r.price()) / r.price();
+            if (divergence > requoteThreshold) {
+                candidates.add(new Candidate(r, divergence, n));
+            }
+            n++;
+        }
+        // По убыванию расхождения; при равенстве — кто встретился раньше.
+        candidates.sort((x, y) -> x.divergence() != y.divergence()
+                ? Double.compare(y.divergence(), x.divergence())
+                : Integer.compare(x.order(), y.order()));
+        var winners = java.util.Collections.newSetFromMap(
+                new java.util.IdentityHashMap<RestingOrder, Boolean>());
+        for (int i = 0; i < Math.min(replacesPerTick, candidates.size()); i++) {
+            winners.add(candidates.get(i).slot());
+        }
+        return winners;
     }
 
     /** Кому достанется единственная замена: по уровням снизу вверх, строго больше. */

@@ -74,11 +74,20 @@ public final class Modules {
             default -> throw new IllegalArgumentException(
                     "неизвестная расстановка: " + layoutName + " (есть: v1)");
         };
+        // «real:3» — три замены за тик. Число нужно затем, что потолок в одну
+        // замену и есть главное ограничение: при периоде тика в секунду шесть
+        // слотов физически не обновляются чаще раза в шесть секунд, а замер по
+        // суткам ADA дал 11-21 секунду на слот при цели, считаемой ежесекундно.
+        int perTick = 1;
+        if (placerName.startsWith("real:")) {
+            perTick = Integer.parseInt(placerName.substring(5));
+            placerName = "real";
+        }
         Placer placer = switch (placerName) {
-            case "real" -> new RateLimitedPlacer(params.requoteThreshold());
+            case "real" -> new RateLimitedPlacer(perTick, params.requoteThreshold());
             case "instant" -> new InstantPlacer(params.requoteThreshold());
             default -> throw new IllegalArgumentException(
-                    "неизвестное приведение: " + placerName + " (есть: real, instant)");
+                    "неизвестное приведение: " + placerName + " (есть: real, real:N, instant)");
         };
         return new Choice(layout, placer);
     }
