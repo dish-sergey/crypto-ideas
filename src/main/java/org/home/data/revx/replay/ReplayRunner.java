@@ -160,7 +160,7 @@ public final class ReplayRunner {
         clock.followSchedule(ticks.stream().mapToLong(ReplayFair.Tick::tsMs).toArray());
         ReplayFair fair = new ReplayFair(ticks, clock);
         SimVenue venue = new SimVenue(clock, model, symbol,
-                ticks.get(0).inventory(), quoteStart);
+                ticks.get(0).inventory(), quoteStart, minNotional);
 
         // Журнал и реестр — во временных файлах: повтор не имеет права трогать
         // ни живой журнал, ни общий реестр владения.

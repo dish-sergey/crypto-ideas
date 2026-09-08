@@ -142,6 +142,78 @@ class FillModelTest {
     }
 
     @Test
+    void tradeAtABetterPriceEatsOurQueue() {
+        // Наша покупка на 98 — третий уровень книги, впереди 3000 чужих лотов.
+        // Дальше проходят два принта: на 99 (до нас не доходит, но очередь
+        // выбирает) и на 98 в один лот. Второй обязан нас исполнить: 3000
+        // впереди уже выбраны первым.
+        //
+        // До 08.09.2026 очередь уменьшали ТОЛЬКО сделки, дошедшие до нашей цены,
+        // то есть выбрать её было некому: она держалась вечно, и модель
+        // отказывала в сделке, требуя выбрать очередь, которую только что съел
+        // сам принт.
+        FillModel.Resting deep = new FillModel.Resting("deep", true, 98, LOT, 0);
+        MarketFillModel m = new MarketFillModel(market(List.of(
+                new MarketTrade(1000, 99.0, 3000, Side.SELL),
+                new MarketTrade(1500, 98.0, LOT, Side.SELL))));
+        m.placed(deep);
+        m.advance(0, List.of(deep));
+
+        assertEquals(1, m.advance(2000, List.of(deep)).size(),
+                "сделка по цене лучше нашей обязана выбирать нашу очередь");
+    }
+
+    @Test
+    void aPrintThatReachedUsProvesTheBetterLevelsAreGone() {
+        // Наша покупка на 98 — впереди 2000 лотов на 100 и 99. Единственный
+        // принт идёт СКВОЗЬ нас, по 97.5, объёмом в один лот.
+        //
+        // Требовать здесь выбрать 3000 лотов бессмысленно: раз агрессор продал
+        // ниже нашей цены, всё, что стояло выше, к этому моменту уже выбрано или
+        // снято — иначе он бы туда не добрался. Впереди осталось не больше того,
+        // что стоит на НАШЕМ уровне.
+        FillModel.Resting deep = new FillModel.Resting("deep", true, 98, LOT, 0);
+        MarketFillModel m = new MarketFillModel(market(List.of(
+                new MarketTrade(1000, 97.5, LOT, Side.SELL))));
+        m.placed(deep);
+        m.advance(0, List.of(deep));
+
+        assertTrue(m.advance(2000, List.of(deep)).isEmpty(),
+                "на нашем уровне стоит 1000 чужих лотов — принт в один лот их не выбирает");
+
+        // А на цене, где чужого нет вовсе (внутри спреда), тот же принт исполняет.
+        FillModel.Resting inner = new FillModel.Resting("inner", true, 101, LOT, 0);
+        MarketFillModel m2 = new MarketFillModel(market(List.of(
+                new MarketTrade(1000, 97.5, LOT, Side.SELL))));
+        m2.placed(inner);
+        m2.advance(0, List.of(inner));
+        assertEquals(1, m2.advance(2000, List.of(inner)).size(),
+                "на своей цене мы одни — принт сквозь нас обязан исполнить");
+    }
+
+    @Test
+    void orderBecomesVisibleWhenThePriceComesToIt() {
+        // Заявка на 97 — ниже пятого видимого уровня в первой книге, но во
+        // второй рынок опустился, и она внутри. Видимость обязана
+        // пересматриваться: заявка становится видимой не оттого, что мы
+        // что-то сделали, а оттого, что цена пришла к ней.
+        BookView low = new BookView(
+                List.of(new BookView.Level(97, 0.5), new BookView.Level(96, 1000)),
+                List.of(new BookView.Level(98, 1000)));
+        MarketData md = MarketData.of(
+                List.of(new MarketTrade(1500, 97.0, 10, Side.SELL)),
+                new long[]{0, 1000}, List.of(book(), low));
+
+        FillModel.Resting far = new FillModel.Resting("far", true, 97, LOT, 0);
+        MarketFillModel m = new MarketFillModel(md);
+        m.placed(far);                     // при постановке 97 вне видимой книги
+        m.advance(0, List.of(far));
+
+        assertEquals(1, m.advance(2000, List.of(far)).size(),
+                "рынок опустился к заявке — она видима и обязана исполниться");
+    }
+
+    @Test
     void orderOutsideTheVisibleBookNeverFills() {
         // Ниже пятого видимого уровня: ни объёма перед нами, ни факта торговли
         // мы не знаем (ТЗ §4.6 п.7).

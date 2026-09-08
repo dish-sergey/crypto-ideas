@@ -71,6 +71,16 @@ public final class SimVenue implements Venue {
     private long cancels;
     private long applied;
     private long replaceRejects;
+    /** Объём, реально исполненный площадкой, и объём, о котором бот не узнал. */
+    private double filledBase;
+    private long filledOrders;
+    private double unreadBase;
+    private long unreadOrders;
+    /** По каким заявкам бот прочитал {@code filled_quantity}. */
+    private final java.util.Set<String> inspected = new java.util.HashSet<>();
+    /** Как заявка ушла из книги: исполнением, заменой или отменой. */
+    private final Map<String, String> gone = new LinkedHashMap<>();
+    private final double minNotional;
     /** Сколько раз площадку спросили и сколько из них заявка на стороне СТОЯЛА. */
     private long probes;
     private long bidPresent;
@@ -84,12 +94,23 @@ public final class SimVenue implements Venue {
 
     public SimVenue(Clock clock, FillModel model, String symbol,
                     double baseStart, double quoteStart) {
+        this(clock, model, symbol, baseStart, quoteStart, 0);
+    }
+
+    /**
+     * @param minNotional минимальная заявка площадки в котируемой валюте
+     *                    (Revolut X: 0.1 USDC). Остаток частичного исполнения
+     *                    мельче этого в книге не живёт — см. {@link #apply}
+     */
+    public SimVenue(Clock clock, FillModel model, String symbol,
+                    double baseStart, double quoteStart, double minNotional) {
         this.clock = clock;
         this.model = model;
         this.base = symbol.substring(0, symbol.indexOf('/'));
         this.quote = symbol.substring(symbol.indexOf('/') + 1);
         this.baseTotal = baseStart;
         this.quoteTotal = quoteStart;
+        this.minNotional = minNotional;
     }
 
     public long placements() {
@@ -111,6 +132,39 @@ public final class SimVenue implements Venue {
 
     public long appliedFills() {
         return applied;
+    }
+
+    /**
+     * Сколько исполненного объёма бот НЕ УВИДЕЛ.
+     *
+     * Бот узнаёт об исполнении единственным способом — заметив, что заявка ушла
+     * из {@code /orders/active}, и прочитав по ней {@code filled_quantity}
+     * ({@code QuoteLoop.inspectGoneOrder}). Значит любое исполнение по заявке,
+     * которая ушла из книги ИНАЧЕ — заменой или отменой, — до бота не доходит
+     * вовсе, и в его P&L, инвентаре и статистике его нет.
+     *
+     * Число нужно рядом с {@link #appliedFills()}: без него «площадка исполнила
+     * 137, бот заметил 52» невозможно разложить на «модель считает исполнения
+     * событиями, а бот — заявками» и на настоящую потерю.
+     */
+    public synchronized String fillDiag() {
+        // Считается НА КОНЕЦ прогона, а не в момент ухода заявки из книги: после
+        // отказа замены (422) бот ещё сверяется с /orders/active и дочитывает
+        // filled_quantity, так что «не увидел» выясняется только в конце.
+        unreadBase = 0;
+        unreadOrders = 0;
+        Map<String, Long> why = new LinkedHashMap<>();
+        for (var e : done.entrySet()) {
+            if (!inspected.contains(e.getKey())) {
+                unreadBase += e.getValue()[0];
+                unreadOrders++;
+                why.merge(gone.getOrDefault(e.getKey(), "осталась в книге"), 1L, Long::sum);
+            }
+        }
+        return String.format(java.util.Locale.ROOT,
+                "исполнено %.8g по %d заявкам; бот не увидел %.8g по %d (%.0f%% объёма); ушли %s",
+                filledBase, filledOrders, unreadBase, unreadOrders,
+                filledBase > 0 ? 100 * unreadBase / filledBase : 0, why);
     }
 
     public FillModel model() {
@@ -162,12 +216,34 @@ public final class SimVenue implements Venue {
         // него нет. Площадка, отвечающая на исчезнувшую заявку нулём, оставляет
         // бота с нулевым инвентарём навсегда — первый прогон разошёлся с живым
         // ровно здесь, на 383-м тике.
-        double[] acc = done.computeIfAbsent(hit.id, k -> new double[2]);
+        double[] acc = done.get(hit.id);
+        if (acc == null) {
+            acc = new double[2];
+            done.put(hit.id, acc);
+            filledOrders++;
+        }
+        filledBase += qty;
         acc[0] += qty;
         acc[1] += qty * f.price();
         hit.size -= qty;
-        if (hit.size <= 1e-12) {
+        // ⚠️ ОСТАТОК МЕЛЬЧЕ МИНИМАЛЬНОЙ ЗАЯВКИ считается исполнением до конца.
+        //
+        // Без этого правила стенд терял 40% исполнений — и не в модели, а в
+        // учёте. Разбор 08.09.2026 на BTC: заявка стенда 0.00001269, а принт,
+        // который её берёт, — ровно 0.00001255, наш же ЖИВОЙ лот, вернувшийся
+        // на ленту. Лоты отличаются на 1%, и после исполнения оставалась пыль
+        // в 0.00000014 (около одного цента). Заявка с такой пылью оставалась в
+        // книге, бот её заменял, а вместе с ней исчезала и запись об
+        // исполнении: узнать о сделке он может ТОЛЬКО по исчезнувшей заявке
+        // ({@code QuoteLoop.inspectGoneOrder}), и заменённая заявка этот путь
+        // обходит. Живьём такого не бывает вовсе — все 346 сделок за сутки
+        // ровно в один лот, — то есть пыль была целиком артефактом стенда.
+        //
+        // Порог — минимальная заявка площадки (0.1 USDC): остаток мельче неё
+        // самостоятельной заявкой быть не может.
+        if (hit.size <= 1e-12 || hit.size * f.price() < minNotional) {
             live.remove(hit.id);
+            gone.put(hit.id, "исполнением");
             model.cancelled(hit.id);
         }
     }
@@ -225,6 +301,9 @@ public final class SimVenue implements Venue {
     public synchronized Response order(String id) {
         advance();
         double[] acc = done.get(id);
+        if (acc != null) {
+            inspected.add(id);
+        }
         double filled = acc == null ? 0 : acc[0];
         double avg = filled > 0 ? acc[1] / filled : 0;
         Order o = live.get(id);
@@ -265,6 +344,9 @@ public final class SimVenue implements Venue {
     public synchronized Response replace(String id, String json) {
         advance();
         Order old = live.remove(id);
+        if (old != null) {
+            gone.put(id, "заменой");
+        }
         if (old == null) {
             // Та самая 422 из док. 111. Проверено зондом 04.09.2026: наследника
             // площадка при этом НЕ создаёт, книга не растёт.
@@ -303,6 +385,7 @@ public final class SimVenue implements Venue {
         advance();
         cancels++;
         if (live.remove(id) == null) {
+            gone.putIfAbsent(id, "отменой");
             return new Response(404, "{\"message\":\"not found\"}", 0);
         }
         model.cancelled(id);

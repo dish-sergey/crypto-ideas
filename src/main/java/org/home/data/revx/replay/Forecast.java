@@ -104,7 +104,7 @@ public final class Forecast {
         double quoteStart = bots.stream().mapToDouble(BotSpec::inventoryCap).sum()
                 * ticks.get(0).fair() * 1.2;
         SimVenue venue = new SimVenue(clock, model, base.symbol(),
-                ticks.get(0).inventory(), quoteStart);
+                ticks.get(0).inventory(), quoteStart, base.minNotional());
 
         Path dir = Files.createTempDirectory("revx-forecast");
         List<ExecJournal> journals = new ArrayList<>();
@@ -205,6 +205,7 @@ public final class Forecast {
 
             log.warn("площадка исполнила заявок: {} (это НЕ то же, что заметил бот)",
                     venue.appliedFills());
+            log.warn("объём: {}", venue.fillDiag());
             log.warn("присутствие в книге: {}", venue.presence());
             // ⚠️ Почему исполнений мало — вопрос, на который до 08.09.2026 нечем
             // было ответить: модель считала пропуски, но никуда их не выводила.
@@ -214,6 +215,7 @@ public final class Forecast {
                 log.warn("модель исполнения: очередью {}, перехватом {}, "
                                 + "ПРОПУЩЕНО из-за невидимости {}",
                         m.queueFills(), m.interceptFills(), m.invisibleSkips());
+                log.warn("{}", m.queueBlockStats());
             }
             for (QuoteLoop l : loops) {
                 log.warn("по уровням, бот {}:%n{}", l.botId(), l.levelPresence());

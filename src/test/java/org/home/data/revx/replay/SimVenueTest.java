@@ -142,6 +142,52 @@ class SimVenueTest {
     }
 
     @Test
+    void dustLeftByAPartialFillDoesNotKeepTheOrderAlive() {
+        // Заявка на 0.0001 BTC по 50000 ($5). Исполняется 0.000099 — остаётся
+        // пыль на 5 центов, мельче минимальной заявки в 0.1 USDC.
+        //
+        // ⚠️ Пока такая заявка оставалась в книге, стенд ТЕРЯЛ исполнение: бот
+        // узнаёт о сделке только по исчезнувшей заявке, а эту он заменял, и
+        // вместе с ней исчезала запись. На BTC так пропадало 40% объёма
+        // (08.09.2026). Живьём частичных исполнений не бывает вовсе — все 346
+        // сделок за сутки ровно в один лот, — то есть пыль была артефактом.
+        SimVenue v = new SimVenue(new SimClock(0), new Partial(0.000099, 50000),
+                "BTC/USDC", 0.001, 100, 0.1);
+        String orderId = id(v.place(buy("50000", "0.0001")));
+
+        assertTrue(ActiveOrder.parse(v.activeOrders().body()).isEmpty(),
+                "заявка с пылью мельче минимальной обязана уйти из книги");
+        assertTrue(v.order(orderId).body().contains("\"filled_quantity\":\"0.000099\""),
+                "и её исполнение обязано быть читаемым: " + v.order(orderId).body());
+    }
+
+    /** Модель, исполняющая ровно один раз заданный объём. */
+    private static final class Partial implements FillModel {
+        private final double qty;
+        private final double price;
+        private boolean done;
+
+        Partial(double qty, double price) {
+            this.qty = qty;
+            this.price = price;
+        }
+
+        @Override
+        public List<Filled> advance(long nowMs, List<Resting> resting) {
+            if (done || resting.isEmpty()) {
+                return List.of();
+            }
+            done = true;
+            return List.of(new Filled(resting.get(0).id(), qty, price));
+        }
+
+        @Override
+        public String describe() {
+            return "одно частичное исполнение";
+        }
+    }
+
+    @Test
     void numbersNeverComeOutInScientificNotation() {
         // Регулярка остатков принимает только [0-9.]+ — экспонента ей не по зубам,
         // и бот решит, что остатка нет вовсе. Лот BTC как раз 1.25E-5.

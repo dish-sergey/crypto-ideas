@@ -93,12 +93,16 @@ public final class MarketFillModel implements FillModel {
      */
     private final double decayPerSecond;
 
+
     private final MarketData market;
     private final Map<String, Queue> queues = new HashMap<>();
     private long lastMs = Long.MIN_VALUE;
     private long interceptFills;
     private long queueFills;
     private long invisibleSkips;
+    /** Цена нас достала, но очередь не выбрана: сколько раз и во сколько раз она была больше сделки. */
+    private long queueBlocks;
+    private final List<Double> queueBlockRatio = new ArrayList<>();
 
     public MarketFillModel(MarketData market) {
         this(market, Double.parseDouble(System.getProperty("revx.queue.decay", "0")));
@@ -122,6 +126,47 @@ public final class MarketFillModel implements FillModel {
      *
      * @return −1, если книги нет и судить не по чему
      */
+    /**
+     * Видна ли заявка в ЭТОЙ книге: лучше лучшей цены или внутри пяти уровней.
+     *
+     * ⚠️ Вопрос обязан задаваться заново на каждом тике, по той же причине, что
+     * и вопрос про очередь: заявка становится видимой не потому, что мы
+     * что-то сделали, а потому что ЦЕНА ПРИХОДИТ К НЕЙ. Пока видимость
+     * вычислялась один раз при постановке, заявка, поставленная в семи
+     * базисных пунктах от рынка, оставалась «слепой» навсегда — включая тот
+     * момент, когда рынок опускался и она становилась лучшим бидом.
+     *
+     * @return {@code null}, если книги нет и судить не по чему
+     */
+    private static Boolean visibleInBook(BookView book, boolean buy, double price) {
+        if (book == null || book.empty()) {
+            return null;
+        }
+        Side side = buy ? Side.BUY : Side.SELL;
+        double best = buy ? book.bestBid() : book.bestAsk();
+        double deepest = book.deepestVisible(side);
+        boolean better = buy ? price > best : price < best;
+        boolean inside = buy ? price >= deepest : price <= deepest;
+        return better || inside;
+    }
+
+    /**
+     * Сколько объёма стоит перед нашей ценой в ЭТОЙ книге.
+     *
+     * ⚠️ Своё из очереди НЕ вычитается, хотя стоило бы. Снимки книги сняты с
+     * площадки, пока на ней работал живой бот, и его собственные заявки в них
+     * есть: на 337 живых исполнениях медианная доля нашего объёма на уровне
+     * нашей цены — 100% на всех шести парах, то есть уровень обычно наш
+     * целиком, а модель принимает его за чужую очередь. Вычитание пробовали
+     * 08.09.2026 и убрали: заявка стенда стоит на своей округлённой цене, а не
+     * на цене живого двойника, поэтому вычитать нечего — эффект оказался
+     * нулевым (BTC 90→90, ADA 58→58). Правило, ослабляющее осторожность модели
+     * без выигрыша, не оставляем.
+     */
+    private Queue q(Resting r) {
+        return queues.get(r.id());
+    }
+
     private static double aheadInBook(BookView book, boolean buy, double price) {
         if (book == null || book.empty()) {
             return -1;
@@ -147,6 +192,25 @@ public final class MarketFillModel implements FillModel {
     /** Сколько раз заявка стояла вне видимой части и потому исполниться не могла. */
     public long invisibleSkips() {
         return invisibleSkips;
+    }
+
+    /**
+     * Сколько раз цена дошла до заявки, но очередь перед ней не была выбрана.
+     *
+     * Рядом с {@link #queueFills()} и {@link #interceptFills()} это отвечает на
+     * единственный вопрос, который при расхождении с живым и надо задавать:
+     * модель не даёт сделку потому, что цена до нас не дошла, или потому, что
+     * дошла, а мы посчитали очередь непроходимой?
+     */
+    public String queueBlockStats() {
+        if (queueBlocks == 0) {
+            return "очередь не блокировала ни разу";
+        }
+        List<Double> sorted = new ArrayList<>(queueBlockRatio);
+        java.util.Collections.sort(sorted);
+        return String.format(java.util.Locale.ROOT,
+                "очередь заблокировала %d раз, медиана «очередь / сделка» = %.1f",
+                queueBlocks, sorted.get(sorted.size() / 2));
     }
 
     @Override
@@ -223,6 +287,26 @@ public final class MarketFillModel implements FillModel {
                 boolean reached = r.buy() ? t.price() <= r.price() : t.price() >= r.price();
                 if (reached && left.getOrDefault(r.id(), 0.0) > 1e-15) {
                     queueAtTrade.add(r);
+                    continue;
+                }
+                // ⚠️ СДЕЛКА ПО ЦЕНЕ ЛУЧШЕ НАШЕЙ ВЫБИРАЕТ НАШУ ОЧЕРЕДЬ.
+                //
+                // До 08.09.2026 модель уменьшала очередь только сделками,
+                // которые до нас ДОШЛИ, — то есть теми, что стоят на нашей цене
+                // или за ней. Но очередь перед нашим бидом состоит именно из
+                // заявок ПО ЛУЧШЕЙ цене, и съедают её ровно те сделки, которые
+                // до нас не дошли. Получалось, что модель ждала, пока очередь
+                // выберет тот, кто до неё не дотягивается.
+                //
+                // Отсюда и вздорные числа диагностики: там, где модель
+                // отказывала в сделке, очередь была в среднем в 300-700 раз
+                // больше самой сделки (BTC 306, ADA 736, ETH 212) — она просто
+                // никогда не уменьшалась. Живьём те же заявки исполнялись.
+                if (!reached && q(r) != null) {
+                    Queue qq = q(r);
+                    if (qq.ahead > 0) {
+                        qq.ahead = Math.max(0, qq.ahead - t.qty());
+                    }
                 }
             }
             // Приоритет цены: лучший бид (выше) и лучший аск (ниже) исполняются
@@ -240,7 +324,9 @@ public final class MarketFillModel implements FillModel {
                 if (q == null) {
                     continue;
                 }
-                if (!q.visible) {
+                BookView bookNow = market.bookAt(t.tsMs());
+                Boolean visibleNow = visibleInBook(bookNow, r.buy(), r.price());
+                if (!(visibleNow == null ? q.visible : visibleNow)) {
                     invisibleSkips++;
                     continue;
                 }
@@ -274,7 +360,22 @@ public final class MarketFillModel implements FillModel {
                 // Берём МИНИМУМ, а не подстановку: приоритет на своём уровне мы
                 // при перестановке действительно теряем, и обнулять очередь
                 // нельзя. Но и держать 3385, когда впереди 9, — неправда.
-                double aheadNow = aheadInBook(market.bookAt(t.tsMs()), r.buy(), r.price());
+                //
+                // ⚠️ И ещё одно, что следует из самого принта, а не из
+                // допущения. Раз сделка прошла ПО НАШЕЙ ЦЕНЕ ИЛИ ЗА НЕЙ, значит
+                // агрессор дошёл до нашего уровня, а всё, что стояло по цене
+                // лучше, к этому моменту уже выбрано или снято — иначе он бы
+                // туда и не добрался. Значит впереди нас осталось не больше
+                // того, что стоит на НАШЕМ уровне, и накопленную сумму по
+                // верхним уровням держать нельзя.
+                //
+                // Без этого правила модель отказывала в сделке, требуя выбрать
+                // очередь, которую только что выбрал сам принт: в отказах
+                // очередь была больше сделки в 306 раз на BTC, 736 на ADA и 212
+                // на ETH (замер 08.09.2026).
+                double aheadNow = bookNow == null || bookNow.empty() ? -1
+                        : bookNow.qtyAt(r.buy() ? Side.BUY : Side.SELL, r.price(),
+                                Math.abs(r.price()) * 1e-9);
                 if (aheadNow >= 0) {
                     q.ahead = Math.min(q.ahead, aheadNow);
                 }
@@ -288,8 +389,13 @@ public final class MarketFillModel implements FillModel {
                     q.sinceMs = t.tsMs();
                 }
                 if (q.ahead > 0) {
+                    double before = q.ahead;
                     q.ahead -= t.qty();
                     if (q.ahead > 0) {
+                        queueBlocks++;
+                        if (queueBlockRatio.size() < 100_000) {
+                            queueBlockRatio.add(before / Math.max(1e-15, t.qty()));
+                        }
                         continue;      // до нас очередь ещё не дошла
                     }
                     q.ahead = 0;
