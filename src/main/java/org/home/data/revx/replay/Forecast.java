@@ -162,6 +162,18 @@ public final class Forecast {
                 }
                 // Потолок нужен счётчику «доля времени в потолке» — раньше его
                 // считали, перечитывая журнал.
+                // Сменные модули: расстановка и приведение книги. Пусто — встроенный
+                // путь, то есть поведение до появления модулей.
+                var mods = org.home.data.revx.layout.Modules.of(
+                        System.getProperty("revx.modules", ""), params,
+                        Executor.buildPolicy(params, base.costFloorMargin(), base.anchorLeash(),
+                                base.anchorWidening(), base.widening(), base.wideningMaxStep(),
+                                spec.size(), spec.inventoryCap(), base.quoteStep()),
+                        spec.levels(), spec.levelStep(), spec.innerFirst(),
+                        spec.dynOffsetK(), 1.0, 1.0);
+                if (!mods.builtIn()) {
+                    loop.modules(mods.layout(), mods.placer());
+                }
                 loop.statsInventoryCap(spec.inventoryCap());
                 loops.add(loop);
             }

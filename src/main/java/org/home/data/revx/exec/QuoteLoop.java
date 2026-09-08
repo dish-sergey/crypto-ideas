@@ -374,6 +374,235 @@ public final class QuoteLoop implements Runnable {
     }
 
     /**
+     * ТОЧЕЧНЫЙ СНИМОК окна тиков для сличения двух путей.
+     *
+     * След действий отвечает на вопрос «что сделали», а расхождение живёт в
+     * «почему решили так»: какой размер посчитан, сколько осталось в пуле, что
+     * лежало в слоте. Включается парой ключей
+     * {@code -Drevx.dumpFrom} / {@code -Drevx.dumpTo} в миллисекундах.
+     */
+    private static final long DUMP_FROM = Long.getLong("revx.dumpFrom", 0);
+    private static final long DUMP_TO = Long.getLong("revx.dumpTo", 0);
+
+    private boolean dumping() {
+        long now = clock.now();
+        return DUMP_TO > 0 && now >= DUMP_FROM && now <= DUMP_TO;
+    }
+
+    private void dump(String line) {
+        if (dumping()) {
+            log.warn("СНИМОК {} {}", clock.now(), line);
+        }
+    }
+
+    /**
+     * СЛЕД ДЕЙСТВИЙ для построчного сличения двух путей расчёта.
+     *
+     * Включается ключом {@code -Drevx.trace=<файл>}. Точка одна на оба пути —
+     * встроенный и модульный проходят через {@link #place}, {@link #replace} и
+     * {@link #cancel}, — поэтому следы прямо сопоставимы.
+     *
+     * ⚠️ Номер уровня обязателен. Без него видно, что цены разошлись, но не
+     * видно, КАКОЙ слот остался без заявки, а именно это и было причиной.
+     *
+     * ⚠️ Только для стенда: на живом боте это лишняя запись на горячем пути.
+     */
+    private static final String TRACE_PATH = System.getProperty("revx.trace", "");
+    private static java.io.PrintWriter traceOut;
+
+    private int levelOf(Side side, Resting r) {
+        var list = side == Side.BUY ? bids : asks;
+        for (int i = 0; i < list.size(); i++) {
+            if (list.get(i) == r) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private void trace(String kind, Side side, Resting r, double price, double size) {
+        if (TRACE_PATH.isEmpty()) {
+            return;
+        }
+        synchronized (QuoteLoop.class) {
+            try {
+                if (traceOut == null) {
+                    traceOut = new java.io.PrintWriter(
+                            new java.io.FileWriter(TRACE_PATH, true), true);
+                }
+                traceOut.printf(java.util.Locale.ROOT, "%d %s %s ур%d %.10f %.10f%n",
+                        clock.now(), kind, side, levelOf(side, r), price, size);
+            } catch (Exception ignored) {
+                // След вспомогательный: его отсутствие не повод ронять прогон.
+            }
+        }
+    }
+
+    /** Сменная расстановка; {@code null} — работает встроенный путь. */
+    private org.home.data.revx.layout.OrderLayout layout;
+
+    /** Сменный способ приведения книги; {@code null} — работает встроенный путь. */
+    private org.home.data.revx.place.Placer placer;
+
+    public void modules(org.home.data.revx.layout.OrderLayout layout,
+                        org.home.data.revx.place.Placer placer) {
+        this.layout = layout;
+        this.placer = placer;
+    }
+
+    /**
+     * Путь через сменные модули: расстановка решает «как должно быть»,
+     * приведение — «что сделать сейчас», цикл выполняет и охраняет.
+     *
+     * ⚠️ Предохранители остаются ЗДЕСЬ и проверяются заново. Расстановка о
+     * пределах знает, но соблюдение их не её забота: ТЗ §6 держит охрану в коде
+     * исполнителя, и сменная версия не должна получить возможность её обойти.
+     *
+     * ⚠️ Раздача капитала тоже здесь. Учесть возврат резерва при замене можно,
+     * только зная резерв КАЖДОГО слота, а это состояние размещения, не рынка.
+     */
+    private void applyLayout(StandReader.Fair fair) {
+        var state = new org.home.data.revx.layout.MarketState(
+                fair.price(), fair.referenceSpreadPct(), fair.bookBid(), fair.bookAsk(),
+                inventory,
+                alloc != null ? Math.max(0, alloc.own(tag.id(), quote)) : quoteBalance,
+                efficiency.open(params.driftGateEr()) ? drift() : 0,
+                budgetPressure, params.quoteStep(), dust > 0 ? dust * 2 : 0,
+                minNotional, maxOrderNotional, maxExposure);
+
+        var desired = layout.layout(state);
+        // ⚠️ Порядок обхода — часть логики: действия выполняются подряд, и
+        // каждое видит остаток средств после предыдущего.
+        var current = new java.util.ArrayList<org.home.data.revx.place.RestingOrder>();
+        for (int k = 0; k < levels; k++) {
+            int i = innerFirst ? k : levels - 1 - k;
+            current.add(restingOf(Side.BUY, i));
+            current.add(restingOf(Side.SELL, i));
+        }
+        var plan = placer.plan(desired, current, clock.now());
+        if (dumping()) {
+            dump("ХОЧУ: " + desired);
+            dump("СЛОТЫ: " + current);
+            dump("ПЛАН: " + plan);
+        }
+
+        double buyCash = alloc != null
+                ? Math.max(0, alloc.own(tag.id(), quote)) : Double.MAX_VALUE;
+        double sellPool = Math.max(0, inventory);
+        for (var r : current) {
+            Resting slot = r.side() == Side.BUY ? bids.get(r.level()) : asks.get(r.level());
+            var want = findWanted(desired, r.side(), r.level());
+            var action = findAction(plan, r.side(), r.level());
+            double pool = r.side() == Side.BUY
+                    ? (want != null && want.price() > 0 ? buyCash / want.price() : 0)
+                    : sellPool;
+            dump(String.format(java.util.Locale.ROOT,
+                    "МОД %s ур%d: слот=%s цена=%.8f размер=%.6f | хочу=%s | план=%s | пул=%.6f",
+                    r.side(), r.level(), slot.venueId == null ? "пуст" : "есть",
+                    slot.price, slot.size,
+                    want == null ? "нет" : String.format(java.util.Locale.ROOT, "%.8f", want.price()),
+                    action == null ? "ничего" : action.kind(), pool));
+            double took = settle(r.side(), slot, want, action, pool);
+            if (r.side() == Side.BUY) {
+                buyCash = Math.max(0, buyCash - took * (want == null ? 0 : want.price()));
+            } else {
+                sellPool = Math.max(0, sellPool - took);
+            }
+        }
+    }
+
+    private org.home.data.revx.place.RestingOrder restingOf(Side side, int level) {
+        Resting r = side == Side.BUY ? bids.get(level) : asks.get(level);
+        return new org.home.data.revx.place.RestingOrder(side, level, r.venueId, r.price, r.size,
+                r.blockedUntilMs);
+    }
+
+    /**
+     * Один слот: посчитать размер, занять пул и — если план велит — действовать.
+     *
+     * ⚠️ ПУЛ ЗАНИМАЕТСЯ ДАЖЕ БЕЗ ДЕЙСТВИЯ. Слот со своей заявкой продолжает
+     * держать ресурс: отдать его дальнему уровню значило бы продать один лот
+     * дважды. Держит он ВНОВЬ ВЫЧИСЛЕННЫЙ размер, а не старую заявку.
+     */
+    private double settle(Side side, Resting slot, org.home.data.revx.layout.DesiredOrder want,
+                          org.home.data.revx.place.Action action, double pool) {
+        if (want == null) {
+            if (slot.venueId != null) {
+                cancel(side, slot, "сторона не котируется");
+            }
+            return 0;
+        }
+        double price = want.price();
+        double size = Math.min(Math.min(want.size(), sizeFor(side, price, slot)),
+                Math.max(0, pool));
+        double notional = size * price;
+        if (size <= 0 || notional < minNotional) {
+            if (slot.venueId != null) {
+                cancel(side, slot, "нечем котировать эту сторону");
+            }
+            warnNoFunds(side, slot);
+            return 0;
+        }
+        if (!(notional > 0 && notional <= maxOrderNotional)) {
+            log.error("заявка {} на {} USDC превышает предел {} — не ставлю",
+                    side, notional, maxOrderNotional);
+            journal.event("limit_blocked", side + " нотионал " + notional);
+            return 0;
+        }
+        if (exposure() + notional > maxExposure) {
+            log.error("экспозиция превысила бы предел {} — не ставлю", maxExposure);
+            journal.event("limit_blocked", "экспозиция");
+            return 0;
+        }
+        if (clock.now() < slot.blockedUntilMs) {
+            return slot.venueId == null ? 0 : slot.size;
+        }
+        // ⚠️ ПУСТОТА СЛОТА ПРОВЕРЯЕТСЯ СЕЙЧАС, а не по плану.
+        //
+        // План строится один раз в начале тика, а слот может опустеть ПОСРЕДИ
+        // него: заявка исполняется, и цикл узнаёт об этом при обходе. Встроенный
+        // путь перечитывал состояние на каждом уровне и потому ставил новую
+        // заявку сразу; модульный работал по устаревшему снимку и пропускал
+        // постановку до следующего тика.
+        //
+        // Найдено снимком 08.09.2026: в списке слотов у нулевого уровня заявка
+        // ЕСТЬ, а к моменту исполнения её уже нет — при полностью совпадающих
+        // ценах, размерах и пулах. Пять предыдущих заходов искали расхождение в
+        // арифметике, а оно было во времени наблюдения.
+        //
+        // Пропускать такую постановку особенно вредно потому, что потолком тика
+        // постановки НЕ ограничены: пустой слот дороже устаревшей цены, и ждать
+        // следующего тика незачем.
+        if (slot.venueId == null) {
+            place(side, slot, price, size);
+        } else if (action != null
+                && action.kind() == org.home.data.revx.place.Action.Kind.REPLACE) {
+            replace(side, slot, price, size);
+        }
+        return size;
+    }
+
+    private static org.home.data.revx.layout.DesiredOrder findWanted(
+            java.util.List<org.home.data.revx.layout.DesiredOrder> desired, Side side, int level) {
+        for (var d : desired) {
+            if (d.side() == side && d.level() == level) {
+                return d;
+            }
+        }
+        return null;
+    }
+
+    private static org.home.data.revx.place.Action findAction(
+            java.util.List<org.home.data.revx.place.Action> plan, Side side, int level) {
+        for (var a : plan) {
+            if (a.side() == side && a.level() == level) {
+                return a;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Общее ведро постановок на весь аккаунт. Без него бот работает по прежнему
      * неподвижному потолку из {@link ExecLimits} — так ходит стенд, которому
      * делить ни с кем нечего.
@@ -912,6 +1141,15 @@ public final class QuoteLoop implements Runnable {
                 askTicks[i]++;
             }
         }
+        // СМЕННАЯ РАССТАНОВКА идёт вместо встроенной, когда её задали.
+        //
+        // Встроенный путь ниже сохранён и остаётся умолчанием: пока сменная
+        // версия не доказала совпадения с ним на прогоне, отключать его нельзя —
+        // сравнивать будет не с чем.
+        if (layout != null && placer != null) {
+            applyLayout(fair);
+            return;
+        }
         // ⚠️ ПОРЯДОК РАЗДАЧИ решает исход, и проверяются оба.
         //
         // Внутренними вперёд: если ресурса хватает на одну заявку, она встаёт
@@ -1123,6 +1361,10 @@ public final class QuoteLoop implements Runnable {
         }
         // Пул уже урезан внутренними уровнями: дальний получает только остаток.
         double size = Math.min(sizeFor(side, targetPrice, resting), Math.max(0, pool));
+        dump(String.format(java.util.Locale.ROOT,
+                "ВСТР %s ур%d: слот=%s цена=%.8f размер=%.6f | цель=%.8f | пул=%.6f | размер=%.6f",
+                side, level, resting.venueId == null ? "пуст" : "есть",
+                resting.price, resting.size, targetPrice, pool, size));
         double notional = size * targetPrice;
         // Ниже минимума площадки заявка не встанет, а попытка потратит суточный
         // лимит постановок. Остаток от частичного исполнения бывает мельче
@@ -1323,6 +1565,7 @@ public final class QuoteLoop implements Runnable {
     }
 
     private void place(Side side, Resting resting, double price, double size) {
+        trace("PLACE", side, resting, price, size);
         // Сначала общее ведро: оно и есть настоящий предел аккаунта.
         //
         // ⚠️ Отказ НЕ выключает бота. Прежде выключал, и 07.09.2026 это стоило
@@ -1381,6 +1624,7 @@ public final class QuoteLoop implements Runnable {
     }
 
     private void replace(Side side, Resting resting, double price, double size) {
+        trace("REPLACE", side, resting, price, size);
         if (replacesThisMinute >= ExecLimits.MAX_REPLACES_PER_MINUTE) {
             return;                       // защита от зацикливания; молча, но с паузой
         }
@@ -1729,6 +1973,7 @@ public final class QuoteLoop implements Runnable {
         if (resting.venueId == null) {
             return;
         }
+        trace("CANCEL", side, resting, resting.price, resting.size);
         String dead = resting.venueId;
         // Обнуляем ДО выяснения: предохранитель по комиссии внутри может позвать
         // остановку, а та — снова сюда, и рекурсия должна упереться в этот null.
