@@ -98,6 +98,8 @@ public final class PairSweep {
         long placements;
         double days;
         double lot;
+        /** Потолок инвентаря в базовой валюте — знаменатель годовых. */
+        double cap;
         double inventoryLots;
         int daysHeld;
         double price;
@@ -332,6 +334,7 @@ public final class PairSweep {
             cell.inventoryLots += q.inventoryLots();
             cell.daysHeld++;
             cell.lot = lot;
+            cell.cap = cap;
             cell.price = price;
             double move = q.days_() == null || q.days_().isEmpty() ? 0
                     : q.days_().get(0).movePct();
@@ -359,7 +362,13 @@ public final class PairSweep {
         // что денег в деле в двадцать пять раз больше.
         record Best(String base, Variant v, Cell cell) {
             double annual() {
-                double capital = cell.lot * cell.price * 20;
+                // ⚠️ Знаменатель — РЕАЛЬНЫЙ потолок, а не «двадцать лотов».
+                // Пока здесь стояло lot*price*20, ключ --cap-usd ломал колонку
+                // молча: при одинаковом капитале в $20 форма «3 уровня по $1»
+                // получала втрое большие годовые, чем «1 уровень по $3», просто
+                // потому что делилась на втрое меньшее число (09.09.2026).
+                double capital = cell.cap > 0 ? cell.cap * cell.price
+                        : cell.lot * cell.price * 20;
                 return capital > 0 && cell.days > 0
                         ? cell.realisedMarket / cell.days * 365 / capital * 100 : 0;
             }
