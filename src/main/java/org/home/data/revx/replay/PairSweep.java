@@ -439,7 +439,11 @@ public final class PairSweep {
                     sb.append("|            -");
                     continue;
                 }
-                double capital = c.lot * c.price * 20;
+                // ⚠️ Тот же знаменатель, что и в главной таблице: РЕАЛЬНЫЙ
+                // потолок. Пока здесь стояло lot*price*20, две таблицы одного
+                // отчёта давали по одной ячейке разные годовые (+254% против
+                // +85%), и какая верна — угадать было нельзя.
+                double capital = c.cap > 0 ? c.cap * c.price : c.lot * c.price * 20;
                 double annual = capital > 0
                         ? c.realisedMarket / c.days * 365 / capital * 100 : 0;
                 double share = c.marketTrades > 0 ? 100.0 * c.fills / c.marketTrades : 0;
