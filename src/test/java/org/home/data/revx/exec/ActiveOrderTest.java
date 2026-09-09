@@ -94,4 +94,40 @@ class ActiveOrderTest {
         assertTrue(ActiveOrder.parse(null).isEmpty());
         assertTrue(ActiveOrder.parse("не json").isEmpty());
     }
+
+    /**
+     * Частично исполненная заявка ИЗ ЖИВОГО ЖУРНАЛА (бот A, 09.09.2026, 13:34:47).
+     *
+     * Список активных называет её состояние сам — {@code partially_filled}, — и
+     * это единственный дешёвый способ узнать, что заменять её бесполезно: PUT по
+     * ней отвечает 422 до конца её жизни. Тело взято дословно.
+     */
+    private static final String PARTIAL = """
+            {"data":[{"id":"c02363a9-46c3-46af-850e-b130f390c271",
+            "previous_order_id":"e051219f-ae36-431a-abc1-6225b084f8d1",
+            "client_order_id":"aaaaaaaa-9a68-46ce-bd94-7b5e2aa6a250","symbol":"BTC/USDC",
+            "side":"buy","type":"limit","quantity":"0.00003765",
+            "filled_quantity":"0.00001023","leaves_quantity":"0.00002742",
+            "amount":"2.993384","filled_amount":"0.813342","price":"79505.53",
+            "average_fill_price":"79505.57","status":"partially_filled",
+            "time_in_force":"gtc","execution_instructions":["post_only"],
+            "created_date":1788960883518,"updated_date":1788960886403}]}""";
+
+    @Test
+    void partiallyFilledIsRecognisedAndSizeIsWhatIsLeft() {
+        ActiveOrder o = ActiveOrder.parse(PARTIAL).getFirst();
+        assertTrue(o.partiallyFilled());
+        assertEquals(0.00001023, o.filled(), 1e-12);
+        // ⚠️ size — это leaves_quantity, то, что ещё стоит в книге, а не весь лот:
+        // резерв площадка держит именно им.
+        assertEquals(0.00002742, o.size(), 1e-12);
+        assertEquals("partially_filled", o.status());
+    }
+
+    @Test
+    void untouchedOrderIsNotPartial() {
+        // Обычная заявка: filled_quantity ноль, статус new — трогать её можно.
+        ActiveOrder o = ActiveOrder.parse(TWO).getFirst();
+        assertTrue(!o.partiallyFilled());
+    }
 }

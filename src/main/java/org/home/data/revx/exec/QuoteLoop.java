@@ -1857,13 +1857,18 @@ public final class QuoteLoop implements Runnable {
             return;                       // не знаем — оставляем всё как было
         }
         String status = field(order.body(), "status");
+        // ⚠️ Ответ передаётся дальше, а не запрашивается заново. Первая версия
+        // звала inspectGoneOrder без него, и в живом журнале 09.09.2026 виден
+        // ОДИН И ТОТ ЖЕ GET дважды с разницей в 60 мс. Лимит это переживает
+        // (100/с), но повторный вопрос о том же — приглашение однажды получить
+        // два разных ответа и провести исполнение по второму.
         if ("partially_filled".equalsIgnoreCase(status)) {
             markPartial(side, resting, number(order.body(), "filled_quantity"),
                     number(order.body(), "quantity"));
-            inspectGoneOrder(side, id);   // провести исполненную часть, пока она видна
+            book(side, id, order.body()); // провести исполненную часть, пока она видна
         } else if ("filled".equalsIgnoreCase(status)) {
             closePartial(resting, "добрана");
-            inspectGoneOrder(side, id);
+            book(side, id, order.body());
             resting.venueId = null;       // слот свободен: пустота дороже паузы
             resting.blockedUntilMs = 0;
             resting.failures = 0;
@@ -2175,11 +2180,21 @@ public final class QuoteLoop implements Runnable {
             fills++;                      // судьбу не выяснили, но заявки нет
             return null;
         }
-        String status = field(order.body(), "status");
-        double total = number(order.body(), "filled_quantity");
-        double price = number(order.body(), "average_fill_price");
-        double fee = number(order.body(), "total_fee");
-        String feeCurrency = field(order.body(), "fee_currency");
+        return book(side, venueId, order.body());
+    }
+
+    /**
+     * Провести то, что площадка УЖЕ рассказала о заявке. Возвращает её статус.
+     *
+     * Отделено от запроса, чтобы ответ, полученный по другому поводу (разбор
+     * отказа замены), не приходилось спрашивать второй раз.
+     */
+    private String book(Side side, String venueId, String responseBody) {
+        String status = field(responseBody, "status");
+        double total = number(responseBody, "filled_quantity");
+        double price = number(responseBody, "average_fill_price");
+        double fee = number(responseBody, "total_fee");
+        String feeCurrency = field(responseBody, "fee_currency");
 
         // ⚠️ filled_quantity НАКОПИТЕЛЬНЫЙ, а спрашиваем мы не по разу: заявку
         // проверяют и при частичном исполнении, и при усыновлении наследника, и
