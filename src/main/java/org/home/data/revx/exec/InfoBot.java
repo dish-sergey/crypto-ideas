@@ -187,6 +187,7 @@ public final class InfoBot implements Runnable {
     }
 
     private String all() {
+        long now = System.currentTimeMillis();
         StringBuilder sb = new StringBuilder("СВОДКА ПО ИСПОЛНИТЕЛЯМ\n\n");
         double totalRealised = 0;
         double totalInventory = 0;
@@ -195,7 +196,10 @@ public final class InfoBot implements Runnable {
         for (Watched w : watched) {
             Snapshot s = read(w);
             totalRealised += s.realised24();
-            totalInventory += s.position() * s.fair();
+            // Инвентарь остановленного бота — снимок; в сумму не берём, см. ниже.
+            if (s.quoting() || now - s.lastEventMs() <= 5 * 60_000L) {
+                totalInventory += s.position() * s.fair();
+            }
             totalPlacements += s.placements24();
             totalCap += s.cap();
             String age = s.lastEventMs() > 0
@@ -210,19 +214,33 @@ public final class InfoBot implements Runnable {
                     : "НЕ ТОРГУЕТ: " + (s.pausedReason() == null ? "гейт закрыт" : s.pausedReason());
             // Доля бюджета важнее самого числа: у ботов разные потолки, и «60»
             // у одного благополучно, а у другого три четверти суток.
+            // ⚠️ У ОСТАНОВЛЕННОГО БОТА ИНВЕНТАРЬ — ЭТО СТАРЫЙ СНИМОК, а не факт.
+            //
+            // Сводка собирается ТОЛЬКО из журналов: ключа у неё нет и быть не
+            // должно. Пока бот работает, он сам пишет позицию каждую секунду;
+            // как только его остановили, запись замирает, а монеты продолжают
+            // жить своей жизнью. 09.09.2026 боты E и F показывали $13.5 и $11.3
+            // инвентаря через два часа после того, как он был продан вручную:
+            // заявки исполнились, а сообщить об этом было некому.
+            //
+            // Поэтому у остановленного бота позиция помечается снимком и НЕ
+            // попадает в итоговую сумму: лучше не показать, чем показать неправду.
+            boolean stale = !s.quoting() && now - s.lastEventMs() > 5 * 60_000L;
             long pct = s.cap() > 0 ? 100 * s.placements24() / s.cap() : 0;
             sb.append(String.format(Locale.ROOT,
                     "%s %s  %s — %s%n  сделок 24ч %d, доход %+.4f USDC%n"
-                            + "  инвентарь %.2f USDC, постановок %d из %d (%d%%)%n"
+                            + "  инвентарь %.2f USDC%s, постановок %d из %d (%d%%)%n"
                             + "  отводов за час %d, тик %s%s%n%n",
                     mark, s.botId().toUpperCase(Locale.ROOT), s.symbol(), what,
                     s.fills24(), s.realised24(), s.position() * s.fair(),
+                    stale ? " — СНИМОК на момент остановки, НЕ ПРОВЕРЕНО" : "",
                     s.placements24(), s.cap(), pct, s.parks1h(), age,
                     s.note() == null ? "" : "\n  ⚠️ " + s.note()));
         }
         sb.append(String.format(Locale.ROOT,
                 "ИТОГО за 24 ч: %+.4f USDC%n"
-                        + "инвентарь %.2f USDC, постановок %d из %d (аккаунту дают 1000)",
+                        + "инвентарь %.2f USDC (только работающие), "
+                        + "постановок %d из %d (аккаунту дают 1000)",
                 totalRealised, totalInventory, totalPlacements, totalCap));
         return sb.toString();
     }
