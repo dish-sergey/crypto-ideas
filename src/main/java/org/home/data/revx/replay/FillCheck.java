@@ -1,8 +1,13 @@
 package org.home.data.revx.replay;
 
+import org.home.data.revx.sim.BookView;
+import org.home.data.revx.sim.MarketTrade;
+import org.home.data.revx.sim.Side;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -122,8 +127,29 @@ public final class FillCheck {
             end = Math.max(end, o.diedMs == Long.MAX_VALUE ? o.bornMs : o.diedMs);
         }
 
+        // ⚠️ ЗАЯВКА С НЕНАЙДЕННОЙ СМЕРТЬЮ — источник ложных исполнений: она
+        // остаётся в книге до конца окна и набирает их сколько угодно. Смерть
+        // не находится, если замена вернула 422 (наследник создан, а его
+        // идентификатор не пришёл никуда — док. 111) или если цепочка оборвалась
+        // на границе выборки.
+        int immortal = 0;
+        List<Double> lifeSec = new ArrayList<>();
+        for (Order o : live) {
+            if (o.diedMs == Long.MAX_VALUE) {
+                immortal++;
+            } else {
+                lifeSec.add((o.diedMs - o.bornMs) / 1000.0);
+            }
+        }
+        Collections.sort(lifeSec);
         log.warn("поверка модели по {}: заявок {}, окно {} — {}", symbol, live.size(),
                 java.time.Instant.ofEpochMilli(start), java.time.Instant.ofEpochMilli(end));
+        log.warn("время жизни, с: медиана {}, p90 {}; БЕЗ НАЙДЕННОЙ СМЕРТИ {} ({}%)",
+                lifeSec.isEmpty() ? "-" : String.format(Locale.ROOT, "%.1f",
+                        lifeSec.get(lifeSec.size() / 2)),
+                lifeSec.isEmpty() ? "-" : String.format(Locale.ROOT, "%.1f",
+                        lifeSec.get((int) (lifeSec.size() * 0.90))),
+                immortal, Math.round(1000.0 * immortal / live.size()) / 10.0);
 
         MarketData market = MarketData.load(standDbPath, symbol, start - 60_000, end + 60_000);
         // ⚠️ Курсор ленты односторонний: перечислять сделки надо по ОТДЕЛЬНОЙ
@@ -141,6 +167,11 @@ public final class FillCheck {
         log.warn("механизм: очередью {}, перехватом {}, пропущено из-за невидимости {}",
                 model.queueFills(), model.interceptFills(), model.invisibleSkips());
         log.warn("{}", model.queueBlockStats());
+        String dumpPath = System.getProperty("revx.fillcheck.dump");
+        if (dumpPath != null && !dumpPath.isBlank()) {
+            dump(dumpPath, symbol, live, v, MarketData.load(standDbPath, symbol,
+                    start - 60_000, end + 60_000));
+        }
     }
 
     /** Что модель сказала по каждой заявке. */
@@ -206,7 +237,64 @@ public final class FillCheck {
         return new Verdict(filledAt);
     }
 
-    private static String render(String symbol, List<Order> live, Verdict v) {
+    /**
+ * Выгрузка признаков по каждой заявке — чтобы сравнить ВЕРНЫЕ исполнения
+ * модели с ВЫДУМАННЫМИ. Ключ {@code -Drevx.fillcheck.dump=<файл>}.
+ *
+ * Признаки выбраны так, чтобы различать причины: как далеко за нашей ценой
+ * прошёл принт, где мы стояли относительно верха книги, во сколько раз принт
+ * крупнее нашей заявки и сколько заявка прожила к моменту исполнения.
+ */
+private static void dump(String path, String symbol, List<Order> live, Verdict v,
+                         MarketData md) {
+    StringBuilder sb = new StringBuilder(
+            "sym,id,side,price,size,born,died,liveFill,modelFill,dpxBp,touchBp,qtyRatio,ageSec" + System.lineSeparator());
+    for (Order o : live) {
+        Long m = v.modelFilledAt().get(o.id);
+        boolean l = o.filledMs > 0;
+        if (m == null && !l) {
+            continue;                      // обе стороны молчат — нечего разбирать
+        }
+        long at = m != null ? m : o.filledMs;
+        double dpx = Double.NaN;
+        double qtyRatio = Double.NaN;
+        for (MarketTrade t : md.tradesBetween(at - 1, at)) {
+            boolean hitsUs = (t.aggressor() == Side.SELL) == o.buy;
+            if (!hitsUs) {
+                continue;
+            }
+            boolean reached = o.buy ? t.price() <= o.price : t.price() >= o.price;
+            if (!reached) {
+                continue;
+            }
+            double d = (o.buy ? o.price - t.price() : t.price() - o.price) / o.price * 10_000;
+            if (Double.isNaN(dpx) || d > dpx) {
+                dpx = d;
+                qtyRatio = t.qty() / o.size;
+            }
+        }
+        BookView b = md.bookAt(at);
+        double touch = Double.NaN;
+        if (b != null && !b.empty()) {
+            double best = o.buy ? b.bestBid() : b.bestAsk();
+            touch = (o.buy ? o.price - best : best - o.price) / o.price * 10_000;
+        }
+        sb.append(String.format(java.util.Locale.ROOT,
+                "%s,%s,%s,%.10g,%.6g,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.1f%n",
+                symbol, o.id, o.buy ? "buy" : "sell", o.price, o.size, o.bornMs,
+                o.diedMs == Long.MAX_VALUE ? -1 : o.diedMs,
+                l ? 1 : 0, m != null ? 1 : 0, dpx, touch, qtyRatio,
+                (at - o.bornMs) / 1000.0));
+    }
+    try {
+        Files.writeString(Path.of(path), sb.toString());
+        log.warn("выгрузка признаков: {}", path);
+    } catch (Exception e) {
+        log.error("выгрузка не записалась: {}", e.toString());
+    }
+}
+
+private static String render(String symbol, List<Order> live, Verdict v) {
         int both = 0;
         int onlyLive = 0;
         int onlyModel = 0;
@@ -264,6 +352,29 @@ public final class FillCheck {
     /** @return символ пары, восстановленный из первой постановки */
     private static String readOrders(Statement st, Map<String, Order> orders) throws Exception {
         String symbol = null;
+        // ⚠️ СПРАВОЧНИК СТОРОН, собранный ДО разбора цепочек. В теле PUT стороны
+        // нет вовсе, она наследуется от предка, — а цепочка замен, чей исходный
+        // POST остался за границей выборки, теряет начало. Площадка называет
+        // сторону в двух ответах (список активных и состояние заявки), и они
+        // закрывают ровно эти случаи.
+        Map<String, Boolean> sides = new HashMap<>();
+        Pattern idSide = Pattern.compile(
+                "\"id\":\"([^\"]+)\"(?:(?!\"id\":).)*?\"side\":\"(buy|sell)\"", Pattern.DOTALL);
+        try (ResultSet rs = st.executeQuery(
+                "SELECT response FROM exec_request WHERE method='GET' AND status=200"
+                        + " AND response LIKE '%\"side\"%'")) {
+            while (rs.next()) {
+                String body = rs.getString(1);
+                if (body == null) {
+                    continue;
+                }
+                Matcher m = idSide.matcher(body);
+                while (m.find()) {
+                    sides.put(m.group(1), "buy".equals(m.group(2)));
+                }
+            }
+        }
+        int unknownSide = 0;
         // Сначала постановки и замены — в порядке времени, чтобы цепочка
         // «предок → наследник» собиралась за один проход.
         try (ResultSet rs = st.executeQuery(
@@ -299,9 +410,21 @@ public final class FillCheck {
                     if (newId == null) {
                         continue;
                     }
+                    Boolean side = prev != null ? Boolean.valueOf(prev.buy) : sides.get(newId);
+                    if (side == null) {
+                        side = sides.get(oldId);
+                    }
+                    if (side == null) {
+                        // Цепочка без начала: сторону НЕ УГАДЫВАЕМ. Первая версия
+                        // подставляла здесь «покупку», и целые слоты продаж
+                        // приходили в модель покупками выше аска — каждый принт
+                        // ниже такой мнимой покупки давал ложный перехват.
+                        unknownSide++;
+                        continue;
+                    }
                     Order o = new Order();
                     o.id = newId;
-                    o.buy = prev != null ? prev.buy : parseBuy(body);
+                    o.buy = side;
                     o.price = num(match(PRICE, body), prev == null ? 0 : prev.price);
                     o.size = num(match(SIZE, body), prev == null ? 0 : prev.size);
                     o.bornMs = ts;
@@ -322,9 +445,13 @@ public final class FillCheck {
                         symbol = m.group(1) + "/" + m.group(2);
                     }
                 }
+                Boolean postSide = parseBuy(body);
+                if (postSide == null) {
+                    continue;              // постановки без стороны не бывает
+                }
                 Order o = new Order();
                 o.id = newId;
-                o.buy = parseBuy(body);
+                o.buy = postSide;
                 o.price = num(match(PRICE, body), 0);
                 o.size = num(match(SIZE, body), 0);
                 o.bornMs = ts;
@@ -353,6 +480,8 @@ public final class FillCheck {
                 }
             }
         }
+        log.warn("справочник сторон: {} записей; сторона не установлена у {} замен",
+                sides.size(), unknownSide);
         return symbol;
     }
 
@@ -363,9 +492,15 @@ public final class FillCheck {
         }
     }
 
-    private static boolean parseBuy(String body) {
+    /**
+     * ⚠️ СТОРОНУ НЕЛЬЗЯ УГАДЫВАТЬ. В теле {@code PUT} её нет, и первая версия
+     * при неизвестном предке молча возвращала «покупку».
+     *
+     * @return {@code null}, если сторону установить не удалось
+     */
+    private static Boolean parseBuy(String body) {
         String s = match(SIDE, body);
-        return !"sell".equalsIgnoreCase(s);
+        return s == null ? null : "buy".equalsIgnoreCase(s);
     }
 
     private static double num(String s, double fallback) {
