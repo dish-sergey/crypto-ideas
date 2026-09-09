@@ -286,6 +286,31 @@ public final class ExecJournal implements AutoCloseable {
         }
     }
 
+    /**
+     * Сколько по этой заявке УЖЕ записано.
+     *
+     * ⚠️ {@code filled_quantity} у площадки накопительный, а спрашивать одну и ту
+     * же заявку можно не раз — при частичном исполнении, при усыновлении
+     * наследника, при разборе исчезнувшей. Записывать надо разницу, иначе первый
+     * объём попадёт в журнал дважды: ровно так 08.09.2026 в журнале бота D
+     * появилось задвоенное исполнение ADA.
+     */
+    public synchronized double filledByOrder(String venueId) {
+        if (venueId == null) {
+            return 0;
+        }
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT COALESCE(SUM(qty), 0) FROM exec_fill WHERE venue_id = ?")) {
+            ps.setString(1, venueId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getDouble(1) : 0;
+            }
+        } catch (Exception e) {
+            log.error("не прочиталось записанное по заявке {}: {}", venueId, e.getMessage());
+            return 0;
+        }
+    }
+
     /** Одно исполнение из журнала — вход для {@link FifoLedger}. */
     /**
      *  handover передача инвентаря между ботами, а не сделка с рынком.

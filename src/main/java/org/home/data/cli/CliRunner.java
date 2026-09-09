@@ -79,6 +79,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe;
     private final ObjectProvider<org.home.data.revx.exec.Panic> panic;
     private final ObjectProvider<org.home.data.revx.exec.ManualOrder> manualOrder;
+    private final ObjectProvider<org.home.data.revx.exec.BookOrder> bookOrder;
     private final ObjectProvider<org.home.data.revx.exec.Park> park;
     private final ObjectProvider<org.home.data.revx.sim.RegimeFrequencyReport> regimeReport;
     private final ObjectProvider<org.home.data.revx.exec.Executor> executor;
@@ -102,6 +103,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe,
                      ObjectProvider<org.home.data.revx.exec.Panic> panic,
                      ObjectProvider<org.home.data.revx.exec.ManualOrder> manualOrder,
+                     ObjectProvider<org.home.data.revx.exec.BookOrder> bookOrder,
                      ObjectProvider<org.home.data.revx.exec.Park> park,
                      ObjectProvider<org.home.data.revx.sim.RegimeFrequencyReport> regimeReport,
                      ObjectProvider<org.home.data.revx.exec.Executor> executor,
@@ -132,6 +134,7 @@ public class CliRunner implements ApplicationRunner {
         this.orderProbe = orderProbe;
         this.panic = panic;
         this.manualOrder = manualOrder;
+        this.bookOrder = bookOrder;
         this.park = park;
         this.regimeReport = regimeReport;
         this.executor = executor;
@@ -258,6 +261,9 @@ public class CliRunner implements ApplicationRunner {
             }
             if (args.containsOption("revx-order-probe")) {
                 orderProbe.getObject().run();
+            }
+            if (args.containsOption("revx-book")) {
+                bookOrder.getObject().run();
             }
             if (args.containsOption("revx-order")) {
                 manualOrder.getObject().run();
