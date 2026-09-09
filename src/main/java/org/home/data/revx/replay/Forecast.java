@@ -101,8 +101,24 @@ public final class Forecast {
         // Счёт ОБЩИЙ: боты делят и книгу, и деньги. Денег даём столько, чтобы
         // каждому хватило на полный потолок, иначе меряли бы не настройку, а
         // нехватку средств.
+        // ⚠️ Первый тик может НЕ ИМЕТЬ справедливой цены — гейты на нём ещё не
+        // пропустили котирование, и в тике лежит NaN. Умножение на него делало
+        // NaN из стартовой кассы, а дальше падало в форматировании остатков
+        // (09.09.2026, PEPE: прогон умирал на первом же обращении к остаткам,
+        // а отчёт показывал ноль сделок как честный результат).
+        double refPrice = Double.NaN;
+        for (ReplayFair.Tick t : ticks) {
+            if (Double.isFinite(t.fair()) && t.fair() > 0) {
+                refPrice = t.fair();
+                break;
+            }
+        }
+        if (!(refPrice > 0)) {
+            throw new IllegalStateException("нет ни одного тика со справедливой ценой для "
+                    + base.symbol());
+        }
         double quoteStart = bots.stream().mapToDouble(BotSpec::inventoryCap).sum()
-                * ticks.get(0).fair() * 1.2;
+                * refPrice * 1.2;
         SimVenue venue = new SimVenue(clock, model, base.symbol(),
                 ticks.get(0).inventory(), quoteStart, base.minNotional());
 
@@ -126,9 +142,9 @@ public final class Forecast {
                 journals.add(journal);
 
                 alloc.claim(spec.botId(), base.symbol().substring(0, base.symbol().indexOf('/')),
-                        0, 0, ticks.get(0).fair(), start);
+                        0, 0, refPrice, start);
                 alloc.claim(spec.botId(), base.symbol().substring(base.symbol().indexOf('/') + 1),
-                        quoteStart / bots.size(), quoteStart, ticks.get(0).fair(), start);
+                        quoteStart / bots.size(), quoteStart, refPrice, start);
 
                 Quoter.Params params = new Quoter.Params(spec.offset(), spec.size(),
                         spec.inventoryCap(), base.skewK(), spec.skewTarget(), cfg.simDriftBeta(),
@@ -154,7 +170,7 @@ public final class Forecast {
                 // и прогон с лотом $10 упирался в них раньше, чем в рынок: 15.5
                 // млн отказов «экспозиция превысила предел» и ровные нули дохода
                 // при живом рынке (06.09.2026). Меряли предохранитель, не пару.
-                loop.scaleLimitsForLot(spec.size() * ticks.get(0).fair());
+                loop.scaleLimitsForLot(spec.size() * refPrice);
                 if (spec.dynOffsetK() > 0) {
                     // Потолок 1% — выше опора считается сломанной (замер
                     // 19.08.2026: 1.18% у ETH на движении 18%).
@@ -186,6 +202,12 @@ public final class Forecast {
             for (QuoteLoop loop : loops) {
                 loop.startQuoting();
             }
+            // ⚠️ УПАВШИЙ КОТИРОВЩИК НЕ ИМЕЕТ ПРАВА ВЫГЛЯДЕТЬ КАК НОЛЬ СДЕЛОК.
+            // Раньше исключение оставалось в потоке, поток тихо умирал, а отчёт
+            // печатал «0 покупок, 0 продаж, доход +0.0000» — то есть ошибку,
+            // неотличимую от честного результата «настройка не торгует».
+            // Поймано 09.09.2026 на PEPE вне выборки.
+            List<Throwable> crashes = java.util.Collections.synchronizedList(new ArrayList<>());
             for (QuoteLoop loop : loops) {
                 final int slotIndex = threads.size();
                 Thread t = new Thread(() -> {
@@ -196,11 +218,19 @@ public final class Forecast {
                         clock.leave();
                     }
                 }, "forecast-" + loop.botId());
+                t.setUncaughtExceptionHandler((thread, e) -> {
+                    log.error("котировщик {} упал: {}", thread.getName(), e.toString(), e);
+                    crashes.add(e);
+                });
                 threads.add(t);
                 t.start();
             }
             for (Thread t : threads) {
                 t.join(600_000);
+            }
+            if (!crashes.isEmpty()) {
+                throw new IllegalStateException("прогон не состоялся: упало котировщиков "
+                        + crashes.size() + ", первый — " + crashes.get(0), crashes.get(0));
             }
 
             log.warn("площадка исполнила заявок: {} (это НЕ то же, что заметил бот)",
