@@ -268,6 +268,18 @@ public class Executor {
      * шаги цены и количества входят в округление котировки, и подставить сюда
      * другие значит гарантированно разойтись.
      */
+    /**
+     * {@code --revx-fill-check --journal=<путь>}: поверка модели исполнения по
+     * каждой РЕАЛЬНОЙ заявке живого бота, без обратной связи.
+     *
+     * Отвечает на вопрос, который сравнение числа сделок не разделяет: модель
+     * ошибается в правиле исполнения или просто уводит траекторию. Подробности —
+     * в {@link org.home.data.revx.replay.FillCheck}.
+     */
+    public void fillCheck(String journalPath, String from, String to) {
+        org.home.data.revx.replay.FillCheck.run(journalPath, standDbPath, from, to);
+    }
+
     public void replay(String journalPath, String fillModel) {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),

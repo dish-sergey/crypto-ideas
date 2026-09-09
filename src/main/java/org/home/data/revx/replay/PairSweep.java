@@ -151,21 +151,37 @@ public final class PairSweep {
         // Потоков не больше числа ядер и не больше числа суток: каждый держит
         // свой срез книг (~200 МБ на сутки), и лишние потоки покупают память без
         // выигрыша.
-        int days = (int) ((to - from) / DAY_MS);
+        // ⚠️ ОКНО КОРОЧЕ СУТОК РАНЬШЕ ДАВАЛО МОЛЧА НОЛЬ. Деление было
+        // целочисленным, и на окне в 11 часов получалось «обход: 0 суток» —
+        // отчёт печатал пустую таблицу, неотличимую от «настройка не торгует».
+        // Поймано 09.09.2026 на проверке модели вне выборки.
+        //
+        // Последний кусок теперь считается неполными сутками и обрезается по
+        // {@code to}. Инвентарь на границе суток обнуляется по-прежнему — это
+        // свойство конструкции, а не следствие деления.
+        int days = (int) Math.max(1, Math.ceil((to - from) / (double) DAY_MS));
         int threads = Math.max(1, Math.min(Runtime.getRuntime().availableProcessors(), days));
-        log.warn("обход: {} суток, {} потоков", days, threads);
+        double hours = (to - from) / 3_600_000.0;
+        log.warn("обход: {} суток ({} ч), {} потоков",
+                days, Math.round(hours * 10) / 10.0, threads);
+        if (hours < 24) {
+            log.warn("⚠️ окно короче суток — результат по одному неполному дню");
+        }
         var pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(), limits,
                 cfg.fairMaxSkewMs())) {
             List<java.util.concurrent.Future<?>> tasks = new ArrayList<>();
             for (int d = 0; d < days; d++) {
                 final long day = from + (long) d * DAY_MS;
+                // Последние сутки обрезаются по концу окна: иначе на неполном
+                // куске читались бы книги за его пределами.
+                final long dayEnd = Math.min(day + DAY_MS - 1, to);
                 final int dayNo = d + 1;
                 tasks.add(pool.submit(() -> {
                     String label = java.time.Instant.ofEpochMilli(day).toString().substring(0, 10);
                     var fair = new StandFair(standDbPath, null, limits, cfg.memecoins(),
                             cfg.fairMaxSkewMs(), org.home.data.revx.exec.Clock.system(),
-                            day, day + DAY_MS - 1);
+                            day, dayEnd);
                     if (fair.pairs() == 0) {
                         log.warn("{}: книг нет, сутки пропущены", label);
                         return;
@@ -233,11 +249,27 @@ public final class PairSweep {
             }
             ticks = kept;
         }
+        // ⚠️ Молчаливых отказов здесь быть не должно: пустая строка в отчёте
+        // читается как «настройка не торгует», а не как «мы это не считали».
         if (ticks.size() < MIN_SNAPSHOTS / Math.max(1, thin)) {
+            log.warn("{} {}: тиков {} при пороге {} — сутки пропущены",
+                    label, symbol, ticks.size(), MIN_SNAPSHOTS / Math.max(1, thin));
             return;
         }
+        // Середина окна как опорная цена: тик посередине может оказаться без
+        // справедливой цены (гейты), и тогда берётся первый, у которого она есть.
         double price = ticks.get(ticks.size() / 2).fair();
         if (!(price > 0)) {
+            for (ReplayFair.Tick t : ticks) {
+                if (Double.isFinite(t.fair()) && t.fair() > 0) {
+                    price = t.fair();
+                    break;
+                }
+            }
+        }
+        if (!(price > 0)) {
+            log.warn("{} {}: ни одного тика со справедливой ценой — сутки пропущены",
+                    label, symbol);
             return;
         }
         MarketData market0 = MarketData.load(standDbPath, symbol,

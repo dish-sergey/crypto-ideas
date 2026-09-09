@@ -33,6 +33,7 @@ public final class MarketData {
     private final List<BookView> books;
     private int tradeCursor;
     private int bookCursor;
+    private int afterCursor;
 
     /**
      * Рынок из готовых рядов — для тестов.
@@ -97,6 +98,24 @@ public final class MarketData {
             return null;
         }
         return books.get(bookCursor);
+    }
+
+    /**
+     * ПЕРВЫЙ снимок книги ПОСЛЕ момента; {@code null}, если такого нет.
+     *
+     * Нужен, чтобы спросить у книги, случился ли свип на самом деле: настоящий
+     * агрессор, продавший ниже нашего бида, обязан был съесть всё, что стояло
+     * выше, — и следующий снимок это покажет. Принт, после которого книга цела,
+     * до книги не доходил (внутренний зачёт, RFQ), и нас исполнить не мог.
+     *
+     * ⚠️ Курсор здесь СВОЙ и назад не ходит, как и у {@link #bookAt}: обход
+     * идёт вперёд по времени.
+     */
+    public BookView bookAfter(long tsMs) {
+        while (afterCursor < bookTs.length && bookTs[afterCursor] <= tsMs) {
+            afterCursor++;
+        }
+        return afterCursor < bookTs.length ? books.get(afterCursor) : null;
     }
 
     /**
