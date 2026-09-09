@@ -1051,6 +1051,63 @@ public final class QuoteLoop implements Runnable {
         }
     }
 
+    /** Проверка размеров сделана; повторять на каждом тике незачем. */
+    private boolean sizingChecked;
+
+    /**
+     * РАЗОВАЯ ПРОВЕРКА РАЗМЕРОВ на первой известной цене.
+     *
+     * Лот и потолок заданы в МОНЕТАХ, а деньги и пределы — в долларах, и связь
+     * между ними держится на цене. Цена меняется, связь тихо уезжает, и
+     * замечаешь это по последствиям, а не по причине. Два последствия, оба
+     * наблюдались:
+     *
+     * <ul>
+     *   <li><b>число лотов в потолке</b> перестаёт быть целым, и потолок можно
+     *       перелететь на неполный лот. При двадцати лотах по $1 такого не было,
+     *       при 6.67 лотах по $3 — до 105% потолка;</li>
+     *   <li><b>лот дорастает до предела заявки.</b> {@code MAX_ORDER_NOTIONAL}
+     *       живьём не масштабируется: лот $3 упрётся в $10 при росте монеты в
+     *       3.3 раза, и бот просто перестанет ставить заявки с записью «заявка
+     *       превышает предел». Молча, потому что это штатная ветка отказа.</li>
+     * </ul>
+     *
+     * Поэтому связь проверяется один раз при первой цене и пишется в журнал:
+     * дрейф становится видимым в момент, когда он ещё ничего не сломал.
+     */
+    private void checkSizing(double price) {
+        if (sizingChecked || !(price > 0)) {
+            return;
+        }
+        sizingChecked = true;
+        double lotUsd = params.size() * price;
+        double capUsd = params.inventoryCap() * price;
+        double lots = params.size() > 0 ? params.inventoryCap() / params.size() : 0;
+        String detail = String.format(java.util.Locale.ROOT,
+                "лот %.2f USDC, потолок %.2f USDC, лотов в потолке %.2f, предел заявки %.2f",
+                lotUsd, capUsd, lots, maxOrderNotional);
+        log.warn("размеры: {}", detail);
+        journal.event("sizing", detail);
+
+        if (Math.abs(lots - Math.round(lots)) > 0.01) {
+            log.warn("⚠️ лотов в потолке НЕ ЦЕЛОЕ ({}): потолок можно перелететь "
+                    + "на неполный лот, а скос грубеет", String.format("%.2f", lots));
+        }
+        if (lots < 7) {
+            log.warn("⚠️ лотов в потолке меньше семи ({}): скос двигается "
+                    + "скачками по {} б.п. при коэффициенте {}",
+                    String.format("%.2f", lots),
+                    String.format("%.1f", lots > 0 ? params.skewK() * 10_000 / lots : 0),
+                    params.skewK());
+        }
+        if (lotUsd > 0.6 * maxOrderNotional) {
+            log.error("⚠️ лот {} USDC занимает больше 60% предела заявки {} — "
+                    + "при дальнейшем росте монеты бот перестанет ставить заявки",
+                    String.format("%.2f", lotUsd), String.format("%.2f", maxOrderNotional));
+            journal.event("sizing_warn", detail);
+        }
+    }
+
     private void tick() {
         rollCounters();
         StandReader.Fair fair = stand.latest(base, 30_000);
@@ -1058,6 +1115,7 @@ public final class QuoteLoop implements Runnable {
         rememberFair(fair.price());
         if (fair.price() > 0) {
             efficiency.accept(clock.now(), fair.price());
+            checkSizing(fair.price());
         }
 
         if (!quoting.get()) {
@@ -1431,7 +1489,22 @@ public final class QuoteLoop implements Runnable {
         // прибыли во все остальные дни; арифметика сходится точно
         // (10 лотов × 0.0000125 × 4 400 ≈ 0.55). Продаж 201 против 192 покупок
         // при нулевой затравке — на споте это невозможно.
-        double ownPositionCap = side == Side.SELL ? Math.max(0, inventory) : Double.MAX_VALUE;
+        // ⚠️ ПОКУПКА РЕЖЕТСЯ ОСТАТКОМ ПОТОЛКА, а не только деньгами.
+        //
+        // Раньше здесь стоял Double.MAX_VALUE, и потолок соблюдался лишь тем,
+        // что котировщик перестаёт выставлять бид при `инвентарь >= потолок`.
+        // Пока в потолок укладывалось ЦЕЛОЕ число лотов (двадцать), этого
+        // хватало: двадцатый лот упирался ровно в потолок. При лоте $3 и
+        // потолке $20 лотов 6.67 — на шести это 90% потолка, бид ещё
+        // выставляется, и седьмой доводит инвентарь до 105%.
+        //
+        // Клип остатком заодно отвечает на вопрос «что делать с нецелым лотом»:
+        // последняя покупка становится частичной, и остаток потолка не пропадает.
+        // Если остаток мельче минимальной заявки площадки, размер обнулится
+        // ниже по общей проверке, и бид просто не выставится.
+        double ownPositionCap = side == Side.SELL
+                ? Math.max(0, inventory)
+                : Math.max(0, params.inventoryCap() - inventory);
         // Симметрично для покупки: тратить можно только СВОЮ долю кассы, иначе
         // бот покупает на деньги соседа. У бота B это стоило 197 отказов
         // «Insufficient balance» за сутки — каждый из них тратит постановку из
