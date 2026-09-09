@@ -196,6 +196,12 @@ public final class SimVenue implements Venue {
         }
     }
 
+    /** Сколько уже исполнилось по заявке — то же число, что живая отдаёт в {@code filled_quantity}. */
+    private double filledOf(String id) {
+        double[] acc = done.get(id);
+        return acc == null ? 0 : acc[0];
+    }
+
     private void apply(FillModel.Filled f) {
         Order hit = live.get(f.orderId());
         if (hit == null) {
@@ -258,13 +264,24 @@ public final class SimVenue implements Venue {
                 sb.append(',');
             }
             first = false;
+            // ⚠️ ЧАСТИЧНО ИСПОЛНЕННАЯ ЗАЯВКА НАЗЫВАЕТ СЕБЯ ТАК ЖЕ, КАК ЖИВАЯ.
+            //
+            // До 09.09.2026 стенд отдавал всем заявкам "status":"new" и не
+            // отдавал filled_quantity вовсе. Живая площадка отдаёт
+            // "partially_filled" — проверено на журнале бота A, заявка
+            // c02363a9 висела в списке активных с filled_quantity 0.00001023
+            // из 0.00003765. Разница не косметическая: замена такой заявки
+            // живьём получает 422, а в стенде проходила, и стенд считал
+            // репрайс возможным там, где его нет.
+            double filled = filledOf(o.id);
             sb.append(String.format(Locale.ROOT,
                     "{\"id\":\"%s\",\"client_order_id\":\"%s\",\"symbol\":\"%s\","
                             + "\"side\":\"%s\",\"type\":\"limit\",\"quantity\":\"%s\","
-                            + "\"leaves_quantity\":\"%s\",\"price\":\"%s\","
-                            + "\"status\":\"new\",\"created_date\":%d}",
+                            + "\"filled_quantity\":\"%s\",\"leaves_quantity\":\"%s\","
+                            + "\"price\":\"%s\",\"status\":\"%s\",\"created_date\":%d}",
                     o.id, o.clientId, o.symbol, o.buy ? "buy" : "sell",
-                    plain(o.size), plain(o.size), plain(o.price), o.createdMs));
+                    plain(o.size + filled), plain(filled), plain(o.size), plain(o.price),
+                    filled > 1e-12 ? "partially_filled" : "new", o.createdMs));
         }
         return new Response(200, sb.append("]}").toString(), 0);
     }
@@ -307,7 +324,9 @@ public final class SimVenue implements Venue {
         double filled = acc == null ? 0 : acc[0];
         double avg = filled > 0 ? acc[1] / filled : 0;
         Order o = live.get(id);
-        String status = o != null ? "new" : (filled > 0 ? "filled" : "cancelled");
+        String status = o != null
+                ? (filled > 1e-12 ? "partially_filled" : "new")
+                : (filled > 0 ? "filled" : "cancelled");
         return new Response(200, String.format(Locale.ROOT,
                 "{\"data\":{\"id\":\"%s\",\"status\":\"%s\",\"filled_quantity\":\"%s\","
                         + "\"average_fill_price\":\"%s\",\"total_fee\":\"0\","
@@ -343,6 +362,17 @@ public final class SimVenue implements Venue {
     @Override
     public synchronized Response replace(String id, String json) {
         advance();
+        // ⚠️ ЧАСТИЧНО ИСПОЛНЕННУЮ ЗАЯВКУ ПЛОЩАДКА ЗАМЕНИТЬ НЕ ДАЁТ, и стенд
+        // обязан отказывать так же. Замена требует состояния NEW, а частичное
+        // исполнение из него выводит: 09.09.2026 бот A получил по одной такой
+        // заявке восемь отказов подряд за 84 секунды. Стенд, пропускавший
+        // замену, приписывал боту возможность переставить цену, которой у него
+        // нет, — и тем занижал стоимость крупного лота.
+        if (live.containsKey(id) && filledOf(id) > 1e-12) {
+            replaceRejects++;
+            return new Response(422,
+                    "{\"message\":\"Cannot replace an order that is not in the 'NEW' state\"}", 0);
+        }
         Order old = live.remove(id);
         if (old != null) {
             gone.put(id, "заменой");

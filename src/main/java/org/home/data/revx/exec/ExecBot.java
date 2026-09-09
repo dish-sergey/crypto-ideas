@@ -217,11 +217,12 @@ public final class ExecBot implements Runnable {
                 Исполнений: %d
                 Постановок за 24 ч: %d из %d (осталось %d)
                 Замен: %d
+                Частичных исполнений: %d (сейчас в книге %d)
                 Инвентарь: %.8f = %.1f лота (%.0f%% потолка)
                 Цель скоса: %.0f%% потолка = %.1f лота
                 Записей в журнале: %d""".formatted(
                 s.fills(), used, limit, Math.max(0, limit - used),
-                s.replaces(), s.inventory(),
+                s.replaces(), s.partials(), s.partialsNow(), s.inventory(),
                 lot > 0 ? s.inventory() / lot : 0,
                 cap > 0 ? 100 * s.inventory() / cap : 0,
                 loop.skewTarget() * 100,

@@ -120,11 +120,28 @@ public final class QuoteLoop implements Runnable {
         long blockedUntilMs;
         int failures;
         long fundsWarnedMs;
+
+        /**
+         * Идентификатор заявки, о которой площадка сказала «частично исполнена».
+         *
+         * ⚠️ Хранится ИМЕННО ИДЕНТИФИКАТОР, а не булев флаг. Флаг пришлось бы
+         * гасить руками во всех местах, где слот меняет заявку, и одно забытое
+         * место заморозило бы слот навсегда. Сравнение с {@link #venueId} гасит
+         * его само: другая заявка — другая жизнь.
+         */
+        String partialId;
+        long partialSinceMs;
+        double partialFilled;
+
+        /** Стоит ли в слоте частично исполненная заявка. Её заменить нельзя. */
+        boolean partial() {
+            return partialId != null && partialId.equals(venueId);
+        }
     }
 
     public record Stats(long placements, long replaces, long cancels, long fills,
                         double inventory, double lastFair, String state, String pausedReason,
-                        long ticks, long ticksAtCap) {
+                        long ticks, long ticksAtCap, long partials, int partialsNow) {
     }
 
     private final Venue client;
@@ -511,10 +528,22 @@ public final class QuoteLoop implements Runnable {
         }
     }
 
+    /**
+     * Слот глазами расстановщика.
+     *
+     * ⚠️ Частично исполненная заявка отдаётся как заблокированная НАВСЕГДА
+     * ({@code Long.MAX_VALUE}), и это не хитрость, а точный смысл поля: «до
+     * этого момента заявку трогать нельзя». Заменить её нельзя вовсе — площадка
+     * требует состояния {@code NEW}. Расстановщик от этого перестаёт тратить на
+     * неё единственный жетон замены и отдаёт его слоту, который двигать МОЖНО.
+     * Постановку и отмену это не задевает: их {@link #settle} решает сам, по
+     * состоянию слота, а не по плану.
+     */
     private org.home.data.revx.place.RestingOrder restingOf(Side side, int level) {
         Resting r = side == Side.BUY ? bids.get(level) : asks.get(level);
+        long blocked = r.partial() ? Long.MAX_VALUE : r.blockedUntilMs;
         return new org.home.data.revx.place.RestingOrder(side, level, r.venueId, r.price, r.size,
-                r.blockedUntilMs);
+                blocked);
     }
 
     /**
@@ -653,6 +682,15 @@ public final class QuoteLoop implements Runnable {
     private long replaces;
     private long cancels;
     private long fills;
+    /**
+     * Сколько заявок за жизнь процесса застали частично исполненными.
+     *
+     * До перехода на лот $3 это было тождественно нулём: все 390 живых сделок за
+     * сутки 08.09.2026 шли ровно в один лот, потому что принты крупнее нашей
+     * заявки. С лотом $3 частичные исполнения стали обычным делом, и число
+     * важно само по себе — оно решает, стоит ли усложнять поведение.
+     */
+    private long partials;
     private long minuteStartMs;
     private long lastReconcileMs;
     private int replacesThisMinute;
@@ -1018,8 +1056,11 @@ public final class QuoteLoop implements Runnable {
     }
 
     public Stats stats() {
+        int partialsNow = (int) java.util.stream.Stream.concat(bids.stream(), asks.stream())
+                .filter(Resting::partial).count();
         return new Stats(placements, replaces, cancels, fills, inventory, lastFair,
-                quoting.get() ? "котирует" : "остановлен", pausedReason, ticks, ticksAtCap);
+                quoting.get() ? "котирует" : "остановлен", pausedReason, ticks, ticksAtCap,
+                partials, partialsNow);
     }
 
     @Override
@@ -1286,6 +1327,14 @@ public final class QuoteLoop implements Runnable {
         }
         if (clock.now() < resting.blockedUntilMs || !quoter.shouldRequote(resting.price, targetPrice)) {
             return best;                 // под наказанием или цена и так годная
+        }
+        if (resting.partial()) {
+            // ⚠️ Право на замену НЕЛЬЗЯ отдавать частично исполненной заявке:
+            // площадка её заменить не даст (422, состояние не NEW), а право у
+            // бота одно на тик — и достанется оно самому отставшему слоту, то
+            // есть как раз тому, кого только что задело исполнение. Остальные
+            // слоты при этом стояли бы с устаревшей ценой не по разу, а подряд.
+            return best;
         }
         double divergence = Math.abs(targetPrice - resting.price) / resting.price;
         if (divergence <= best) {
@@ -1701,6 +1750,12 @@ public final class QuoteLoop implements Runnable {
         if (replacesThisMinute >= ExecLimits.MAX_REPLACES_PER_MINUTE) {
             return;                       // защита от зацикливания; молча, но с паузой
         }
+        if (resting.partial()) {
+            // Последний рубеж: замена частично исполненной заявки ОБРЕЧЕНА, и
+            // отправлять её значит платить запросом за заведомый 422. Оба пути —
+            // встроенный и модульный — сюда сходятся, поэтому проверка здесь.
+            return;
+        }
         String body = """
                 {"client_order_id":"%s","base_size":"%s","price":"%s",
                  "execution_instructions":["post_only"]}"""
@@ -1748,6 +1803,12 @@ public final class QuoteLoop implements Runnable {
             // заявку поверх живой (01.09.2026, 06:26 — резерв удвоился).
             log.info("замена {} не прошла ({}), сверяюсь с книгой", side, response.status());
             resting.failures++;
+            // ⚠️ Отказ «не в состоянии NEW» — это НЕ «повтори позже», а «эта
+            // заявка больше никогда не заменится». Слепая пауза с удвоением
+            // превращала его в серию: 09.09.2026 бот A получил по одной заявке
+            // восемь таких отказов за 84 секунды. Спрашиваем судьбу сразу — один
+            // запрос вместо семи лишних.
+            resolveNotNew(side, resting, response.body());
             // Пауза на сторону: без неё каждый отказ тянет за собой четыре запроса
             // (замена, статус, остатки, активные), и на устойчивом отказе это
             // 8 запросов в секунду по кругу — наблюдалось 01.09.2026.
@@ -1756,6 +1817,104 @@ public final class QuoteLoop implements Runnable {
             reconcile("отказ замены");
             refreshBalances();
         }
+    }
+
+    /**
+     * Отказ «Cannot replace an order that is not in the 'NEW' state»: выяснить
+     * судьбу заявки НЕМЕДЛЕННО, а не ждать, пока догадается сверка.
+     *
+     * <h2>Почему это отдельный случай, а не общий отказ</h2>
+     *
+     * Общий отказ («заняты средства», «слишком часто») означает «попробуй
+     * позже». Этот — не означает: состояние заявки уже изменилось необратимо, и
+     * следующая попытка получит тот же ответ. Ждать нечего, а вопрос ровно один:
+     * ЧТО с ней стало. Ответ даёт сама площадка, тремя разными исходами:
+     *
+     * <ul>
+     *   <li>{@code filled} — заявку исполнили целиком. Слот освобождается СРАЗУ,
+     *       и следующий тик ставит новую. Раньше это выяснялось только через
+     *       {@link #ADOPT_GRACE_MS} и паузу отказа: 09.09.2026 в 14:26 бот A
+     *       узнал об исполнении через 9 секунд и три отказа, а всё это время
+     *       сторона стояла пустой;</li>
+     *   <li>{@code partially_filled} — исполнена часть. Заменить её нельзя до
+     *       конца жизни, поэтому слот ПОМЕЧАЕТСЯ и замены на него больше не
+     *       тратятся. Исполненная часть проводится здесь же;</li>
+     *   <li>{@code cancelled/replaced} — наследник создан, а ответ до нас не
+     *       дошёл (док. 111). Ничего не решаем: наследника найдёт и усыновит
+     *       сверка, которая идёт следующей строкой.</li>
+     * </ul>
+     *
+     * Цена — один GET на отказ, при лимите 100/с и 1000/мин. Взамен исчезает
+     * серия из PUT, GET активных и GET остатков на каждой попытке.
+     */
+    private void resolveNotNew(Side side, Resting resting, String body) {
+        if (resting.venueId == null || body == null || !body.contains("'NEW' state")) {
+            return;
+        }
+        String id = resting.venueId;
+        Venue.Response order = client.order(id);
+        if (!order.ok() || order.body() == null) {
+            return;                       // не знаем — оставляем всё как было
+        }
+        String status = field(order.body(), "status");
+        if ("partially_filled".equalsIgnoreCase(status)) {
+            markPartial(side, resting, number(order.body(), "filled_quantity"),
+                    number(order.body(), "quantity"));
+            inspectGoneOrder(side, id);   // провести исполненную часть, пока она видна
+        } else if ("filled".equalsIgnoreCase(status)) {
+            closePartial(resting, "добрана");
+            inspectGoneOrder(side, id);
+            resting.venueId = null;       // слот свободен: пустота дороже паузы
+            resting.blockedUntilMs = 0;
+            resting.failures = 0;
+        }
+        // Прочие состояния (cancelled/replaced) разбирает сверка: судьбу заявки
+        // нельзя выводить из её собственного статуса — только из списка активных.
+    }
+
+    /**
+     * Пометить слот как «стоит частично исполненная заявка».
+     *
+     * ⚠️ Событие пишется ОДИН РАЗ на заявку, а не на каждое обнаружение: пометка
+     * ставится каждой сверкой заново, а мерить надо частичные исполнения, а не
+     * число сверок.
+     */
+    private void markPartial(Side side, Resting resting, double filled, double quantity) {
+        if (resting.partial()) {
+            resting.partialFilled = filled;
+            return;                       // уже помечена, счётчик не портим
+        }
+        resting.partialId = resting.venueId;
+        resting.partialSinceMs = clock.now();
+        resting.partialFilled = filled;
+        partials++;
+        double share = quantity > 0 ? filled / quantity * 100 : 0;
+        String text = side + " " + resting.venueId + " исполнено " + fmt(filled)
+                + " из " + fmt(quantity) + " (" + Math.round(share) + "%), замена невозможна";
+        log.warn("частичное исполнение: {}", text);
+        journal.event("partial", text);
+    }
+
+    /**
+     * Частичная заявка дожила до развязки — записать, СКОЛЬКО она ждала.
+     *
+     * Это и есть то измерение, ради которого всё затевалось: решение «ждать или
+     * снимать и ставить заново» упирается в вопрос, как часто остаток добирается
+     * сам и за какое время. Один наблюдённый случай (84 секунды) статистикой не
+     * является. Ответ читается из журнала: {@code SELECT detail FROM exec_event
+     * WHERE kind = 'partial_done'}.
+     */
+    private void closePartial(Resting resting, String outcome) {
+        if (!resting.partial()) {
+            resting.partialId = null;
+            return;
+        }
+        long waited = Math.max(0, clock.now() - resting.partialSinceMs);
+        String text = resting.partialId + " " + outcome + " через " + waited / 1000
+                + " с, частичное было " + fmt(resting.partialFilled);
+        log.warn("частичная заявка: {}", text);
+        journal.event("partial_done", text);
+        resting.partialId = null;
     }
 
     /**
@@ -1932,13 +2091,22 @@ public final class QuoteLoop implements Runnable {
         if (keep == null) {
             boolean fresh = clock.now() - resting.sinceMs < ADOPT_GRACE_MS;
             if (resting.venueId != null && !fresh) {
-                inspectGoneOrder(side, resting.venueId);
+                String status = inspectGoneOrder(side, resting.venueId);
+                closePartial(resting, "filled".equalsIgnoreCase(status)
+                        ? "добрана" : "ушла из книги (" + status + ")");
                 resting.venueId = null;
                 refreshBalances();
             }
             return;
         }
         if (keep.id().equals(resting.venueId)) {
+            // ⚠️ ПОМЕТКА БЕРЁТСЯ ИЗ ОТВЕТА ПЛОЩАДКИ на каждой сверке, а не
+            // помнится. Список активных сам называет состояние заявки
+            // (`partially_filled`), и потому пометка не может ни устареть, ни
+            // застрять: пропала заявка — пропала и она.
+            if (keep.partiallyFilled()) {
+                markPartial(side, resting, keep.filled(), keep.filled() + keep.size());
+            }
             // ⚠️ ЗАЯВКА НА МЕСТЕ, НО ПОХУДЕЛА — значит её частично исполнили.
             //
             // Единственный путь, которым бот узнаёт о сделке, — исчезнувшая
@@ -1961,7 +2129,8 @@ public final class QuoteLoop implements Runnable {
         // если он исполнился, запись должна появиться. Повторного счёта нет —
         // {@link #bookedByOrder} помнит, сколько по нему уже записано.
         if (resting.venueId != null) {
-            inspectGoneOrder(side, resting.venueId);
+            String status = inspectGoneOrder(side, resting.venueId);
+            closePartial(resting, "сменилась наследником (" + status + ")");
         }
         log.warn("усыновляю заявку {} {} по {} ({})", side, keep.id(), keep.price(), why);
         journal.event("adopt", side + " " + keep.id() + " по " + fmt(keep.price())
@@ -1970,6 +2139,11 @@ public final class QuoteLoop implements Runnable {
         resting.price = keep.price();
         resting.size = keep.size();
         resting.sinceMs = clock.now();
+        if (keep.partiallyFilled()) {
+            // Усыновлённая заявка тоже бывает частично исполненной: наследник
+            // мог успеть поймать часть, пока мы о нём не знали.
+            markPartial(side, resting, keep.filled(), keep.filled() + keep.size());
+        }
         // Наследник найден — значит предыдущий отказ был мнимым, и держать
         // за него паузу не за что.
         resting.failures = 0;
@@ -1995,11 +2169,11 @@ public final class QuoteLoop implements Runnable {
      * при maker 0%, и появление любой ненулевой комиссии означает конец промо —
      * то есть смену экономики, а не параметра. Решение принимает человек.
      */
-    private void inspectGoneOrder(Side side, String venueId) {
+    private String inspectGoneOrder(Side side, String venueId) {
         Venue.Response order = client.order(venueId);
         if (!order.ok() || order.body() == null) {
             fills++;                      // судьбу не выяснили, но заявки нет
-            return;
+            return null;
         }
         String status = field(order.body(), "status");
         double total = number(order.body(), "filled_quantity");
@@ -2035,6 +2209,7 @@ public final class QuoteLoop implements Runnable {
             alert.accept(message);
             stopQuoting();
         }
+        return status;
     }
 
     /**
@@ -2117,6 +2292,7 @@ public final class QuoteLoop implements Runnable {
             return;
         }
         trace("CANCEL", side, resting, resting.price, resting.size);
+        closePartial(resting, "снята нами");
         String dead = resting.venueId;
         // Обнуляем ДО выяснения: предохранитель по комиссии внутри может позвать
         // остановку, а та — снова сюда, и рекурсия должна упереться в этот null.

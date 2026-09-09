@@ -24,7 +24,26 @@ import java.util.List;
  * после приведения.
  */
 public record ActiveOrder(String id, String clientId, String symbol, Side side,
-                          double price, double size, long createdMs) {
+                          double price, double size, long createdMs,
+                          String status, double filled) {
+
+    /**
+     * Заявка исполнена ЧАСТИЧНО, и заменить её площадка уже НЕ ДАСТ.
+     *
+     * ⚠️ Это не догадка, а поле ответа: список активных отдаёт
+     * {@code "status":"partially_filled"} наравне с {@code "new"}. Проверено на
+     * живом журнале бота A 09.09.2026 — заявка {@code c02363a9} висела в списке
+     * с {@code filled_quantity 0.00001023} из {@code 0.00003765}.
+     *
+     * Замена требует состояния {@code NEW}, поэтому на такой заявке PUT отвечает
+     * 422 «Cannot replace an order that is not in the 'NEW' state» — и будет
+     * отвечать так до конца её жизни. Бот, который этого не знает, ломится в неё
+     * с растущей паузой: 09.09.2026 по этой самой заявке ушло ВОСЕМЬ отказов за
+     * 84 секунды, пока остаток не добрался сам.
+     */
+    public boolean partiallyFilled() {
+        return "partially_filled".equalsIgnoreCase(status) || filled > 1e-12;
+    }
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -74,7 +93,9 @@ public record ActiveOrder(String id, String clientId, String symbol, Side side,
                 "sell".equalsIgnoreCase(side) ? Side.SELL : Side.BUY,
                 number(node, "price"),
                 size,
-                (long) number(node, "created_date", "created_at"));
+                (long) number(node, "created_date", "created_at"),
+                text(node, "status"),
+                number(node, "filled_quantity"));
     }
 
     /** {@code BTC-USDC} и {@code BTC/USDC} — одна и та же пара. */
