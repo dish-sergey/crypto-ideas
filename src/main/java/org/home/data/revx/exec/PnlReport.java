@@ -145,7 +145,12 @@ public final class PnlReport {
         // «сделок», свежий бот показывал «0 сделок» после двух настоящих
         // покупок — читалось как «ничего не делал», хотя круг просто ещё не
         // замкнулся. Число исполнений печатается отдельной строкой ниже.
-        sb.append("Окно      |    пар | реализовано |   на пару |     оборот | передачи\n");
+        // ⚠️ «На пару» заменено на «б.п. оборота»: делить доход на число пар
+        // можно, только пока все сделки одного размера. При смене лота продажа
+        // новым лотом закрывает несколько старых партий и считается за несколько
+        // пар — доход тот же, «на пару» падает кратно (09.09.2026, переход с $1
+        // на $3). Оборот от размера лота не зависит вовсе.
+        sb.append("Окно      |    пар | реализовано | б.п. оборота | оборот USDC | передачи\n");
         if (boot != null) {
             sb.append(row("С ЗАПУСКА", ledger, boot.tsMs()));
         }
@@ -181,15 +186,19 @@ public final class PnlReport {
         sb.append("\nот движения рынка не зависит. Передачи — пары, где хоть одна нога");
         sb.append("\nпередача или затравка: это не заработок бота.");
         sb.append("\nНереализовано — переоценка остатка, это ставка на рынок.");
+        sb.append("\n\n⚠️ Сравнивать настройки — по БАЗИСНЫМ ПУНКТАМ ОБОРОТА, а не по числу");
+        sb.append("\nпар: при смене лота одна продажа закрывает несколько старых партий и");
+        sb.append("\nсчитается за несколько пар. Оборот от размера лота не зависит.");
         return sb.toString();
     }
 
     private static String row(String label, FifoLedger ledger, long from) {
         int closed = ledger.tradingClosedSince(from);
         double realised = ledger.tradingRealisedSince(from);
-        double qty = ledger.tradingClosedQtySince(from);
+        double notional = ledger.tradingClosedNotionalSince(from);
         double handover = ledger.handoverRealisedSince(from);
-        return String.format(Locale.ROOT, "%-9s | %6d | %+11.4f | %+9.5f | %.8f | %+8.4f%n",
-                label, closed, realised, closed > 0 ? realised / closed : 0, qty, handover);
+        double bp = notional > 0 ? realised / notional * 10_000 : 0;
+        return String.format(Locale.ROOT, "%-9s | %6d | %+11.4f | %+12.2f | %11.4f | %+8.4f%n",
+                label, closed, realised, bp, notional, handover);
     }
 }

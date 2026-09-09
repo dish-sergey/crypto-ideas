@@ -157,6 +157,7 @@ public final class InfoBot implements Runnable {
     private record Snapshot(String botId, String symbol, boolean quoting, boolean trading,
                             String pausedReason, long parks1h, long lastEventMs,
                             double position, double fair, int fills24, double realised24,
+                            double notional24,
                             long placements24, long cap, String note) {
     }
 
@@ -176,12 +177,13 @@ public final class InfoBot implements Runnable {
                     pos == null ? 0 : pos, j.lastFair(),
                     ledger.tradingClosedSince(now - 86_400_000L),
                     ledger.tradingRealisedSince(now - 86_400_000L),
+                    ledger.tradingClosedNotionalSince(now - 86_400_000L),
                     j.placementsSince(now - 86_400_000L),
                     ExecLimits.maxPlacementsPerDay(w.botId()), null);
         } catch (Exception e) {
             // Недоступный журнал — это САМ ПО СЕБЕ результат: бот не запускался
             // или упал так, что файла нет. Молчать об этом нельзя.
-            return new Snapshot(w.botId(), w.symbol(), false, false, null, 0, 0, 0, 0, 0, 0, 0,
+            return new Snapshot(w.botId(), w.symbol(), false, false, null, 0, 0, 0, 0, 0, 0, 0, 0,
                     ExecLimits.maxPlacementsPerDay(w.botId()), "журнал недоступен");
         }
     }
@@ -228,13 +230,17 @@ public final class InfoBot implements Runnable {
             boolean stale = !s.quoting() && now - s.lastEventMs() > 5 * 60_000L;
             long pct = s.cap() > 0 ? 100 * s.placements24() / s.cap() : 0;
             sb.append(String.format(Locale.ROOT,
-                    "%s %s  %s — %s%n  сделок 24ч %d, доход %+.4f USDC%n"
+                    "%s %s  %s — %s%n  закрытых пар 24ч %d, доход %+.4f USDC%n"
                             + "  инвентарь %.2f USDC%s, постановок %d из %d (%d%%)%n"
+                            + "  оборот 24ч %.2f USDC, доход %+.1f б.п. оборота%n"
                             + "  отводов за час %d, тик %s%s%n%n",
                     mark, s.botId().toUpperCase(Locale.ROOT), s.symbol(), what,
                     s.fills24(), s.realised24(), s.position() * s.fair(),
                     stale ? " — СНИМОК на момент остановки, НЕ ПРОВЕРЕНО" : "",
-                    s.placements24(), s.cap(), pct, s.parks1h(), age,
+                    s.placements24(), s.cap(), pct,
+                    s.notional24(),
+                    s.notional24() > 0 ? s.realised24() / s.notional24() * 10_000 : 0,
+                    s.parks1h(), age,
                     s.note() == null ? "" : "\n  ⚠️ " + s.note()));
         }
         sb.append(String.format(Locale.ROOT,
