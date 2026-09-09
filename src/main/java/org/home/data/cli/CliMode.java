@@ -34,7 +34,8 @@ public class CliMode {
             "revx-sim", "revx-flow", "revx-screen", "revx-exec-report", "revx-perp-basis", "revx-mirror",
             "revx-trade-check", "revx-order-probe", "revx-panic", "revx-park", "revx-exec", "revx-regimes",
             "revx-replay", "revx-forecast", "revx-ladder", "revx-pair-forecast",
-            "revx-pair-sweep", "revx-info", "revx-assemble", "revx-fill-check");
+            "revx-pair-sweep", "revx-info", "revx-assemble", "revx-fill-check",
+            "revx-order");
 
     /**
      * Параметры команд. Их нельзя считать неизвестными опциями: они не запускают
