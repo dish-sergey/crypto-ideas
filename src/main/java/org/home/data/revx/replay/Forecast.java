@@ -246,6 +246,7 @@ public final class Forecast {
                                 + "ПРОПУЩЕНО из-за невидимости {}",
                         m.queueFills(), m.interceptFills(), m.invisibleSkips());
                 log.warn("{}", m.queueBlockStats());
+                log.warn("{}", m.gates().render());
             }
             for (QuoteLoop l : loops) {
                 log.warn("по уровням, бот {}:%n{}", l.botId(), l.levelPresence());

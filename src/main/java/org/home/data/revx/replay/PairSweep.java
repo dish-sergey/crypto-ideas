@@ -131,6 +131,8 @@ public final class PairSweep {
         int daysHeld;
         double price;
         final List<Forecast.Day> byDay = new ArrayList<>();
+        /** Отсев принтов по гейтам, накопленный по всем суткам этой ступени. */
+        MarketFillModel.Gates gates = MarketFillModel.Gates.empty();
     }
 
     private PairSweep() {
@@ -401,7 +403,8 @@ public final class PairSweep {
                     levels, levelStepBp / 10_000, lot, innerFirst, dynK);
             List<Forecast.BotSpec> one = List.of(spec);
 
-            var queue = Forecast.run(ticks, new MarketFillModel(market0.fresh()), bp, one, cfg);
+            MarketFillModel model = new MarketFillModel(market0.fresh());
+            var queue = Forecast.run(ticks, model, bp, one, cfg);
             var touch = Forecast.run(ticks, new TouchFillModel(market0.fresh()), bp, one, cfg);
             if (queue.isEmpty() || touch.isEmpty()) {
                 continue;
@@ -433,6 +436,7 @@ public final class PairSweep {
             double move = q.days_() == null || q.days_().isEmpty() ? 0
                     : q.days_().get(0).movePct();
             cell.byDay.add(new Forecast.Day(label, move, q.realised(), q.fills()));
+            cell.gates = cell.gates.merge(model.gates());
             }
         }
         }
@@ -474,6 +478,71 @@ public final class PairSweep {
      * не сама величина, а разница между концентрацией дохода и концентрацией
      * СДЕЛОК: она этим смещением почти не задета.
      */
+
+    /**
+     * ОТСЕВ ПРИНТОВ ПО ГЕЙТАМ: куда девается поток, до которого мы дотянулись.
+     *
+     * <h2>Зачем таблица, а не одно число исполнений</h2>
+     *
+     * До 10.09.2026 расхождение стенда с живым разбиралось только снаружи —
+     * отдельными приборами, по одной гипотезе за раз, и так были проверены и
+     * отвергнуты семь штук подряд (смещение справедливой цены, побитовое
+     * сравнение цен, отставание котировки, обратная связь по инвентарю,
+     * {@code StandFair} против {@code StandReader}, частота тиков, слепота к
+     * шипам между тиками). Все семь стоили дня работы каждая, а ответ «куда
+     * делись принты» всё это время лежал внутри модели исполнения и просто не
+     * считался.
+     *
+     * <h2>Как читать</h2>
+     *
+     * Сумма всех граф равна числу принтов на ленте — метка у каждого ровно
+     * одна. Осмысленные вопросы к ней:
+     *
+     * <ul>
+     *   <li><b>ДОШЛО</b> — потолок: сколько принтов вообще дотянулось до нашей
+     *       цены. Если стенд берёт заметно меньше, теряет он на своих гейтах, а
+     *       не на данных;</li>
+     *   <li><b>не дошло</b> с медианным недолётом — цена стратегии. Недолёт в
+     *       2 б.п. значит, что отступ на 2 б.п. уже, и поток был бы наш
+     *       (при κ = 0.385 на б.п. это половина потока);</li>
+     *   <li><b>нет заявки</b> — мы не котировали эту сторону вовсе: потолок
+     *       инвентаря, гейт справедливой цены или заявка в полёте. Большая
+     *       графа здесь означает, что чинить надо расстановку, а не модель;</li>
+     *   <li><b>невидима</b> — заявка вне пяти собранных уровней в момент
+     *       принта. Это предел ДАННЫХ, а не поведения: глубже книги у нас нет;</li>
+     *   <li><b>очередь</b> — единственная графа, где виновата сама модель
+     *       очереди. На живых окнах она обычно ноль, и это само по себе
+     *       находка: механизм очереди фактически выключен, работает перехват.</li>
+     * </ul>
+     */
+    private static String gatesTable(Map<String, Map<Variant, Cell>> grid) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n\n=== ОТСЕВ ПРИНТОВ ПО ГЕЙТАМ (рабочая модель) ===\n\n");
+        sb.append("пара     | ступень |принтов|нет заявки|не дошло| недолёт |невидима|очередь|слот выбран|объём|ВЗЯТО|дошло\n");
+        sb.append("---------+---------+-------+----------+--------+---------+--------+-------+-----------+-----+-----+-----\n");
+        for (var byBase : grid.entrySet()) {
+            for (var e : byBase.getValue().entrySet()) {
+                MarketFillModel.Gates g = e.getValue().gates;
+                if (g.prints() == 0) {
+                    continue;
+                }
+                List<Double> miss = new ArrayList<>(g.missBp());
+                java.util.Collections.sort(miss);
+                sb.append(String.format(Locale.ROOT,
+                        "%-8s | %7s |%7d|%10d|%8d|%9s|%8d|%7d|%11d|%5d|%5d|%5d%n",
+                        byBase.getKey(), e.getKey().label(), g.prints(), g.noOrderOnSide(),
+                        g.notReached(),
+                        miss.isEmpty() ? "-" : String.format(Locale.ROOT, "%.2f б.п.",
+                                miss.get(miss.size() / 2)),
+                        g.invisible(), g.queueBlocked(), g.slotSpent(), g.noVolumeLeft(),
+                        g.taken(), g.reached()));
+            }
+        }
+        sb.append("\n⚠️ метка у принта одна: сумма граф = число принтов. «дошло» — потолок,\n");
+        sb.append("   до которого модель вообще могла дотянуться; «недолёт» — медиана того,\n");
+        sb.append("   на сколько б.п. принт не долетел до ближайшей нашей заявки.\n");
+        return sb.toString();
+    }
     private static String concentration(Map<String, Map<Variant, Cell>> grid) {
         StringBuilder sb = new StringBuilder(
                 "\n\n=== КОНЦЕНТРАЦИЯ: сколько суток делают доход ===\n\n");
@@ -666,6 +735,7 @@ public final class PairSweep {
         }
 
         sb.append(concentration(grid));
+        sb.append(gatesTable(grid));
 
         // Разрез по суткам у лучших пар: средний доход прячет главное — держится
         // ли конструкция на падении.

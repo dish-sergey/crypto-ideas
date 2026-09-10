@@ -167,6 +167,7 @@ public final class FillCheck {
         log.warn("механизм: очередью {}, перехватом {}, пропущено из-за невидимости {}",
                 model.queueFills(), model.interceptFills(), model.invisibleSkips());
         log.warn("{}", model.queueBlockStats());
+        log.warn("{}", model.gates().render());
         String dumpPath = System.getProperty("revx.fillcheck.dump");
         if (dumpPath != null && !dumpPath.isBlank()) {
             dump(dumpPath, symbol, live, v, MarketData.load(standDbPath, symbol,

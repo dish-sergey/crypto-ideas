@@ -128,6 +128,81 @@ public final class MarketFillModel implements FillModel {
     private final MarketData market;
     private final Map<String, Queue> queues = new HashMap<>();
     private long lastMs = Long.MIN_VALUE;
+    /**
+     * ОТСЕВ ПО ГЕЙТАМ: почему каждый принт НЕ стал нашим исполнением.
+     *
+     * <h2>Зачем</h2>
+     *
+     * Замер 10.09.2026 показал, что дело не в данных: лента полна (все 60 живых
+     * исполнений бота A найдены в собранных принтах), а потолок достижимого на
+     * окне — 56 принтов из 422 при заявке в 12 б.п. от справедливой цены. Стенд
+     * брал 30. То есть половина теряется на СВОИХ гейтах, а какой именно из них
+     * съедает — до этих счётчиков было неизвестно, и все шесть предыдущих
+     * гипотез приходилось проверять снаружи, отдельными приборами.
+     *
+     * <h2>Как считается</h2>
+     *
+     * Ровно ОДНА метка на принт, а не на заявку: иначе один принт, дошедший до
+     * трёх наших уровней, попадал бы в три графы сразу и сумма перестала бы
+     * сходиться с числом принтов. Метка — по ЛУЧШЕМУ исходу: если хоть одна
+     * заявка исполнилась, принт считается взятым; иначе берётся причина отказа
+     * у ближайшей к рынку из тех, до кого он дошёл.
+     */
+    public record Gates(long prints, long noAggressor, long noOrderOnSide, long notReached,
+                        long invisible, long queueBlocked, long slotSpent, long noVolumeLeft,
+                        long taken, List<Double> missBp) {
+
+        public Gates merge(Gates o) {
+            List<Double> m = new ArrayList<>(missBp);
+            m.addAll(o.missBp());
+            return new Gates(prints + o.prints(), noAggressor + o.noAggressor(),
+                    noOrderOnSide + o.noOrderOnSide(), notReached + o.notReached(),
+                    invisible + o.invisible(), queueBlocked + o.queueBlocked(),
+                    slotSpent + o.slotSpent(), noVolumeLeft + o.noVolumeLeft(),
+                    taken + o.taken(), m);
+        }
+
+        public static Gates empty() {
+            return new Gates(0, 0, 0, 0, 0, 0, 0, 0, 0, new ArrayList<>());
+        }
+
+        /** Сколько принтов ДОШЛО до нашей цены — потолок, который стенд мог бы взять. */
+        public long reached() {
+            return invisible + queueBlocked + slotSpent + noVolumeLeft + taken;
+        }
+
+        public String render() {
+            if (prints == 0) {
+                return "принтов не было";
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append(String.format(java.util.Locale.ROOT,
+                    "отсев принтов: всего %d, агрессор неизвестен %d, нашей заявки на этой стороне нет %d, "
+                            + "цена не дошла %d", prints, noAggressor, noOrderOnSide, notReached));
+            if (!missBp.isEmpty()) {
+                List<Double> s = new ArrayList<>(missBp);
+                java.util.Collections.sort(s);
+                sb.append(String.format(java.util.Locale.ROOT,
+                        " (недолёт: медиана %.2f б.п., 10%% %.2f, 90%% %.2f)",
+                        s.get(s.size() / 2), s.get(s.size() / 10), s.get(s.size() * 9 / 10)));
+            }
+            sb.append(String.format(java.util.Locale.ROOT,
+                    "; ДОШЛО %d = невидима %d + очередь %d + слот уже выбран %d + объём кончился %d "
+                            + "+ ВЗЯТО %d",
+                    reached(), invisible, queueBlocked, slotSpent, noVolumeLeft, taken));
+            return sb.toString();
+        }
+    }
+
+    private long gPrints, gNoAggressor, gNoOrder, gNotReached, gInvisible, gQueueBlocked;
+    private long gSlotSpent, gNoVolume, gTaken;
+    private final List<Double> gMissBp = new ArrayList<>();
+
+    public Gates gates() {
+        return new Gates(gPrints, gNoAggressor, gNoOrder, gNotReached,
+                gInvisible, gQueueBlocked, gSlotSpent, gNoVolume, gTaken, new ArrayList<>(gMissBp));
+    }
+
     private long interceptFills;
     private long queueFills;
     private long invisibleSkips;
@@ -306,19 +381,31 @@ public final class MarketFillModel implements FillModel {
             left.put(r.id(), r.size());
         }
         for (MarketTrade t : trades) {
+            gPrints++;
             if (t.aggressor() == null) {
+                gNoAggressor++;
                 continue;              // агрессор неизвестен — исполнения нет
             }
             boolean hitsBuys = t.aggressor() == Side.SELL;
+            // ⚠️ ОДНА МЕТКА НА ПРИНТ. Заявок на стороне может быть несколько
+            // (уровни), и без этого один принт попадал бы в несколько граф сразу.
+            int onSide = 0;
+            double nearestMissBp = Double.MAX_VALUE;
+            boolean spent = false;          // заявка дошла, но её уже выбрал предыдущий принт
+            String verdict = null;
             List<Resting> queueAtTrade = new ArrayList<>();
             for (Resting r : resting) {
                 if (r.buy() != hitsBuys) {
                     continue;
                 }
+                onSide++;
                 boolean reached = r.buy() ? t.price() <= r.price() : t.price() >= r.price();
                 if (reached && left.getOrDefault(r.id(), 0.0) > 1e-15) {
                     queueAtTrade.add(r);
                     continue;
+                }
+                if (reached) {
+                    spent = true;
                 }
                 // ⚠️ СДЕЛКА ПО ЦЕНЕ ЛУЧШЕ НАШЕЙ ВЫБИРАЕТ НАШУ ОЧЕРЕДЬ.
                 //
@@ -333,6 +420,11 @@ public final class MarketFillModel implements FillModel {
                 // отказывала в сделке, очередь была в среднем в 300-700 раз
                 // больше самой сделки (BTC 306, ADA 736, ETH 212) — она просто
                 // никогда не уменьшалась. Живьём те же заявки исполнялись.
+                if (!reached) {
+                    // насколько принт НЕ ДОЛЕТЕЛ до этой заявки, в базисных пунктах
+                    double miss = Math.abs(t.price() - r.price()) / Math.abs(r.price()) * 1e4;
+                    nearestMissBp = Math.min(nearestMissBp, miss);
+                }
                 if (!reached && q(r) != null) {
                     Queue qq = q(r);
                     if (qq.ahead > 0) {
@@ -349,6 +441,9 @@ public final class MarketFillModel implements FillModel {
             double volume = t.qty();
             for (Resting r : queueAtTrade) {
                 if (volume <= 1e-15) {
+                    if (verdict == null) {
+                        verdict = "volume";
+                    }
                     break;
                 }
                 Queue q = queues.get(r.id());
@@ -359,6 +454,9 @@ public final class MarketFillModel implements FillModel {
                 Boolean visibleNow = visibleInBook(bookNow, r.buy(), r.price());
                 if (!(visibleNow == null ? q.visible : visibleNow)) {
                     invisibleSkips++;
+                    if (verdict == null) {
+                        verdict = "invisible";
+                    }
                     continue;
                 }
                 // ⚠️ Очередь у каждой заявки списывается ОТДЕЛЬНО, из полного
@@ -427,6 +525,9 @@ public final class MarketFillModel implements FillModel {
                         if (queueBlockRatio.size() < 100_000) {
                             queueBlockRatio.add(before / Math.max(1e-15, t.qty()));
                         }
+                        if (verdict == null) {
+                            verdict = "queue";
+                        }
                         continue;      // до нас очередь ещё не дошла
                     }
                     q.ahead = 0;
@@ -435,6 +536,9 @@ public final class MarketFillModel implements FillModel {
                 // надо. Это единственная настоящая конкуренция, и она невелика —
                 // 27% сделок мельче двух лотов, остальным места хватает обоим.
                 if (volume <= 1e-15) {
+                    if (verdict == null) {
+                        verdict = "volume";
+                    }
                     break;
                 }
                 double qty = Math.min(left.get(r.id()), volume);
@@ -449,7 +553,34 @@ public final class MarketFillModel implements FillModel {
                 } else {
                     queueFills++;
                 }
+                verdict = "taken";
                 out.add(new Filled(r.id(), qty, r.price()));
+            }
+            // ⚠️ Метка ставится ОДИН раз на принт, по лучшему исходу: «взято»
+            // бьёт любой отказ, иначе взятый принт попал бы ещё и в отсев.
+            if (onSide == 0) {
+                gNoOrder++;
+            } else if (queueAtTrade.isEmpty() && spent) {
+                // ⚠️ ОТДЕЛЬНАЯ ГРАФА, и это не педантизм. «Слот уже выбран» значит,
+                // что принт пришёл на нашу цену, пока заявка мертва: её взял
+                // предыдущий принт, а новую котировщик ещё не поставил. Это
+                // задержка ВОССТАНОВЛЕНИЯ, лечится частотой перевыставления и
+                // числом уровней. «Объём кончился» — совсем другое: принт
+                // разошёлся по соседним нашим заявкам, и лечить нечего.
+                gSlotSpent++;
+            } else if (queueAtTrade.isEmpty()) {
+                gNotReached++;
+                if (nearestMissBp < Double.MAX_VALUE && gMissBp.size() < 500_000) {
+                    gMissBp.add(nearestMissBp);
+                }
+            } else if ("taken".equals(verdict)) {
+                gTaken++;
+            } else if ("queue".equals(verdict)) {
+                gQueueBlocked++;
+            } else if ("invisible".equals(verdict)) {
+                gInvisible++;
+            } else {
+                gNoVolume++;
             }
         }
         return out;
