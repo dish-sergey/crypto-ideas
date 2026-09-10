@@ -36,7 +36,13 @@ public final class FairPrice {
             int minPairs,
             double maxDispersionPct,
             double maxReferenceSpreadPct,
-            double maxResidualPct) {
+            double maxResidualPct,
+            double fixedRate) {
+
+        public Limits(int minPairs, double maxDispersionPct,
+                      double maxReferenceSpreadPct, double maxResidualPct) {
+            this(minPairs, maxDispersionPct, maxReferenceSpreadPct, maxResidualPct, 0);
+        }
     }
 
     /** Почему по паре нельзя котировать; null = можно. */
@@ -105,7 +111,16 @@ public final class FairPrice {
                 continue;
             }
             double residualPct = 100.0 * (q.implied() / rate - 1);
-            double fair = q.midUsd() / rate;
+            // ⚠️ ПОДМЕНА КУРСА — ПРИБОР, А НЕ НАСТРОЙКА. Подменяется ТОЛЬКО
+            // делитель цены; медиана, разброс, остатки и все три гейта считаются
+            // по-прежнему. Иначе опыт менял бы сразу две вещи, и разделить
+            // «сдвинулась цена» и «иначе сработали гейты» было бы нечем.
+            //
+            // Зачем: 10.09.2026 нашлось, что у площадки есть прямая книга
+            // USDC/USD, и наша медиана с ней расходится на 3–10 б.п. при отступе
+            // 12. Подстановка курса 1.0 показывает верхнюю оценку того, сколько
+            // вообще решает эта величина.
+            double fair = q.midUsd() / (limits.fixedRate() > 0 ? limits.fixedRate() : rate);
             String paused = null;
             if (!reliable) {
                 paused = "курс ненадёжен: " + unreliableReason;

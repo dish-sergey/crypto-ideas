@@ -135,9 +135,16 @@ public final class PairSweep {
                            int thin, double dynK, double capUsd) {
         long from = java.time.Instant.parse(fromIso).toEpochMilli();
         long to = java.time.Instant.parse(toIso).toEpochMilli();
+        // Подмена курса — только для опыта, см. FairPrice. Ноль = считать медианой.
+        double fixedRate = Double.parseDouble(
+                System.getProperty("revx.fair.fixed-rate", "0"));
+        if (fixedRate > 0) {
+            log.warn("⚠️ ОПЫТ: курс USDC/USD подменён на {} — гейты считаются "
+                    + "по-прежнему, подменён только делитель цены", fixedRate);
+        }
         FairPrice.Limits limits = new FairPrice.Limits(cfg.fairMinPairs(),
                 cfg.fairMaxDispersionPct(), cfg.fairMaxReferenceSpreadPct(),
-                cfg.fairMaxResidualPct());
+                cfg.fairMaxResidualPct(), fixedRate);
 
         // пара → отступ → накопитель
         Map<String, Map<Variant, Cell>> grid = new TreeMap<>();
