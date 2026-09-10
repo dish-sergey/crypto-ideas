@@ -49,6 +49,8 @@ public class RevxConfig {
     private final int tradesPeriodTier1Seconds;
     private final int tradesPeriodOtherSeconds;
     private final int pairsRefreshHours;
+    private final String rateBookSymbol;
+    private final int rateBookPeriodSeconds;
     private final int tradesPagesPerRun;
     private final int tradesBackfillMaxHours;
     private final String healthFile;
@@ -175,6 +177,8 @@ public class RevxConfig {
             @Value("${revx.trades-period-tier1-seconds}") int tradesPeriodTier1Seconds,
             @Value("${revx.trades-period-other-seconds}") int tradesPeriodOtherSeconds,
             @Value("${revx.pairs-refresh-hours}") int pairsRefreshHours,
+            @Value("${revx.rate-book-symbol:}") String rateBookSymbol,
+            @Value("${revx.rate-book-period-seconds:0}") int rateBookPeriodSeconds,
             @Value("${revx.trades-pages-per-run}") int tradesPagesPerRun,
             @Value("${revx.trades-backfill-max-hours}") int tradesBackfillMaxHours,
             @Value("${revx.health-file}") String healthFile,
@@ -296,6 +300,8 @@ public class RevxConfig {
         this.tradesPeriodTier1Seconds = tradesPeriodTier1Seconds;
         this.tradesPeriodOtherSeconds = tradesPeriodOtherSeconds;
         this.pairsRefreshHours = pairsRefreshHours;
+        this.rateBookSymbol = rateBookSymbol == null ? "" : rateBookSymbol.trim();
+        this.rateBookPeriodSeconds = rateBookPeriodSeconds;
         this.tradesPagesPerRun = tradesPagesPerRun;
         this.tradesBackfillMaxHours = tradesBackfillMaxHours;
         this.healthFile = healthFile;
@@ -551,6 +557,16 @@ public class RevxConfig {
 
     public int tradesPeriodOtherSeconds() {
         return tradesPeriodOtherSeconds;
+    }
+
+    /** Прямая книга курса USDC/USD: путь символа для запроса. Пусто — не собирать. */
+    public String rateBookSymbol() {
+        return rateBookSymbol;
+    }
+
+    /** Период сбора прямой книги курса. Ноль — не собирать. */
+    public int rateBookPeriodSeconds() {
+        return rateBookPeriodSeconds;
     }
 
     public int pairsRefreshHours() {

@@ -273,6 +273,28 @@ public class RevxCollectorDaemon {
                 // иначе его шаг перестанет быть тем, ради чего он заведён.
                 addBookTasks(queue, fast, fastPeriodMs, now, 0);
             }
+            // ПРЯМАЯ книга курса USDC/USD. Один запрос за период — на бюджете это
+            // не сказывается (0.1 req/s при десяти секундах), а сравнивать нашу
+            // медиану станет с чем. Приоритет 1, как у обычного яруса: она нужна
+            // не быстрее торгуемых пар, но и не в самом хвосте.
+            if (cfg.rateBookPeriodSeconds() > 0 && !cfg.rateBookSymbol().isBlank()) {
+                long ratePeriodMs = cfg.rateBookPeriodSeconds() * 1000L;
+                String path = cfg.rateBookSymbol();
+                String symbol = path.replace('-', '/');
+                queue.add(new Task("курс " + symbol, ratePeriodMs, 1, now + 1_000,
+                        () -> {
+                            BookCollector.Snapshot snap = books.collectRate(path, symbol);
+                            if (snap.written() > 0) {
+                                lastBookWriteMs.set(System.currentTimeMillis());
+                                bookSnapshots.addAndGet(snap.written());
+                            }
+                        }));
+                plannedRps += 1.0 / cfg.rateBookPeriodSeconds();
+                log.warn("прямая книга курса {} раз в {} с (+{} req/s) — только СБОР, "
+                                + "справедливая цена по-прежнему считается медианой",
+                        symbol, cfg.rateBookPeriodSeconds(),
+                        Math.round(100.0 / cfg.rateBookPeriodSeconds()) / 100.0);
+            }
             addTradeTasks(queue, universe, tradesPeriodMs, now + 2_000, 2);
             long refresh = cfg.pairsRefreshHours() * 3600_000L;
             queue.add(new Task("pairs", refresh, 5, now + refresh, catalog::refresh));

@@ -129,6 +129,59 @@ public class BookCollector {
         return new Snapshot(snapId, rows.size(), skewMs, skewExceeded);
     }
 
+    /**
+     * ПРЯМАЯ книга курса USDC/USD — одна книга, а не пара ног.
+     *
+     * <h2>Зачем отдельный путь</h2>
+     *
+     * Курс USDC/USD мы до 10.09.2026 вычисляли медианой {@code implied} по всем
+     * парам, а у площадки всё это время был свой рынок этой пары. Он живой и
+     * глубокий: спред 1 б.п., по пять уровней с десятками тысяч USDC.
+     *
+     * ⚠️ И наша медиана с ним НЕ СХОДИТСЯ. Три одновременных замера 10.09.2026:
+     * прямая книга неподвижна на 1.00005, медиана дала 0.999744 / 0.999710 /
+     * 0.999065 — расхождение 3.1, 3.4 и 9.9 б.п. при боевом отступе 12. Причина
+     * видна в разбросе: {@code implied} по 23 парам лежат в полосе 35 б.п., и
+     * медиана скачет между соседями, потому что это отношение середин ДВУХ
+     * РАЗНЫХ книг одного актива — оно тащит разность их спредов и потока, а не
+     * только отклонение привязки.
+     *
+     * <h2>Почему только собираем, а не считаем по ней</h2>
+     *
+     * Курс — основание всего котирования, а ТЗ §4.1 предписывает медиану
+     * сознательно: чтобы одна разъехавшаяся книга не двигала цену. Менять это
+     * на три замера нельзя. Здесь только сбор: два курса пишутся рядом, и через
+     * сутки будет чем сравнивать.
+     *
+     * В схему «пара = нога USDC + нога USD» она не ложится: книга одна, второй
+     * ноги у неё нет. Поэтому свой метод, а не подгонка под {@link PairsCatalog.Leg}.
+     */
+    public Snapshot collectRate(String pathSymbol, String symbol) {
+        long snapId = snapSeq.updateAndGet(prev -> Math.max(prev + 1, System.currentTimeMillis()));
+        RevxHttp.Response response = http.getSequential(List.of(endpoints.book(pathSymbol))).get(0);
+        if (!response.ok()) {
+            if (response.status() == 429) {
+                anomalies.record("http_429", symbol, "прямая книга курса: лимит запросов");
+            } else {
+                anomalies.record("http_error", symbol, "прямая книга курса: HTTP "
+                        + response.status() + (response.error() == null ? "" : " " + response.error()));
+            }
+            uptime.record("book", 1, 0, response.status() == 429 ? 1 : 0,
+                    response.status() == 429 ? 0 : 1, 0);
+            return new Snapshot(snapId, 0, 0, false);
+        }
+        // Нога помечена usd: книга котируется в долларах. Перекоса нет по
+        // построению — снимок один, сшивать не с чем.
+        Object[] row = row(symbol, "usd", snapId, response, 0, false);
+        List<Object[]> rows = new ArrayList<>(1);
+        if (row != null) {
+            rows.add(row);
+        }
+        db.batch(INSERT_BOOK, rows);
+        uptime.record("book", 1, 1, 0, 0, rows.size());
+        return new Snapshot(snapId, rows.size(), 0, false);
+    }
+
     /** null = снимок отбракован (перекрещенная или пустая книга) — ТЗ §3.2. */
     private Object[] row(String symbol, String leg, long snapId, RevxHttp.Response response,
                          long skewMs, boolean skewExceeded) {
