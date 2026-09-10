@@ -250,6 +250,7 @@ public final class Forecast {
             }
             for (QuoteLoop l : loops) {
                 log.warn("по уровням, бот {}:%n{}", l.botId(), l.levelPresence());
+                log.warn("бот {}: {}", l.botId(), l.effectiveOffset());
             }
             List<BotResult> out = new ArrayList<>();
             for (int i = 0; i < bots.size(); i++) {

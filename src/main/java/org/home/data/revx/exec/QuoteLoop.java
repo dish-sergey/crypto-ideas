@@ -228,6 +228,51 @@ public final class QuoteLoop implements Runnable {
     private long[] askTicks;
     private long levelTicks;
 
+
+    /**
+     * ФАКТИЧЕСКОЕ расстояние котировки от справедливой цены, в базисных пунктах.
+     *
+     * <h2>Зачем мерить то, что задано настройкой</h2>
+     *
+     * Настройка задаёт отступ, но до книги доезжает не он. По дороге его
+     * двигают скос по инвентарю, динамический отступ по ширине опоры, два
+     * раздвижения (по пошлине и по бюджету постановок) и зажим по книге и тику.
+     * Сумма этих поправок и есть то, что решает поток: κ = 0.385 на базисный
+     * пункт, то есть ошибка в один пункт стоит трети исполнений.
+     *
+     * Замер 10.09.2026 показал, что сравнивать стенд с живым по ЧИСЛУ СДЕЛОК
+     * бесполезно — так было потрачено восемь гипотез подряд. У живого бота
+     * заявка в моменты исполнений стояла в 8.67 б.п. от собственной
+     * справедливой цены при настройке 12, и именно это давало ему 50 отдельных
+     * возможностей против 34 у ровных 12 б.п. Значит сравнивать надо здесь, до
+     * всякой модели исполнения.
+     */
+    private final java.util.List<Double> bidOffsetsBp = new java.util.ArrayList<>();
+    private final java.util.List<Double> askOffsetsBp = new java.util.ArrayList<>();
+    /** То же, но по цене ФАКТИЧЕСКИ СТОЯЩЕЙ заявки, а не по цели. */
+    private final java.util.List<Double> bidRestingBp = new java.util.ArrayList<>();
+    private final java.util.List<Double> askRestingBp = new java.util.ArrayList<>();
+
+    public String effectiveOffset() {
+        if (bidOffsetsBp.isEmpty() && askOffsetsBp.isEmpty()) {
+            return "эффективный отступ: нет котировок";
+        }
+        return "ЦЕЛЬ, б.п.: бид " + pct(bidOffsetsBp) + "; аск " + pct(askOffsetsBp)
+                + System.lineSeparator() + "    В КНИГЕ, б.п.: бид " + pct(bidRestingBp)
+                + "; аск " + pct(askRestingBp);
+    }
+
+    private static String pct(java.util.List<Double> v) {
+        if (v.isEmpty()) {
+            return "нет";
+        }
+        java.util.List<Double> s = new java.util.ArrayList<>(v);
+        java.util.Collections.sort(s);
+        return String.format(java.util.Locale.ROOT,
+                "медиана %.2f (10%% %.2f, 25%% %.2f, 75%% %.2f, 90%% %.2f), тиков %d",
+                s.get(s.size() / 2), s.get(s.size() / 10), s.get(s.size() / 4),
+                s.get(s.size() * 3 / 4), s.get(s.size() * 9 / 10), s.size());
+    }
     public String levelPresence() {
         if (levelTicks == 0) {
             return "нет данных";
@@ -1235,6 +1280,32 @@ public final class QuoteLoop implements Runnable {
         // общего ведра постановок, у которого нет истории, и без записи повтор
         // воспроизвести котировку не может в принципе — см. replayPressure.
         countTick();
+        if (fair.price() > 0 && bidOffsetsBp.size() < 500_000) {
+            // ⚠️ обе стороны НУЛЛЯБЕЛЬНЫ: подавленную сторону котировщик отдаёт null
+            if (target.hasBid() && target.bid() > 0) {
+                bidOffsetsBp.add((fair.price() - target.bid()) / fair.price() * 1e4);
+            }
+            if (target.hasAsk() && target.ask() > 0) {
+                askOffsetsBp.add((target.ask() - fair.price()) / fair.price() * 1e4);
+            }
+            // ⚠️ И ОТДЕЛЬНО — цена, которая РЕАЛЬНО стоит в книге. Цель
+            // пересчитывается каждый тик, а заявку двигает только замена, и
+            // порог перевыставления держит её на месте, пока цель не уедет.
+            // Исполняется книга, а не цель, поэтому сравнивать с живым надо
+            // именно этот ряд.
+            for (Resting r : bids) {
+                if (r.venueId != null && r.price > 0) {
+                    bidRestingBp.add((fair.price() - r.price) / fair.price() * 1e4);
+                    break;
+                }
+            }
+            for (Resting r : asks) {
+                if (r.venueId != null && r.price > 0) {
+                    askRestingBp.add((r.price - fair.price()) / fair.price() * 1e4);
+                    break;
+                }
+            }
+        }
         journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null,
                 pressure);
 
