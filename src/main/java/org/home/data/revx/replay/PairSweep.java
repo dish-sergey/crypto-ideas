@@ -78,6 +78,33 @@ public final class PairSweep {
         }
     }
 
+    /**
+     * Настройки и позиция ЖИВОГО бота, если обход просят считать по ним.
+     *
+     * <h2>Зачем</h2>
+     *
+     * Обход по умолчанию сам придумывает себе конструкцию: лот из долларов,
+     * потолок из долларов, скос из `application.properties`, а стартовый
+     * инвентарь — НОЛЬ. Для скрининга вселенной это правильно (пары надо
+     * сравнивать при равном капитале), но для сличения с живым ботом — нет.
+     *
+     * ⚠️ Нулевой стартовый инвентарь мешает сильнее, чем кажется. При цели скоса
+     * 0.3 пустой счёт даёт скос −0.43, то есть бид оказывается в 7.7 б.п., а аск
+     * в 16.3 вместо симметричных 12. Пока инвентарь набирается, обход торгует
+     * другой конструкцией, чем живой бот, и сравнивать их нельзя.
+     *
+     * Настройки берутся ИЗ ЖУРНАЛА, а не из окружения, по той же причине, по
+     * какой так делает повтор: живому боту половина приходит из systemd-юнита,
+     * и подстановка умолчаний однажды уже превратила сверку в сравнение двух
+     * разных настроек.
+     *
+     * @param inventoryAt инвентарь живого бота на заданный момент; обход
+     *                    спрашивает его на границе КАЖДЫХ суток, а не один раз
+     */
+    public record Live(BootParams boot, double dynK, double dynMaxPct,
+                       java.util.function.LongToDoubleFunction inventoryAt) {
+    }
+
     /** Накопитель по одной паре и одной ступени. */
     private static final class Cell {
         /**
@@ -133,8 +160,23 @@ public final class PairSweep {
                            int levels, double levelStepBp, boolean innerFirst,
                            double[] offsetsBp, java.util.Set<String> only, double[] lotsUsd,
                            int thin, double dynK, double capUsd) {
+        run(standDbPath, cfg, fromIso, toIso, levels, levelStepBp, innerFirst, offsetsBp,
+                only, lotsUsd, thin, dynK, capUsd, null);
+    }
+
+    public static void run(String standDbPath, RevxConfig cfg, String fromIso, String toIso,
+                           int levels, double levelStepBp, boolean innerFirst,
+                           double[] offsetsBp, java.util.Set<String> only, double[] lotsUsd,
+                           int thin, double dynK, double capUsd, Live live) {
         long from = java.time.Instant.parse(fromIso).toEpochMilli();
         long to = java.time.Instant.parse(toIso).toEpochMilli();
+        // ⚠️ С журналом обход считает ОДНУ пару — ту, по которой журнал: лот и
+        // потолок заданы в базовой валюте, и на другой паре это были бы
+        // бессмысленные числа.
+        final java.util.Set<String> onlyPairs = live != null
+                ? java.util.Set.of(live.boot().symbol()
+                        .substring(0, live.boot().symbol().indexOf('/')))
+                : only;
         // Подмена курса — только для опыта, см. FairPrice. Ноль = считать медианой.
         double fixedRate = Double.parseDouble(
                 System.getProperty("revx.fair.fixed-rate", "0"));
@@ -145,6 +187,20 @@ public final class PairSweep {
         FairPrice.Limits limits = new FairPrice.Limits(cfg.fairMinPairs(),
                 cfg.fairMaxDispersionPct(), cfg.fairMaxReferenceSpreadPct(),
                 cfg.fairMaxResidualPct(), fixedRate);
+
+        // ⚠️ С журналом обход считает ОДНУ пару — ту, по которой журнал. Лот и
+        // потолок в нём заданы в базовой валюте (0.00003765 BTC), и на другой
+        // паре это были бы бессмысленные числа. Молча применить их ко всем —
+        // ровно тот класс ошибки, который в отчёте не виден.
+        if (live != null) {
+            log.warn("НАСТРОЙКИ ИЗ ЖУРНАЛА: пара {}, лот {}, потолок {}, скос k={} цель {}%, "
+                            + "уровней {}, шаг {}, гейт по опоре k={}",
+                    onlyPairs.iterator().next(), live.boot().size(), live.boot().inventoryCap(),
+                    live.boot().skewK(), live.boot().skewTarget() * 100,
+                    live.boot().levels(), live.boot().levelStep() * 10_000, live.dynK());
+            log.warn("Стартовый инвентарь берётся из журнала на границе каждых суток, "
+                    + "а не ноль. Перебираются только ОТСТУПЫ.");
+        }
 
         // пара → отступ → накопитель
         Map<String, Map<Variant, Cell>> grid = new TreeMap<>();
@@ -198,7 +254,7 @@ public final class PairSweep {
                     log.warn("=== сутки {} ({} из {}), пар в срезе {} ===",
                             label, dayNo, days, fair.pairs());
                     for (String base : new ArrayList<>(fair.bases())) {
-                        if (only != null && !only.contains(base)) {
+                        if (onlyPairs != null && !onlyPairs.contains(base)) {
                             continue;
                         }
                         String symbol = base + "/USDC";
@@ -216,7 +272,7 @@ public final class PairSweep {
                             continue;             // пара не торгуется — считать нечего
                         }
                         try {
-                            oneDay(standDbPath, cfg, fair, base, symbol, ps, label, day,
+                            oneDay(standDbPath, cfg, fair, base, symbol, ps, label, day, live,
                                     levels, levelStepBp, innerFirst, offsetsBp, lotsUsd, thin, dynK,
                                     capUsd, grid);
                         } catch (Exception e) {
@@ -240,7 +296,7 @@ public final class PairSweep {
 
     private static void oneDay(String standDbPath, RevxConfig cfg, StandFair fair,
                                String base, String symbol, StandReader.PairSpec ps,
-                               String label, long dayStart, int levels, double levelStepBp,
+                               String label, long dayStart, Live live, int levels, double levelStepBp,
                                boolean innerFirst, double[] offsetsBp, double[] lotsUsd, int thin,
                                double dynK, double capUsd,
                                Map<String, Map<Variant, Cell>> grid) throws Exception {
@@ -288,6 +344,7 @@ public final class PairSweep {
         // Лот заданного размера, округлённый к шагу количества. У части пар шаг
         // грубый, и доллар в него не укладывается — тогда лот выходит больше,
         // и это видно в отчёте отдельной колонкой.
+        double lotUsdLocal = lotUsd;
         double lot = ps.baseStep() > 0
                 ? Math.max(ps.baseStep(),
                         Math.round(lotUsd / price / ps.baseStep()) * ps.baseStep())
@@ -304,13 +361,43 @@ public final class PairSweep {
                         : capUsd / price)
                 : lot * 20;
 
-        var bp = new BootParams(symbol, "a", lot, cap, offsetsBp[0] / 10_000,
+        BootParams bp = new BootParams(symbol, "a", lot, cap, offsetsBp[0] / 10_000,
                 cfg.simSkewK(), 0.3, 1000, ps.minNotional(), ps.baseStep(),
                 ps.quoteStep(), 0.10, -1, -1, 0, 0.02, 0.5, true,
                 levels, levelStepBp / 10_000, innerFirst);
 
+        // ⚠️ С журналом КОНСТРУКЦИЯ БЕРЁТСЯ ИЗ НЕГО ЦЕЛИКОМ, а перебирается
+        // только отступ. Иначе сравнение с живым ботом идёт против другой
+        // машины: другой лот, другой потолок, другая цель скоса.
+        if (live != null) {
+            bp = live.boot();
+            lot = bp.size();
+            cap = bp.inventoryCap();
+            levels = bp.levels();
+            levelStepBp = bp.levelStep() * 10_000;
+            innerFirst = bp.innerFirst();
+            dynK = live.dynK();
+            lotUsd = lot * price;                 // только для подписи ступени
+        }
+
+        // ⚠️ СТАРТОВЫЙ ИНВЕНТАРЬ. По умолчанию обход начинает сутки с нуля, и
+        // это не нейтрально: при цели скоса 0.3 пустой счёт даёт скос −0.43,
+        // то есть бид в 7.7 б.п. и аск в 16.3 вместо симметричных 12. С
+        // журналом берётся позиция живого бота на начало этих суток.
+        //
+        // Кладётся в ПЕРВЫЙ тик, потому что именно оттуда {@link Forecast#run}
+        // берёт начальный остаток базовой валюты для {@code SimVenue}.
+        if (live != null && !ticks.isEmpty()) {
+            double startInv = live.inventoryAt().applyAsDouble(ticks.get(0).tsMs());
+            ReplayFair.Tick t0 = ticks.get(0);
+            ticks.set(0, new ReplayFair.Tick(t0.tsMs(), t0.fair(), t0.bid(), t0.ask(),
+                    startInv, t0.quotable(), t0.reason(), t0.pressure()));
+            log.warn("{} {}: стартовый инвентарь из журнала {} ({} лота)",
+                    label, base, startInv, lot > 0 ? Math.round(startInv / lot * 10) / 10.0 : 0);
+        }
+
         for (double offBp : offsetsBp) {
-            var spec = new Forecast.BotSpec("a", offBp / 10_000, 0.3, cap,
+            var spec = new Forecast.BotSpec("a", offBp / 10_000, bp.skewTarget(), cap,
                     levels, levelStepBp / 10_000, lot, innerFirst, dynK);
             List<Forecast.BotSpec> one = List.of(spec);
 

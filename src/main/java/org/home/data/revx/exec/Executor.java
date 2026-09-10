@@ -536,6 +536,27 @@ public class Executor {
     public void pairSweep(String from, String to, String offsets, int levels,
                           double levelStepBp, boolean innerFirst, String symbols, String lots,
                           int thin, double dynK, double capUsd) {
+        pairSweep(from, to, offsets, levels, levelStepBp, innerFirst, symbols, lots,
+                thin, dynK, capUsd, "");
+    }
+
+    /**
+     * @param journalPath журнал живого бота. Пусто — обход считает по своим
+     *        настройкам, как раньше. Задан — КОНСТРУКЦИЯ БЕРЁТСЯ ИЗ НЕГО: лот,
+     *        потолок, скос, уровни, гейт по опоре, и главное — СТАРТОВЫЙ
+     *        ИНВЕНТАРЬ на границе каждых суток. Перебираются только отступы.
+     *
+     *        ⚠️ Нужно ровно для одного: сравнить обход с живым ботом на равных.
+     *        Пустой стартовый инвентарь при цели скоса 0.3 даёт скос −0.43, то
+     *        есть бид в 7.7 б.п. и аск в 16.3 вместо симметричных 12 — обход
+     *        торговал другой конструкцией и сравнивать было нечего.
+     *
+     *        Для скрининга вселенной журнал НЕ нужен и вреден: пары надо
+     *        сравнивать при равном капитале, а не при капитале одного бота.
+     */
+    public void pairSweep(String from, String to, String offsets, int levels,
+                          double levelStepBp, boolean innerFirst, String symbols, String lots,
+                          int thin, double dynK, double capUsd, String journalPath) {
         String[] parts = offsets.split(",");
         double[] off = new double[parts.length];
         for (int i = 0; i < parts.length; i++) {
@@ -552,7 +573,50 @@ public class Executor {
                         .map(s -> s.contains("/") ? s.substring(0, s.indexOf('/')) : s)
                         .toList());
         org.home.data.revx.replay.PairSweep.run(standDbPath, cfg, from, to,
-                levels, levelStepBp, innerFirst, off, only, lotsUsd, thin, dynK, capUsd);
+                levels, levelStepBp, innerFirst, off, only, lotsUsd, thin, dynK, capUsd,
+                liveFrom(journalPath, from, to));
+    }
+
+    /**
+     * Настройки и позиция живого бота из его журнала — для обхода «на равных».
+     *
+     * ⚠️ Инвентарь берётся НЕ ОДИН РАЗ, а по запросу на любой момент: обход
+     * считает сутки порознь, и каждым сутками бот начинал с той позицией,
+     * которая у него была на тот момент, а не с той, что была в начале окна.
+     *
+     * Настройки — из события {@code boot}, гейт по опоре — из {@code dyn_offset},
+     * ровно как их берёт повтор. Из окружения не подставляется НИЧЕГО: живому
+     * боту половина приходит из systemd-юнита.
+     */
+    private org.home.data.revx.replay.PairSweep.Live liveFrom(String journalPath,
+                                                              String fromIso, String toIso) {
+        if (journalPath == null || journalPath.isBlank()) {
+            return null;
+        }
+        var bp = org.home.data.revx.replay.BootParams.parse(
+                org.home.data.revx.replay.ReplayRunner.lastBootDetail(journalPath));
+        if (bp == null) {
+            throw new IllegalStateException("в журнале " + journalPath + " нет машинной части "
+                    + "события boot — подставлять окружение нельзя, именно так сверка и врала");
+        }
+        long from = java.time.Instant.parse(fromIso).toEpochMilli();
+        long to = java.time.Instant.parse(toIso).toEpochMilli();
+        java.util.TreeMap<Long, Double> inv = new java.util.TreeMap<>();
+        for (var t : org.home.data.revx.replay.ReplayRunner.readTicks(journalPath, from, to)) {
+            inv.put(t.tsMs(), t.inventory());
+        }
+        double[] dyn = org.home.data.revx.replay.ReplayRunner.dynOffset(journalPath);
+        log.warn("обход считает ПО ЖУРНАЛУ {}: {} тиков с инвентарём, "
+                        + "лот {}, потолок {}, гейт по опоре k={}",
+                journalPath, inv.size(), bp.size(), bp.inventoryCap(), dyn[0]);
+        if (inv.isEmpty()) {
+            throw new IllegalStateException("в журнале нет тиков в окне " + fromIso + " … " + toIso
+                    + " — стартовый инвентарь взять неоткуда");
+        }
+        return new org.home.data.revx.replay.PairSweep.Live(bp, dyn[0], dyn[1], ts -> {
+            var e = inv.floorEntry(ts);
+            return e != null ? e.getValue() : inv.firstEntry().getValue();
+        });
     }
 
     /**
