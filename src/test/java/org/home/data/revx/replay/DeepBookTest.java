@@ -66,6 +66,38 @@ class DeepBookTest {
     }
 
     @Test
+    void baseWithoutDepthColumnsStillLoads() throws Exception {
+        // ⚠️ РЕГРЕССИЯ 10.09.2026, пойманная в тот же день. Запрос спрашивал
+        // deep_bids безусловно, на базе до миграции SQLite отвечал «no such
+        // column», чтение рынка падало целиком — и прогон печатал «0 сделок,
+        // доход +0.0000». Ошибка, неотличимая от «настройка не торгует»: она
+        // отравила бы каждый локальный обход, и молча.
+        java.nio.file.Path db = java.nio.file.Files.createTempFile("old-base", ".db");
+        java.nio.file.Files.delete(db);
+        try (java.sql.Connection c =
+                     java.sql.DriverManager.getConnection("jdbc:sqlite:" + db);
+             java.sql.Statement st = c.createStatement()) {
+            st.execute("CREATE TABLE revx_book (symbol TEXT, t_recv_ms INTEGER,"
+                    + " bp1 REAL, bq1 REAL, bp2 REAL, bq2 REAL, bp3 REAL, bq3 REAL,"
+                    + " bp4 REAL, bq4 REAL, bp5 REAL, bq5 REAL,"
+                    + " ap1 REAL, aq1 REAL, ap2 REAL, aq2 REAL, ap3 REAL, aq3 REAL,"
+                    + " ap4 REAL, aq4 REAL, ap5 REAL, aq5 REAL)");
+            st.execute("CREATE TABLE revx_trade (trade_id TEXT, symbol TEXT, ts_ms INTEGER,"
+                    + " price REAL, qty REAL, side TEXT)");
+            st.execute("INSERT INTO revx_book(symbol,t_recv_ms,bp1,bq1,ap1,aq1)"
+                    + " VALUES('BTC/USDC', 1000, 100, 5, 101, 5)");
+            assertTrue(!MarketData.hasColumn(st, "deep_bids"),
+                    "в базе до миграции колонок глубины нет");
+        }
+        MarketData md = MarketData.load(db.toString(), "BTC/USDC", 0, 2000);
+        BookView book = md.bookAt(1500);
+        assertTrue(book != null && !book.empty(),
+                "старая база обязана читаться, а не отдавать пустой рынок");
+        assertEquals(100.0, book.bestBid(), 1e-9);
+        java.nio.file.Files.deleteIfExists(db);
+    }
+
+    @Test
     void oldBasesWithoutDepthStillRead() {
         // База, собранная до 10.09.2026: колонки глубины пустые или отсутствуют.
         List<BookView.Level> side = new ArrayList<>();

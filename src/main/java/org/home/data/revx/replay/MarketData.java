@@ -97,6 +97,20 @@ public final class MarketData {
      * пяти колонок; переупорядочивать не надо и нельзя — { asks} приходят
      * по убыванию, и сортировка здесь сломала бы { deepestVisible}.
      */
+    /** Есть ли такая колонка в revx_book этой базы. */
+    static boolean hasColumn(java.sql.Statement st, String column) {
+        try (ResultSet rs = st.executeQuery("PRAGMA table_info(revx_book)")) {
+            while (rs.next()) {
+                if (column.equalsIgnoreCase(rs.getString("name"))) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            log.warn("не прочиталась схема revx_book: {}", e.toString());
+        }
+        return false;
+    }
+
     public static void appendDeep(List<BookView.Level> side, String packed) {
         if (packed == null || packed.isEmpty()) {
             return;
@@ -171,10 +185,17 @@ public final class MarketData {
                             rs.getDouble(3), aggressor));
                 }
             }
+            // ⚠️ Колонки глубины есть НЕ ВЕЗДЕ: они добавлены 10.09.2026, а баз,
+            // снятых до этого, у нас гигабайты. Спрашивать их безусловно нельзя —
+            // SQLite отвечает «no such column», чтение рынка падает целиком, и
+            // прогон печатает «0 сделок, доход +0.0000», то есть ошибку,
+            // неотличимую от честного результата «настройка не торгует». Ровно
+            // на этом уже теряли время 09.09.2026 с упавшим котировщиком.
+            boolean hasDeep = hasColumn(st, "deep_bids");
             try (ResultSet rs = st.executeQuery(
                     "SELECT t_recv_ms, bp1,bq1,bp2,bq2,bp3,bq3,bp4,bq4,bp5,bq5,"
                             + "ap1,aq1,ap2,aq2,ap3,aq3,ap4,aq4,ap5,aq5,"
-                            + "deep_bids,deep_asks FROM revx_book"
+                            + (hasDeep ? "deep_bids,deep_asks" : "NULL,NULL") + " FROM revx_book"
                             + " WHERE symbol = '" + symbol + "' AND t_recv_ms >= " + fromMs
                             + " AND t_recv_ms <= " + toMs + " ORDER BY t_recv_ms")) {
                 while (rs.next()) {
