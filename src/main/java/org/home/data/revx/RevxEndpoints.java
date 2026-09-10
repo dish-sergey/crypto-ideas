@@ -33,9 +33,24 @@ public class RevxEndpoints {
     }
 
     public String book(String pathSymbol) {
+        return book(pathSymbol, cfg.bookDepth());
+    }
+
+    /**
+     * Книга заданной глубины.
+     *
+     * ⚠️ Глубина стоит ТРАФИКА И МЕСТА, но НЕ ЗАПРОСОВ: { limit} — параметр
+     * того же обращения, и на ведро лимитов он не влияет никак. Поэтому глубже
+     * собираются только те пары, где мы котируем, а не вся вселенная.
+     *
+     * ⚠️ На ПУБЛИЧНОМ пути { limit} игнорируется: при 5, 10, 20, 50 и 100
+     * приходит один и тот же ответ с пятью уровнями (проверено 10.09.2026).
+     * Глубина есть только с ключом, и потолок площадки — 100 (200 отдаёт 400).
+     */
+    public String book(String pathSymbol, int depth) {
         return auth.enabled()
                 ? cfg.baseUrl() + "/api/1.0/order-book/" + pathSymbol
-                        + "?limit=" + cfg.bookDepth() + "&region=" + cfg.region()
+                        + "?limit=" + depth + "&region=" + cfg.region()
                 : cfg.bookUrl(pathSymbol);
     }
 

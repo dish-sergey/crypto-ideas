@@ -7,7 +7,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.sql.Connection;
+import java.sql.SQLException;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.Statement;
@@ -79,8 +81,15 @@ public final class StandAssembler {
                     st.execute("ATTACH '" + tmp.toString().replace("\\", "/") + "' AS s");
                     for (String t : TABLES) {
                         try {
-                            st.executeUpdate("INSERT OR IGNORE INTO " + t
-                                    + " SELECT * FROM s." + t);
+                            // ⚠️ НЕ «SELECT *»: у частей может быть РАЗНОЕ число
+                            // колонок. 10.09.2026 в revx_book добавились deep_bids
+                            // и deep_asks, и звёздочка сложила бы базу, собранную
+                            // до правки, с базой после неё — с невнятной ошибкой
+                            // про число значений. Переносим ПЕРЕСЕЧЕНИЕ колонок:
+                            // то, чего в источнике нет, останется NULL.
+                            String cols = String.join(",", shared(st, t));
+                            st.executeUpdate("INSERT OR IGNORE INTO " + t + "(" + cols + ")"
+                                    + " SELECT " + cols + " FROM s." + t);
                         } catch (Exception e) {
                             // Таблицы может не быть в раннем инкременте — это не
                             // повод бросать всю сборку.
@@ -105,6 +114,35 @@ public final class StandAssembler {
              OutputStream os = Files.newOutputStream(to)) {
             in.transferTo(os);
         }
+    }
+
+    /**
+     * Колонки, которые есть И в приёмнике, И в источнике.
+     *
+     * Порядок берётся из приёмника: перечисление в INSERT и в SELECT должно
+     * совпадать, а полагаться на совпадение порядка в двух файлах нельзя.
+     */
+    private static List<String> shared(Statement st, String table) throws SQLException {
+        List<String> destination = columns(st, "main", table);
+        List<String> source = columns(st, "s", table);
+        List<String> both = new ArrayList<>();
+        for (String c : destination) {
+            if (source.contains(c)) {
+                both.add(c);
+            }
+        }
+        return both;
+    }
+
+    private static List<String> columns(Statement st, String schema, String table)
+            throws SQLException {
+        List<String> out = new ArrayList<>();
+        try (ResultSet rs = st.executeQuery("PRAGMA " + schema + ".table_info(" + table + ")")) {
+            while (rs.next()) {
+                out.add(rs.getString("name"));
+            }
+        }
+        return out;
     }
 
     private static long count(Path db, String table) {

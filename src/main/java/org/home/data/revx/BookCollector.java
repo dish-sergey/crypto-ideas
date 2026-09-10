@@ -37,8 +37,9 @@ public class BookCollector {
                 skew_ms, flags,
                 bp1, bq1, bp2, bq2, bp3, bq3, bp4, bq4, bp5, bq5,
                 ap1, aq1, ap2, aq2, ap3, aq3, ap4, aq4, ap5, aq5,
+                deep_bids, deep_asks,
                 n_bid, n_ask)
-            VALUES(?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?)
+            VALUES(?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?, ?,?)
             """;
 
     private final RevxConfig cfg;
@@ -76,8 +77,13 @@ public class BookCollector {
         // чередуется от снимка к снимку: сдвиг остаётся, но становится шумом с
         // нулевым средним. Какая нога была первой, видно по t_sent_ms в данных.
         boolean quotedFirst = legOrderCounter.getAndIncrement() % 2 == 0;
-        String quotedUrl = endpoints.book(pair.quoted().pathSymbol());
-        String referenceUrl = endpoints.book(pair.reference().pathSymbol());
+        // ⚠️ ГЛУБЖЕ — ТОЛЬКО ТАМ, ГДЕ КОТИРУЕМ. Глубина не стоит ни одного
+        // лишнего запроса (это параметр того же обращения), но стоит места:
+        // пятнадцать лишних уровней это около 600 байт на строку при 800 тысячах
+        // строк в сутки. Хвостовым парам она не нужна — мы в них не стоим.
+        int depth = cfg.fastPairs().contains(pair.base()) ? cfg.bookDepthDeep() : cfg.bookDepth();
+        String quotedUrl = endpoints.book(pair.quoted().pathSymbol(), depth);
+        String referenceUrl = endpoints.book(pair.reference().pathSymbol(), depth);
         List<String> urls = quotedFirst
                 ? List.of(quotedUrl, referenceUrl)
                 : List.of(referenceUrl, quotedUrl);
@@ -206,7 +212,7 @@ public class BookCollector {
                     Math.round(book.relativeSpread() * 1e6) / 1e4, BookFlags.describe(flags));
         }
 
-        Object[] row = new Object[30];
+        Object[] row = new Object[32];
         row[0] = symbol;
         row[1] = response.sentMs();
         row[2] = snapId;
@@ -217,8 +223,10 @@ public class BookCollector {
         row[7] = flags;
         fillSide(row, 8, book.bids());
         fillSide(row, 18, book.asks());
-        row[28] = book.bids().size();
-        row[29] = book.asks().size();
+        row[28] = deepOf(book.bids());
+        row[29] = deepOf(book.asks());
+        row[30] = book.bids().size();
+        row[31] = book.asks().size();
         return row;
     }
 
@@ -227,6 +235,32 @@ public class BookCollector {
             return "пусто";
         }
         return body.length() <= 220 ? body : body.substring(0, 220) + "…";
+    }
+
+    /**
+     * Уровни ГЛУБЖЕ пятого — компактной строкой, или { null}, если их нет.
+     *
+     * ⚠️ Текстом, а не колонками, и это осознанный размен. Колонок понадобилось
+     * бы шестьдесят, а читателей у { bp1..bp5} — весь стенд; текст же
+     * ничего не ломает и разбирается только тем, кому глубина нужна. Платим
+     * местом: строка на 15 уровней — около 600 байт против 240 в колонках.
+     *
+     * Формат намеренно тупой: { цена:объём,цена:объём}. Ни JSON, ни
+     * пробелов — при 800 тысячах строк в сутки каждый лишний байт это
+     * мегабайты, а разбирать это будет ровно одно место.
+     */
+    public static String deepOf(java.util.List<BookParser.Level> levels) {
+        if (levels.size() <= 5) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder(levels.size() * 20);
+        for (int i = 5; i < levels.size(); i++) {
+            if (sb.length() > 0) {
+                sb.append(',');
+            }
+            sb.append(levels.get(i).price()).append(':').append(levels.get(i).qty());
+        }
+        return sb.toString();
     }
 
     /** Пять уровней стороны в десять колонок; недостающие остаются NULL. */

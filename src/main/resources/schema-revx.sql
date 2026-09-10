@@ -42,6 +42,14 @@ CREATE TABLE IF NOT EXISTS revx_book (
     flags        INTEGER NOT NULL DEFAULT 0,    -- битовая маска, см. BookFlags
     bp1 REAL, bq1 REAL, bp2 REAL, bq2 REAL, bp3 REAL, bq3 REAL, bp4 REAL, bq4 REAL, bp5 REAL, bq5 REAL,
     ap1 REAL, aq1 REAL, ap2 REAL, aq2 REAL, ap3 REAL, aq3 REAL, ap4 REAL, aq4 REAL, ap5 REAL, aq5 REAL,
+    -- Уровни ГЛУБЖЕ пятого, компактным текстом 'цена:объём,цена:объём'.
+    -- Пять колонок оставлены как есть: по ним читает весь существующий код,
+    -- а переписывать читателей ради глубины, нужной трём парам, дороже.
+    -- Зачем вообще: замер 10.09.2026 показал, что заявка в 12 б.п. на BTC для
+    -- модели невидима в 19% случаев, а в 14 б.п. — в 38%, потому что уходит за
+    -- пятый уровень. Правая часть лестницы отступов из-за этого занижена.
+    deep_bids    TEXT,
+    deep_asks    TEXT,
     n_bid        INTEGER NOT NULL,              -- сколько уровней реально отдали
     n_ask        INTEGER NOT NULL,
     PRIMARY KEY (symbol, t_sent_ms)

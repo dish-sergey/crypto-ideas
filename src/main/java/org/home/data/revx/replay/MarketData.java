@@ -90,6 +90,34 @@ public final class MarketData {
     }
 
     /** Последний снимок книги не позже {@code tsMs}; {@code null}, если такого нет. */
+    /**
+     * Дочитать уровни глубже пятого из компактной строки { цена:объём,…}.
+     *
+     * Порядок в строке тот же, в каком отдала площадка, то есть продолжение
+     * пяти колонок; переупорядочивать не надо и нельзя — { asks} приходят
+     * по убыванию, и сортировка здесь сломала бы { deepestVisible}.
+     */
+    public static void appendDeep(List<BookView.Level> side, String packed) {
+        if (packed == null || packed.isEmpty()) {
+            return;
+        }
+        for (String part : packed.split(",")) {
+            int colon = part.indexOf(':');
+            if (colon <= 0) {
+                continue;
+            }
+            try {
+                double p = Double.parseDouble(part.substring(0, colon));
+                double q = Double.parseDouble(part.substring(colon + 1));
+                if (p > 0 && q > 0) {
+                    side.add(new BookView.Level(p, q));
+                }
+            } catch (NumberFormatException ignore) {
+                // битая строка не должна ронять прогон: пять колонок уже прочитаны
+            }
+        }
+    }
+
     public BookView bookAt(long tsMs) {
         while (bookCursor + 1 < bookTs.length && bookTs[bookCursor + 1] <= tsMs) {
             bookCursor++;
@@ -145,7 +173,8 @@ public final class MarketData {
             }
             try (ResultSet rs = st.executeQuery(
                     "SELECT t_recv_ms, bp1,bq1,bp2,bq2,bp3,bq3,bp4,bq4,bp5,bq5,"
-                            + "ap1,aq1,ap2,aq2,ap3,aq3,ap4,aq4,ap5,aq5 FROM revx_book"
+                            + "ap1,aq1,ap2,aq2,ap3,aq3,ap4,aq4,ap5,aq5,"
+                            + "deep_bids,deep_asks FROM revx_book"
                             + " WHERE symbol = '" + symbol + "' AND t_recv_ms >= " + fromMs
                             + " AND t_recv_ms <= " + toMs + " ORDER BY t_recv_ms")) {
                 while (rs.next()) {
@@ -165,6 +194,12 @@ public final class MarketData {
                             asks.add(new BookView.Level(p, q));
                         }
                     }
+                    // ⚠️ Уровни глубже пятого лежат текстом и есть НЕ ВЕЗДЕ: до
+                    // 10.09.2026 их не собирали вовсе, а собираются они только
+                    // по парам, в которых котируем. Пустая колонка — норма, а не
+                    // повреждение, и старые базы обязаны читаться по-прежнему.
+                    appendDeep(bids, rs.getString(22));
+                    appendDeep(asks, rs.getString(23));
                     ts.add(rs.getLong(1));
                     books.add(new BookView(bids, asks));
                 }

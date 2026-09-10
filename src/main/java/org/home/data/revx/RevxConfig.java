@@ -20,6 +20,7 @@ public class RevxConfig {
     private final String baseUrl;
     private final String region;
     private final int bookDepth;
+    private final int bookDepthDeep;
     private final double maxRequestsPerSecond;
     private final int burstCapacity;
     private final double authMaxRequestsPerSecond;
@@ -149,6 +150,7 @@ public class RevxConfig {
             @Value("${revx.base-url}") String baseUrl,
             @Value("${revx.region}") String region,
             @Value("${revx.book-depth}") int bookDepth,
+            @Value("${revx.book-depth-deep}") int bookDepthDeep,
             @Value("${revx.max-requests-per-second}") double maxRequestsPerSecond,
             @Value("${revx.burst-capacity}") int burstCapacity,
             @Value("${revx.auth.max-requests-per-second}") double authMaxRequestsPerSecond,
@@ -272,6 +274,7 @@ public class RevxConfig {
         this.baseUrl = baseUrl;
         this.region = region;
         this.bookDepth = bookDepth;
+        this.bookDepthDeep = bookDepthDeep;
         this.maxRequestsPerSecond = maxRequestsPerSecond;
         this.burstCapacity = burstCapacity;
         this.authMaxRequestsPerSecond = authMaxRequestsPerSecond;
@@ -504,6 +507,10 @@ public class RevxConfig {
      * 2.86 б.п. из четырнадцати (док. 88). Левая часть кривой в симуляции
      * недоступна — данные собраны с шагом 5 с, — поэтому её собирают отдельно.
      */
+    public int bookDepthDeep() {
+        return bookDepthDeep;
+    }
+
     public List<String> fastPairs() {
         return fastPairs;
     }

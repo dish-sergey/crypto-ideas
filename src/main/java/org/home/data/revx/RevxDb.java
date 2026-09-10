@@ -20,5 +20,9 @@ public class RevxDb extends Db {
 
     public RevxDb(@Value("${revx.db-path}") String dbPath) {
         super(dbPath, "schema-revx.sql");
+        // ⚠️ Глубина книги добавлена 10.09.2026, а базы собираются с 19.08 —
+        // на живом файле CREATE TABLE IF NOT EXISTS новых колонок не создаст.
+        addColumn("revx_book", "deep_bids TEXT");
+        addColumn("revx_book", "deep_asks TEXT");
     }
 }

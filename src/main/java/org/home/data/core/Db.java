@@ -107,6 +107,30 @@ public class Db {
         return sb.toString();
     }
 
+
+    /**
+     * ДОБАВИТЬ КОЛОНКУ В УЖЕ СУЩЕСТВУЮЩУЮ БАЗУ.
+     *
+     * Схемы у нас идемпотентны через {@code CREATE TABLE IF NOT EXISTS}, и это
+     * значит, что новая колонка в файле схемы доезжает только до ПУСТОЙ базы.
+     * У живой она молча не появляется, а запись с ней падает уже в проде.
+     *
+     * Повторный запуск безвреден: SQLite отвечает «duplicate column name», и
+     * это ожидаемый ответ, а не ошибка. Любой другой — настоящая поломка, и её
+     * глушить нельзя.
+     */
+    public synchronized void addColumn(String table, String columnDefinition) {
+        String sql = "ALTER TABLE " + table + " ADD COLUMN " + columnDefinition;
+        try (Statement st = conn.createStatement()) {
+            st.execute(sql);
+            log.info("схема: добавлена колонка {}.{}", table, columnDefinition);
+        } catch (SQLException e) {
+            String message = e.getMessage() == null ? "" : e.getMessage();
+            if (!message.contains("duplicate column name")) {
+                throw new IllegalStateException("не добавилась колонка: " + sql, e);
+            }
+        }
+    }
     /** Одиночный upsert. SQL обязан быть INSERT OR REPLACE / ON CONFLICT. */
     public synchronized int upsert(String sql, Object... params) {
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
