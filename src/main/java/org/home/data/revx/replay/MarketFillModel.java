@@ -150,20 +150,22 @@ public final class MarketFillModel implements FillModel {
      */
     public record Gates(long prints, long noAggressor, long noOrderOnSide, long notReached,
                         long invisible, long queueBlocked, long slotSpent, long noVolumeLeft,
-                        long taken, List<Double> missBp) {
+                        long taken, List<Double> missBp, List<Double> spentGapMs) {
 
         public Gates merge(Gates o) {
             List<Double> m = new ArrayList<>(missBp);
             m.addAll(o.missBp());
+            List<Double> gaps = new ArrayList<>(spentGapMs);
+            gaps.addAll(o.spentGapMs());
             return new Gates(prints + o.prints(), noAggressor + o.noAggressor(),
                     noOrderOnSide + o.noOrderOnSide(), notReached + o.notReached(),
                     invisible + o.invisible(), queueBlocked + o.queueBlocked(),
                     slotSpent + o.slotSpent(), noVolumeLeft + o.noVolumeLeft(),
-                    taken + o.taken(), m);
+                    taken + o.taken(), m, gaps);
         }
 
         public static Gates empty() {
-            return new Gates(0, 0, 0, 0, 0, 0, 0, 0, 0, new ArrayList<>());
+            return new Gates(0, 0, 0, 0, 0, 0, 0, 0, 0, new ArrayList<>(), new ArrayList<>());
         }
 
         /** Сколько принтов ДОШЛО до нашей цены — потолок, который стенд мог бы взять. */
@@ -190,6 +192,15 @@ public final class MarketFillModel implements FillModel {
                     "; ДОШЛО %d = невидима %d + очередь %d + слот уже выбран %d + объём кончился %d "
                             + "+ ВЗЯТО %d",
                     reached(), invisible, queueBlocked, slotSpent, noVolumeLeft, taken));
+            if (!spentGapMs.isEmpty()) {
+                List<Double> s = new ArrayList<>(spentGapMs);
+                java.util.Collections.sort(s);
+                long instant = s.stream().filter(v -> v <= 50).count();
+                sb.append(String.format(java.util.Locale.ROOT,
+                        " (слот был мёртв: медиана %.0f мс, 10%% %.0f, 90%% %.0f; в пределах 50 мс %d из %d)",
+                        s.get(s.size() / 2), s.get(s.size() / 10), s.get(s.size() * 9 / 10),
+                        instant, s.size()));
+            }
             return sb.toString();
         }
     }
@@ -197,10 +208,24 @@ public final class MarketFillModel implements FillModel {
     private long gPrints, gNoAggressor, gNoOrder, gNotReached, gInvisible, gQueueBlocked;
     private long gSlotSpent, gNoVolume, gTaken;
     private final List<Double> gMissBp = new ArrayList<>();
+    /**
+     * СКОЛЬКО СЛОТ УЖЕ БЫЛ МЁРТВ, когда пришёл принт, в миллисекундах.
+     *
+     * ⚠️ Без этого числа графа «слот уже выбран» НЕЧИТАЕМА, и вывод из неё
+     * получается противоположный правде. Разрыв в 1500 мс значит задержку
+     * восстановления — живой бот с секундным тиком успел бы переставить и взял
+     * бы этот принт. Разрыв в 0-50 мс значит совсем другое: одна рыночная
+     * заявка размела книгу и распалась на несколько принтов подряд. Тогда наш
+     * лот выбран первым же из них, и ЖИВОЙ БОТ ТОЖЕ не взял бы остальные —
+     * чинить нечего, а «недостающие исполнения» существуют только на бумаге.
+     */
+    private final List<Double> gSpentGapMs = new ArrayList<>();
+    private final Map<String, Long> lastFillMs = new HashMap<>();
 
     public Gates gates() {
         return new Gates(gPrints, gNoAggressor, gNoOrder, gNotReached,
-                gInvisible, gQueueBlocked, gSlotSpent, gNoVolume, gTaken, new ArrayList<>(gMissBp));
+                gInvisible, gQueueBlocked, gSlotSpent, gNoVolume, gTaken,
+                new ArrayList<>(gMissBp), new ArrayList<>(gSpentGapMs));
     }
 
     private long interceptFills;
@@ -392,6 +417,7 @@ public final class MarketFillModel implements FillModel {
             int onSide = 0;
             double nearestMissBp = Double.MAX_VALUE;
             boolean spent = false;          // заявка дошла, но её уже выбрал предыдущий принт
+            double spentGap = Double.MAX_VALUE;
             String verdict = null;
             List<Resting> queueAtTrade = new ArrayList<>();
             for (Resting r : resting) {
@@ -406,6 +432,10 @@ public final class MarketFillModel implements FillModel {
                 }
                 if (reached) {
                     spent = true;
+                    Long fill = lastFillMs.get(r.id());
+                    if (fill != null) {
+                        spentGap = Math.min(spentGap, (double) (t.tsMs() - fill));
+                    }
                 }
                 // ⚠️ СДЕЛКА ПО ЦЕНЕ ЛУЧШЕ НАШЕЙ ВЫБИРАЕТ НАШУ ОЧЕРЕДЬ.
                 //
@@ -554,6 +584,7 @@ public final class MarketFillModel implements FillModel {
                     queueFills++;
                 }
                 verdict = "taken";
+                lastFillMs.put(r.id(), t.tsMs());
                 out.add(new Filled(r.id(), qty, r.price()));
             }
             // ⚠️ Метка ставится ОДИН раз на принт, по лучшему исходу: «взято»
@@ -568,6 +599,9 @@ public final class MarketFillModel implements FillModel {
                 // числом уровней. «Объём кончился» — совсем другое: принт
                 // разошёлся по соседним нашим заявкам, и лечить нечего.
                 gSlotSpent++;
+                if (spentGap < Double.MAX_VALUE && gSpentGapMs.size() < 500_000) {
+                    gSpentGapMs.add(spentGap);
+                }
             } else if (queueAtTrade.isEmpty()) {
                 gNotReached++;
                 if (nearestMissBp < Double.MAX_VALUE && gMissBp.size() < 500_000) {

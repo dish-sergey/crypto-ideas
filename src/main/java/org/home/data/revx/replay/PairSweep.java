@@ -538,6 +538,22 @@ public final class PairSweep {
                         g.taken(), g.reached()));
             }
         }
+        for (var byBase : grid.entrySet()) {
+            for (var e : byBase.getValue().entrySet()) {
+                MarketFillModel.Gates g = e.getValue().gates;
+                if (g.slotSpent() == 0 || g.spentGapMs().isEmpty()) {
+                    continue;
+                }
+                List<Double> s = new ArrayList<>(g.spentGapMs());
+                java.util.Collections.sort(s);
+                long instant = s.stream().filter(v -> v <= 50).count();
+                sb.append(String.format(Locale.ROOT,
+                        "%s %s: слот был мёртв — медиана %.0f мс (10%% %.0f, 90%% %.0f); "
+                                + "в пределах 50 мс %d из %d%n",
+                        byBase.getKey(), e.getKey().label(), s.get(s.size() / 2),
+                        s.get(s.size() / 10), s.get(s.size() * 9 / 10), instant, s.size()));
+            }
+        }
         sb.append("\n⚠️ метка у принта одна: сумма граф = число принтов. «дошло» — потолок,\n");
         sb.append("   до которого модель вообще могла дотянуться; «недолёт» — медиана того,\n");
         sb.append("   на сколько б.п. принт не долетел до ближайшей нашей заявки.\n");

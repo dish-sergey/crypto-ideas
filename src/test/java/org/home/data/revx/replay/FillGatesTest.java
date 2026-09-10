@@ -134,6 +134,34 @@ class FillGatesTest {
     }
 
     @Test
+    void burstOfPrintsInOneMillisecondIsNotACaseOfSlowRestock() {
+        // ⚠️ Ради этого различения графа и заведена отдельно. Одна рыночная
+        // заявка, разметающая книгу, приходит на ленту НЕСКОЛЬКИМИ принтами с
+        // одной отметкой времени. Наш единственный лот берёт первый из них,
+        // остальные попадают в «слот уже выбран» — но живой бот с тем же одним
+        // лотом не взял бы их тоже. Отличить это от медленного восстановления
+        // можно ТОЛЬКО по разрыву: ноль миллисекунд — пачка, полторы секунды —
+        // задержка. На живом окне 09-10.09 медиана оказалась 0 мс.
+        MarketFillModel m = new MarketFillModel(market(List.of(
+                new MarketTrade(1000, 100.5, LOT, Side.SELL),
+                new MarketTrade(1000, 100.0, LOT, Side.SELL),
+                new MarketTrade(1000, 99.5, LOT, Side.SELL))));
+        List<FillModel.Resting> bid = List.of(new FillModel.Resting("b", true, 101, LOT, 0));
+        m.advance(0, bid);
+        m.placed(bid.get(0));
+        List<FillModel.Filled> filled = m.advance(2000, bid);
+
+        assertEquals(1, filled.size(), "один лот берёт только первый принт пачки");
+        MarketFillModel.Gates g = m.gates();
+        assertEquals(1, g.taken());
+        assertEquals(2, g.slotSpent());
+        assertEquals(2, g.spentGapMs().size());
+        assertTrue(g.spentGapMs().stream().allMatch(v -> v == 0.0),
+                "у пачки разрыв нулевой — это НЕ задержка восстановления");
+        sumMatchesPrints(g);
+    }
+
+    @Test
     void onePrintReachingTwoOfOurOrdersIsLabelledOnce() {
         // Обе покупки внутри спреда (101 и 100.5), принт по 100 достаёт обе.
         // Меток должно быть одна, а не две.
