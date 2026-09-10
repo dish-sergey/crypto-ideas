@@ -343,11 +343,18 @@ public class Executor {
             };
             log.warn("модель исполнения: {}", model.describe());
 
+            // ⚠️ Гейт по опоре живёт ОТДЕЛЬНЫМ событием журнала, не в машинной
+            // части boot. Без него повтор котирует по нераздвинутому отступу, и
+            // сверка показывает провал там, где бот исправен (см. ReplayRunner).
+            double[] dyn = ReplayRunner.dynOffset(journalPath);
+            log.warn("гейт по опоре из журнала: k={}, потолок ширины {}%{}",
+                    dyn[0], dyn[1], dyn[0] > 0 ? "" : " — в записи его нет, повтор без гейта");
             ReplayRunner.Result result = ReplayRunner.run(ticks, fills, params, policy,
                     bp.symbol(), bp.periodMs(), bp.minNotional(), bp.botId(),
                     bp.baseStep(), bp.parkDistance(),
                     bp.inventoryCap() * 1.2 * ticks.get(0).fair(),
-                    model, bp.levels(), bp.levelStep(), bp.innerFirst(), 0);
+                    model, bp.levels(), bp.levelStep(), bp.innerFirst(), 0,
+                    dyn[0], dyn[1]);
             log.info("\n{}", ReplayRunner.render(result));
         } catch (Exception e) {
             log.error("повтор не прошёл: {}", e.toString(), e);

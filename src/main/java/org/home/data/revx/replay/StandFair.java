@@ -140,7 +140,7 @@ public final class StandFair implements FairSource {
                 own.moveTo(ts);
                 StandReader.Fair f = latest(forBase, 30_000);
                 out.add(new ReplayFair.Tick(ts, f.price(), null, null, 0,
-                        f.quotable() && f.price() > 0, f.pausedReason()));
+                        f.quotable() && f.price() > 0, f.pausedReason(), 0));
             }
         } finally {
             replaceClock(saved);

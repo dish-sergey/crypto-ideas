@@ -56,7 +56,8 @@ public final class ExecJournal implements AutoCloseable {
                 ask       REAL,
                 inventory REAL,
                 quotable  INTEGER NOT NULL,
-                reason    TEXT
+                reason    TEXT,
+                pressure  REAL
             );
             CREATE INDEX IF NOT EXISTS idx_exec_quote_ts ON exec_quote(ts_ms);
             CREATE TABLE IF NOT EXISTS exec_fill (
@@ -142,6 +143,18 @@ public final class ExecJournal implements AutoCloseable {
                     if (!part.isBlank()) {
                         st.execute(part);
                     }
+                }
+                // ⚠️ CREATE TABLE IF NOT EXISTS новую колонку в СУЩЕСТВУЮЩУЮ
+                // таблицу не добавляет — журналы живых ботов её не получили бы
+                // никогда, а запись котировок падала бы каждую секунду.
+                // Повторный ALTER даёт «duplicate column name»; это не ошибка,
+                // а «уже есть».
+                try {
+                    st.execute("ALTER TABLE exec_quote ADD COLUMN pressure REAL");
+                    log.warn("в exec_quote добавлена колонка pressure "
+                            + "(раздвижение отступа от дефицита постановок)");
+                } catch (Exception already) {
+                    log.debug("колонка pressure уже есть: {}", already.getMessage());
                 }
             }
             log.info("журнал исполнителя: {}", path);
@@ -237,12 +250,24 @@ public final class ExecJournal implements AutoCloseable {
 
     public synchronized void quote(double fair, Double bid, Double ask, double inventory,
                                    boolean quotable, String reason) {
+        quote(fair, bid, ask, inventory, quotable, reason, 0);
+    }
+
+    /**
+     * @param pressure применённая доля раздвижения отступа от дефицита
+     *                 постановок. Пишется потому, что восстановить её задним
+     *                 числом НЕЛЬЗЯ: ведро постановок общее на трёх ботов и
+     *                 истории не хранит. Без неё повтор котирует по
+     *                 нераздвинутому отступу, и сверка врёт (см. QuoteLoop).
+     */
+    public synchronized void quote(double fair, Double bid, Double ask, double inventory,
+                                   boolean quotable, String reason, double pressure) {
         if (quotesOff) {
             return;
         }
         try (PreparedStatement ps = connection.prepareStatement(
-                "INSERT INTO exec_quote(ts_ms, fair, bid, ask, inventory, quotable, reason)"
-                        + " VALUES (?,?,?,?,?,?,?)")) {
+                "INSERT INTO exec_quote(ts_ms, fair, bid, ask, inventory, quotable, reason,"
+                        + " pressure) VALUES (?,?,?,?,?,?,?,?)")) {
             ps.setLong(1, clock.now());
             ps.setDouble(2, fair);
             if (bid == null) ps.setNull(3, java.sql.Types.REAL); else ps.setDouble(3, bid);
@@ -250,6 +275,7 @@ public final class ExecJournal implements AutoCloseable {
             ps.setDouble(5, inventory);
             ps.setInt(6, quotable ? 1 : 0);
             ps.setString(7, reason);
+            ps.setDouble(8, pressure);
             ps.executeUpdate();
         } catch (Exception e) {
             log.error("не записалась котировка: {}", e.getMessage());

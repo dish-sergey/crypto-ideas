@@ -20,9 +20,17 @@ import java.util.List;
  */
 public final class ReplayFair implements FairSource {
 
-    /** Один записанный тик. */
+    /**
+     * Один записанный тик.
+     *
+     * @param pressure применённая живым ботом доля раздвижения отступа от
+     *                 дефицита постановок. Восстановить её задним числом
+     *                 нельзя — ведро постановок общее и истории не хранит, —
+     *                 поэтому живой пишет её в каждый тик. Ноль у старых
+     *                 записей: колонки в них нет.
+     */
     public record Tick(long tsMs, double fair, Double bid, Double ask, double inventory,
-                       boolean quotable, String reason) {
+                       boolean quotable, String reason, double pressure) {
     }
 
     private final List<Tick> ticks;

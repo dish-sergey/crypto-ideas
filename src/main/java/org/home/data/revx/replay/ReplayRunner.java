@@ -69,7 +69,11 @@ public final class ReplayRunner {
     /** То же, но с верхней границей окна: для прогона на выбранном отрезке. */
     public static List<ReplayFair.Tick> readTicks(String journalPath, long fromMs, long toMs) {
         List<ReplayFair.Tick> out = new ArrayList<>();
-        String sql = "SELECT ts_ms, fair, bid, ask, inventory, quotable, reason FROM exec_quote"
+        // ⚠️ pressure читается через COALESCE: в журналах до 10.09.2026 колонки
+        // нет вовсе, и запрос по имени упал бы целиком. Ноль там — честное «бот
+        // этого не записал», а не «раздвижения не было».
+        String sql = "SELECT ts_ms, fair, bid, ask, inventory, quotable, reason, "
+                + hasPressure(journalPath) + " AS pressure FROM exec_quote"
                 + " WHERE ts_ms >= " + fromMs + " AND ts_ms <= " + toMs + " ORDER BY ts_ms";
         try (Connection c = open(journalPath);
              Statement st = c.createStatement();
@@ -81,12 +85,47 @@ public final class ReplayRunner {
                 boolean askNull = rs.wasNull();
                 out.add(new ReplayFair.Tick(rs.getLong(1), rs.getDouble(2),
                         bidNull ? null : bid, askNull ? null : ask,
-                        rs.getDouble(5), rs.getInt(6) != 0, rs.getString(7)));
+                        rs.getDouble(5), rs.getInt(6) != 0, rs.getString(7),
+                        rs.getDouble(8)));
             }
         } catch (Exception e) {
             log.error("не прочитались тики: {}", e.getMessage());
         }
         return out;
+    }
+
+    /** Есть ли в этой записи колонка с раздвижением: старые журналы её не знают. */
+    private static String hasPressure(String journalPath) {
+        try (Connection c = open(journalPath);
+             Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA table_info(exec_quote)")) {
+            while (rs.next()) {
+                if ("pressure".equalsIgnoreCase(rs.getString("name"))) {
+                    return "COALESCE(pressure, 0)";
+                }
+            }
+        } catch (Exception e) {
+            log.warn("не прочитались колонки exec_quote: {}", e.getMessage());
+        }
+        return "0";
+    }
+
+    /**
+     * Раздвижение по отметке времени: то, что живой бот применил на этом тике.
+     *
+     * Ноль на всех тиках означает либо старую запись, либо полное ведро
+     * постановок — различить их нельзя, и это записано в
+     * {@link ReplayFair.Tick#pressure()}.
+     */
+    private static java.util.function.LongToDoubleFunction pressureAt(
+            List<ReplayFair.Tick> ticks) {
+        java.util.Map<Long, Double> byTs = new java.util.HashMap<>();
+        for (ReplayFair.Tick t : ticks) {
+            if (t.pressure() > 0) {
+                byTs.put(t.tsMs(), t.pressure());
+            }
+        }
+        return ts -> byTs.getOrDefault(ts, 0.0);
     }
 
     /** Исполнения из журнала. Передачи между ботами исключены: рынок их не делал. */
@@ -133,6 +172,38 @@ public final class ReplayRunner {
         }
     }
 
+    /**
+     * Настройки гейта по опоре из ТОГО ЖЕ журнала: {@code {k, потолок ширины %}}.
+     *
+     * ⚠️ В машинной части события {@code boot} их нет — гейт пишется отдельным
+     * событием {@code dyn_offset} («k=0.333 потолок 1.0%»). Брать его из
+     * окружения нельзя по той же причине, по какой нельзя брать остальные
+     * настройки: живому боту они приходят из systemd-юнита, и подстановка
+     * умолчаний уже однажды превратила сверку в сравнение двух разных настроек.
+     *
+     * Нет события — {@code {0, 0}}: запись сделана до появления гейта, и
+     * включать его в повторе было бы такой же подменой.
+     */
+    public static double[] dynOffset(String journalPath) {
+        try (Connection c = open(journalPath);
+             Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT detail FROM exec_event WHERE kind = 'dyn_offset' "
+                             + "ORDER BY ts_ms DESC LIMIT 1")) {
+            if (!rs.next()) {
+                return new double[]{0, 0};
+            }
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("k=([0-9.eE+-]+).*?потолок\\s+([0-9.eE+-]+)")
+                    .matcher(rs.getString(1));
+            return m.find()
+                    ? new double[]{Double.parseDouble(m.group(1)), Double.parseDouble(m.group(2))}
+                    : new double[]{0, 0};
+        } catch (Exception e) {
+            return new double[]{0, 0};
+        }
+    }
+
     private static Connection open(String path) throws Exception {
         return DriverManager.getConnection("jdbc:sqlite:file:" + path + "?mode=ro");
     }
@@ -149,7 +220,7 @@ public final class ReplayRunner {
                              FillModel model, int levels, double levelStep,
                              boolean innerFirst,
 
-                             double tolerance) throws Exception {
+                             double tolerance, double dynK, double dynMaxPct) throws Exception {
         if (ticks.isEmpty()) {
             return new Result(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
@@ -178,6 +249,33 @@ public final class ReplayRunner {
                     periodMs, minNotional, new BotTag(botId), policy, true,
                     ticks.get(0).inventory(), baseStep, parkDistance, alloc,
                     levels, levelStep, innerFirst);
+            // ⚠️ ГЕЙТ ПО ОПОРЕ ОБЯЗАН БЫТЬ И ЗДЕСЬ. Он включался только в боевом
+            // пути, и повтор молча котировал по НЕРАЗДВИНУТОМУ отступу. Разница
+            // мелкая — у бота A 12.041 б.п. против 12.001, то есть треть
+            // процента, — но её хватает, чтобы цена легла на СОСЕДНИЙ тик, а
+            // сравнение идёт до знака: 09.09.2026 совпадение котировок бота A
+            // упало до 0.62% при полностью исправном боте. Это отказ ПРИБОРА,
+            // и он же — вероятная причина давнего «бот B — только 72.6%,
+            // причина не разобрана».
+            if (dynK > 0) {
+                loop.dynamicOffset(dynK, dynMaxPct);
+            }
+            // ⚠️ РАЗДВИЖЕНИЕ ОТ ДЕФИЦИТА ПОСТАНОВОК — второй недостающий вход.
+            //
+            // Живой бот раздвигает отступ на долю `budgetPressure`, а повтор о
+            // ней знать неоткуда: ведро постановок — общее ЖИВОЕ состояние, его
+            // истории нет, и восстановить задним числом нельзя. Поэтому живой
+            // пишет применённую долю в КАЖДЫЙ тик, а повтор её оттуда берёт.
+            //
+            // Цена незнания измерена 10.09.2026: у бота A давление было 0.00336,
+            // отступ 12.041 б.п. против 12.001 в повторе — треть процента. Этого
+            // хватило, чтобы цена легла на СОСЕДНИЙ тик, а сравнение идёт до
+            // знака: совпадение котировок упало до 0.62% при исправном боте.
+            // Одно и то же значение воспроизводит и бид, и аск до пятого знака —
+            // проверено подстановкой на двух тиках.
+            //
+            // Записи без этой колонки дают ноль, то есть прежнее поведение.
+            loop.replayPressure(pressureAt(ticks));
             clock.stopAt(end, loop::shutdown);
             loop.startQuoting();
             loop.run();

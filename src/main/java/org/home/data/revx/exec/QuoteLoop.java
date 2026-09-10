@@ -269,6 +269,22 @@ public final class QuoteLoop implements Runnable {
         this.spreadToOffsetMaxPct = maxPct;
     }
 
+    /**
+     * ПОВТОР: брать раздвижение отступа из записи, а не из живого ведра.
+     *
+     * Ведро постановок — общее состояние трёх ботов, и истории оно не хранит:
+     * восстановить, каким было давление в прошлую среду, нельзя ниоткуда.
+     * Поэтому живой пишет применённую долю в каждый тик, а повтор подставляет
+     * её обратно. Без этого повтор котирует по нераздвинутому отступу — разница
+     * в треть процента, но её хватает, чтобы цена легла на соседний тик и
+     * сверка показала провал при исправном боте (10.09.2026, бот A: 0.62%).
+     */
+    public void replayPressure(java.util.function.LongToDoubleFunction source) {
+        this.pressureFromRecord = source;
+    }
+
+    private java.util.function.LongToDoubleFunction pressureFromRecord;
+
     /** Причина паузы — именно ширина опоры, а не что-то другое из гейтов. */
     private static boolean isReferenceSpreadReason(String reason) {
         return reason != null && reason.startsWith("опорная книга широка");
@@ -1209,11 +1225,18 @@ public final class QuoteLoop implements Runnable {
         // ADA простояла так 11 часов, а PEPE 7, и вернуть их мог только человек.
         // Теперь бот вместо остановки отходит от цены, реже исполняется и
         // тратит меньше — то есть подстраивается под остаток сам.
-        target = widenForBudget(target, fair.price(), budgetPressure);
+        double pressure = pressureFromRecord != null
+                ? pressureFromRecord.applyAsDouble(clock.now()) : budgetPressure;
+        target = widenForBudget(target, fair.price(), pressure);
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
+        //
+        // ⚠️ Вместе с ней пишется и ПРИМЕНЁННОЕ РАЗДВИЖЕНИЕ. Оно приходит из
+        // общего ведра постановок, у которого нет истории, и без записи повтор
+        // воспроизвести котировку не может в принципе — см. replayPressure.
         countTick();
-        journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null);
+        journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null,
+                pressure);
 
         // ⚠️ Пул РАЗДЕЛЯЕТСЯ между уровнями, и внутренние забирают первыми.
         //
