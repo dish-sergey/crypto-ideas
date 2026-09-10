@@ -102,7 +102,51 @@ public final class TradeClient implements Venue {
                 : "[quota " + quota.toString().trim() + "] " + response.body();
     }
 
+    /**
+     * ПОВТОР ТОЛЬКО ДЛЯ GET, и это не осторожность, а необходимость.
+     *
+     * У POST, PUT и DELETE повтор недопустим: неизвестно, дошёл ли первый
+     * запрос. Повторённая постановка — ВТОРАЯ заявка в книге на те же деньги,
+     * повторённая замена — лишний расход и потерянный наследник. Поэтому здесь
+     * повторяется только чтение, оно идемпотентно по определению.
+     *
+     * Зачем вообще: до 10.09.2026 ретраев не было НИКАКИХ, и на неудачном
+     * `GET /orders/{id}` бот молча терял судьбу заявки — то есть сделку.
+     * Измерено по журналам: 117 579 таких запросов прошли, 46 нет (31 × 429,
+     * 14 × 404, 1 × 503), причём 429 приходят пачками по восемь подряд. Каждая
+     * неудача — исполнение, о котором никто никогда не узнает: другого способа
+     * узнать о сделке у бота нет.
+     *
+     * 404 не повторяется: это ответ по существу («такой заявки нет»), а не сбой.
+     */
+    private static final int GET_ATTEMPTS = 3;
+
     private Venue.Response call(String method, String path, String body) {
+        if (!"GET".equals(method)) {
+            return once(method, path, body);
+        }
+        Venue.Response last = null;
+        for (int attempt = 1; attempt <= GET_ATTEMPTS; attempt++) {
+            last = once(method, path, body);
+            if (last.ok() || last.status() == 404 || last.status() == 401 || last.status() == 403) {
+                return last;
+            }
+            if (attempt < GET_ATTEMPTS) {
+                sleep(200L * attempt);
+            }
+        }
+        return last;
+    }
+
+    private static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private Venue.Response once(String method, String path, String body) {
         URI uri = URI.create(baseUrl + path);
         long started = System.currentTimeMillis();
         try {

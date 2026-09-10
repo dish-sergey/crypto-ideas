@@ -2303,7 +2303,24 @@ public final class QuoteLoop implements Runnable {
     private String book(Side side, String venueId, String responseBody) {
         String status = field(responseBody, "status");
         double total = number(responseBody, "filled_quantity");
-        double price = number(responseBody, "average_fill_price");
+        // ⚠️ ЦЕНА — ИЗ ПОЛЯ `price`, А НЕ ИЗ `average_fill_price`.
+        //
+        // `average_fill_price` это НЕ цена, а частное `filled_amount /
+        // filled_quantity` ПОСЛЕ ОКРУГЛЕНИЯ. Наши заявки только `post_only` и
+        // только лимитные, поэтому исполняются они ровно по своей цене, и на
+        // ленте принт совпадает с полем `price` ТОЧНО.
+        //
+        // Разница не косметическая: 10.09.2026 сверка живых исполнений с лентой
+        // по частному дала 27% совпадений, по `price` — 100%. По этому же полю
+        // считаются захват и markout, то есть округление садилось прямо в
+        // экономику. Пример из журнала: наш SELL стоял на 79357.60, принт прошёл
+        // по 79357.60, а частное показывало 79357.50.
+        //
+        // ⚠️ Записи в `exec_fill` СТАРШЕ 10.09.2026 содержат частное.
+        double price = number(responseBody, "price");
+        if (!(price > 0)) {
+            price = number(responseBody, "average_fill_price");   // запасной путь
+        }
         double fee = number(responseBody, "total_fee");
         String feeCurrency = field(responseBody, "fee_currency");
 

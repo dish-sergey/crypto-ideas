@@ -197,14 +197,32 @@ public class RevxHttp {
      * Значения меньше 60 трактуем всё же как секунды: так ведёт себя спека, и
      * ошибка в эту сторону безопаснее (подождём дольше, чем нужно).
      */
-    private static long retryAfterMs(HttpResponse<String> response) {
+    /**
+     * ⚠️ ЕДИНИЦА ЗАВИСИТ ОТ ТОГО, КТО ОТВЕТИЛ, а не от величины числа.
+     *
+     * Раньше здесь стояла догадка «value <= 60 — значит секунды, иначе
+     * миллисекунды». Она держалась на том, что все наблюдённые значения были
+     * больше шестидесяти (334, 507, 375, 531, 919, 27000). Но документация
+     * площадки говорит прямо: «The Retry-After header specifies the delay in
+     * milliseconds», и при пополнении ведра раз в 100 мс заголовок в 50 мс —
+     * величина совершенно обычная. По старому правилу он дал бы паузу в
+     * 50 СЕКУНД вместо 50 миллисекунд.
+     *
+     * Различать надо не по размеру, а по отвечающему, и это ВИДНО ПО ТЕЛУ.
+     * Из ~694 ответов 429 во всех журналах 564 — HTML-страница без JSON: их
+     * отдаёт защита периметра, которая живёт по обычному HTTP, то есть в
+     * СЕКУНДАХ. Остальные — JSON самой площадки, и там МИЛЛИСЕКУНДЫ.
+     */
+    static long retryAfterMs(HttpResponse<String> response) {
+        String body = response.body();
+        boolean fromVenue = body != null && body.stripLeading().startsWith("{");
         return response.headers().firstValue("retry-after")
                 .map(v -> {
                     try {
                         long value = Long.parseLong(v.trim());
-                        return value <= 60 ? value * 1000 : value;
+                        return fromVenue ? value : value * 1000;
                     } catch (NumberFormatException e) {
-                        return 0L;
+                        return 0L;      // бывает и HTTP-дата; ждём по своей лестнице
                     }
                 })
                 .orElse(0L);
