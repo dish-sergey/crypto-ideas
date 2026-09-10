@@ -293,6 +293,22 @@ public final class ReplayRunner {
      * котором живой не котировал (бид или аск пуст), сверяется на то же самое:
      * «не котировал» — тоже решение, и разойтись здесь так же плохо.
      */
+    /** Квантили ряда одной строкой: медиана и хвосты важнее среднего. */
+    private static String quantiles(java.util.List<Double> v) {
+        if (v.isEmpty()) {
+            return "нет данных";
+        }
+        java.util.List<Double> x = new java.util.ArrayList<>(v);
+        java.util.Collections.sort(x);
+        double mean = x.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+        double sd = Math.sqrt(x.stream().mapToDouble(d -> (d - mean) * (d - mean))
+                .average().orElse(0));
+        return String.format(Locale.ROOT,
+                "10%% %.8f, медиана %.8f, 90%% %.8f, СКО %.8f",
+                x.get(x.size() / 10), x.get(x.size() / 2),
+                x.get(Math.min(x.size() - 1, x.size() * 9 / 10)), sd);
+    }
+
     private static Result compare(List<ReplayFair.Tick> live, ExecJournal journal, Path dir,
                                   SimVenue venue, double tolerance,
                                   List<RecordedFillModel.RecordedFill> liveFills) throws Exception {
@@ -355,6 +371,16 @@ public final class ReplayRunner {
                     liveFills.get(i).buy() ? "BUY" : "SELL", liveFills.get(i).qty(),
                     mineFills.get(i).buy() ? "BUY" : "SELL", mineFills.get(i).qty());
         }
+        // ⚠️ РАЗБРОС ИНВЕНТАРЯ, А НЕ ТОЛЬКО СОВПАДЕНИЕ. Совпадение отвечает на
+        // вопрос «повторилась ли траектория», а разброс — на другой, и более
+        // важный для модели исполнения: НАСКОЛЬКО ЖИВЁТ СКОС. Скос двигает цену
+        // на 10 б.п. на краю инвентаря, а один базисный пункт стоит трети
+        // потока (κ = 0.385), поэтому бот с неподвижным инвентарём котирует
+        // дальше и исполняется реже — сам себя загоняя в угол. Проверять эту
+        // обратную связь нечем, пока не видно обоих разбросов сразу.
+        log.warn("инвентарь: живой {}, повтор {}",
+                quantiles(live.stream().map(ReplayFair.Tick::inventory).toList()),
+                quantiles(mine.stream().map(ReplayFair.Tick::inventory).toList()));
         log.warn("инвентарь совпал на {} тиках из {} ({}%), первое расхождение {}",
                 invMatch, compared, compared > 0 ? 100 * invMatch / compared : 0,
                 firstInvMismatch == 0 ? "нет" : java.time.Instant.ofEpochMilli(firstInvMismatch));
