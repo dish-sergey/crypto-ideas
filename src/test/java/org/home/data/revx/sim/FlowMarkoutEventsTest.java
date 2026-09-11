@@ -72,6 +72,34 @@ class FlowMarkoutEventsTest {
     }
 
     @Test
+    @DisplayName("микроцена тянется к стороне, которую сметут раньше")
+    void microPriceLeansToThinSide() {
+        // На биде втрое больше, чем на аске: аск сметут раньше, значит цена
+        // ближе к аску. Перепутанный вес дал бы ровно обратное, а замер
+        // 11.09.2026 показал, что знак верен: при аск-тяжёлой книге отбор у
+        // продавцов +50.40 б.п. против −1.13 у покупателей (ETH), то есть цена
+        // после принта идёт вниз — как микроцена и предсказывает.
+        FlowMarkout.Top bidHeavy = new FlowMarkout.Top(100, 102, 30, 10);
+        assertThat(bidHeavy.micro()).isGreaterThan(bidHeavy.mid());
+
+        FlowMarkout.Top askHeavy = new FlowMarkout.Top(100, 102, 10, 30);
+        assertThat(askHeavy.micro()).isLessThan(askHeavy.mid());
+
+        FlowMarkout.Top balanced = new FlowMarkout.Top(100, 102, 20, 20);
+        assertThat(balanced.micro()).isEqualTo(balanced.mid());
+    }
+
+    @Test
+    @DisplayName("поправка микроцены не больше полуспреда")
+    void microStaysInsideSpread() {
+        // Это и есть причина, по которой полная микроцена проиграла простой
+        // середине: её поправка масштаба полуспреда (у BTC ±6.9 б.п.), а сама
+        // середина за минуту проходит 1.3 б.п.
+        FlowMarkout.Top extreme = new FlowMarkout.Top(100, 102, 1e9, 1);
+        assertThat(extreme.micro()).isBetween(100.0, 102.0);
+    }
+
+    @Test
     @DisplayName("принты ближе порога не открывают событие вовсе")
     void tooCloseIsNotAnEvent() {
         List<FlowMarkout.Print> prints = List.of(print(1000, 1, 3), print(2000, 1, 4));

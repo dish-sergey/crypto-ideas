@@ -124,8 +124,25 @@ public final class FlowMarkout {
             return "\n" + base + ": справедливой цены почти нет (" + fair.size() + " тиков)\n";
         }
 
-        TreeMap<Long, Double> imb = imbalance(standDbPath, base + "/USDC", from, to);
+        TreeMap<Long, Top> book = book(standDbPath, base + "/USDC", from, to);
         MarketData md = MarketData.load(standDbPath, base + "/USDC", from, to);
+
+        StringBuilder sb = new StringBuilder("\n--- " + base + " ---\n");
+        sb.append(String.format(Locale.ROOT,
+                "тиков справедливой цены %d, снимков книги %d%n", fair.size(), book.size()));
+        // ⚠️ Разреженная опора делает кривую бессмысленной, и молча. На окне
+        // 25-27.08.2026 справедливой цены нашлось 9905 тиков за двое суток — один
+        // в 17 секунд, — и «расстояние принта» стало мерить её устаревание:
+        // медиана 9.75 при хвостах ±50..84 б.п. против ±13 на здоровом окне.
+        if (fair.size() / days < 20_000) {
+            sb.append("⚠️ опора разрежена (").append(String.format(Locale.ROOT, "%.0f", fair.size() / days))
+                    .append(" тиков в сутки) — расстояние будет мерить её устаревание, не поток\n");
+        }
+
+        sb.append(anchors(md, fair, book));
+
+        Ref ref = Ref.valueOf(System.getProperty("revx.flow.ref", "FAIR").toUpperCase(Locale.ROOT));
+        sb.append("опора расчёта: ").append(ref).append('\n');
 
         List<Print> prints = new ArrayList<>();
         long prevTs = 0;
@@ -137,32 +154,30 @@ public final class FlowMarkout {
             if (t.aggressor() == null) {
                 continue;                    // сторону не выводим — см. ТЗ §4.3
             }
-            Map.Entry<Long, Double> f = fair.floorEntry(t.tsMs());
-            if (f == null || f.getValue() <= 0) {
+            Double anchor = anchor(ref, t.tsMs(), fair, book);
+            if (anchor == null || anchor <= 0) {
                 continue;
             }
             int agg = t.aggressor() == Side.BUY ? 1 : -1;
-            double dist = 1e4 * agg * (t.price() - f.getValue()) / f.getValue();
-            Map.Entry<Long, Double> im = imb.floorEntry(t.tsMs());
-            prints.add(new Print(t.tsMs(), t.price(), t.qty(), agg, dist, f.getValue(),
+            double dist = 1e4 * agg * (t.price() - anchor) / anchor;
+            Map.Entry<Long, Top> bk = book.floorEntry(t.tsMs());
+            prints.add(new Print(t.tsMs(), t.price(), t.qty(), agg, dist, anchor,
                     prevTs == 0 ? -1 : t.tsMs() - prevTs,
                     burstSize.getOrDefault(t.tsMs(), 1),
-                    im == null ? Double.NaN : im.getValue()));
+                    bk == null ? Double.NaN : bk.getValue().imbalance()));
             prevTs = t.tsMs();
         }
         if (prints.size() < 50) {
-            return "\n" + base + ": принтов со стороной всего " + prints.size() + "\n";
+            return sb.append("принтов со стороной всего ").append(prints.size()).append('\n').toString();
         }
 
-        StringBuilder sb = new StringBuilder("\n--- " + base + " ---\n");
         sb.append(String.format(Locale.ROOT,
-                "принтов со стороной %d (%.0f в сутки), тиков справедливой цены %d%n",
-                prints.size(), prints.size() / days, fair.size()));
+                "принтов со стороной %d (%.0f в сутки)%n", prints.size(), prints.size() / days));
 
         // Распределение расстояний — чтобы видеть, где вообще есть поток.
         List<Double> d = prints.stream().map(Print::distBp).sorted().toList();
         sb.append(String.format(Locale.ROOT,
-                "расстояние от справедливой цены, б.п.: медиана %.2f (10%% %.2f, 90%% %.2f)%n",
+                "расстояние от опоры, б.п.: медиана %.2f (10%% %.2f, 90%% %.2f)%n",
                 q(d, 0.5), q(d, 0.10), q(d, 0.90)));
 
         sb.append("\nКРИВАЯ: сколько СОБЫТИЙ дотягивается до δ и что они с нами делают\n");
@@ -360,6 +375,18 @@ public final class FlowMarkout {
         sb.append(cut(far, fair, "пауза с прошлого принта, мс",
                 p -> p.gapMs() < 0 ? Double.NaN : p.gapMs()));
         sb.append(cut(far, fair, "перекос книги (бид/(бид+аск))", Print::imbalance));
+        // ⚠️ РЕШАЮЩИЙ РАЗРЕЗ: направление или токсичность.
+        //
+        // Если перекос — направленный сигнал, отбор у ПОКУПОК и ПРОДАЖ обязан
+        // зависеть от него в ПРОТИВОПОЛОЖНЫЕ стороны (книга с тяжёлым бидом →
+        // цена вверх → дорого тем, кто продал). Если же обе стороны страдают
+        // одинаково, перекос меряет не направление, а токсичность потока — и
+        // тогда сдвигать им опору бессмысленно, а раздвигать отступ или вовсе
+        // не котировать — осмысленно.
+        sb.append(cut(far.stream().filter(p -> p.aggressor() > 0).toList(), fair,
+                "  тот же перекос, ТОЛЬКО покупки", Print::imbalance));
+        sb.append(cut(far.stream().filter(p -> p.aggressor() < 0).toList(), fair,
+                "  тот же перекос, ТОЛЬКО продажи", Print::imbalance));
         List<Print> sweep = far.stream().filter(p -> p.burst() > 1).toList();
         List<Print> single = far.stream().filter(p -> p.burst() == 1).toList();
         Double cs = sweep.isEmpty() ? null : cost(sweep, fair, 60_000);
@@ -392,26 +419,204 @@ public final class FlowMarkout {
         return sb.append('\n').toString();
     }
 
+    private static Double anchor(Ref ref, long ts, TreeMap<Long, Double> fair,
+                                 TreeMap<Long, Top> book) {
+        if (ref == Ref.FAIR) {
+            Map.Entry<Long, Double> f = fair.floorEntry(ts);
+            return f == null ? null : f.getValue();
+        }
+        Map.Entry<Long, Top> b = book.floorEntry(ts);
+        if (b == null) {
+            return null;
+        }
+        return ref == Ref.MID ? b.getValue().mid() : b.getValue().micro();
+    }
+
     /**
-     * Перекос лучшего уровня книги — кандидат номер один в предикторы
-     * (микроцена Stoikov). Берётся по ноге USDC: котируем мы в ней.
+     * СРАВНЕНИЕ ОПОР — главный вывод прибора для задачи «улучшить опору».
+     *
+     * Опора оценивается двумя мерками, и обе не требуют торговли:
+     * <ul>
+     *   <li><b>перекос сторон</b> — доля принтов, оказавшихся ВЫШЕ опоры. У
+     *       несмещённой опоры она около половины: покупки и продажи уходят от
+     *       неё одинаково. Отклонение от 50% — прямая мера смещения, и оно
+     *       асимметрично искажает расстояние, по которому мы выбираем отступ;</li>
+     *   <li><b>ошибка прогноза</b> — насколько опора предсказывает середину книги
+     *       через 60 с. Это тот самый критерий, который предлагает док. 151:
+     *       markout по определению есть ошибка прогноза, обусловленная тем, что
+     *       нас исполнили, поэтому опора с меньшей ошибкой обязана давать
+     *       меньший отбор.</li>
+     * </ul>
      */
-    private static TreeMap<Long, Double> imbalance(String dbPath, String symbol,
-                                                   long from, long to) {
-        TreeMap<Long, Double> out = new TreeMap<>();
+    private static String anchors(MarketData md, TreeMap<Long, Double> fair,
+                                  TreeMap<Long, Top> book) {
+        if (book.size() < 100) {
+            return "сравнение опор: книги мало\n";
+        }
+        StringBuilder sb = new StringBuilder(
+                "\nСРАВНЕНИЕ ОПОР (чем ниже ошибка прогноза и чем ближе перекос к 50%, тем лучше)\n");
+        sb.append("  опора | принтов выше опоры | ошибка прогноза середины через 60 с, б.п.\n");
+        for (Ref ref : Ref.values()) {
+            int above = 0;
+            int n = 0;
+            for (MarketTrade t : md.trades()) {
+                Double a = anchor(ref, t.tsMs(), fair, book);
+                if (a == null || a <= 0) {
+                    continue;
+                }
+                n++;
+                if (t.price() > a) {
+                    above++;
+                }
+            }
+            // Ошибка прогноза: |опора(t) − середина(t+60с)|, по снимкам книги.
+            double err = 0;
+            int m = 0;
+            long last = book.lastKey();
+            for (Map.Entry<Long, Top> e : book.entrySet()) {
+                if (e.getKey() + 60_000 > last) {
+                    break;
+                }
+                Double a = anchor(ref, e.getKey(), fair, book);
+                Map.Entry<Long, Top> fut = book.floorEntry(e.getKey() + 60_000);
+                if (a == null || a <= 0 || fut == null) {
+                    continue;
+                }
+                err += Math.abs(1e4 * (a - fut.getValue().mid()) / fut.getValue().mid());
+                m++;
+            }
+            sb.append(String.format(Locale.ROOT, "  %-5s | %17.1f%% | %38.2f%n",
+                    ref, n == 0 ? 0 : 100.0 * above / n, m == 0 ? 0 : err / m));
+        }
+        sb.append(betaSweep(book));
+        return sb.toString();
+    }
+
+    /**
+     * ВЕС ПЕРЕКОСА: сколько микроцены добавлять к середине.
+     *
+     * Полная микроцена Stoikov сдвигает опору на полуспред, умноженный на
+     * перекос: у BTC это до ±6.9 б.п. при том, что сама середина за минуту
+     * проходит 1.3. Неудивительно, что в полную величину она проигрывает простой
+     * середине — она добавляет больше шума, чем сигнала.
+     *
+     * Но перекос отбор ПРЕДСКАЗЫВАЕТ (разрезы кривой: у BTC 11.22 против 2.72
+     * между крайними квартилями). Значит вопрос не «брать или не брать», а «с
+     * каким весом», и вес подбирается по тому же критерию — ошибке прогноза
+     * середины через 60 с.
+     *
+     * ⚠️ Печатаются ДВЕ ошибки. Сырая содержит систематический сдвиг опоры,
+     * который чинится вычитанием константы и потому дёшев. Ошибка без сдвига —
+     * это шум, и он не чинится ничем. Смешивать их нельзя: опора со сдвигом
+     * 4 б.п. и нулевым шумом лучше опоры без сдвига и с шумом 4 б.п., хотя сырая
+     * мерка у них одинаковая.
+     */
+    private static String betaSweep(TreeMap<Long, Top> book) {
+        double[] betas = {0, 0.05, 0.10, 0.20, 0.35, 0.50, 1.0};
+        StringBuilder sb = new StringBuilder(
+                "\n  вес перекоса β: середина + β·(микроцена − середина), прогноз через 60 с\n");
+        sb.append("     β | ошибка, б.п. | она же без систематического сдвига\n");
+        long last = book.lastKey();
+        for (double b : betas) {
+            double sum = 0;
+            double sumSigned = 0;
+            int n = 0;
+            List<Double> signed = new ArrayList<>();
+            for (Map.Entry<Long, Top> e : book.entrySet()) {
+                if (e.getKey() + 60_000 > last) {
+                    break;
+                }
+                Map.Entry<Long, Top> fut = book.floorEntry(e.getKey() + 60_000);
+                if (fut == null) {
+                    continue;
+                }
+                Top t = e.getValue();
+                double a = t.mid() + b * (t.micro() - t.mid());
+                double e60 = 1e4 * (a - fut.getValue().mid()) / fut.getValue().mid();
+                sum += Math.abs(e60);
+                sumSigned += e60;
+                signed.add(e60);
+                n++;
+            }
+            if (n == 0) {
+                continue;
+            }
+            double bias = sumSigned / n;
+            double deb = 0;
+            for (double v : signed) {
+                deb += Math.abs(v - bias);
+            }
+            sb.append(String.format(Locale.ROOT, "  %5.2f | %12.3f | %34.3f%n",
+                    b, sum / n, deb / n));
+        }
+        return sb.toString();
+    }
+
+    /** Лучший уровень книги: бид, аск и объёмы на них. */
+    record Top(double bid, double ask, double bq, double aq) {
+
+        double mid() {
+            return (bid + ask) / 2;
+        }
+
+        /**
+         * Микроцена: середина, взвешенная ОБРАТНО объёмам.
+         *
+         * Мысль Stoikov в одну строку: если на биде стоит втрое больше, чем на
+         * аске, то аск сметут раньше, и «настоящая» цена ближе к аску, а не
+         * посередине. Вес именно перекрёстный — {@code bid·aq + ask·bq}, не
+         * наоборот; перепутанный знак превращает лучший известный предиктор в
+         * худший, поэтому он закреплён тестом.
+         */
+        double micro() {
+            double s = bq + aq;
+            return s <= 0 ? mid() : (bid * aq + ask * bq) / s;
+        }
+
+        double imbalance() {
+            double s = bq + aq;
+            return s <= 0 ? Double.NaN : bq / s;
+        }
+    }
+
+    /**
+     * Опора, от которой меряется и расстояние принта, и markout.
+     *
+     * ⚠️ Опора — не деталь отчёта, а предмет измерения. Она решает ДВЕ вещи
+     * сразу: где стоит наша заявка (мы котируем от неё) и как мы считаем, куда
+     * ушла цена. Смещённая опора искажает расстояние АСИММЕТРИЧНО — покупки
+     * кажутся дальше, продажи ближе, — и это видно по доле покупок на дальних
+     * ступенях. На окне 29–31.08.2026 у BTC она доходила до 82% при нетто-ходе
+     * рынка −0.22%, чего направление объяснить не может.
+     */
+    enum Ref {
+        /** Межплощадочная справедливая цена — та, от которой котирует бот. */
+        FAIR,
+        /** Середина собственной книги пары. */
+        MID,
+        /** Микроцена: середина, взвешенная перекосом объёмов. */
+        MICRO
+    }
+
+    /**
+     * Лучший уровень книги по ноге USDC: котируем мы в ней, значит и опора
+     * должна считаться по ней.
+     */
+    private static TreeMap<Long, Top> book(String dbPath, String symbol, long from, long to) {
+        TreeMap<Long, Top> out = new TreeMap<>();
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + dbPath);
              Statement st = c.createStatement();
              ResultSet rs = st.executeQuery(
-                     "SELECT t_recv_ms, bq1, aq1 FROM revx_book WHERE symbol = '" + symbol
-                             + "' AND t_recv_ms >= " + from + " AND t_recv_ms <= " + to
-                             + " AND bq1 > 0 AND aq1 > 0 ORDER BY t_recv_ms")) {
+                     "SELECT t_recv_ms, bp1, ap1, bq1, aq1 FROM revx_book WHERE symbol = '"
+                             + symbol + "' AND t_recv_ms >= " + from + " AND t_recv_ms <= " + to
+                             + " AND bp1 > 0 AND ap1 > 0 AND bq1 > 0 AND aq1 > 0"
+                             + " ORDER BY t_recv_ms")) {
             while (rs.next()) {
-                double bq = rs.getDouble(2);
-                double aq = rs.getDouble(3);
-                out.put(rs.getLong(1), bq / (bq + aq));
+                out.put(rs.getLong(1), new Top(rs.getDouble(2), rs.getDouble(3),
+                        rs.getDouble(4), rs.getDouble(5)));
             }
         } catch (Exception e) {
-            log.warn("перекос книги {}: {}", symbol, e.toString());
+            log.warn("книга {}: {}", symbol, e.toString());
         }
         return out;
     }
