@@ -77,7 +77,37 @@ public final class Forecast {
                             double inventoryLots, long placements, long replaces,
                             long placementCap, double days, String state, long lossStops,
                             double atCapShare, double lotNotional, int buys, int sells,
-                            java.util.List<Day> days_, double emptyShare, long[] lotHist) {
+                            java.util.List<Day> days_, double emptyShare, long[] lotHist,
+                            double holdMedMin, double holdP90Min, double volBpPerMin) {
+
+        /**
+         * РИСК ЗА ВРЕМЯ УДЕРЖАНИЯ, б.п.: σ√T.
+         *
+         * Пока лот висит T минут, цена уходит на σ√T — это и есть цена опциона,
+         * который мы выписываем, ставя заявку. Захват равен 2δ и от времени не
+         * зависит.
+         */
+        public double riskBp() {
+            return volBpPerMin * Math.sqrt(Math.max(0, holdMedMin));
+        }
+
+        /**
+         * Платят ли нам за риск: захват, делённый на σ√T.
+         *
+         * ⚠️ ЭТО И ЕСТЬ ПРАВИЛЬНАЯ МЕРКА ДЛЯ СРАВНЕНИЯ НАСТРОЕК. Доход за окно
+         * зависит от того, какая ценовая траектория попалась, и на августовском
+         * окне он советовал широкие ступени, которые на другой траектории дают
+         * хвост (у бота A шесть худших кругов из 62 отняли втрое больше, чем
+         * заработали остальные 56). Отношение захвата к риску от траектории не
+         * зависит.
+         *
+         * Меньше единицы — мы продаём опцион дешевле его стоимости. Живьём
+         * 11.09.2026 так было у пяти ботов из шести.
+         */
+        public double payPerRisk() {
+            double r = riskBp();
+            return r > 0 ? 2 * offsetBp / r : 0;
+        }
     }
 
     /**
@@ -87,6 +117,42 @@ public final class Forecast {
      * росте и проваливаться на падении. «Универсальность» иначе не проверить.
      */
     public record Day(String label, double movePct, double realised, int fills) {
+    }
+
+    /**
+     * Волатильность справедливой цены, б.п. в минуту — СКО минутных приращений.
+     *
+     * ⚠️ Именно СКО, а не медиана модуля. 11.09.2026 выяснилось, что колонка
+     * «ход середины» в docs/pairs считалась медианой, и у ликвидных пар она ниже
+     * СКО в 6–15 раз: книга стоит бо́льшую часть минут и изредка прыгает. Риск
+     * живёт в прыжках, поэтому в σ√T должно входить СКО.
+     */
+    static double volBpPerMin(List<ReplayFair.Tick> ticks) {
+        TreeMap<Long, Double> byMin = new TreeMap<>();
+        for (ReplayFair.Tick t : ticks) {
+            if (Double.isFinite(t.fair()) && t.fair() > 0) {
+                byMin.putIfAbsent(t.tsMs() / 60_000, t.fair());
+            }
+        }
+        if (byMin.size() < 10) {
+            return 0;
+        }
+        List<Double> d = new ArrayList<>();
+        Long prevKey = null;
+        double prevVal = 0;
+        for (Map.Entry<Long, Double> e : byMin.entrySet()) {
+            if (prevKey != null && e.getKey() - prevKey == 1 && prevVal > 0) {
+                d.add(1e4 * (e.getValue() - prevVal) / prevVal);
+            }
+            prevKey = e.getKey();
+            prevVal = e.getValue();
+        }
+        if (d.size() < 10) {
+            return 0;
+        }
+        double m = d.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+        double v = d.stream().mapToDouble(x -> (x - m) * (x - m)).sum() / d.size();
+        return Math.sqrt(v);
     }
 
     private Forecast() {
@@ -428,7 +494,8 @@ public final class Forecast {
                 // Зашитая цена биткойна здесь врала на SOL втрое: лот $1
                 // печатался как 788.
                 spec.size() * st.lastFair(), buys, sells, byDay(ledger, ticks),
-                tickCount > 0 ? (double) st.ticksEmpty() / tickCount : 0, st.lotHist());
+                tickCount > 0 ? (double) st.ticksEmpty() / tickCount : 0, st.lotHist(),
+                ledger.holdMinutes(0)[0], ledger.holdMinutes(0)[1], volBpPerMin(ticks));
     }
 
     /**
@@ -513,7 +580,15 @@ public final class Forecast {
         // без аска 15% времени у BTC, 24% у SOL, 44% у ETH), а лечатся они
         // ПРОТИВОПОЛОЖНЫМИ движениями потолка.
         sb.append("бот | отступ |  лот | покупок | продаж | реализовано | инвентарь"
-                + " | пусто | в потолке | постановок/сут | на постановку | замен/с\n");
+                + " | пусто | в потолке | держ,мин | риск,б.п. | ЗАХВ/РИСК"
+                + " | постановок/сут | на постановку | замен/с\n");
+        // ⚠️ ЗАХВАТ/РИСК — ГЛАВНАЯ КОЛОНКА, а не доход. Доход зависит от того,
+        // какая ценовая траектория попалась в окно: на августовском окне он
+        // советовал широкие ступени, а живьём они дали хвост — у бота A шесть
+        // худших кругов из 62 отняли втрое больше, чем заработали остальные 56.
+        // Отношение 2δ к σ√T от траектории не зависит. Меньше единицы означает,
+        // что мы продаём опцион дешевле его стоимости; живьём 11.09.2026 так
+        // было у пяти ботов из шести (задача A15).
         for (BotResult r : results) {
             // ⚠️ Состояние на конец прогона печатается не для полноты. Бот
             // встаёт сам, когда торговый убыток против buy & hold превышает
@@ -531,9 +606,10 @@ public final class Forecast {
             double perPlacement = r.placements() > 0 ? r.realised() / r.placements() : 0;
             sb.append(String.format(Locale.ROOT,
                     "%-3s | %5.1f  | %4.2f | %7d | %6d | %+11.4f | %8.1f  | %4.1f%% | %8.1f%% "
-                            + "| %6.0f/%-5d | %+13.6f | %6.2f%s%n",
+                            + "| %8.0f | %9.1f | %9.2f | %6.0f/%-5d | %+13.6f | %6.2f%s%n",
                     r.botId(), r.offsetBp(), r.lotNotional(), r.buys(), r.sells(), r.realised(),
                     r.inventoryLots(), 100 * r.emptyShare(), 100 * r.atCapShare(),
+                    r.holdMedMin(), r.riskBp(), r.payPerRisk(),
                     r.placements() / r.days(), r.placementCap(), perPlacement,
                     r.replaces() / (r.days() * 86_400), state));
         }

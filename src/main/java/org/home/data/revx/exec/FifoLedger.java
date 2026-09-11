@@ -63,10 +63,22 @@ public final class FifoLedger {
     /**
      * Закрытая пара «вход — выход». {@code pnl} уже за вычетом комиссий обеих ног.
      *
+     * @param openedMs когда открылась ВХОДНАЯ нога. Без неё нельзя посчитать
+     *        время под позицией, а оно оказалось решающей величиной: пока лот
+     *        висит T минут, цена уходит на σ√T, и у пяти боевых ботов из шести
+     *        этот риск ПРЕВЫШАЕТ захват 2δ (замер 11.09.2026, задача A15).
+     *        Захват фиксирован, риск растёт как корень времени — поэтому
+     *        сравнивать настройки по доходу за окно нельзя, выигрывает та,
+     *        которой повезло с траекторией.
      * @param handover хоть одна нога пары — передача: заработком бота это не является
      */
-    public record Realisation(long tsMs, double qty, double entry, double exit, double pnl,
-                              boolean handover) {
+    public record Realisation(long tsMs, long openedMs, double qty, double entry, double exit,
+                              double pnl, boolean handover) {
+
+        /** Сколько партия пролежала под риском, миллисекунды. */
+        public long heldMs() {
+            return Math.max(0, tsMs - openedMs);
+        }
     }
 
     /** Текущее состояние остатка. */
@@ -113,7 +125,7 @@ public final class FifoLedger {
             // Прибыль длинной партии: (выход − вход)·объём. Для короткой знак
             // переворачивается сам, потому что head.qty() отрицателен.
             double pnl = Math.signum(head.qty()) * (price - head.price()) * take;
-            closed.add(new Realisation(tsMs, take, head.price(), price, pnl,
+            closed.add(new Realisation(tsMs, head.tsMs(), take, head.price(), price, pnl,
                     handover || head.handover()));
             left -= take;
             double rest = Math.abs(head.qty()) - take;
@@ -158,6 +170,33 @@ public final class FifoLedger {
     /** Результат по парам, где хоть одна нога — передача или затравка. */
     public double handoverRealisedSince(long fromMs) {
         return sum(fromMs, Realisation::handover, Realisation::pnl);
+    }
+
+    /**
+     * ВРЕМЯ ПОД ПОЗИЦИЕЙ по закрытым парам, в минутах: медиана и 90-й процентиль.
+     *
+     * Это половина ответа на вопрос «платят ли нам за риск»: вторая половина —
+     * волатильность пары. Риск круга равен σ√T, захват равен 2δ, и сравнивать
+     * настройки надо по их отношению, а не по доходу за окно (задача A15).
+     *
+     * ⚠️ Считается по ЗАКРЫТЫМ парам. Партия, которая висит до сих пор, сюда не
+     * входит — а она и есть самая опасная. Поэтому медиана здесь ЗАНИЖАЕТ
+     * настоящее время под риском, и тем сильнее, чем хуже шли дела.
+     */
+    public double[] holdMinutes(long fromMs) {
+        java.util.List<Long> held = new java.util.ArrayList<>();
+        for (Realisation r : closed) {
+            if (r.tsMs() >= fromMs && !r.handover()) {
+                held.add(r.heldMs());
+            }
+        }
+        if (held.isEmpty()) {
+            return new double[]{0, 0};
+        }
+        java.util.Collections.sort(held);
+        return new double[]{
+                held.get(held.size() / 2) / 60_000.0,
+                held.get(Math.min(held.size() - 1, held.size() * 9 / 10)) / 60_000.0};
     }
 
     /** Сколько пар закрылось в окне — знаменатель для «на сделку». */

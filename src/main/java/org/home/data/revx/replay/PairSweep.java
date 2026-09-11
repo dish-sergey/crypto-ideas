@@ -138,6 +138,9 @@ public final class PairSweep {
          */
         double emptyShare;
         double atCapShare;
+        /** Медиана времени под позицией и волатильность — для мерки «захват/риск». */
+        double holdMedMin;
+        double volBpPerMin;
         /** Сумма гистограмм по суткам: сколько тиков инвентарь стоял на N лотах. */
         long[] lotHist = new long[0];
         int daysHeld;
@@ -475,6 +478,8 @@ public final class PairSweep {
             cell.inventoryLots += q.inventoryLots();
             cell.emptyShare += q.emptyShare();
             cell.atCapShare += q.atCapShare();
+            cell.holdMedMin += q.holdMedMin();
+            cell.volBpPerMin += q.volBpPerMin();
             if (q.lotHist() != null) {
                 if (cell.lotHist.length < q.lotHist().length) {
                     cell.lotHist = java.util.Arrays.copyOf(cell.lotHist, q.lotHist().length);
@@ -741,6 +746,57 @@ public final class PairSweep {
     }
 
     /**
+     * ПЛАТЯТ ЛИ НАМ ЗА РИСК: захват против σ√T.
+     *
+     * <h2>Зачем это главнее дохода</h2>
+     *
+     * Доход за окно зависит от того, какая ценовая траектория попалась. На
+     * августовском окне он советовал широкие ступени, а живьём они дали хвост:
+     * у бота A шесть худших кругов из 62 отняли −$0.54, тогда как остальные 56
+     * заработали +$0.27. Настройка, выигравшая на одной траектории, на другой
+     * разоряет, и по доходу этого не видно.
+     *
+     * Отношение захвата к риску от траектории не зависит. Захват равен 2δ и
+     * фиксирован; риск равен σ√T, где T — время под позицией, и растёт как
+     * корень времени. Меньше единицы означает, что мы выписываем опцион дешевле
+     * его стоимости.
+     *
+     * ⚠️ Замер на живых ботах 11.09.2026 дал отношение ниже единицы у ПЯТИ из
+     * шести: A 0.46, B 0.62, C 0.49, d 0.79, f 0.37 — и только у e, самого
+     * тесного и быстрого, 1.43. Это и есть объяснение того, почему обход обещал
+     * плюс, а боты торговали в минус.
+     *
+     * ⚠️ T считается по ЗАКРЫТЫМ парам: партия, которая висит до сих пор, сюда
+     * не входит, а она и есть самая опасная. Значит риск здесь ЗАНИЖЕН.
+     */
+    private static String risk(Map<String, Map<Variant, Cell>> grid) {
+        StringBuilder sb = new StringBuilder(
+                "\n\n=== ПЛАТЯТ ЛИ ЗА РИСК: захват 2δ против σ√T ===\n\n");
+        sb.append("пара     | ступень | держ,мин | сигма,б.п./мин | риск | захват | ЗАХВ/РИСК\n");
+        for (var e : grid.entrySet()) {
+            for (var o : e.getValue().entrySet()) {
+                Cell c = o.getValue();
+                if (c.daysHeld == 0) {
+                    continue;
+                }
+                double hold = c.holdMedMin / c.daysHeld;
+                double vol = c.volBpPerMin / c.daysHeld;
+                double riskBp = vol * Math.sqrt(Math.max(0, hold));
+                double capBp = 2 * o.getKey().offBp();
+                sb.append(String.format(Locale.ROOT,
+                        "%-8s | %7s | %8.0f | %14.2f | %4.1f | %6.1f | %9.2f%s%n",
+                        e.getKey(), o.getKey().label(), hold, vol, riskBp, capBp,
+                        riskBp > 0 ? capBp / riskBp : 0,
+                        riskBp > 0 && capBp / riskBp < 1 ? "  ⚠️ дешевле стоимости" : ""));
+            }
+        }
+        sb.append("\n⚠️ отношение ниже единицы — риск за время удержания превышает захват.\n");
+        sb.append("Сравнивать настройки надо по ЭТОЙ колонке, а не по доходу: доход\n");
+        sb.append("зависит от попавшейся траектории, отношение — нет.\n");
+        return sb.toString();
+    }
+
+    /**
      * ЗАНЯТОСТЬ ИНВЕНТАРЯ: сколько времени котируются обе стороны, а сколько одна.
      *
      * <h2>Зачем</h2>
@@ -931,6 +987,8 @@ public final class PairSweep {
         sb.append(touchLadder(grid, variants,
                 best.stream().map(Best::base).toList()));
         sb.append(concentration(grid));
+        sb.append(risk(grid));
+        sb.append(risk(grid));
         sb.append(occupancy(grid));
         sb.append(gatesTable(grid));
 
