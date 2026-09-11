@@ -727,6 +727,18 @@ public final class PairSweep {
                 .append(String.format(Locale.ROOT, "%.0f", levelStepBp)).append(" б.п., ")
                 .append(innerFirst ? "от ближнего" : "от дальнего")
                 .append(", потолок 20 лотов ===\n");
+        // ⚠️ ОКНО И НАСТРОЙКИ — В САМОМ ОТЧЁТЕ, а не только в логе. Отчёты
+        // пересылаются и цитируются кусками, и таблица без даты окна
+        // неотличима от такой же таблицы за другие сутки: за 11.09.2026 дважды
+        // приходилось выяснять задним числом, на каких днях считано.
+        sb.append("окно: ").append(fromIso).append(" .. ").append(toIso)
+                .append(", суток ").append(days.size()).append("\n");
+        sb.append("дни: ").append(String.join(", ", days)).append("\n");
+        sb.append("цель скоса: ")
+                .append(System.getProperty("revx.sim.skew-target", "0.3"))
+                .append(", стартовый запас: ")
+                .append(System.getProperty("revx.sim.start-inventory", "0"))
+                .append(" потолка\n");
 
         List<Variant> variants = grid.values().stream().flatMap(m -> m.keySet().stream())
                 .distinct().sorted().toList();

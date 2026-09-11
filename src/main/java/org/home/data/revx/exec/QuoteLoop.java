@@ -458,6 +458,41 @@ public final class QuoteLoop implements Runnable {
      * отступом в 30 б.п. и биткойн с десятью получили бы одинаковую прибавку в
      * долларах, то есть совершенно разное наказание.
      */
+    /**
+     * ПЕРВЫЙ ЛОТ ПОКУПАЕМ АГРЕССИВНЕЕ ОСТАЛЬНЫХ.
+     *
+     * <h2>Зачем</h2>
+     *
+     * Первый лот стоит дороже своего спреда: пока его нет, НЕТ И АСКА, то есть
+     * простаивает половина конструкции. Замер по живым журналам 11.09.2026 за
+     * пять суток: с нулевым инвентарём бот A живёт 15.7% времени, B — 28.8%,
+     * C — 44.0%; с одним лотом и меньше — 54%, 70% и 72%. Цель скоса при этом
+     * 2.1 лота, то есть до неё боты почти не доходят.
+     *
+     * Скос и так подтягивает бид (у A с 12 до 7.7 б.п. при пустом инвентаре),
+     * но линейно и потому слабо. Этот ключ делает подтягивание НЕЛИНЕЙНЫМ:
+     * пока своих лотов меньше одного, бид ставится на заданный тесный отступ.
+     * При κ = 0.385 на базисный пункт сужение с 7.7 до 4 б.п. примерно удваивает
+     * темп набора.
+     *
+     * ⚠️ ОПЫТ, по умолчанию ВЫКЛЮЧЕН (0). Живых ботов не трогает, пока ключ не
+     * задан: конструкция меняет риск на сделку, и включать её можно только
+     * замера на обоих типах окон.
+     */
+    private Quoter.Quotes pullFirstLot(Quoter.Quotes target, double price) {
+        double firstLotBp = Double.parseDouble(
+                System.getProperty("revx.sim.first-lot-offset", "0"));
+        if (!(firstLotBp > 0) || !target.hasBid() || !(price > 0)) {
+            return target;
+        }
+        if (inventory >= params.size() - 1e-15) {
+            return target;            // свой лот уже есть, аск стоит — гнаться незачем
+        }
+        double pulled = price * (1 - firstLotBp / 10_000);
+        // Только ПОДТЯГИВАЕМ: если скос уже увёл бид ближе, не отодвигаем назад.
+        return new Quoter.Quotes(Math.max(target.bid(), pulled), target.ask());
+    }
+
     static Quoter.Quotes widenForBudget(Quoter.Quotes target, double price, double pressure) {
         if (!(pressure > 0) || !(price > 0)) {
             return target;
@@ -817,6 +852,23 @@ public final class QuoteLoop implements Runnable {
     private double maxOrderNotional = ExecLimits.MAX_ORDER_NOTIONAL_USDC;
     private double maxExposure = ExecLimits.MAX_TOTAL_EXPOSURE_USDC;
     private double maxTradingLoss = ExecLimits.MAX_TRADING_LOSS_USDC;
+
+    /**
+     * ПРЕДЕЛ УБЫТКА — АБСОЛЮТНЫЙ, и поэтому у мелкого бота он жёстче.
+     *
+     * Один доллар при потолке  — это 5% капитала, при потолке  уже 14%.
+     * Опытные боты на малом потолке останавливались бы втрое чаще больших, и
+     * меряли бы мы не настройку, а срабатывание предохранителя.
+     *
+     * Задаётся юнитом (`--revx.exec.max-loss=`), по умолчанию прежняя единица:
+     * у боевых ботов ничего не меняется, пока значение не передано явно.
+     */
+    public void maxTradingLoss(double usdc) {
+        if (usdc > 0) {
+            this.maxTradingLoss = usdc;
+            log.warn("предел убытка задан юнитом: {} USDC", fmt(usdc));
+        }
+    }
     private PlacementBudget budget;
     /**
      * Счётчики тиков — В ПАМЯТИ, а не через журнал.
@@ -1307,6 +1359,7 @@ public final class QuoteLoop implements Runnable {
         double pressure = pressureFromRecord != null
                 ? pressureFromRecord.applyAsDouble(clock.now()) : budgetPressure;
         target = widenForBudget(target, fair.price(), pressure);
+        target = pullFirstLot(target, fair.price());
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
         //

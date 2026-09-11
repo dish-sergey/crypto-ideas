@@ -68,6 +68,8 @@ public class Executor {
     private final boolean ownPosition;
     private final double positionSeed;
     private final double parkDistance;
+    /** Предел убытка из юнита; 0 — прежний общий предел из ExecLimits. */
+    private final double maxLossUsdc;
     private final double dynOffsetK;
     private final double dynOffsetMaxPct;
     private final int levels;
@@ -94,6 +96,7 @@ public class Executor {
                     @Value("${revx.exec.own-position}") boolean ownPosition,
                     @Value("${revx.exec.position-seed}") double positionSeed,
                     @Value("${revx.exec.park-distance}") double parkDistance,
+                    @Value("${revx.exec.max-loss:0}") double maxLossUsdc,
                     @Value("${revx.exec.dyn-offset}") double dynOffsetK,
                     @Value("${revx.exec.dyn-offset-max-pct}") double dynOffsetMaxPct,
                     @Value("${revx.exec.levels}") int levels,
@@ -119,6 +122,7 @@ public class Executor {
         this.ownPosition = ownPosition;
         this.positionSeed = positionSeed;
         this.parkDistance = parkDistance;
+        this.maxLossUsdc = maxLossUsdc;
         this.dynOffsetK = dynOffsetK;
         this.dynOffsetMaxPct = dynOffsetMaxPct;
         this.levels = levels;
@@ -168,6 +172,7 @@ public class Executor {
         // же причине: суточный лимит у площадки один на аккаунт, а процессов
         // шесть. Общий файл — единственное место, где они могут договориться.
         loop.placementBudget(new PlacementBudget(allocPath, ExecLimits.BOTS_SHARING_ACCOUNT));
+        loop.maxTradingLoss(maxLossUsdc);
 
         // ГЕЙТ ПО ШИРИНЕ ОПОРЫ РАЗДВИГАЕТ ОТСТУП, А НЕ ВЫКЛЮЧАЕТ КОТИРОВАНИЕ.
         //

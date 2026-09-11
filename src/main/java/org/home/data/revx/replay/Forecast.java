@@ -123,8 +123,9 @@ public final class Forecast {
         }
         double quoteStart = bots.stream().mapToDouble(BotSpec::inventoryCap).sum()
                 * refPrice * 1.2;
+        double startBase = ticks.get(0).inventory();
         SimVenue venue = new SimVenue(clock, model, base.symbol(),
-                ticks.get(0).inventory(), quoteStart, base.minNotional());
+                startBase, quoteStart, base.minNotional());
 
         Path dir = Files.createTempDirectory("revx-forecast");
         List<ExecJournal> journals = new ArrayList<>();
@@ -150,8 +151,16 @@ public final class Forecast {
                 journal.quotesOff();
                 journals.add(journal);
 
+                // ⚠️ СТАРТОВЫЙ ЗАПАС НАДО И ЗАХВАТИТЬ, И ЗАСЕЯТЬ.
+                //
+                // Здесь стоял ноль, и это сводило на нет любой стартовый
+                // инвентарь: на площадке монета есть, а бот с `ownPosition`
+                // считает своим только ЗАХВАЧЕННОЕ, то есть ничего. Поймано
+                // 11.09.2026: прогон с `-Drevx.sim.start-inventory=0.3` дал
+                // числа, совпавшие с нулевым запасом до десятых процента.
+                double baseSeed = startBase / bots.size();
                 alloc.claim(spec.botId(), base.symbol().substring(0, base.symbol().indexOf('/')),
-                        0, 0, refPrice, start);
+                        baseSeed, startBase, refPrice, start);
                 alloc.claim(spec.botId(), base.symbol().substring(base.symbol().indexOf('/') + 1),
                         quoteStart / bots.size(), quoteStart, refPrice, start);
 
@@ -168,7 +177,7 @@ public final class Forecast {
                         Executor.buildPolicy(params, base.costFloorMargin(), base.anchorLeash(),
                                 base.anchorWidening(), base.widening(), base.wideningMaxStep(),
                                 spec.size(), spec.inventoryCap(), base.quoteStep()),
-                        true, 0, base.baseStep(), base.parkDistance(), alloc,
+                        true, baseSeed, base.baseStep(), base.parkDistance(), alloc,
                         spec.levels(), spec.levelStep(), spec.innerFirst());
                 // ⚠️ ОБЩЕЕ ВЕДРО ПОСТАНОВОК — по ключу, а не всегда.
                 //
@@ -291,7 +300,7 @@ public final class Forecast {
             List<BotResult> out = new ArrayList<>();
             for (int i = 0; i < bots.size(); i++) {
                 out.add(measure(bots.get(i), journals.get(i), loops.get(i), base,
-                        Math.max(1e-9, (end - start) / 86_400_000.0), ticks));
+                        Math.max(1e-9, (end - start) / 86_400_000.0), ticks, startBase / bots.size()));
             }
             return out;
         } finally {
@@ -370,8 +379,19 @@ public final class Forecast {
     }
     private static BotResult measure(BotSpec spec, ExecJournal journal,
                                      QuoteLoop loop, BootParams base, double days,
-                                     List<ReplayFair.Tick> ticks) {
+                                     List<ReplayFair.Tick> ticks, double seedQty) {
         FifoLedger ledger = new FifoLedger();
+        // ⚠️ СТАРТОВЫЙ ЗАПАС ОБЯЗАН ВОЙТИ В КНИГУ ПАРТИЙ, И ПО ЦЕНЕ ОТКРЫТИЯ.
+        //
+        // Без этого продажа запаса не находит встречной партии, книга открывает
+        // КОРОТКУЮ позицию по цене продажи, а следующая покупка её закрывает —
+        // и на падающем рынке это записывается в прибыль, пропорциональную
+        // падению. Поймано 11.09.2026: прогон с полным запасом дал у SOL +577%
+        // годовых на ПАДАЮЩЕМ окне против +12% с пустым. Подаренный лот
+        // засчитывался как заработанный.
+        if (seedQty > 1e-15 && !ticks.isEmpty() && ticks.get(0).fair() > 0) {
+            ledger.add(ticks.get(0).tsMs(), true, seedQty, ticks.get(0).fair(), 0);
+        }
         int fills = 0;
         int buys = 0;
         int sells = 0;
