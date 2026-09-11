@@ -15,7 +15,32 @@ public record PairQuote(
         double spreadUsdc,
         double spreadUsd,
         boolean memecoin,
-        long availableAtMs) {
+        long availableAtMs,
+        double bqUsdc,
+        double aqUsdc) {
+
+    /**
+     * Без объёмов на лучшем уровне. Микроцена по такой паре не считается и
+     * молча вырождается в середину — это верно: объёмов нет, перекоса нет.
+     */
+    public PairQuote(String base, double midUsdc, double midUsd, double spreadUsdc,
+                     double spreadUsd, boolean memecoin, long availableAtMs) {
+        this(base, midUsdc, midUsd, spreadUsdc, spreadUsd, memecoin, availableAtMs, 0, 0);
+    }
+
+    /**
+     * Микроцена Stoikov по ноге USDC: середина, взвешенная ОБРАТНО объёмам.
+     * Если на биде втрое больше, чем на аске, аск сметут раньше, и цена ближе к
+     * аску. Перепутанный вес превращает лучший предиктор в худший.
+     */
+    public double microUsdc() {
+        double s = bqUsdc + aqUsdc;
+        if (s <= 0 || spreadUsdc <= 0) {
+            return midUsdc;
+        }
+        double half = midUsdc * spreadUsdc / 200.0;
+        return midUsdc + half * (bqUsdc - aqUsdc) / s;
+    }
 
     /** Подразумеваемый курс USDC/USD по этой паре. */
     public double implied() {

@@ -37,12 +37,48 @@ public final class FairPrice {
             double maxDispersionPct,
             double maxReferenceSpreadPct,
             double maxResidualPct,
-            double fixedRate) {
+            double fixedRate,
+            Anchor anchor,
+            double beta) {
 
         public Limits(int minPairs, double maxDispersionPct,
                       double maxReferenceSpreadPct, double maxResidualPct) {
             this(minPairs, maxDispersionPct, maxReferenceSpreadPct, maxResidualPct, 0);
         }
+
+        /**
+         * ⚠️ Опора и её вес берутся ИЗ СВОЙСТВ, а не из конфигурации, намеренно:
+         * это опыт, а не настройка. По умолчанию CROSS с весом ноль, то есть
+         * поведение в точности прежнее.
+         */
+        public Limits(int minPairs, double maxDispersionPct,
+                      double maxReferenceSpreadPct, double maxResidualPct, double fixedRate) {
+            this(minPairs, maxDispersionPct, maxReferenceSpreadPct, maxResidualPct, fixedRate,
+                    Anchor.valueOf(System.getProperty("revx.fair.anchor", "CROSS")
+                            .toUpperCase(java.util.Locale.ROOT)),
+                    Double.parseDouble(System.getProperty("revx.fair.beta", "0")));
+        }
+    }
+
+    /**
+     * Откуда берётся справедливая цена ТОРГУЕМОЙ пары.
+     *
+     * ⚠️ Курс USDC/USD считается медианой по всем парам при ЛЮБОЙ опоре — от
+     * него зависят гейты по разбросу и остатку, и подменять его нельзя.
+     * Меняется только цена, от которой котируем.
+     *
+     * Замер 11.09.2026 по ленте (ошибка прогноза середины книги через 60 с):
+     * CROSS 2.91 у BTC, 6.68 у ETH, 5.43 у SOL; MID 1.28, 1.20, 1.97 — то есть
+     * вдвое-вшестеро точнее. Перекос сторон у CROSS на ETH 61.7% против 49.3%
+     * у MID: наша межплощадочная опора ещё и смещена.
+     */
+    public enum Anchor {
+        /** Медиана implied по 23 парам: { mid_usd / rate}. Так было всегда. */
+        CROSS,
+        /** Середина собственной книги пары в USDC. */
+        MID,
+        /** Середина плюс { beta} долей поправки микроцены. */
+        MICRO
     }
 
     /** Почему по паре нельзя котировать; null = можно. */
@@ -121,6 +157,15 @@ public final class FairPrice {
             // 12. Подстановка курса 1.0 показывает верхнюю оценку того, сколько
             // вообще решает эта величина.
             double fair = q.midUsd() / (limits.fixedRate() > 0 ? limits.fixedRate() : rate);
+            // ⚠️ ОПОРА — ТОТ ЖЕ КЛАСС ПРИБОРА, что и подмена курса выше, и правило
+            // то же: меняется ТОЛЬКО цена, от которой котируем. Курс, разброс,
+            // остатки и гейты считаются по медиане при любой опоре — иначе опыт
+            // менял бы две вещи разом.
+            if (limits.anchor() != Anchor.CROSS && q.midUsdc() > 0) {
+                double mid = q.midUsdc();
+                fair = limits.anchor() == Anchor.MID ? mid
+                        : mid + limits.beta() * (q.microUsdc() - mid);
+            }
             String paused = null;
             if (!reliable) {
                 paused = "курс ненадёжен: " + unreliableReason;

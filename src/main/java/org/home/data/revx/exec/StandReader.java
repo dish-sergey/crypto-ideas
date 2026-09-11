@@ -50,7 +50,7 @@ public final class StandReader implements FairSource, AutoCloseable {
      * точечных выборок вместо одного скана.
      */
     private static final String SELECT_LATEST = """
-            SELECT snap_id, ap1, bp1, skew_ms, t_recv_ms
+            SELECT snap_id, ap1, bp1, bq1, aq1, skew_ms, t_recv_ms
             FROM revx_book
             WHERE symbol = ? AND t_sent_ms >= ?
             ORDER BY t_sent_ms DESC
@@ -206,7 +206,7 @@ public final class StandReader implements FairSource, AutoCloseable {
             ownBook.put(pairBase, usdc);
             quotes.add(new PairQuote(pairBase, usdc.mid(), usd.mid(),
                     usdc.spread(), usd.spread(), memecoins.contains(pairBase),
-                    Math.max(usdc.recvMs, usd.recvMs)));
+                    Math.max(usdc.recvMs, usd.recvMs), usdc.bq(), usdc.aq()));
             asOf = Math.max(asOf, Math.max(usdc.recvMs, usd.recvMs));
         }
 
@@ -226,7 +226,8 @@ public final class StandReader implements FairSource, AutoCloseable {
     }
 
     /** Одна нога последнего снимка символа. */
-    private record Leg(long snapId, double ask, double bid, long skewMs, long recvMs) {
+    private record Leg(long snapId, double ask, double bid, long skewMs, long recvMs,
+                       double bq, double aq) {
 
         double mid() {
             return (ask + bid) / 2;
@@ -252,7 +253,8 @@ public final class StandReader implements FairSource, AutoCloseable {
                         continue;                    // пустой ответ книги, такое бывает
                     }
                     out.put(rs.getLong("snap_id"), new Leg(rs.getLong("snap_id"), ask, bid,
-                            rs.getLong("skew_ms"), rs.getLong("t_recv_ms")));
+                            rs.getLong("skew_ms"), rs.getLong("t_recv_ms"),
+                            rs.getDouble("bq1"), rs.getDouble("aq1")));
                 }
             }
         } catch (Exception e) {

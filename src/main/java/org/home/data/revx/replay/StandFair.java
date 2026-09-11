@@ -51,7 +51,8 @@ public final class StandFair implements FairSource {
 
     /** Сшитый снимок одной пары: обе ноги из одного цикла. */
     private record Slice(long recvMs, double midUsdc, double midUsd,
-                         double spreadUsdc, double spreadUsd, double bid, double ask) {
+                         double spreadUsdc, double spreadUsd, double bid, double ask,
+                         double bq, double aq) {
     }
 
     private final String base;
@@ -204,7 +205,7 @@ public final class StandFair implements FairSource {
                 continue;
             }
             out.add(new Slice((long) Math.max(q[4], u[4]), midQ, midU,
-                    (q[0] - q[1]) / midQ, (u[0] - u[1]) / midU, q[1], q[0]));
+                    (q[0] - q[1]) / midQ, (u[0] - u[1]) / midU, q[1], q[0], q[5], q[6]));
         }
         out.sort(java.util.Comparator.comparingLong(Slice::recvMs));
         return out;
@@ -213,7 +214,7 @@ public final class StandFair implements FairSource {
     /** {@code snap_id → [ask, bid, _, skew, recv]}. */
     private static Map<Long, double[]> legs(Connection c, String symbol, long from, long to) {
         Map<Long, double[]> out = new HashMap<>();
-        String sql = "SELECT snap_id, ap1, bp1, skew_ms, t_recv_ms FROM revx_book "
+        String sql = "SELECT snap_id, ap1, bp1, bq1, aq1, skew_ms, t_recv_ms FROM revx_book "
                 + "WHERE symbol = ? AND t_recv_ms >= ? AND t_recv_ms <= ?";
         try (PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, symbol);
@@ -227,7 +228,8 @@ public final class StandFair implements FairSource {
                         continue;                 // пустой ответ книги, такое бывает
                     }
                     out.put(rs.getLong("snap_id"), new double[]{ask, bid, 0,
-                            rs.getLong("skew_ms"), rs.getLong("t_recv_ms")});
+                            rs.getLong("skew_ms"), rs.getLong("t_recv_ms"),
+                            rs.getDouble("bq1"), rs.getDouble("aq1")});
                 }
             }
         } catch (Exception e) {
@@ -266,7 +268,8 @@ public final class StandFair implements FairSource {
                 own = s;
             }
             quotes.add(new PairQuote(pair, s.midUsdc(), s.midUsd(),
-                    s.spreadUsdc(), s.spreadUsd(), memecoins.contains(pair), s.recvMs()));
+                    s.spreadUsdc(), s.spreadUsd(), memecoins.contains(pair), s.recvMs(),
+                    s.bq(), s.aq()));
             asOf = Math.max(asOf, s.recvMs());
         }
         if (quotes.isEmpty()) {
