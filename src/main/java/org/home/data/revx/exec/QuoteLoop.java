@@ -194,6 +194,40 @@ public final class QuoteLoop implements Runnable {
      */
     private final java.util.List<Resting> bids = new java.util.ArrayList<>();
     private final java.util.List<Resting> asks = new java.util.ArrayList<>();
+
+    /**
+     * УРОВЕНЬ СЕТКИ ПО ИДЕНТИФИКАТОРУ ЗАЯВКИ.
+     *
+     * Нужен, чтобы разложить доход по уровням: до 11.09.2026 он был известен
+     * только целиком по боту, и вопрос «зарабатывает ли дальний уровень или
+     * числится» ответа не имел.
+     *
+     * Почему отдельная карта, а не поиск по слотам в момент проводки: к этому
+     * моменту слот уже может держать НАСЛЕДНИКА (замена создаёт новый
+     * идентификатор) или быть пустым, и связь с исполнившейся заявкой теряется.
+     * Карта помнит её с постановки.
+     *
+     * Размер ограничен: заявок за сутки десятки тысяч, а нужны только живые и
+     * недавно умершие.
+     */
+    private final java.util.Map<String, Integer> levelByOrder =
+            new java.util.LinkedHashMap<>(256, 0.75f, false) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, Integer> eldest) {
+                    return size() > 4096;
+                }
+            };
+
+    private void rememberLevel(Side side, Resting resting) {
+        if (resting.venueId != null) {
+            levelByOrder.put(resting.venueId, levelOf(side, resting));
+        }
+    }
+
+    private int levelOf(String venueId) {
+        Integer v = venueId == null ? null : levelByOrder.get(venueId);
+        return v == null ? -1 : v;
+    }
     private final int levels;
     /** Расстояние между уровнями в долях цены. 0 при одном уровне. */
     private final double levelStep;
@@ -1816,6 +1850,7 @@ public final class QuoteLoop implements Runnable {
         placements++;
         if (response.ok()) {
             resting.venueId = extract(response.body());
+            rememberLevel(side, resting);
             resting.price = price;
             resting.size = size;
             resting.sinceMs = clock.now();
@@ -1876,6 +1911,7 @@ public final class QuoteLoop implements Runnable {
             String oldId = resting.venueId;
             String newId = extract(response.body());
             resting.venueId = newId != null ? newId : resting.venueId;
+            rememberLevel(side, resting);
             if (oldId != null && !oldId.equals(resting.venueId)) {
                 inspectGoneOrder(side, oldId);
             }
@@ -2252,6 +2288,7 @@ public final class QuoteLoop implements Runnable {
         journal.event("adopt", side + " " + keep.id() + " по " + fmt(keep.price())
                 + " (" + why + ")");
         resting.venueId = keep.id();
+        rememberLevel(side, resting);
         resting.price = keep.price();
         resting.size = keep.size();
         resting.sinceMs = clock.now();
@@ -2332,7 +2369,8 @@ public final class QuoteLoop implements Runnable {
             bookedByOrder.put(venueId, total);
             fills++;
             totalFilledNotional += filled * price;
-            journal.fill(venueId, side.name(), filled, price, lastFair, fee, feeCurrency, status);
+            journal.fill(venueId, side.name(), filled, price, lastFair, fee, feeCurrency, status,
+                    levelOf(venueId));
             // Своя позиция и касса меняются ЗДЕСЬ, а не по остаткам аккаунта:
             // при двух ботах остатки содержат чужие сделки.
             applyFill(side, filled, price);

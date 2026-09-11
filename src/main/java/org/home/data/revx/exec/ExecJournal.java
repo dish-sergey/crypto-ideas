@@ -69,6 +69,7 @@ public final class ExecJournal implements AutoCloseable {
                 fair         REAL,
                 fee          REAL,
                 fee_currency TEXT,
+                level        INTEGER,
                 status       TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_exec_fill_ts ON exec_fill(ts_ms);
@@ -155,6 +156,15 @@ public final class ExecJournal implements AutoCloseable {
                             + "(раздвижение отступа от дефицита постановок)");
                 } catch (Exception already) {
                     log.debug("колонка pressure уже есть: {}", already.getMessage());
+                }
+                // Уровень сетки, на котором стояла исполнившаяся заявка. Нужен,
+                // чтобы понять, зарабатывают ли дальние уровни или числятся:
+                // до 11.09.2026 доход был известен только целиком по боту.
+                try {
+                    st.execute("ALTER TABLE exec_fill ADD COLUMN level INTEGER");
+                    log.warn("в exec_fill добавлена колонка level (уровень сетки)");
+                } catch (Exception already) {
+                    log.debug("колонка level уже есть: {}", already.getMessage());
                 }
             }
             log.info("журнал исполнителя: {}", path);
@@ -294,9 +304,27 @@ public final class ExecJournal implements AutoCloseable {
      */
     public synchronized void fill(String venueId, String side, double qty, double price,
                                   double fair, double fee, String feeCurrency, String status) {
+        fill(venueId, side, qty, price, fair, fee, feeCurrency, status, -1);
+    }
+
+    /**
+     * То же, но с УРОВНЕМ СЕТКИ, на котором стояла заявка.
+     *
+     * ⚠️ Уровень пишется отдельным полем, а не выводится задним числом из цены:
+     * цена уровня зависит от скоса и раздвижений, и восстановить по ней номер
+     * нельзя — соседние уровни в момент скоса сходятся почти вплотную.
+     *
+     * Значение −1 означает «неизвестен»: так пишутся записи из путей, где слот
+     * уже потерян (перехват чужой заявки при старте), и все записи старше
+     * 11.09.2026.
+     */
+    public synchronized void fill(String venueId, String side, double qty, double price,
+                                  double fair, double fee, String feeCurrency, String status,
+                                  int level) {
         try (PreparedStatement ps = connection.prepareStatement(
-                "INSERT INTO exec_fill(ts_ms, venue_id, side, qty, price, fair, fee, fee_currency, status)"
-                        + " VALUES (?,?,?,?,?,?,?,?,?)")) {
+                "INSERT INTO exec_fill(ts_ms, venue_id, side, qty, price, fair, fee, fee_currency,"
+                        + " status, level)"
+                        + " VALUES (?,?,?,?,?,?,?,?,?,?)")) {
             ps.setLong(1, clock.now());
             ps.setString(2, venueId);
             ps.setString(3, side);
@@ -306,6 +334,7 @@ public final class ExecJournal implements AutoCloseable {
             ps.setDouble(7, fee);
             ps.setString(8, feeCurrency);
             ps.setString(9, status);
+            ps.setInt(10, level);
             ps.executeUpdate();
         } catch (Exception e) {
             log.error("не записалось исполнение: {}", e.getMessage());
@@ -345,6 +374,37 @@ public final class ExecJournal implements AutoCloseable {
      *                 измерения фальшивое исполнение. Книга партий, наоборот,
      *                 её учитывает: партии передача действительно открывает.
      */
+
+    /** Исполнение с уровнем сетки и справедливой ценой — для разреза по уровням. */
+    public record LevelFill(long tsMs, boolean buy, double qty, double price, double fair,
+                            int level) {
+    }
+
+    /**
+     * Исполнения с уровнем сетки, на котором стояла заявка.
+     *
+     * ⚠️ Записи старше 11.09.2026 колонки не имеют и приходят с уровнем −1:
+     * разрез по ним посчитать нельзя, и смешивать их с новыми — значит получить
+     * «уровень −1» размером во всю историю.
+     */
+    public synchronized List<LevelFill> levelFills() {
+        List<LevelFill> out = new ArrayList<>();
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT ts_ms, side, qty, price, fair, COALESCE(level, -1), status"
+                             + " FROM exec_fill ORDER BY ts_ms")) {
+            while (rs.next()) {
+                if ("handover".equalsIgnoreCase(rs.getString(7))) {
+                    continue;             // проводка владения, а не сделка
+                }
+                out.add(new LevelFill(rs.getLong(1), "BUY".equalsIgnoreCase(rs.getString(2)),
+                        rs.getDouble(3), rs.getDouble(4), rs.getDouble(5), rs.getInt(6)));
+            }
+        } catch (Exception e) {
+            log.error("не прочитались исполнения по уровням: {}", e.getMessage());
+        }
+        return out;
+    }
     public record FillRow(long tsMs, boolean buy, double qty, double price, double fee,
                           boolean handover) {
     }

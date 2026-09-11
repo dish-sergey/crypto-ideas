@@ -16,6 +16,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Collections;
+import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * Прогон НЕСКОЛЬКИХ котировщиков по одной книге.
@@ -266,7 +269,9 @@ public final class Forecast {
                 log.warn("{}", m.queueBlockStats());
                 log.warn("{}", m.gates().render());
             }
-            for (QuoteLoop l : loops) {
+            for (int i = 0; i < loops.size(); i++) {
+                QuoteLoop l = loops.get(i);
+                log.warn("ДОХОД ПО УРОВНЯМ, бот {}:{}", l.botId(), levelBreakdown(journals.get(i)));
                 log.warn("по уровням, бот {}:%n{}", l.botId(), l.levelPresence());
                 log.warn("бот {}: {}", l.botId(), l.effectiveOffset());
             }
@@ -303,6 +308,50 @@ public final class Forecast {
         }
     }
 
+
+    /**
+     * РАЗРЕЗ ДОХОДА ПО УРОВНЯМ СЕТКИ.
+     *
+     * Отвечает на вопрос, который до 11.09.2026 задать было нечем: дальние
+     * уровни зарабатывают или числятся? Доход был известен только целиком по
+     * боту, а {@code levelPresence} показывает лишь, сколько тиков уровень
+     * простоял в книге, — присутствие, а не вклад.
+     *
+     * Считается ЗАХВАТ: насколько выгоднее справедливой цены прошла сделка.
+     * Это та же величина, которой раскладывался живой доход по дням, и она
+     * складывается по уровням честно — в отличие от реализованного P&L, где
+     * покупка одного уровня закрывается продажей другого и разнести нельзя.
+     */
+    private static String levelBreakdown(ExecJournal journal) {
+        List<ExecJournal.LevelFill> fills = journal.levelFills();
+        if (fills.isEmpty()) {
+            return "исполнений нет";
+        }
+        Map<Integer, List<Double>> edges = new TreeMap<>();
+        Map<Integer, Double> gross = new TreeMap<>();
+        Map<Integer, Integer> count = new TreeMap<>();
+        for (ExecJournal.LevelFill f : fills) {
+            if (!(f.fair() > 0)) {
+                continue;
+            }
+            double edgeBp = (f.buy() ? (f.fair() - f.price()) : (f.price() - f.fair()))
+                    / f.fair() * 1e4;
+            edges.computeIfAbsent(f.level(), k -> new ArrayList<>()).add(edgeBp);
+            gross.merge(f.level(), edgeBp / 1e4 * f.qty() * f.price(), Double::sum);
+            count.merge(f.level(), 1, Integer::sum);
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format(Locale.ROOT, "%n  %-8s %8s %12s %12s%n",
+                "уровень", "сделок", "захват,б.п.", "валовое,$"));
+        for (Integer level : edges.keySet()) {
+            List<Double> v = new ArrayList<>(edges.get(level));
+            Collections.sort(v);
+            sb.append(String.format(Locale.ROOT, "  %-8s %8d %12.2f %12.4f%n",
+                    level < 0 ? "неизв." : String.valueOf(level),
+                    count.get(level), v.get(v.size() / 2), gross.get(level)));
+        }
+        return sb.toString();
+    }
     private static BotResult measure(BotSpec spec, ExecJournal journal,
                                      QuoteLoop loop, BootParams base, double days,
                                      List<ReplayFair.Tick> ticks) {
