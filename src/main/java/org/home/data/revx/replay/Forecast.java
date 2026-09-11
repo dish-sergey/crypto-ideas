@@ -271,7 +271,8 @@ public final class Forecast {
             }
             for (int i = 0; i < loops.size(); i++) {
                 QuoteLoop l = loops.get(i);
-                log.warn("ДОХОД ПО УРОВНЯМ, бот {}:{}", l.botId(), levelBreakdown(journals.get(i)));
+                log.warn("ДОХОД ПО УРОВНЯМ, бот {}:{}", l.botId(),
+                        levelBreakdown(journals.get(i), bots.get(i).size()));
                 log.warn("по уровням, бот {}:%n{}", l.botId(), l.levelPresence());
                 log.warn("бот {}: {}", l.botId(), l.effectiveOffset());
             }
@@ -322,7 +323,7 @@ public final class Forecast {
      * складывается по уровням честно — в отличие от реализованного P&L, где
      * покупка одного уровня закрывается продажей другого и разнести нельзя.
      */
-    private static String levelBreakdown(ExecJournal journal) {
+    private static String levelBreakdown(ExecJournal journal, double lot) {
         List<ExecJournal.LevelFill> fills = journal.levelFills();
         if (fills.isEmpty()) {
             return "исполнений нет";
@@ -330,6 +331,9 @@ public final class Forecast {
         Map<Integer, List<Double>> edges = new TreeMap<>();
         Map<Integer, Double> gross = new TreeMap<>();
         Map<Integer, Integer> count = new TreeMap<>();
+        Map<Integer, Integer> buys = new TreeMap<>();
+        Map<Integer, Double> bought = new TreeMap<>();
+        Map<Integer, Double> sold = new TreeMap<>();
         for (ExecJournal.LevelFill f : fills) {
             if (!(f.fair() > 0)) {
                 continue;
@@ -339,16 +343,28 @@ public final class Forecast {
             edges.computeIfAbsent(f.level(), k -> new ArrayList<>()).add(edgeBp);
             gross.merge(f.level(), edgeBp / 1e4 * f.qty() * f.price(), Double::sum);
             count.merge(f.level(), 1, Integer::sum);
+            if (f.buy()) {
+                buys.merge(f.level(), 1, Integer::sum);
+                bought.merge(f.level(), f.qty(), Double::sum);
+            } else {
+                sold.merge(f.level(), f.qty(), Double::sum);
+            }
         }
         StringBuilder sb = new StringBuilder();
-        sb.append(String.format(Locale.ROOT, "%n  %-8s %8s %12s %12s%n",
-                "уровень", "сделок", "захват,б.п.", "валовое,$"));
+        sb.append(String.format(Locale.ROOT, "%n  %-8s %7s %7s %12s %12s %11s%n",
+                "уровень", "покуп", "прод", "захват,б.п.", "валовое,$", "нетто,лот"));
         for (Integer level : edges.keySet()) {
             List<Double> v = new ArrayList<>(edges.get(level));
             Collections.sort(v);
-            sb.append(String.format(Locale.ROOT, "  %-8s %8d %12.2f %12.4f%n",
+            int nb = buys.getOrDefault(level, 0);
+            // ⚠️ КРУГ МОЖЕТ ИДТИ ЧЕРЕЗ РАЗНЫЕ УРОВНИ: купили на дальнем, продали
+            // на ближнем. Поэтому кредитуется КАЖДАЯ НОГА отдельно, а не круг, и
+            // «нетто» показывает перекос уровня: сильно положительное значит,
+            // что уровень в основном НАБИРАЕТ, а разгружают его соседи.
+            double net = bought.getOrDefault(level, 0.0) - sold.getOrDefault(level, 0.0);
+            sb.append(String.format(Locale.ROOT, "  %-8s %7d %7d %12.2f %12.4f %11.2f%n",
                     level < 0 ? "неизв." : String.valueOf(level),
-                    count.get(level), v.get(v.size() / 2), gross.get(level)));
+                    nb, count.get(level) - nb, v.get(v.size() / 2), gross.get(level), net / lot));
         }
         return sb.toString();
     }
