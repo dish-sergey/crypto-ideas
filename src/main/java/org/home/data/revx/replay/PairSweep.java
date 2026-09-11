@@ -363,8 +363,16 @@ public final class PairSweep {
                         : capUsd / price)
                 : lot * 20;
 
+        // ⚠️ ЦЕЛЬ СКОСА — ключ, а не константа. Разбор 11.09.2026 показал, что
+        // носимая позиция даёт P&L того же порядка, что весь дневной спред:
+        // при цели 0.3 бот держит постоянный лонг в два лота, и суточный ход в
+        // процент стоит -e.04-0.08 против -e.12-0.19 спреда. Значит сравнивать
+        // ступени лестницы, не умея менять скос, — мерить одно слагаемое на
+        // фоне другого, равного по величине и случайного по знаку.
+        double skewTarget = Double.parseDouble(
+                System.getProperty("revx.sim.skew-target", "0.3"));
         BootParams bp = new BootParams(symbol, "a", lot, cap, offsetsBp[0] / 10_000,
-                cfg.simSkewK(), 0.3, 1000, ps.minNotional(), ps.baseStep(),
+                cfg.simSkewK(), skewTarget, 1000, ps.minNotional(), ps.baseStep(),
                 ps.quoteStep(), 0.10, -1, -1, 0, 0.02, 0.5, true,
                 levels, levelStepBp / 10_000, innerFirst);
 
