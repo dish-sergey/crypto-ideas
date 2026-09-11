@@ -221,6 +221,12 @@ public class CliRunner implements ApplicationRunner {
                         firstOr(args, "journal", "state/exec.db"),
                         firstOr(args, "from", ""), firstOr(args, "to", ""));
             }
+            if (args.containsOption("revx-flow-markout")) {
+                executor.getObject().flowMarkout(
+                        firstOr(args, "symbols", "BTC,ETH,SOL"),
+                        firstOr(args, "from", "2026-09-10T00:00:00Z"),
+                        firstOr(args, "to", "2026-09-11T00:00:00Z"));
+            }
             if (args.containsOption("revx-forecast")) {
                 executor.getObject().forecast(firstOr(args, "journal", "state/exec.db"),
                         firstOr(args, "offsets", "10,14"),

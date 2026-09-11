@@ -285,6 +285,20 @@ public class Executor {
         org.home.data.revx.replay.FillCheck.run(journalPath, standDbPath, from, to);
     }
 
+    /**
+     * {@code --revx-flow-markout}: кривая неблагоприятного отбора по ленте.
+     *
+     * Прибор не торгует и журналов не читает — ему нужна только собранная база
+     * стенда. Поэтому его можно гонять на любом окне и сколько угодно раз.
+     */
+    public void flowMarkout(String bases, String from, String to) {
+        org.home.data.revx.sim.FlowMarkout.run(standDbPath, bases, from, to,
+                cfg.memecoins(),
+                new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
+                        cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
+                cfg.fairMaxSkewMs());
+    }
+
     public void replay(String journalPath, String fillModel) {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),

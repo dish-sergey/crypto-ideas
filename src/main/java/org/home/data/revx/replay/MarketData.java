@@ -67,6 +67,18 @@ public final class MarketData {
         return trades.size();
     }
 
+    /**
+     * Вся лента окна, без курсора.
+     *
+     * Нужна приборам, которые ходят по ленте не как повтор — не вперёд по
+     * времени, а разом (кривая отбора {@code FlowMarkout}). {@link #tradesBetween}
+     * для них не годится: он двигает односторонний курсор, и второй проход по
+     * тем же данным вернул бы пусто.
+     */
+    public List<MarketTrade> trades() {
+        return java.util.List.copyOf(trades);
+    }
+
     public int bookCount() {
         return books.size();
     }
