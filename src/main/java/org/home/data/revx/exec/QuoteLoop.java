@@ -958,6 +958,7 @@ public final class QuoteLoop implements Runnable {
         this.policy = policy != null ? policy : this.quoter;
         this.ownPosition = ownPosition;
         this.positionSeed = positionSeed;
+        this.baseStep = baseStep;
         this.dust = baseStep > 0 ? baseStep / 2 : 0;
         this.parkDistance = parkDistance;
     }
@@ -976,6 +977,7 @@ public final class QuoteLoop implements Runnable {
      * проверяется условием «своя позиция не больше общей», и занижение его не
      * ломает.
      */
+    private final double baseStep;
     private final double dust;
 
     /**
@@ -1747,7 +1749,31 @@ public final class QuoteLoop implements Runnable {
         if (side == Side.BUY && alloc != null && price > 0) {
             ownCashCap = Math.max(0, alloc.own(tag.id(), quote)) / price;
         }
-        return Math.min(want, Math.min(Math.min(affordable, ownPositionCap), ownCashCap));
+        // ⚠️ ПРОДАЖУ ОГРАНИЧИВАЕТ И ЗАХВАТ, А НЕ ТОЛЬКО СВОЙ СЧЁТЧИК.
+        //
+        // До 11.09.2026 потолок продажи стоял только по { inventory} —
+        // внутреннему счётчику бота. Пока счётчик верен, этого хватает; но он
+        // ПРОИЗВОДНАЯ величина и расходится с реальностью как минимум тремя
+        // путями, найденными в тот же день: потерянное исполнение на третьей
+        // 422, невыясненная судьба заявки при неудачном GET, и перезапуск.
+        //
+        // Реестр же говорит, что МОЁ, и обновляется на каждом исполнении
+        // ({ AllocRegistry#applyFill}). Покупка по нему уже ограничена
+        // строкой выше; продажа не была — асимметрия, которая и выстрелила.
+        //
+        // 11.09.2026 бот C сам написал в журнал «РАСХОЖДЕНИЕ: своя позиция
+        // 0.00120795 больше остатка аккаунта 0.0008053», а через 38 секунд
+        // продал 0.0008053 — вдвое больше своего захвата (0.00040265), то есть
+        // отдал лот остановленного соседа по той же паре.
+        //
+        // Теперь расхождение счётчика приводит к НЕДОпродаже, а не к продаже
+        // чужого. Само расхождение по-прежнему только логируется.
+        double ownClaimCap = Double.MAX_VALUE;
+        if (side == Side.SELL && alloc != null) {
+            ownClaimCap = Math.max(0, alloc.own(tag.id(), base));
+        }
+        return Math.min(Math.min(want, ownClaimCap),
+                Math.min(Math.min(affordable, ownPositionCap), ownCashCap));
     }
 
     /**
@@ -1897,7 +1923,7 @@ public final class QuoteLoop implements Runnable {
                  "order_configuration":{"limit":{"base_size":"%s","price":"%s",
                  "execution_instructions":["post_only"]}}}"""
                 .formatted(tag.newClientOrderId(), symbol.replace('/', '-'),
-                        side == Side.BUY ? "buy" : "sell", fmt(size), fmt(price))
+                        side == Side.BUY ? "buy" : "sell", fmtSize(size), fmt(price))
                 .replaceAll("\\s*\\n\\s*", "");
         Venue.Response response = client.place(body);
         placements++;
@@ -1914,6 +1940,17 @@ public final class QuoteLoop implements Runnable {
             // растёт с каждым отказом подряд: даже неизвестная причина не должна
             // успевать съесть тысячу постановок, как в ночь на 29.08.2026.
             resting.failures++;
+            // ⚠️ Токен ведра возвращаем, если заявки ТОЧНО не возникло.
+            // Определённый отказ площадки (4xx без идентификатора) заявки не
+            // создаёт, и тратить на него общий суточный бюджет не за что. На
+            // 5xx и на отсутствие ответа токен остаётся потраченным: там
+            // неизвестно, создалась заявка или нет.
+            boolean definitelyNotPlaced = budget != null
+                    && response.status() >= 400 && response.status() < 500
+                    && extract(response.body()) == null;
+            if (definitelyNotPlaced) {
+                budget.refund(tag.id(), clock.now());
+            }
             long pause = Math.min(MAX_PLACE_BACKOFF_MS, 5_000L << Math.min(4, resting.failures - 1));
             resting.blockedUntilMs = clock.now() + pause;
             log.warn("постановка {} не прошла: {} {} — пауза {} с", side, response.status(),
@@ -1941,7 +1978,7 @@ public final class QuoteLoop implements Runnable {
         String body = """
                 {"client_order_id":"%s","base_size":"%s","price":"%s",
                  "execution_instructions":["post_only"]}"""
-                .formatted(tag.newClientOrderId(), fmt(size), fmt(price))
+                .formatted(tag.newClientOrderId(), fmtSize(size), fmt(price))
                 .replaceAll("\\s*\\n\\s*", "");
         Venue.Response response = client.replace(resting.venueId, body);
         replaces++;
@@ -3066,6 +3103,33 @@ public final class QuoteLoop implements Runnable {
     }
 
     /** Без экспоненты и без лишних нулей: площадка принимает десятичную строку. */
+    /**
+     * РАЗМЕР ЗАЯВКИ — С ОКРУГЛЕНИЕМ К ШАГУ ПАРЫ.
+     *
+     * ⚠️ Без этого в запрос уходит мусор двоичной арифметики. Три лота ETH по
+     * 0.00040265 в сумме дают 0.0012079499999999999, `BigDecimal.valueOf`
+     * печатает все девятнадцать знаков, и площадка отвечает
+     * `400 base_size precision must not exceed 8 decimal places`.
+     *
+     * Поймано 11.09.2026 на опытном боте d: за пятнадцать минут ТРИДЦАТЬ таких
+     * отказов подряд при двух удачных постановках. Бот не мог продать вообще,
+     * молотил вхолостую и жёг общий лимит запросов — со стороны выглядело как
+     * «не хватает лимитов».
+     *
+     * Округляем ВНИЗ: продать больше, чем есть, нельзя, а остаток мельче шага
+     * всё равно не примут.
+     */
+    private String fmtSize(double size) {
+        if (!(baseStep > 0)) {
+            return fmt(size);
+        }
+        java.math.BigDecimal step = java.math.BigDecimal.valueOf(baseStep);
+        java.math.BigDecimal q = java.math.BigDecimal.valueOf(size)
+                .divide(step, 0, java.math.RoundingMode.DOWN)
+                .multiply(step);
+        return q.stripTrailingZeros().toPlainString();
+    }
+
     private static String fmt(double value) {
         return java.math.BigDecimal.valueOf(value).stripTrailingZeros().toPlainString();
     }

@@ -190,6 +190,46 @@ public final class PlacementBudget implements AutoCloseable {
         }
     }
 
+    /**
+     * ВЕРНУТЬ ТОКЕН, если постановки НЕ СОСТОЯЛОСЬ.
+     *
+     * Токен берётся ДО запроса — иначе двое ботов успевают проскочить мимо
+     * последнего. Но если площадка ответила отказом по существу, заявки не
+     * возникло, и ведро тратить не за что.
+     *
+     * ⚠️ Возвращаем ТОЛЬКО при определённом ответе (4xx без идентификатора
+     * заявки). На 5xx и на отсутствие ответа токен остаётся потраченным: там
+     * неизвестно, создалась заявка или нет, а считать несозданной то, что может
+     * существовать, — как раз тот класс ошибок, который сегодня стоил нам
+     * потерянного исполнения.
+     *
+     * Зачем: 11.09.2026 бот d получил ТРИДЦАТЬ отказов `400 base_size precision`
+     * за пятнадцать минут (размер уходил без округления к шагу пары). Заявок не
+     * возникло ни одной, а из ведра ушло тридцать токенов из 850 — и со стороны
+     * это выглядело как «не хватает лимитов».
+     */
+    public synchronized void refund(String botId, long nowMs) {
+        try {
+            begin();
+            double tokens = refill(nowMs);
+            writeTokens(Math.min(CAPACITY, tokens + 1.0), nowMs);
+            // Снимаем ПОСЛЕДНЮЮ отметку расхода этого бота: суточный счёт по
+            // ней же и считается, иначе пол в сто постановок выбирался бы
+            // отказами.
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "DELETE FROM placement_spend WHERE id = ("
+                            + "SELECT id FROM placement_spend WHERE bot_id = ? "
+                            + "ORDER BY id DESC LIMIT 1)")) {
+                ps.setString(1, botId);
+                ps.executeUpdate();
+            }
+            commit();
+        } catch (Exception e) {
+            rollback();
+            log.warn("токен постановки не вернулся: {}", e.toString());
+        }
+    }
+
     /** Состояние без расхода: для отчётов и для сужения потока. */
     public synchronized State state(String botId, long nowMs) {
         try {
