@@ -17,7 +17,18 @@ public record PairQuote(
         boolean memecoin,
         long availableAtMs,
         double bqUsdc,
-        double aqUsdc) {
+        double aqUsdc,
+        double smoothUsdc) {
+
+    /**
+     * Без сглаженной середины: опора SMOOTH вырождается в обычную.
+     */
+    public PairQuote(String base, double midUsdc, double midUsd, double spreadUsdc,
+                     double spreadUsd, boolean memecoin, long availableAtMs,
+                     double bqUsdc, double aqUsdc) {
+        this(base, midUsdc, midUsd, spreadUsdc, spreadUsd, memecoin, availableAtMs,
+                bqUsdc, aqUsdc, 0);
+    }
 
     /**
      * Без объёмов на лучшем уровне. Микроцена по такой паре не считается и
@@ -25,7 +36,7 @@ public record PairQuote(
      */
     public PairQuote(String base, double midUsdc, double midUsd, double spreadUsdc,
                      double spreadUsd, boolean memecoin, long availableAtMs) {
-        this(base, midUsdc, midUsd, spreadUsdc, spreadUsd, memecoin, availableAtMs, 0, 0);
+        this(base, midUsdc, midUsd, spreadUsdc, spreadUsd, memecoin, availableAtMs, 0, 0, 0);
     }
 
     /**

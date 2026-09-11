@@ -39,7 +39,8 @@ public final class FairPrice {
             double maxResidualPct,
             double fixedRate,
             Anchor anchor,
-            double beta) {
+            double beta,
+            double biasBp) {
 
         public Limits(int minPairs, double maxDispersionPct,
                       double maxReferenceSpreadPct, double maxResidualPct) {
@@ -56,7 +57,8 @@ public final class FairPrice {
             this(minPairs, maxDispersionPct, maxReferenceSpreadPct, maxResidualPct, fixedRate,
                     Anchor.valueOf(System.getProperty("revx.fair.anchor", "CROSS")
                             .toUpperCase(java.util.Locale.ROOT)),
-                    Double.parseDouble(System.getProperty("revx.fair.beta", "0")));
+                    Double.parseDouble(System.getProperty("revx.fair.beta", "0")),
+                    Double.parseDouble(System.getProperty("revx.fair.bias-bp", "0")));
         }
     }
 
@@ -78,7 +80,23 @@ public final class FairPrice {
         /** Середина собственной книги пары в USDC. */
         MID,
         /** Середина плюс { beta} долей поправки микроцены. */
-        MICRO
+        MICRO,
+        /**
+         * СГЛАЖЕННАЯ середина собственной книги.
+         *
+         * ⚠️ Это прибор под ОДИН вопрос, и вопрос решающий. К 11.09.2026 три
+         * объяснения преимущества межплощадочной опоры проверены и отвергнуты:
+         * ширина (при равном числе сделок она всё равно вдвое доходнее),
+         * асимметрия (сумма по двум режимам плоская) и вес микроцены. Осталось
+         * одно: в медиане по 23 активам есть то, чего нет в одной книге.
+         *
+         * Но «того, чего нет» бывает двух сортов: ФИЛЬТРАЦИЯ идиосинкразического
+         * шума и межрыночная ИНФОРМАЦИЯ. Сглаженная середина даёт первое и не
+         * даёт второго. Если она воспроизводит преимущество — механизм
+         * фильтрация, и его можно получить дёшево. Если нет — опора несёт
+         * настоящий сигнал с других рынков, и трогать её нельзя.
+         */
+        SMOOTH
     }
 
     /** Почему по паре нельзя котировать; null = можно. */
@@ -163,8 +181,28 @@ public final class FairPrice {
             // менял бы две вещи разом.
             if (limits.anchor() != Anchor.CROSS && q.midUsdc() > 0) {
                 double mid = q.midUsdc();
-                fair = limits.anchor() == Anchor.MID ? mid
-                        : mid + limits.beta() * (q.microUsdc() - mid);
+                fair = switch (limits.anchor()) {
+                    case MID -> mid;
+                    case MICRO -> mid + limits.beta() * (q.microUsdc() - mid);
+                    case SMOOTH -> q.smoothUsdc() > 0 ? q.smoothUsdc() : mid;
+                    default -> fair;
+                };
+            }
+            // ⚠️ УПРАВЛЯЕМОЕ СМЕЩЕНИЕ ОПОРЫ — прибор под один вопрос.
+            //
+            // Наша межплощадочная опора лежит НИЖЕ середины книги (живьём 09-10.09
+            // на -0.13 у BTC, -1.91 у SOL, -3.77 у ETH; на срезе 05.09 было
+            // -4.56 / -5.20 / -9.98). Значит котировка на самом деле асимметрична:
+            // аск ближе к рынку, бид дальше. Сетка 11.09 показала, что эта
+            // асимметрия ВЫГОДНА — середина книги проиграла ей всюду.
+            //
+            // Открытый вопрос: выигрывает знание, которое несёт межплощадочная
+            // оценка, или сама асимметрия? Здесь она задаётся ЯВНО поверх любой
+            // опоры. Если середина со смещением воспроизводит результат — значит
+            // асимметрия, и мы получаем управляемый параметр вместо величины,
+            // которая гуляет впятеро и зависит от состава корзины.
+            if (limits.biasBp() != 0) {
+                fair *= 1 - limits.biasBp() / 10_000.0;
             }
             String paused = null;
             if (!reliable) {

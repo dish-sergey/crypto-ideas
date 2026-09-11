@@ -52,7 +52,7 @@ public final class StandFair implements FairSource {
     /** Сшитый снимок одной пары: обе ноги из одного цикла. */
     private record Slice(long recvMs, double midUsdc, double midUsd,
                          double spreadUsdc, double spreadUsd, double bid, double ask,
-                         double bq, double aq) {
+                         double bq, double aq, double smooth) {
     }
 
     private final String base;
@@ -205,10 +205,10 @@ public final class StandFair implements FairSource {
                 continue;
             }
             out.add(new Slice((long) Math.max(q[4], u[4]), midQ, midU,
-                    (q[0] - q[1]) / midQ, (u[0] - u[1]) / midU, q[1], q[0], q[5], q[6]));
+                    (q[0] - q[1]) / midQ, (u[0] - u[1]) / midU, q[1], q[0], q[5], q[6], 0));
         }
         out.sort(java.util.Comparator.comparingLong(Slice::recvMs));
-        return out;
+        return smooth(out);
     }
 
     /** {@code snap_id → [ask, bid, _, skew, recv]}. */
@@ -234,6 +234,37 @@ public final class StandFair implements FairSource {
             }
         } catch (Exception e) {
             log.error("не прочиталась нога {}: {}", symbol, e.getMessage());
+        }
+        return out;
+    }
+
+    /**
+     * Экспоненциальное сглаживание середины книги с постоянной времени
+     * {@code revx.fair.smooth-sec}.
+     *
+     * ⚠️ Сглаживается ТОЛЬКО цена, от которой котируем. Курс USDC/USD считается
+     * по несглаженным серединам обеих ног — иначе опыт менял бы две вещи разом,
+     * и это то же правило, что у подмены курса и у выбора опоры.
+     *
+     * Сглаживание идёт ПО ВРЕМЕНИ, а не по числу снимков: плотность сбора
+     * менялась (07.09.2026 с секунды на полторы), и оконное среднее по
+     * фиксированному числу точек означало бы на разных окнах разное время.
+     */
+    private static List<Slice> smooth(List<Slice> in) {
+        double tau = Double.parseDouble(System.getProperty("revx.fair.smooth-sec", "0"));
+        if (tau <= 0 || in.isEmpty()) {
+            return in;
+        }
+        List<Slice> out = new ArrayList<>(in.size());
+        double ema = in.get(0).midUsdc();
+        long prev = in.get(0).recvMs();
+        for (Slice s : in) {
+            double dt = Math.max(0, s.recvMs() - prev) / 1000.0;
+            double a = 1 - Math.exp(-dt / tau);
+            ema += a * (s.midUsdc() - ema);
+            prev = s.recvMs();
+            out.add(new Slice(s.recvMs(), s.midUsdc(), s.midUsd(), s.spreadUsdc(),
+                    s.spreadUsd(), s.bid(), s.ask(), s.bq(), s.aq(), ema));
         }
         return out;
     }
@@ -269,7 +300,7 @@ public final class StandFair implements FairSource {
             }
             quotes.add(new PairQuote(pair, s.midUsdc(), s.midUsd(),
                     s.spreadUsdc(), s.spreadUsd(), memecoins.contains(pair), s.recvMs(),
-                    s.bq(), s.aq()));
+                    s.bq(), s.aq(), s.smooth()));
             asOf = Math.max(asOf, s.recvMs());
         }
         if (quotes.isEmpty()) {
