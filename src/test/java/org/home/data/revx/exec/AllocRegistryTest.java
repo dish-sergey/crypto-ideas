@@ -26,6 +26,34 @@ class AllocRegistryTest {
     }
 
     @Test
+    void thirdBotClaimingExactlyTheRemainderIsNotRefusedByRounding(@TempDir Path dir) {
+        // ⚠️ РЕГРЕССИЯ 11.09.2026. Допуск был абсолютный, 1e-15 — меньше точности
+        // double на этих величинах. Три бота делят кассу поровну, и третий просит
+        // ровно остаток; из-за крошки округления (24.81717010645232 против
+        // свободных 24.817170106452316, разница 4e-15) он получал отказ и не
+        // котировал вовсе. Все прогоны мульти-бота до этого меряли двоих.
+        try (AllocRegistry reg = open(dir)) {
+            double total = 74.45151031935696;
+            double share = total / 3;
+            assertTrue(reg.claim("a", "USDC", share, total, 1, T0), "первый берёт треть");
+            assertTrue(reg.claim("b", "USDC", share, total, 1, T0), "второй берёт треть");
+            assertTrue(reg.claim("c", "USDC", share, total, 1, T0),
+                    "третий просит ровно остаток — отказывать нельзя");
+        }
+    }
+
+    @Test
+    void claimBeyondTheFreePoolIsStillRefused(@TempDir Path dir) {
+        // Послабление не должно превратиться в дыру: заметно большее по-прежнему
+        // отклоняется.
+        try (AllocRegistry reg = open(dir)) {
+            assertTrue(reg.claim("a", "USDC", 50.0, 100.0, 1, T0));
+            assertFalse(reg.claim("b", "USDC", 50.01, 100.0, 1, T0),
+                    "просит больше свободного — отказ");
+        }
+    }
+
+    @Test
     void claimTakesFromTheFreePool(@TempDir Path dir) {
         try (AllocRegistry r = open(dir)) {
             assertEquals(TOTAL, r.free(BTC, TOTAL, T0).free(), 1e-15, "сначала свободно всё");
