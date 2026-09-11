@@ -293,7 +293,11 @@ public final class PairSweep {
             pool.shutdown();
         }
 
-        log.info("\n{}", render(grid, levels, levelStepBp, innerFirst, skipped));
+        log.info("\n{}", render(grid, levels, levelStepBp, innerFirst, skipped,
+                fromIso, toIso, grid.values().stream()
+                        .flatMap(m -> m.values().stream())
+                        .flatMap(c -> c.byDay.stream().map(Forecast.Day::label))
+                        .distinct().sorted().toList()));
     }
 
     private static void oneDay(String standDbPath, RevxConfig cfg, StandFair fair,
@@ -404,6 +408,26 @@ public final class PairSweep {
                     startInv, t0.quotable(), t0.reason(), t0.pressure()));
             log.warn("{} {}: стартовый инвентарь из журнала {} ({} лота)",
                     label, base, startInv, lot > 0 ? Math.round(startInv / lot * 10) / 10.0 : 0);
+        }
+
+        // ⚠️ СТАРТОВЫЙ ЗАПАС КАК ДОЛЯ ПОТОЛКА.
+        //
+        // По умолчанию обход начинал сутки с НУЛЯ, и это воспроизводило ровно ту
+        // беду, которую 11.09.2026 нашли у живых ботов: пустой инвентарь значит
+        // отсутствующий аск, то есть работающую половину конструкции. Замер по
+        // живым журналам за пять суток: без аска 15% времени у BTC, 24% у SOL,
+        // 32% у ETH; принтов, которые дошли бы до нашего аска за это время —
+        // 122, 55 и 54 против 295, 83 и 80 фактических продаж.
+        //
+        // Ключ задаёт долю потолка: 0 — как было, 0.3 — цель скоса, 1.0 — полный.
+        // С журналом не действует: там позиция берётся фактическая.
+        double startFraction = Double.parseDouble(
+                System.getProperty("revx.sim.start-inventory", "0"));
+        if (live == null && startFraction > 0 && !ticks.isEmpty()) {
+            double startInv = cap * startFraction;
+            ReplayFair.Tick t0 = ticks.get(0);
+            ticks.set(0, new ReplayFair.Tick(t0.tsMs(), t0.fair(), t0.bid(), t0.ask(),
+                    startInv, t0.quotable(), t0.reason(), t0.pressure()));
         }
 
         for (double offBp : offsetsBp) {
@@ -523,6 +547,50 @@ public final class PairSweep {
      *       находка: механизм очереди фактически выключен, работает перехват.</li>
      * </ul>
      */
+    /**
+     * ТА ЖЕ ЛЕСТНИЦА, НО ПО ВЕРХНЕЙ ГРАНИЦЕ (модель касания).
+     *
+     * Нужна не ради числа, а ради проверки УСТОЙЧИВОСТИ вывода. Рабочая модель
+     * недобирает исполнения (на сверке 30 из 60 живых), и недобор неравномерен:
+     * тесные ступени живут числом сделок и страдают сильнее широких. Значит
+     * гребень лестницы, посчитанный по ней одной, смещён ВПРАВО на неизвестную
+     * величину.
+     *
+     * Модель касания завышает заведомо (ТЗ §4.3). Если гребень на обеих моделях
+     * стоит в одном месте, вывод переживает недобор; если расходится — по
+     * рабочей модели выбирать ступень нельзя, и это надо знать до, а не после.
+     */
+    private static String touchLadder(Map<String, Map<Variant, Cell>> grid,
+                                      List<Variant> variants, List<String> bases) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n\n=== ЛЕСТНИЦА ПО ВЕРХНЕЙ ГРАНИЦЕ (касание): годовых на капитал ===\n\n");
+        sb.append("пара     ");
+        for (Variant v : variants) {
+            sb.append(String.format(Locale.ROOT, "|%13s", v.label()));
+        }
+        sb.append("\n---------");
+        for (int i = 0; i < variants.size(); i++) {
+            sb.append("+-------------");
+        }
+        sb.append(System.lineSeparator());
+        for (String base : bases) {
+            sb.append(String.format(Locale.ROOT, "%-8s ", base));
+            for (Variant v : variants) {
+                Cell c = grid.get(base).get(v);
+                if (c == null || c.days <= 0) {
+                    sb.append("|            -");
+                    continue;
+                }
+                double capital = c.cap > 0 ? c.cap * c.price : c.lot * c.price * 20;
+                double annual = capital > 0
+                        ? c.realisedTouch / c.days * 365 / capital * 100 : 0;
+                sb.append(String.format(Locale.ROOT, "|%+12.0f%%", annual));
+            }
+            sb.append(System.lineSeparator());
+        }
+        return sb.toString();
+    }
+
     private static String gatesTable(Map<String, Map<Variant, Cell>> grid) {
         StringBuilder sb = new StringBuilder();
         sb.append("\n\n=== ОТСЕВ ПРИНТОВ ПО ГЕЙТАМ (рабочая модель) ===\n\n");
@@ -652,7 +720,8 @@ public final class PairSweep {
 
     private static String render(Map<String, Map<Variant, Cell>> grid,
                                  int levels, double levelStepBp, boolean innerFirst,
-                                 Map<String, Integer> skipped) {
+                                 Map<String, Integer> skipped, String fromIso, String toIso,
+                                 java.util.Collection<String> days) {
         StringBuilder sb = new StringBuilder();
         sb.append("\n=== ОБХОД ВСЕЛЕННОЙ: ").append(levels).append(" уровня шагом ")
                 .append(String.format(Locale.ROOT, "%.0f", levelStepBp)).append(" б.п., ")
@@ -758,6 +827,8 @@ public final class PairSweep {
             sb.append('\n');
         }
 
+        sb.append(touchLadder(grid, variants,
+                best.stream().map(Best::base).toList()));
         sb.append(concentration(grid));
         sb.append(gatesTable(grid));
 
