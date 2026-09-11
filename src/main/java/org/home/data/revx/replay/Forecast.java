@@ -6,6 +6,7 @@ import org.home.data.revx.exec.ExecJournal;
 import org.home.data.revx.exec.Executor;
 import org.home.data.revx.exec.FifoLedger;
 import org.home.data.revx.exec.QuoteLoop;
+import org.home.data.revx.exec.PlacementBudget;
 import org.home.data.revx.sim.Quoter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -127,6 +128,11 @@ public final class Forecast {
         List<QuoteLoop> loops = new ArrayList<>();
         List<Thread> threads = new ArrayList<>();
         AllocRegistry alloc = new AllocRegistry(dir.resolve("alloc.db").toString());
+        // Ведро живёт в том же файле, что и реестр, — как на живом аккаунте.
+        PlacementBudget sharedBudget =
+                Boolean.getBoolean("revx.forecast.budget") && bots.size() > 1
+                        ? new PlacementBudget(dir.resolve("alloc.db").toString(), bots.size())
+                        : null;
         // В прогоне процесс один: терять претензию некому, а продление стоило
         // 23 тысяч записей на бота (модельная минута пролетает мгновенно).
         alloc.heartbeatOff();
@@ -161,10 +167,22 @@ public final class Forecast {
                                 spec.size(), spec.inventoryCap(), base.quoteStep()),
                         true, 0, base.baseStep(), base.parkDistance(), alloc,
                         spec.levels(), spec.levelStep(), spec.innerFirst());
-                // Для прогноза лимит поднимается: иначе многоуровневый режим
-                // упирается в него и глохнет, и меряется не экономика, а
-                // скорость выгорания бюджета.
-                loop.placementCap(100_000);
+                // ⚠️ ОБЩЕЕ ВЕДРО ПОСТАНОВОК — по ключу, а не всегда.
+                //
+                // По умолчанию лимит поднят до заведомо недостижимого: иначе
+                // многоуровневый режим упирается в него и глохнет, и меряется не
+                // экономика пары, а скорость выгорания бюджета.
+                //
+                // Но когда ботов несколько, ведро и есть предмет измерения:
+                // 1000 постановок в сутки — на ВЕСЬ аккаунт, и три бота их
+                // делят. С `-Drevx.forecast.budget=true` прогон получает то же
+                // ведро, что и живые боты (`PlacementBudget` на общей базе), и
+                // тогда видно главное: во сколько обходится соседство.
+                if (sharedBudget != null) {
+                    loop.placementBudget(sharedBudget);
+                } else {
+                    loop.placementCap(100_000);
+                }
                 // ⚠️ И денежные пределы — тоже в масштабе лота. Они записаны в
                 // абсолютных долларах под лот $1 (заявка ≤ $10, экспозиция ≤ $40),
                 // и прогон с лотом $10 упирался в них раньше, чем в рынок: 15.5
@@ -252,6 +270,18 @@ public final class Forecast {
                 log.warn("по уровням, бот {}:%n{}", l.botId(), l.levelPresence());
                 log.warn("бот {}: {}", l.botId(), l.effectiveOffset());
             }
+            if (sharedBudget != null) {
+                // Ради чего всё и затевалось: сколько ведра осталось и кто
+                // сколько взял. Без этой строки соседство ботов не видно.
+                long endMs = ticks.get(ticks.size() - 1).tsMs();
+                for (BotSpec s : bots) {
+                    PlacementBudget.State st = sharedBudget.state(s.botId(), endMs);
+                    log.warn("ВЕДРО, бот {}: своих постановок за сутки {}, всего на аккаунте {}, "
+                                    + "токенов осталось {}, давление {}%",
+                            s.botId(), st.ownSpendDay(), st.totalSpendDay(),
+                            Math.round(st.tokens()), Math.round(st.pressure() * 100));
+                }
+            }
             List<BotResult> out = new ArrayList<>();
             for (int i = 0; i < bots.size(); i++) {
                 out.add(measure(bots.get(i), journals.get(i), loops.get(i), base,
@@ -260,6 +290,9 @@ public final class Forecast {
             return out;
         } finally {
             journals.forEach(ExecJournal::close);
+            if (sharedBudget != null) {
+                sharedBudget.close();
+            }
             // ⚠️ Реестр закрывать ОБЯЗАТЕЛЬНО, иначе на Windows файл alloc.db
             // остаётся заблокированным, удаление каталога молча не проходит, и
             // временные каталоги копятся: к 07.09.2026 их набралось 4861 штука
