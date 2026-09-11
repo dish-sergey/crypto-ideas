@@ -128,6 +128,18 @@ public final class PairSweep {
         /** Потолок инвентаря в базовой валюте — знаменатель годовых. */
         double cap;
         double inventoryLots;
+        /**
+         * Доли времени «продать нечего» и «купить не на что», суммируемые по
+         * суткам и делимые на {@link #daysHeld} при печати.
+         *
+         * ⚠️ Обе нужны вместе. Каждая порознь читается как «бот работает», а на
+         * деле это два РАЗНЫХ простоя: пустой не продаёт, полный не покупает, и
+         * потолок для их лечения надо двигать в противоположные стороны.
+         */
+        double emptyShare;
+        double atCapShare;
+        /** Сумма гистограмм по суткам: сколько тиков инвентарь стоял на N лотах. */
+        long[] lotHist = new long[0];
         int daysHeld;
         double price;
         final List<Forecast.Day> byDay = new ArrayList<>();
@@ -461,6 +473,16 @@ public final class PairSweep {
             cell.placements += q.placements();
             cell.days += q.days();
             cell.inventoryLots += q.inventoryLots();
+            cell.emptyShare += q.emptyShare();
+            cell.atCapShare += q.atCapShare();
+            if (q.lotHist() != null) {
+                if (cell.lotHist.length < q.lotHist().length) {
+                    cell.lotHist = java.util.Arrays.copyOf(cell.lotHist, q.lotHist().length);
+                }
+                for (int i = 0; i < q.lotHist().length; i++) {
+                    cell.lotHist[i] += q.lotHist()[i];
+                }
+            }
             cell.daysHeld++;
             cell.lot = lot;
             cell.cap = cap;
@@ -718,6 +740,73 @@ public final class PairSweep {
         return n;
     }
 
+    /**
+     * ЗАНЯТОСТЬ ИНВЕНТАРЯ: сколько времени котируются обе стороны, а сколько одна.
+     *
+     * <h2>Зачем</h2>
+     *
+     * Доход за окно ничего не говорит о том, какой ценой он получен. Бот,
+     * простоявший треть времени без аска, и бот, работавший обеими сторонами,
+     * дают в таблице ступеней одинаковые строки — а это разные машины: у
+     * первого половина конструкции выключена, и «оптимальный отступ», найденный
+     * на нём, оптимален для калеки.
+     *
+     * <h2>Почему обе доли, а не средний инвентарь</h2>
+     *
+     * Средний инвентарь в два лота получается и у ровного бота, и у бота,
+     * скачущего между нулём и потолком; в первом случае потолок мал, во втором
+     * велик, а среднее одно. Поэтому здесь три величины: доля времени без
+     * продажи (инвентаря меньше лота), доля времени у потолка (≥90%) и
+     * МЕДИАНА числа лотов — она и отвечает на вопрос «сколько лотов нужно».
+     *
+     * ⚠️ Читать вместе с доходом, а не вместо: пустой инвентарь — не порок сам
+     * по себе, а цена дальнего отступа, и иногда она оправдана.
+     */
+    private static String occupancy(Map<String, Map<Variant, Cell>> grid) {
+        StringBuilder sb = new StringBuilder(
+                "\n\n=== ЗАНЯТОСТЬ ИНВЕНТАРЯ: сколько времени работает одна сторона ===\n\n");
+        sb.append("пара     | ступень |  пусто | у потолка | медиана лотов"
+                + " | лотов в потолке | распределение по лотам, %\n");
+        for (var e : grid.entrySet()) {
+            for (var o : e.getValue().entrySet()) {
+                Cell c = o.getValue();
+                if (c.daysHeld == 0) {
+                    continue;
+                }
+                long total = 0;
+                for (long v : c.lotHist) {
+                    total += v;
+                }
+                int median = 0;
+                long running = 0;
+                for (int i = 0; i < c.lotHist.length && total > 0; i++) {
+                    running += c.lotHist[i];
+                    if (running * 2 >= total) {
+                        median = i;
+                        break;
+                    }
+                }
+                StringBuilder hist = new StringBuilder();
+                for (int i = 0; i < c.lotHist.length && total > 0; i++) {
+                    if (i > 0) {
+                        hist.append(' ');
+                    }
+                    hist.append(String.format(Locale.ROOT, "%.0f", 100.0 * c.lotHist[i] / total));
+                }
+                double capLots = c.lot > 0 ? c.cap / c.lot : 0;
+                sb.append(String.format(Locale.ROOT,
+                        "%-8s | %7s | %5.1f%% | %8.1f%% | %13d | %15.1f | %s%n",
+                        e.getKey(), o.getKey().label(),
+                        100 * c.emptyShare / c.daysHeld, 100 * c.atCapShare / c.daysHeld,
+                        median, capLots, hist));
+            }
+        }
+        sb.append("\n⚠️ «пусто» — инвентаря меньше лота, продать нечего, аска в книге НЕТ.\n");
+        sb.append("«у потолка» — ≥90% потолка, покупать не на что. Графы распределения —\n");
+        sb.append("доля времени при 0, 1, 2, … лотах в руках; последняя собирает всё сверх.\n");
+        return sb.toString();
+    }
+
     private static String render(Map<String, Map<Variant, Cell>> grid,
                                  int levels, double levelStepBp, boolean innerFirst,
                                  Map<String, Integer> skipped, String fromIso, String toIso,
@@ -842,6 +931,7 @@ public final class PairSweep {
         sb.append(touchLadder(grid, variants,
                 best.stream().map(Best::base).toList()));
         sb.append(concentration(grid));
+        sb.append(occupancy(grid));
         sb.append(gatesTable(grid));
 
         // Разрез по суткам у лучших пар: средний доход прячет главное — держится

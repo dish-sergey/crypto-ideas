@@ -141,7 +141,8 @@ public final class QuoteLoop implements Runnable {
 
     public record Stats(long placements, long replaces, long cancels, long fills,
                         double inventory, double lastFair, String state, String pausedReason,
-                        long ticks, long ticksAtCap, long partials, int partialsNow) {
+                        long ticks, long ticksAtCap, long partials, int partialsNow,
+                        long ticksEmpty, long[] lotHist) {
     }
 
     private final Venue client;
@@ -882,6 +883,25 @@ public final class QuoteLoop implements Runnable {
      */
     private long ticks;
     private long ticksAtCap;
+    /**
+     * Тики, когда продать НЕЧЕГО: инвентаря меньше лота, аска в книге нет.
+     *
+     * Симметричная беда к «полному инвентарю» и на живых ботах куда более
+     * частая (замер 10.09.2026: без аска 15% времени у BTC, 24% у SOL, 44% у
+     * ETH). Обе доли нужны вместе: порознь они не говорят, в какую сторону
+     * двигать потолок, — у пустого и полного бота простаивает РАЗНАЯ половина
+     * конструкции.
+     */
+    private long ticksEmpty;
+    /**
+     * Сколько тиков инвентарь стоял на каждом целом числе лотов.
+     *
+     * Средний инвентарь и две доли на краях не отвечают на вопрос «сколько
+     * лотов вообще нужно»: одно и то же среднее даёт и ровный бот, и бот,
+     * скачущий между пустым и полным. Корзина по индексу
+     * floor(инвентарь / лот), последняя собирает всё сверх.
+     */
+    private long[] lotHist = new long[0];
     private double statsCap;
 
     /** Потолок инвентаря для счётчика «доля времени в потолке». */
@@ -893,6 +913,19 @@ public final class QuoteLoop implements Runnable {
         ticks++;
         if (statsCap > 0 && inventory >= 0.9 * statsCap) {
             ticksAtCap++;
+        }
+        double lot = params.size();
+        if (lot > 0) {
+            if (inventory < lot) {
+                ticksEmpty++;
+            }
+            int bucket = Math.max(0, (int) Math.floor(inventory / lot));
+            int capLots = statsCap > 0 ? (int) Math.ceil(statsCap / lot) : bucket;
+            int want = Math.min(Math.max(capLots, bucket) + 1, 64);
+            if (lotHist.length < want) {
+                lotHist = java.util.Arrays.copyOf(lotHist, want);
+            }
+            lotHist[Math.min(bucket, lotHist.length - 1)]++;
         }
     }
     /**
@@ -1209,7 +1242,7 @@ public final class QuoteLoop implements Runnable {
                 .filter(Resting::partial).count();
         return new Stats(placements, replaces, cancels, fills, inventory, lastFair,
                 quoting.get() ? "котирует" : "остановлен", pausedReason, ticks, ticksAtCap,
-                partials, partialsNow);
+                partials, partialsNow, ticksEmpty, lotHist.clone());
     }
 
     @Override

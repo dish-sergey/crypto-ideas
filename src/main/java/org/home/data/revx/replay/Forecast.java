@@ -77,7 +77,7 @@ public final class Forecast {
                             double inventoryLots, long placements, long replaces,
                             long placementCap, double days, String state, long lossStops,
                             double atCapShare, double lotNotional, int buys, int sells,
-                            java.util.List<Day> days_) {
+                            java.util.List<Day> days_, double emptyShare, long[] lotHist) {
     }
 
     /**
@@ -427,7 +427,8 @@ public final class Forecast {
                 // ⚠️ Номинал лота в валюте котировки, а НЕ размер в базовой.
                 // Зашитая цена биткойна здесь врала на SOL втрое: лот $1
                 // печатался как 788.
-                spec.size() * st.lastFair(), buys, sells, byDay(ledger, ticks));
+                spec.size() * st.lastFair(), buys, sells, byDay(ledger, ticks),
+                tickCount > 0 ? (double) st.ticksEmpty() / tickCount : 0, st.lotHist());
     }
 
     /**
@@ -506,8 +507,13 @@ public final class Forecast {
         // ⚠️ Покупки и продажи РАЗДЕЛЬНО. Одно общее число исполнений скрывает
         // главное: не набирает бот инвентарь или не может его сбыть. Это разные
         // болезни с разными причинами, а выглядят они одинаково.
+        // ⚠️ «Пусто» стоит рядом с «в потолке» НАМЕРЕННО. Порознь каждая доля
+        // обманчива: бот у потолка не покупает, пустой не продаёт, и обе
+        // выглядят в отчёте как обычная работа. Живьём чаще вторая (10.09.2026:
+        // без аска 15% времени у BTC, 24% у SOL, 44% у ETH), а лечатся они
+        // ПРОТИВОПОЛОЖНЫМИ движениями потолка.
         sb.append("бот | отступ |  лот | покупок | продаж | реализовано | инвентарь"
-                + " | в потолке | постановок/сут | на постановку | замен/с\n");
+                + " | пусто | в потолке | постановок/сут | на постановку | замен/с\n");
         for (BotResult r : results) {
             // ⚠️ Состояние на конец прогона печатается не для полноты. Бот
             // встаёт сам, когда торговый убыток против buy & hold превышает
@@ -524,12 +530,67 @@ public final class Forecast {
             // потратил больше бюджета.
             double perPlacement = r.placements() > 0 ? r.realised() / r.placements() : 0;
             sb.append(String.format(Locale.ROOT,
-                    "%-3s | %5.1f  | %4.2f | %7d | %6d | %+11.4f | %8.1f  | %8.1f%% "
+                    "%-3s | %5.1f  | %4.2f | %7d | %6d | %+11.4f | %8.1f  | %4.1f%% | %8.1f%% "
                             + "| %6.0f/%-5d | %+13.6f | %6.2f%s%n",
                     r.botId(), r.offsetBp(), r.lotNotional(), r.buys(), r.sells(), r.realised(),
-                    r.inventoryLots(), 100 * r.atCapShare(),
+                    r.inventoryLots(), 100 * r.emptyShare(), 100 * r.atCapShare(),
                     r.placements() / r.days(), r.placementCap(), perPlacement,
                     r.replaces() / (r.days() * 86_400), state));
+        }
+        sb.append(lotHistogram(results));
+        return sb.toString();
+    }
+
+    /**
+     * Гистограмма времени по числу лотов в руках.
+     *
+     * Отвечает на вопрос, на который не отвечают ни средний инвентарь, ни две
+     * доли на краях: сколько лотов боту РЕАЛЬНО нужно. Если хвост за седьмым
+     * лотом пустой, потолок в двадцать лотов — это замороженные деньги, а не
+     * запас; если горб упёрт в последнюю графу, потолок мал.
+     */
+    private static String lotHistogram(List<BotResult> results) {
+        int width = 0;
+        for (BotResult r : results) {
+            if (r.lotHist() != null) {
+                width = Math.max(width, r.lotHist().length);
+            }
+        }
+        if (width == 0) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder("\nДОЛЯ ВРЕМЕНИ ПО ЧИСЛУ ЛОТОВ В РУКАХ, %\n");
+        sb.append("бот | отступ");
+        for (int i = 0; i < width; i++) {
+            sb.append(String.format(Locale.ROOT, " |%5d", i));
+        }
+        sb.append(" | медиана\n");
+        for (BotResult r : results) {
+            long[] h = r.lotHist();
+            if (h == null || h.length == 0) {
+                continue;
+            }
+            long total = 0;
+            for (long v : h) {
+                total += v;
+            }
+            if (total == 0) {
+                continue;
+            }
+            sb.append(String.format(Locale.ROOT, "%-3s | %5.1f  ", r.botId(), r.offsetBp()));
+            long running = 0;
+            int median = 0;
+            boolean found = false;
+            for (int i = 0; i < width; i++) {
+                long v = i < h.length ? h[i] : 0;
+                sb.append(String.format(Locale.ROOT, " |%5.1f", 100.0 * v / total));
+                running += v;
+                if (!found && running * 2 >= total) {
+                    median = i;
+                    found = true;
+                }
+            }
+            sb.append(String.format(Locale.ROOT, " | %7d%n", median));
         }
         return sb.toString();
     }
