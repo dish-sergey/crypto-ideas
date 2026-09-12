@@ -144,7 +144,7 @@ public final class QuoteLoop implements Runnable {
     public record Stats(long placements, long replaces, long cancels, long fills,
                         double inventory, double lastFair, String state, String pausedReason,
                         long ticks, long ticksAtCap, long partials, int partialsNow,
-                        long ticksEmpty, long[] lotHist) {
+                        long ticksEmpty, long[] lotHist, long volGated) {
     }
 
     private final Venue client;
@@ -563,6 +563,123 @@ public final class QuoteLoop implements Runnable {
      */
     private final Deque<double[]> lotAges = new ArrayDeque<>();
 
+
+    /**
+     * ГЕЙТ ПО РЕЖИМУ РЫНКА: не котировать, пока волатильность выше обычной.
+     *
+     * <h2>Что за находка</h2>
+     *
+     * Разложение живых кругов по волатильности часа (задача A32, четверо суток
+     * 08–12.09) дало у всех трёх ботов с полной историей одно и то же: в тихом
+     * режиме захват на круг <b>+0.2…+20.7 б.п.</b>, в информативном
+     * <b>−14.9…−65.4</b>. И вторая половина, из-за которой это не лечится само:
+     * информативные часы занимают 8–14% времени, а кругов в них закрывается
+     * 23–28%. Волатильность двигает справедливую цену, цена доходит до наших
+     * заявок, исполнений становится больше — <b>бот сам стягивает торговлю в тот
+     * режим, где теряет</b>.
+     *
+     * Это единственная найденная за два дня вещь, которая не является разменом
+     * на кривой «меньше инвентаря — лучше сделка, меньше сделок»: тихий и
+     * информативный режимы различаются ЗНАКОМ, а не ценой.
+     *
+     * <h2>Правило</h2>
+     *
+     * {@code σ} за короткое окно против {@code σ} за длинное, обе по минутным
+     * приращениям справедливой цены. Гейт срабатывает, когда короткая выше
+     * длинной в {@code VOL_GATE_MULT} раз.
+     *
+     * Режимы: {@code bid} — снимается только бид (перестаём НАБИРАТЬ, но
+     * разгружаться можно), {@code both} — обе стороны. Первый ближе к замеру:
+     * терялись мы на позициях, набранных в шуме, а не на продажах.
+     *
+     * ⚠️ Порог относительный, а не абсолютный: у пар разная σ, и константа
+     * означала бы у BTC одно, а у SOL другое. По той же причине длинное окно
+     * должно быть заметно длиннее короткого — иначе всплеск попадёт в обе
+     * половины и отношение не вырастет.
+     *
+     * ⚠️ Ключ задаёт ось опыта, а не боевую настройку. По умолчанию выключено.
+     */
+    private Quoter.Quotes volGate(Quoter.Quotes target) {
+        if (VOL_GATE_MULT <= 0 || volMinutes.size() < VOL_LONG_MIN / 2) {
+            return target;
+        }
+        double shortSd = sdOfLast(VOL_SHORT_MIN);
+        double longSd = sdOfLast(VOL_LONG_MIN);
+        if (!(longSd > 0) || shortSd < VOL_GATE_MULT * longSd) {
+            return target;
+        }
+        volGated++;
+        return "both".equals(VOL_GATE_SIDE)
+                ? new Quoter.Quotes(null, null)
+                : new Quoter.Quotes(null, target.ask());
+    }
+
+    /** СКО минутных приращений по последним {@code minutes} отсчётам, б.п. */
+    private double sdOfLast(int minutes) {
+        int n = volMinutes.size();
+        if (n < 3) {
+            return 0;
+        }
+        double[] values = new double[n];
+        int i = 0;
+        for (double[] p : volMinutes) {
+            values[i++] = p[1];
+        }
+        int from = Math.max(1, n - minutes);
+        int count = 0;
+        double sum = 0;
+        double sum2 = 0;
+        for (int k = from; k < n; k++) {
+            if (!(values[k - 1] > 0)) {
+                continue;
+            }
+            double r = (values[k] - values[k - 1]) / values[k - 1] * 10_000;
+            sum += r;
+            sum2 += r * r;
+            count++;
+        }
+        if (count < 3) {
+            return 0;
+        }
+        double mean = sum / count;
+        return Math.sqrt(Math.max(0, sum2 / count - mean * mean));
+    }
+
+    /** Один отсчёт справедливой цены на минуту — вход для гейта по режиму. */
+    private void rememberVol(double fair) {
+        if (VOL_GATE_MULT <= 0 || !(fair > 0)) {
+            return;
+        }
+        long minute = clock.now() / 60_000;
+        if (!volMinutes.isEmpty() && (long) volMinutes.peekLast()[0] == minute) {
+            return;
+        }
+        volMinutes.addLast(new double[]{minute, fair});
+        while (volMinutes.size() > VOL_LONG_MIN + 2) {
+            volMinutes.pollFirst();
+        }
+    }
+
+    /** Во сколько раз короткая σ должна превысить длинную; 0 — гейт выключен. */
+    private static final double VOL_GATE_MULT =
+            Double.parseDouble(System.getProperty("revx.sim.vol-gate-mult", "0"));
+
+    /** Что снимать при срабатывании: {@code bid} (только набор) или {@code both}. */
+    private static final String VOL_GATE_SIDE =
+            System.getProperty("revx.sim.vol-gate-side", "bid");
+
+    /** Короткое окно волатильности, минут. */
+    private static final int VOL_SHORT_MIN =
+            Integer.getInteger("revx.sim.vol-short-min", 15);
+
+    /** Длинное окно волатильности, минут. */
+    private static final int VOL_LONG_MIN =
+            Integer.getInteger("revx.sim.vol-long-min", 360);
+
+    private final Deque<double[]> volMinutes = new ArrayDeque<>();
+
+    /** Сколько тиков гейт держал сторону снятой — печатается прогоном. */
+    private long volGated;
     private Quoter.Quotes pullFirstLot(Quoter.Quotes target, double price) {
         double firstLotBp = Double.parseDouble(
                 System.getProperty("revx.sim.first-lot-offset", "0"));
@@ -1325,7 +1442,7 @@ public final class QuoteLoop implements Runnable {
                 .filter(Resting::partial).count();
         return new Stats(placements, replaces, cancels, fills, inventory, lastFair,
                 quoting.get() ? "котирует" : "остановлен", pausedReason, ticks, ticksAtCap,
-                partials, partialsNow, ticksEmpty, lotHist.clone());
+                partials, partialsNow, ticksEmpty, lotHist.clone(), volGated);
     }
 
     @Override
@@ -1479,6 +1596,8 @@ public final class QuoteLoop implements Runnable {
         target = widenForBudget(target, fair.price(), pressure);
         target = pullFirstLot(target, fair.price());
         target = decayAsk(target, fair.price(), params.offset());
+        rememberVol(fair.price());
+        target = volGate(target);
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
         //

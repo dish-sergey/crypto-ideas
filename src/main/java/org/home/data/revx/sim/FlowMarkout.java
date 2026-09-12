@@ -207,6 +207,7 @@ public final class FlowMarkout {
         sb.append(costByHorizon(prints, fair));
         sb.append(unloadWait(prints, days, fair));
         sb.append(afterSweep(prints, days, fair));
+        sb.append(drawdownHint(prints, fair));
         sb.append(payPerRisk(prints, days, fair, halfSpread(book), book));
         sb.append(kappa(lambda, days));
         sb.append(rollingKappa(prints, days, from, to));
@@ -405,6 +406,125 @@ public final class FlowMarkout {
         return sb.toString();
     }
 
+
+    /**
+     * ПОДСКАЗЫВАЕТ ЛИ ПРОСАДКА: если цена ушла на X б.п. против позиции, ждать
+     * или выходить?
+     *
+     * <h2>Вопрос</h2>
+     *
+     * Выход тейкером и придвижение аска — оба стоят денег, и оба применялись бы
+     * «по возрасту». Но у рынка может быть подсказка получше возраста: насколько
+     * цена уже ушла. Если после просадки в 100 б.п. она в среднем ВОЗВРАЩАЕТСЯ,
+     * ждать правильно и выходить нельзя; если продолжает уходить — наоборот.
+     *
+     * <h2>Как считается</h2>
+     *
+     * Каждое событие, которое дотянулось бы до нашего бида, считается входом
+     * (цена входа — справедливая в этот момент). Дальше ряд справедливой цены
+     * идёт вперёд, и ищется ПЕРВЫЙ момент, когда позиция оказалась под водой на
+     * {@code X} б.п. От этого момента меряется дальнейшее движение через
+     * 5/15/30/60 минут и доля случаев, когда цена вернулась к цене входа.
+     *
+     * Знак: ПЛЮС — цена пошла обратно, просадка отыгрывается, ждать выгодно;
+     * МИНУС — уходит дальше, и любая задержка с выходом дорожает.
+     *
+     * ⚠️ Это условная величина, и условие ОТБИРАЕТ наблюдения: до просадки в 100
+     * б.п. доживают только те эпизоды, где цена уже ушла далеко. Поэтому доля
+     * «дожили» печатается рядом — на глубоких порогах она мала, и числа там
+     * держатся на десятках случаев.
+     *
+     * ⚠️ Вход берётся по справедливой цене, а не по цене нашей заявки: отступ
+     * сдвинул бы все пороги на константу и ничего не изменил бы в форме.
+     */
+    private static String drawdownHint(List<Print> prints, TreeMap<Long, Double> fair) {
+        List<Print> entries = prints.stream().filter(p -> p.aggressor() < 0).toList();
+        if (entries.size() < 100) {
+            return "";
+        }
+        long last = fair.lastKey();
+        double[] levels = {5, 10, 20, 40, 80, 160};
+        long[] horizons = {300_000, 900_000, 1_800_000, 3_600_000};
+        String[] labels = {"5м", "15м", "30м", "1ч"};
+        StringBuilder sb = new StringBuilder(
+                "\nПОДСКАЗЫВАЕТ ЛИ ПРОСАДКА: что делает цена ПОСЛЕ того, как ушла на X\n");
+        sb.append("(вход = покупка по справедливой цене; плюс = возврат, минус = уходит дальше)\n");
+        sb.append("  просадка | дожили |");
+        for (String l : labels) {
+            sb.append(String.format(Locale.ROOT, " %7s |", l));
+        }
+        sb.append(" вернулась к входу за 1ч\n");
+        for (double level : levels) {
+            int reached = 0;
+            double[] sum = new double[horizons.length];
+            int[] n = new int[horizons.length];
+            int back = 0;
+            int backDenom = 0;
+            for (Print e : entries) {
+                if (!(e.fair() > 0)) {
+                    continue;
+                }
+                // первый момент, когда цена ниже входа на level б.п.
+                Long hit = null;
+                double hitPrice = 0;
+                for (Map.Entry<Long, Double> f : fair.tailMap(e.tsMs()).entrySet()) {
+                    if (f.getKey() > e.tsMs() + 3_600_000) {
+                        break;                       // час на то, чтобы просесть
+                    }
+                    if (f.getValue() > 0
+                            && (e.fair() - f.getValue()) / e.fair() * 10_000 >= level) {
+                        hit = f.getKey();
+                        hitPrice = f.getValue();
+                        break;
+                    }
+                }
+                if (hit == null) {
+                    continue;
+                }
+                reached++;
+                for (int h = 0; h < horizons.length; h++) {
+                    if (hit + horizons[h] > last) {
+                        continue;
+                    }
+                    Map.Entry<Long, Double> f = fair.floorEntry(hit + horizons[h]);
+                    if (f == null || f.getValue() <= 0) {
+                        continue;
+                    }
+                    sum[h] += (f.getValue() - hitPrice) / hitPrice * 10_000;
+                    n[h]++;
+                }
+                if (hit + 3_600_000 <= last) {
+                    backDenom++;
+                    for (Map.Entry<Long, Double> f : fair.tailMap(hit).entrySet()) {
+                        if (f.getKey() > hit + 3_600_000) {
+                            break;
+                        }
+                        if (f.getValue() >= e.fair()) {
+                            back++;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (reached < 20) {
+                continue;
+            }
+            StringBuilder row = new StringBuilder(String.format(Locale.ROOT,
+                    "  %8.0f | %5.0f%% |", level, 100.0 * reached / entries.size()));
+            for (int h = 0; h < horizons.length; h++) {
+                row.append(n[h] == 0 ? String.format(Locale.ROOT, " %7s |", "—")
+                        : String.format(Locale.ROOT, " %+7.2f |", sum[h] / n[h]));
+            }
+            row.append(String.format(Locale.ROOT, " %17s",
+                    backDenom == 0 ? "—" : String.format(Locale.ROOT, "%.0f%% (%d)",
+                            100.0 * back / backDenom, backDenom)));
+            sb.append(row).append('\n');
+        }
+        sb.append("⚠️ Условие ОТБИРАЕТ наблюдения: до глубокой просадки доживают только\n");
+        sb.append("эпизоды, где цена уже ушла. Графа «дожили» показывает, насколько\n");
+        sb.append("редок каждый порог.\n");
+        return sb.toString();
+    }
     /** Свип как целое: одна рыночная заявка, разложенная на несколько принтов. */
     private record Sweep(long tsMs, int side, double depthBp, double qty, int prints,
                          double fair) {
