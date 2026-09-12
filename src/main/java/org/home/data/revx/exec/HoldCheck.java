@@ -579,23 +579,46 @@ public class HoldCheck {
         double median = quantile(sorted, 0.5);
         double threshold = REGIME_MULT * median;
 
-        double[] sum = new double[2];
-        double[] hold = new double[2];
-        double[] sig = new double[2];
-        int[] cnt = new int[2];
+        // ⚠️ ТРИ РАЗМЕТКИ, И ОНИ ДАЮТ РАЗНЫЕ ОТВЕТЫ.
+        //
+        // Круг живёт во времени и может начаться в одном режиме, а кончиться в
+        // другом. Разметка по часу ЗАКРЫТИЯ приписывает убыток моменту, когда он
+        // ЗАФИКСИРОВАН, а не когда создан: продали в шторм — записали убыток в
+        // шторм. Разметка по часу ПОКУПКИ отвечает на другой вопрос — «стоило ли
+        // набирать в этот момент».
+        //
+        // 🔑 Честная третья: круги, у которых ОБА конца в одном режиме. Только
+        // они не влияют на соседний период и только по ним можно говорить «в
+        // таком режиме конструкция зарабатывает столько-то». Остальные —
+        // переходные, и их надо показывать отдельно, а не растворять в обеих
+        // половинах.
+        String[] modes = {"по закрытию", "по покупке", "ЦЕЛИКОМ внутри"};
+        double[][] sum = new double[3][2];
+        double[][] hold = new double[3][2];
+        double[][] sig = new double[3][2];
+        int[][] cnt = new int[3][2];
+        int spanning = 0;
         for (Pair p : match(fills, true, false)) {
             if (p.closedMs() < fromMs || p.closedMs() >= toMs || p.handover()) {
                 continue;
             }
-            Double s = sigma.get(p.closedMs() / 3_600_000);
-            if (s == null) {
+            Double sc = sigma.get(p.closedMs() / 3_600_000);
+            Double so = sigma.get(p.openedMs() / 3_600_000);
+            if (sc == null) {
                 continue;
             }
-            int r = s >= threshold ? 1 : 0;
-            sum[r] += p.bp();
-            hold[r] += p.minutes();
-            sig[r] += s;
-            cnt[r]++;
+            int rc = sc >= threshold ? 1 : 0;
+            add(sum[0], hold[0], sig[0], cnt[0], rc, p, sc);
+            if (so == null) {
+                continue;
+            }
+            int ro = so >= threshold ? 1 : 0;
+            add(sum[1], hold[1], sig[1], cnt[1], ro, p, so);
+            if (ro == rc) {
+                add(sum[2], hold[2], sig[2], cnt[2], rc, p, sc);
+            } else {
+                spanning++;
+            }
         }
         StringBuilder sb = new StringBuilder("\n## Режим рынка: тихий против информативного\n\n");
         sb.append(String.format(Locale.ROOT,
@@ -603,34 +626,51 @@ public class HoldCheck {
                         + "часов в окне %d, из них информативных %d%n%n",
                 REGIME_MULT, median, threshold, sigma.size(),
                 sigma.values().stream().filter(v -> v >= threshold).count()));
-        sb.append("| режим | кругов | средний круг | всего | σ | держание | риск σ√T | ЗАХВ/РИСК |\n");
-        sb.append("|---|---:|---:|---:|---:|---:|---:|---:|\n");
-        for (int r = 0; r < 2; r++) {
-            if (cnt[r] == 0) {
-                continue;
+        sb.append("| разметка | режим | кругов | средний круг | всего | σ | держание | ЗАХВ/РИСК |\n");
+        sb.append("|---|---|---:|---:|---:|---:|---:|---:|\n");
+        for (int m = 0; m < 3; m++) {
+            for (int r = 0; r < 2; r++) {
+                if (cnt[m][r] == 0) {
+                    continue;
+                }
+                double s = sig[m][r] / cnt[m][r];
+                double t = hold[m][r] / cnt[m][r];
+                double risk = s * Math.sqrt(t);
+                sb.append(String.format(Locale.ROOT,
+                        "| %s | %s | %d | %+.1f | %+.1f | %.2f | %.0f мин | %s |%n",
+                        modes[m], r == 0 ? "тихий" : "информативный", cnt[m][r],
+                        sum[m][r] / cnt[m][r], sum[m][r], s, t,
+                        offsetBp > 0 && risk > 0
+                                ? String.format(Locale.ROOT, "%.2f", 2 * offsetBp / risk) : "—"));
             }
-            double s = sig[r] / cnt[r];
-            double t = hold[r] / cnt[r];
-            double risk = s * Math.sqrt(t);
-            sb.append(String.format(Locale.ROOT,
-                    "| %s | %d | %+.1f | %+.1f | %.2f | %.0f мин | %.1f | %s |%n",
-                    r == 0 ? "тихий" : "**информативный**", cnt[r], sum[r] / cnt[r], sum[r],
-                    s, t, risk,
-                    offsetBp > 0 && risk > 0
-                            ? String.format(Locale.ROOT, "%.2f", 2 * offsetBp / risk) : "—"));
         }
-        if (cnt[0] > 0 && cnt[1] > 0) {
+        if (cnt[0][0] > 0 && cnt[0][1] > 0) {
             sb.append(String.format(Locale.ROOT,
                     "%nдоля кругов, закрывшихся в информативном режиме: **%.0f%%** "
                             + "при его доле во времени %.0f%%%n",
-                    100.0 * cnt[1] / (cnt[0] + cnt[1]),
+                    100.0 * cnt[0][1] / (cnt[0][0] + cnt[0][1]),
                     100.0 * sigma.values().stream().filter(v -> v >= threshold).count()
                             / sigma.size()));
         }
-        sb.append("\n⚠️ Круг отнесён к режиму часа, в котором ЗАКРЫЛСЯ: круги, пережившие\n")
-                .append("смену режима, попадают в последний. На длинных кругах это смазывает\n")
-                .append("границу, и разделение надо читать как оценку, а не как разрез.\n");
+        sb.append(String.format(Locale.ROOT,
+                "переходных кругов (начались в одном режиме, кончились в другом): **%d**%n",
+                spanning));
+        sb.append("\n🔑 Читать надо строку «ЦЕЛИКОМ внутри»: только у этих кругов оба конца\n")
+                .append("в одном режиме, и только они не влияют на соседний период. Разметка\n")
+                .append("«по закрытию» приписывает убыток моменту ФИКСАЦИИ, а не создания;\n")
+                .append("«по покупке» отвечает на другой вопрос — стоило ли набирать тогда.\n")
+                .append("Расхождение этих трёх строк и есть мера того, насколько разделение\n")
+                .append("по режиму вообще осмысленно на данном окне.\n");
         return sb.toString();
+    }
+
+    /** Накопитель одной клетки разметки. */
+    private static void add(double[] sum, double[] hold, double[] sig, int[] cnt,
+                            int regime, Pair p, double sigma) {
+        sum[regime] += p.bp();
+        hold[regime] += p.minutes();
+        sig[regime] += sigma;
+        cnt[regime]++;
     }
 
     /** Во сколько раз часовая σ должна превысить медианную, чтобы час считался информативным. */

@@ -208,6 +208,8 @@ public final class FlowMarkout {
         sb.append(unloadWait(prints, days, fair));
         sb.append(afterSweep(prints, days, fair));
         sb.append(drawdownHint(prints, fair));
+        sb.append(drawdownBySpeed(prints, fair));
+        sb.append(reversalBothSides(prints, fair));
         sb.append(payPerRisk(prints, days, fair, halfSpread(book), book));
         sb.append(kappa(lambda, days));
         sb.append(rollingKappa(prints, days, from, to));
@@ -523,6 +525,190 @@ public final class FlowMarkout {
         sb.append("⚠️ Условие ОТБИРАЕТ наблюдения: до глубокой просадки доживают только\n");
         sb.append("эпизоды, где цена уже ушла. Графа «дожили» показывает, насколько\n");
         sb.append("редок каждый порог.\n");
+        return sb.toString();
+    }
+
+    /**
+     * ТА ЖЕ ПРОСАДКА, НО РАЗЛОЖЕННАЯ ПО СКОРОСТИ.
+     *
+     * ⚠️ Вопрос владельца, снимающий двусмысленность предыдущей таблицы: «ушла на
+     * 80 б.п.» — это ОДНИМ свипом или сползанием за час? Пути разные, и если
+     * отскок живёт только в быстром, то это переоценка свипа, то есть
+     * измеримая точка разворота. Если в медленном — это возврат тренда, и
+     * торговать его нечем.
+     *
+     * Скорость = сколько минут прошло от входа до момента, когда просадка
+     * впервые достигла порога. Полосы: до минуты (по сути один свип или пачка),
+     * 1–15 минут, дольше 15.
+     */
+
+    /**
+     * 🔑 РАЗВОРОТ, ПОДТВЕРЖДЁННЫЙ ОБЕИМИ СТОРОНАМИ.
+     *
+     * ⚠️ Односторонняя таблица врёт, и это проверено на живом примере. Быстрое
+     * падение BTC на 20 б.п. в августе давало «разворот +60.47 за час» — цифра,
+     * которая больше самого падения. Контроль по РОСТУ показал −11.23: после
+     * быстрого роста цена тоже шла вверх. Значит обе стороны двигал общий СНОС
+     * рынка, а разворота на этом ходе нет вовсе.
+     *
+     * Раскладка та же, что у {@code c(δ, H)}:
+     * <pre>
+     *   разворот = (R_падение + R_рост) / 2     против нас с обеих сторон
+     *   снос     = (R_падение − R_рост) / 2     общее движение рынка
+     * </pre>
+     * где {@code R} — ход ПРОТИВ первоначального направления. Разворот настоящий
+     * только когда обе половины положительны; знак у одной и ноль у другой
+     * означает, что мы померили направление рынка.
+     */
+    private static String reversalBothSides(List<Print> prints, TreeMap<Long, Double> fair) {
+        double[] levels = {20, 40, 80};
+        double[] speedEdges = {1, 15, 1e9};
+        String[] speedNames = {"до 1 мин", "1–15 мин", "больше 15"};
+        StringBuilder sb = new StringBuilder(
+                "\nРАЗВОРОТ, ПОДТВЕРЖДЁННЫЙ ОБЕИМИ СТОРОНАМИ (за час)\n");
+        sb.append("  ход,б.п. |   скорость | падение | рост | РАЗВОРОТ | снос\n");
+        for (double level : levels) {
+            for (int b = 0; b < speedNames.length; b++) {
+                double lo = b == 0 ? 0 : speedEdges[b - 1];
+                double hi = speedEdges[b];
+                double[] down = reversalAt(prints, fair, -1, level, lo, hi);
+                double[] up = reversalAt(prints, fair, 1, level, lo, hi);
+                if (down[1] < 20 || up[1] < 20) {
+                    continue;
+                }
+                double rev = (down[0] + up[0]) / 2;
+                double drift = (down[0] - up[0]) / 2;
+                sb.append(String.format(Locale.ROOT,
+                        "  %8.0f | %10s | %+7.2f | %+5.2f | %+8.2f | %+5.2f%s%n",
+                        level, speedNames[b], down[0], up[0], rev, drift,
+                        down[0] > 0 && up[0] > 0 ? "  ✓" : "  ⚠️ одной стороной"));
+            }
+        }
+        sb.append("⚠️ Читать только строки с ✓: там разворот подтверждён обеими сторонами.\n");
+        sb.append("Остальные означают снос рынка, а не свойство хода.\n");
+        return sb.toString();
+    }
+
+    /** {@code {средний ход против направления за час, число случаев}}. */
+    private static double[] reversalAt(List<Print> prints, TreeMap<Long, Double> fair,
+                                       int side, double level, double loMin, double hiMin) {
+        long last = fair.lastKey();
+        double sum = 0;
+        int n = 0;
+        int cnt = 0;
+        for (Print e : prints) {
+            if (e.aggressor() != side || !(e.fair() > 0)) {
+                continue;
+            }
+            Long hit = null;
+            double hitPrice = 0;
+            for (Map.Entry<Long, Double> f : fair.tailMap(e.tsMs()).entrySet()) {
+                if (f.getKey() > e.tsMs() + 3_600_000) {
+                    break;
+                }
+                if (f.getValue() > 0
+                        && side * (f.getValue() - e.fair()) / e.fair() * 10_000 >= level) {
+                    hit = f.getKey();
+                    hitPrice = f.getValue();
+                    break;
+                }
+            }
+            if (hit == null) {
+                continue;
+            }
+            double minutes = (hit - e.tsMs()) / 60_000.0;
+            if (minutes < loMin || minutes >= hiMin) {
+                continue;
+            }
+            cnt++;
+            if (hit + 3_600_000 > last) {
+                continue;
+            }
+            Map.Entry<Long, Double> f = fair.floorEntry(hit + 3_600_000);
+            if (f == null || f.getValue() <= 0) {
+                continue;
+            }
+            sum += -side * (f.getValue() - hitPrice) / hitPrice * 10_000;
+            n++;
+        }
+        return new double[]{n == 0 ? 0 : sum / n, cnt};
+    }
+    private static String drawdownBySpeed(List<Print> prints, TreeMap<Long, Double> fair) {
+        return speedTable(prints, fair, -1) + speedTable(prints, fair, 1);
+    }
+
+    private static String speedTable(List<Print> prints, TreeMap<Long, Double> fair, int side) {
+        List<Print> entries = prints.stream().filter(p -> p.aggressor() == side).toList();
+        if (entries.size() < 100) {
+            return "";
+        }
+        long last = fair.lastKey();
+        double[] levels = {20, 40, 80};
+        double[] speedEdges = {0, 1, 15, 1e9};
+        String[] speedNames = {"до 1 мин", "1–15 мин", "больше 15"};
+        StringBuilder sb = new StringBuilder("\nХОД ПО СКОРОСТИ — "
+                + (side < 0 ? "ПАДЕНИЕ (бьют наш бид)" : "РОСТ (КОНТРОЛЬ)")
+                + ": одним свипом или сползанием\n");
+        sb.append("  ход,б.п. |   скорость | случаев |    +15м |     +1ч   (плюс = разворот)\n");
+        for (double level : levels) {
+            double[] sum15 = new double[3];
+            double[] sum60 = new double[3];
+            int[] n15 = new int[3];
+            int[] n60 = new int[3];
+            int[] cnt = new int[3];
+            for (Print e : entries) {
+                if (!(e.fair() > 0)) {
+                    continue;
+                }
+                Long hit = null;
+                double hitPrice = 0;
+                for (Map.Entry<Long, Double> f : fair.tailMap(e.tsMs()).entrySet()) {
+                    if (f.getKey() > e.tsMs() + 3_600_000) {
+                        break;
+                    }
+                    if (f.getValue() > 0
+                            && side * (f.getValue() - e.fair()) / e.fair() * 10_000 >= level) {
+                        hit = f.getKey();
+                        hitPrice = f.getValue();
+                        break;
+                    }
+                }
+                if (hit == null) {
+                    continue;
+                }
+                double minutes = (hit - e.tsMs()) / 60_000.0;
+                int band = minutes < speedEdges[1] ? 0 : minutes < speedEdges[2] ? 1 : 2;
+                cnt[band]++;
+                if (hit + 900_000 <= last) {
+                    Map.Entry<Long, Double> f = fair.floorEntry(hit + 900_000);
+                    if (f != null && f.getValue() > 0) {
+                        sum15[band] += -side * (f.getValue() - hitPrice) / hitPrice * 10_000;
+                        n15[band]++;
+                    }
+                }
+                if (hit + 3_600_000 <= last) {
+                    Map.Entry<Long, Double> f = fair.floorEntry(hit + 3_600_000);
+                    if (f != null && f.getValue() > 0) {
+                        sum60[band] += -side * (f.getValue() - hitPrice) / hitPrice * 10_000;
+                        n60[band]++;
+                    }
+                }
+            }
+            for (int b = 0; b < 3; b++) {
+                if (cnt[b] < 20) {
+                    continue;
+                }
+                sb.append(String.format(Locale.ROOT,
+                        "  %8.0f | %10s | %7d | %+7.2f | %+7.2f%n",
+                        level, speedNames[b], cnt[b],
+                        n15[b] == 0 ? 0 : sum15[b] / n15[b],
+                        n60[b] == 0 ? 0 : sum60[b] / n60[b]));
+            }
+        }
+        sb.append("⚠️ «до 1 мин» — просадка набрана свипом или пачкой, то есть ОДНИМ\n");
+        sb.append("движением; «больше 15» — сползание. Если отскок есть только в первой\n");
+        sb.append("полосе, это переоценка свипа и точка разворота; если во второй —\n");
+        sb.append("просто возврат тренда, и торговать его нечем.\n");
         return sb.toString();
     }
     /** Свип как целое: одна рыночная заявка, разложенная на несколько принтов. */
