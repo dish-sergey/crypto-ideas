@@ -204,6 +204,7 @@ public final class FlowMarkout {
         sb.append("«доля покупок» — предохранитель от беты: сильный перекос значит, что\n");
         sb.append("кривая меряет направление рынка, а не отбор.\n");
 
+        sb.append(costByHorizon(prints, fair));
         sb.append(payPerRisk(prints, days, fair, halfSpread(book), book));
         sb.append(kappa(lambda, days));
         sb.append(rollingKappa(prints, days, from, to));
@@ -273,6 +274,155 @@ public final class FlowMarkout {
             n++;
         }
         return n == 0 ? null : sum / n;
+    }
+
+    /** Горизонты для {@code c(δ, H)}: от боевой минуты до двух часов держания. */
+    private static final long[] HOLD_HORIZONS = {
+            60_000, 300_000, 900_000, 1_800_000, 3_600_000, 7_200_000};
+
+    private static final String[] HOLD_LABELS = {"1м", "5м", "15м", "30м", "1ч", "2ч"};
+
+    /**
+     * ОТБОР НА ГОРИЗОНТЕ РЕАЛЬНОГО ДЕРЖАНИЯ — {@code c(δ, H)}.
+     *
+     * <h2>Зачем</h2>
+     *
+     * Кривая {@code c(δ)} мерилась на 60 секундах, а позиция живёт десятки минут
+     * (замер A27: среднее держание живых ботов 19–187 минут). На минутном
+     * горизонте край положителен; на горизонте, где круг реально закрывается,
+     * его никто не мерил. Разрыв между «ожидаемым по кривой» и фактическим
+     * результатом лежит ровно там, где кончалось измерение.
+     *
+     * <h2>⚠️ Почему нельзя просто увеличить горизонт</h2>
+     *
+     * {@code c} считается как {@code сторона_агрессора · Δfair}. На минуте это
+     * почти чистый отбор: цена за минуту далеко не уходит. На двух часах в ту же
+     * величину входит СНОС РЫНКА, и если поток перекошен (покупок больше, чем
+     * продаж), {@code c} померяет направление рынка, а не то, что у нас забирают.
+     * Прямое увеличение горизонта дало бы красивую растущую кривую, которая
+     * означала бы «биткойн рос», а не «нас отбирают».
+     *
+     * <h2>Контроль</h2>
+     *
+     * Поэтому {@code c} считается ОТДЕЛЬНО по сторонам агрессора и раскладывается:
+     * <pre>
+     *   отбор = (c_покупки + c_продажи) / 2     — одинаково против нас с обеих сторон
+     *   снос  = (c_покупки − c_продажи) / 2     — просто движение рынка за H
+     * </pre>
+     * Если отбор настоящий, обе половины положительны. Если это снос, они
+     * противоположны по знаку и гасятся. Величина, которую можно класть в
+     * арифметику круга, — только «отбор».
+     *
+     * ⚠️ События, у которых горизонт выходит за конец данных, отбрасываются
+     * целиком, поэтому на двух часах выборка заметно меньше — колонка «событий»
+     * печатается, чтобы это было видно, а не угадывалось.
+     */
+    private static String costByHorizon(List<Print> prints, TreeMap<Long, Double> fair) {
+        StringBuilder sb = new StringBuilder(
+                "\nОТБОР НА ГОРИЗОНТЕ ДЕРЖАНИЯ: c(δ, H), б.п.\n"
+                        + "(взвешено по потоку, как считалось всегда; очищенная от сноса\n"
+                        + "величина — в таблице КОНТРОЛЬ СНОСА ниже, графа ОТБОР)\n");
+        sb.append("  δ,б.п.");
+        for (String label : HOLD_LABELS) {
+            sb.append(String.format(Locale.ROOT, " | %6s", label));
+        }
+        sb.append(" | событий на 2ч\n");
+        for (double dist : GRID) {
+            List<Print> reach = events(prints, dist);
+            if (reach.size() < 30) {
+                continue;
+            }
+            StringBuilder row = new StringBuilder(String.format(Locale.ROOT, "  %6.0f", dist));
+            for (long h : HOLD_HORIZONS) {
+                Double c = cost(reach, fair, h);
+                row.append(c == null ? String.format(Locale.ROOT, " | %6s", "—")
+                        : String.format(Locale.ROOT, " |%+6.2f%s", c, mark(reach, fair, h)));
+            }
+            row.append(String.format(Locale.ROOT, " | %13d", usable(reach, fair, 7_200_000)));
+            sb.append(row).append('\n');
+        }
+        sb.append("«?» — клетка НЕГОДНА: снос рынка за H больше измеряемой величины.\n");
+
+        sb.append("\nКОНТРОЛЬ СНОСА: та же величина, разложенная по сторонам агрессора\n");
+        sb.append("  δ,б.п. |     H | c(покупки) | c(продажи) |  ОТБОР |   снос | покуп/прод\n");
+        for (double dist : new double[]{6, 8, 10, 12, 14}) {
+            List<Print> reach = events(prints, dist);
+            if (reach.size() < 30) {
+                continue;
+            }
+            List<Print> buys = reach.stream().filter(p -> p.aggressor() > 0).toList();
+            List<Print> sells = reach.stream().filter(p -> p.aggressor() < 0).toList();
+            for (int i = 0; i < HOLD_HORIZONS.length; i++) {
+                Double cb = cost(buys, fair, HOLD_HORIZONS[i]);
+                Double cs = cost(sells, fair, HOLD_HORIZONS[i]);
+                if (cb == null || cs == null) {
+                    continue;
+                }
+                double pick = (cb + cs) / 2;
+                double drift = (cb - cs) / 2;
+                sb.append(String.format(Locale.ROOT,
+                        "  %6.0f | %5s | %+10.2f | %+10.2f | %+6.2f | %+6.2f%s | %5d/%d%n",
+                        dist, HOLD_LABELS[i], cb, cs, pick, drift,
+                        Math.abs(drift) > Math.abs(pick) ? " ⚠️" : "  ",
+                        buys.size(), sells.size()));
+            }
+        }
+        sb.append("⚠️ ОТБОР — то, что забирают с обеих сторон одинаково; снос — движение\n");
+        sb.append("рынка за H, которое к нам отношения не имеет и на длинном окне гасится.\n");
+        sb.append("В арифметику круга кладётся ОТБОР, а не c.\n");
+
+        sb.append("\nКРАЙ НА ГОРИЗОНТЕ: δ − отбор(δ, H), б.п. (положительно = круг в плюсе)\n");
+        sb.append("  δ,б.п.");
+        for (String label : HOLD_LABELS) {
+            sb.append(String.format(Locale.ROOT, " | %6s", label));
+        }
+        sb.append('\n');
+        for (double dist : GRID) {
+            List<Print> reach = events(prints, dist);
+            if (reach.size() < 30) {
+                continue;
+            }
+            List<Print> buys = reach.stream().filter(p -> p.aggressor() > 0).toList();
+            List<Print> sells = reach.stream().filter(p -> p.aggressor() < 0).toList();
+            StringBuilder row = new StringBuilder(String.format(Locale.ROOT, "  %6.0f", dist));
+            for (long h : HOLD_HORIZONS) {
+                Double cb = cost(buys, fair, h);
+                Double cs = cost(sells, fair, h);
+                row.append(cb == null || cs == null ? String.format(Locale.ROOT, " | %6s", "—")
+                        : String.format(Locale.ROOT, " |%+6.2f%s", dist - (cb + cs) / 2,
+                                Math.abs(cb - cs) > Math.abs(cb + cs) ? "?" : " "));
+            }
+            sb.append(row).append('\n');
+        }
+        sb.append("⚠️ Это край ОДНОЙ ноги. Круг берёт обе, но и отбор платится дважды,\n");
+        sb.append("поэтому знак у круга тот же, что здесь.\n");
+        sb.append("\n🔑 ЧИТАТЬ ТОЛЬКО КЛЕТКИ БЕЗ «?». Замер 12.09.2026 на трёх парах и двух\n");
+        sb.append("окнах: до 15 минут годны почти все клетки, после 30 минут — почти ни\n");
+        sb.append("одной. Снос за два часа доходил до −27 б.п. при измеряемой величине в 8,\n");
+        sb.append("то есть дальше получаса величина не «большая», а несуществующая.\n");
+        return sb.toString();
+    }
+
+    /** «?» у клетки, где снос рынка за H перевесил измеряемый отбор. */
+    private static String mark(List<Print> reach, TreeMap<Long, Double> fair, long h) {
+        Double cb = cost(reach.stream().filter(p -> p.aggressor() > 0).toList(), fair, h);
+        Double cs = cost(reach.stream().filter(p -> p.aggressor() < 0).toList(), fair, h);
+        if (cb == null || cs == null) {
+            return " ";
+        }
+        return Math.abs(cb - cs) > Math.abs(cb + cs) ? "?" : " ";
+    }
+
+    /** Сколько событий доживает до горизонта внутри данных — знаменатель выборки. */
+    private static int usable(List<Print> prints, TreeMap<Long, Double> fair, long horizonMs) {
+        long last = fair.lastKey();
+        int n = 0;
+        for (Print p : prints) {
+            if (p.tsMs() + horizonMs <= last) {
+                n++;
+            }
+        }
+        return n;
     }
 
     /**
