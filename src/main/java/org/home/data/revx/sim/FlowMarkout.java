@@ -471,6 +471,69 @@ public final class FlowMarkout {
         }
         sb.append("  ⚠️ захват круга = бид 8 + средний аск В МОМЕНТ исполнения.\n");
         sb.append("  Затухание платит захватом за время: вопрос в том, что дешевле.\n");
+        sb.append(ladder(lam, tBid, dBid, sigma));
+        return sb.toString();
+    }
+
+    /**
+     * ЛЕСТНИЦА УРОВНЕЙ против одного уровня.
+     *
+     * <h2>Что сравнивается</h2>
+     *
+     * Один и тот же капитал либо стоит одной заявкой на расстоянии δ, либо
+     * разложен по нескольким уровням вокруг δ. Каждая доля ждёт своего
+     * исполнения: ближний уровень исполняется быстро и берёт мало, дальний
+     * наоборот. Средние по долям и дают время и захват лестницы.
+     *
+     * <h2>Чего ждать заранее</h2>
+     *
+     * ⚠️ {@code λ} падает с расстоянием экспоненциально, значит ожидание
+     * {@code 1/λ} растёт экспоненциально, то есть ВЫПУКЛО. По неравенству
+     * Йенсена среднее от выпуклой функции больше функции от среднего — поэтому
+     * у лестницы среднее ожидание ДЛИННЕЕ, чем у одиночной заявки на том же
+     * среднем расстоянии. Чистого выигрыша во времени быть не должно.
+     *
+     * Польза лестницы, если она есть, — не в среднем, а в РАЗБРОСЕ: ближние
+     * уровни закрываются быстро и не дают позиции состариться целиком. Поэтому
+     * рядом со средним печатается и хвост.
+     */
+    private static String ladder(TreeMap<Double, Double> lam, double tBid, double dBid,
+                                 double sigma) {
+        record Rung(String name, double[] levels) {
+        }
+        List<Rung> rungs = List.of(
+                new Rung("1 уровень: 8", new double[]{8}),
+                new Rung("1 уровень: 10", new double[]{10}),
+                new Rung("2 уровня: 6, 10", new double[]{6, 10}),
+                new Rung("3 уровня: 6, 8, 10", new double[]{6, 8, 10}),
+                new Rung("3 уровня: 4, 8, 12", new double[]{4, 8, 12}),
+                new Rung("3 уровня: 6, 10, 14", new double[]{6, 10, 14}),
+                new Rung("5 уровней: 4..12 шагом 2", new double[]{4, 6, 8, 10, 12}));
+        StringBuilder sb = new StringBuilder(
+                "\n  ЛЕСТНИЦА АСКА (тот же капитал, разложенный по уровням)\n");
+        sb.append("  раскладка                   | ждём аск | захват | всего T | риск | ЗАХВ/РИСК"
+                + " | худший ур.\n");
+        for (Rung r : rungs) {
+            double sumT = 0;
+            double sumCap = 0;
+            double worstT = 0;
+            for (double d : r.levels()) {
+                double t = 1440.0 / lambdaAt(lam, d);
+                sumT += t;
+                sumCap += d;
+                worstT = Math.max(worstT, t);
+            }
+            int n = r.levels().length;
+            double askT = sumT / n;
+            double cap = dBid + sumCap / n;
+            double totT = tBid + askT;
+            double risk = sigma * Math.sqrt(totT);
+            sb.append(String.format(Locale.ROOT,
+                    "  %-27s | %6.0f м | %6.1f | %6.0f м | %4.1f | %9.2f | %7.0f м%n",
+                    r.name(), askT, cap, totT, risk, cap / risk, worstT));
+        }
+        sb.append("  ⚠️ «худший ур.» — ожидание самого дальнего уровня: он и создаёт хвост,\n");
+        sb.append("  потому что его доля позиции стареет дольше всех.\n");
         return sb.toString();
     }
 
