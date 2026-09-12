@@ -35,7 +35,8 @@ public class CliMode {
             "revx-trade-check", "revx-order-probe", "revx-panic", "revx-park", "revx-exec", "revx-regimes",
             "revx-replay", "revx-forecast", "revx-ladder", "revx-pair-forecast",
             "revx-pair-sweep", "revx-info", "revx-assemble", "revx-fill-check",
-            "revx-order", "revx-book", "revx-depth-probe", "revx-flow-markout");
+            "revx-order", "revx-book", "revx-depth-probe", "revx-flow-markout",
+            "revx-hold-check");
 
     /**
      * Параметры команд. Их нельзя считать неизвестными опциями: они не запускают
@@ -48,7 +49,7 @@ public class CliMode {
     private static final Set<String> PARAMS = Set.of(
             "symbol", "symbols", "hours", "from", "to", "interval",
             "out", "table", "bucket-seconds", "days", "edge", "up", "down", "flat",
-            "journal", "offset", "model", "offsets", "share-cap", "levels", "level-step", "size-mult", "outer-first", "inner-first", "lots", "thin", "dyn-offset", "cap-usd", "from-dir", "stand-db");
+            "journal", "offset", "model", "offsets", "share-cap", "levels", "level-step", "size-mult", "outer-first", "inner-first", "lots", "thin", "dyn-offset", "cap-usd", "from-dir", "stand-db", "sigma", "offset-bp");
 
     private final boolean scheduleMode;
     private final Set<String> unknownOptions;

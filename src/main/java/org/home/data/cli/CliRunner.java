@@ -85,6 +85,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.sim.RegimeFrequencyReport> regimeReport;
     private final ObjectProvider<org.home.data.revx.exec.Executor> executor;
     private final ObjectProvider<org.home.data.revx.exec.ExecReport> execReport;
+    private final ObjectProvider<org.home.data.revx.exec.HoldCheck> holdCheck;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
     /** Кого наблюдает сводный бот: метка:пара:путь. */
@@ -110,6 +111,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.sim.RegimeFrequencyReport> regimeReport,
                      ObjectProvider<org.home.data.revx.exec.Executor> executor,
                      ObjectProvider<org.home.data.revx.exec.ExecReport> execReport,
+                     ObjectProvider<org.home.data.revx.exec.HoldCheck> holdCheck,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols,
                      @Value("${revx.info.bots}") List<String> infoBots) {
@@ -142,6 +144,7 @@ public class CliRunner implements ApplicationRunner {
         this.regimeReport = regimeReport;
         this.executor = executor;
         this.execReport = execReport;
+        this.holdCheck = holdCheck;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
         this.infoBots = infoBots;
@@ -325,6 +328,20 @@ public class CliRunner implements ApplicationRunner {
                         args.containsOption("offset")
                                 ? Double.valueOf(firstOr(args, "offset", "0")) : null,
                         firstOr(args, "out", "reports/revx_exec.md"));
+            }
+            if (args.containsOption("revx-hold-check")) {
+                long to = java.time.Instant.parse(firstOr(args, "to",
+                        java.time.Instant.now().toString())).toEpochMilli();
+                long hours = Long.parseLong(firstOr(args, "hours", "24"));
+                holdCheck.getObject().run(
+                        firstOr(args, "journal", "state/exec.db"),
+                        args.containsOption("from")
+                                ? java.time.Instant.parse(firstOr(args, "from", "")).toEpochMilli()
+                                : to - hours * 3_600_000L,
+                        to,
+                        Double.parseDouble(firstOr(args, "sigma", "0")),
+                        Double.parseDouble(firstOr(args, "offset-bp", "0")),
+                        firstOr(args, "out", "reports/revx_hold.md"));
             }
             if (args.containsOption("revx-mirror")) {
                 revx.getObject().mirror(
