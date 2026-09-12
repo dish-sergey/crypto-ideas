@@ -204,7 +204,7 @@ public final class FlowMarkout {
         sb.append("«доля покупок» — предохранитель от беты: сильный перекос значит, что\n");
         sb.append("кривая меряет направление рынка, а не отбор.\n");
 
-        sb.append(payPerRisk(prints, days, fair));
+        sb.append(payPerRisk(prints, days, fair, halfSpread(book)));
         sb.append(kappa(lambda, days));
         sb.append(rollingKappa(prints, days, from, to));
         sb.append(slices(prints, fair));
@@ -312,7 +312,7 @@ public final class FlowMarkout {
      * лот у нас один, могут только ухудшить.
      */
     private static String payPerRisk(List<Print> prints, double days,
-                                     TreeMap<Long, Double> fair) {
+                                     TreeMap<Long, Double> fair, double halfSpreadBp) {
         double sigma = volBpPerMin(fair);
         if (!(sigma > 0)) {
             return "\nотношение по ленте: волатильности не хватило данных\n";
@@ -341,7 +341,7 @@ public final class FlowMarkout {
         sb.append("⚠️ ожидание круга = 1/λ_бид + 1/λ_аск: нужны обе ноги.\n");
         sb.append("Это ВЕРХНЯЯ оценка — предполагает, что до нас доходит каждое событие.\n");
         sb.append(skewSweep(prints, days, sigma));
-        sb.append(askSchedule(prints, days, sigma));
+        sb.append(askSchedule(prints, days, sigma, halfSpreadBp));
         return sb.toString();
     }
 
@@ -394,7 +394,8 @@ public final class FlowMarkout {
      * «сколько ждать и сколько взять», а не «куда пойдёт рынок» — и это верно:
      * риск уже учтён через σ√T.
      */
-    private static String askSchedule(List<Print> prints, double days, double sigma) {
+    private static String askSchedule(List<Print> prints, double days, double sigma,
+                                      double halfSpreadBp) {
         // λ_аск(δ) по сетке: сколько событий в сутки дотягивается до δ со
         // стороны покупателя (он бьёт наш аск).
         TreeMap<Double, Double> lam = new TreeMap<>();
@@ -471,7 +472,8 @@ public final class FlowMarkout {
         }
         sb.append("  ⚠️ захват круга = бид 8 + средний аск В МОМЕНТ исполнения.\n");
         sb.append("  Затухание платит захватом за время: вопрос в том, что дешевле.\n");
-        sb.append(ladder(lam, tBid, dBid, sigma));
+        sb.append(ladder(lam, tBid, dBid, sigma, prints, days));
+        sb.append(takerExit(lam, tBid, dBid, sigma, halfSpreadBp));
         return sb.toString();
     }
 
@@ -498,7 +500,7 @@ public final class FlowMarkout {
      * рядом со средним печатается и хвост.
      */
     private static String ladder(TreeMap<Double, Double> lam, double tBid, double dBid,
-                                 double sigma) {
+                                 double sigma, List<Print> prints, double days) {
         record Rung(String name, double[] levels) {
         }
         List<Rung> rungs = List.of(
@@ -534,7 +536,144 @@ public final class FlowMarkout {
         }
         sb.append("  ⚠️ «худший ур.» — ожидание самого дальнего уровня: он и создаёт хвост,\n");
         sb.append("  потому что его доля позиции стареет дольше всех.\n");
+        sb.append(sweepThroughput(prints, days));
         return sb.toString();
+    }
+
+    /**
+     * 🔑 ГДЕ ЛЕСТНИЦА ВЫИГРЫВАЕТ: СВИПЫ.
+     *
+     * <h2>Чего не видит расчёт выше</h2>
+     *
+     * В {@link #ladder} уровни считаются независимыми пуассоновскими событиями,
+     * и по выпуклости лестница обязана проигрывать. Но исполнение у нас идёт
+     * СВИПАМИ: одна рыночная заявка разметает несколько уровней разом. Одиночная
+     * заявка возьмёт с такого события ОДИН лот, а лестница — все уровни, до
+     * которых свип дотянулся.
+     *
+     * Это и есть «бонус», про который спрашивает владелец, и он НЕ случайность:
+     * он считается из распределения глубины событий, которое уже измерено.
+     *
+     * <h2>Что печатается</h2>
+     *
+     * Для каждой раскладки — сколько лотов в сутки она снимет и какой захват
+     * соберёт, если считать, что событие глубиной {@code d} исполняет ВСЕ уровни
+     * с {@code δ ≤ d}.
+     *
+     * ⚠️ Это верхняя оценка пропускной способности: она требует, чтобы на каждом
+     * уровне лежал лот, то есть чтобы инвентаря и потолка хватало. Когда потолок
+     * связывает, лестница вырождается обратно в одиночную заявку.
+     *
+     * ⚠️ И это ДРУГОЙ вопрос, чем отношение захват/риск. Там сравнивался один
+     * круг, здесь — оборот за сутки. Лестница может проигрывать по риску на лот и
+     * выигрывать по обороту; что важнее, зависит от того, упёрты ли мы в потолок
+     * инвентаря или в бюджет постановок.
+     */
+    private static String sweepThroughput(List<Print> prints, double days) {
+        record Rung(String name, double[] levels) {
+        }
+        List<Rung> rungs = List.of(
+                new Rung("1 уровень: 8", new double[]{8}),
+                new Rung("1 уровень: 10", new double[]{10}),
+                new Rung("2 уровня: 6, 10", new double[]{6, 10}),
+                new Rung("3 уровня: 6, 8, 10", new double[]{6, 8, 10}),
+                new Rung("3 уровня: 6, 10, 14", new double[]{6, 10, 14}),
+                new Rung("5 уровней: 4..12 шагом 2", new double[]{4, 6, 8, 10, 12}));
+        // События по стороне аска (покупатель бьёт наш аск), схлопнутые в пачки.
+        List<Print> ev = events(prints, 2).stream().filter(p -> p.aggressor() > 0).toList();
+        if (ev.size() < 20) {
+            return "\n  пропускная способность: событий мало\n";
+        }
+        StringBuilder sb = new StringBuilder(
+                "\n  ПРОПУСКНАЯ СПОСОБНОСТЬ НА СВИПАХ (событие глубиной d берёт все уровни ≤ d)\n");
+        sb.append("  раскладка                   | лотов/сут | захват/сут, б.п. | лотов на событие\n");
+        for (Rung r : rungs) {
+            double lots = 0;
+            double cap = 0;
+            for (Print p : ev) {
+                for (double d : r.levels()) {
+                    if (p.distBp() >= d) {
+                        lots++;
+                        cap += d;
+                    }
+                }
+            }
+            if (lots == 0) {
+                continue;
+            }
+            sb.append(String.format(Locale.ROOT,
+                    "  %-27s | %9.1f | %16.0f | %16.2f%n",
+                    r.name(), lots / days, cap / days, lots / ev.size()));
+        }
+        sb.append("  ⚠️ верхняя оценка: требует, чтобы на каждом уровне лежал лот. При упёртом\n");
+        sb.append("  потолке инвентаря лестница вырождается в одиночную заявку.\n");
+        return sb.toString();
+    }
+
+    /**
+     * ТЕЙКЕРСКИЙ ВЫХОД ПО ТАЙМЕРУ: платим спред и комиссию, но обрезаем хвост.
+     *
+     * <h2>Чем он отличается от всего остального</h2>
+     *
+     * Все прочие политики подчиняются {@code λ(δ)} — они ЖДУТ. Тейкерский выход
+     * не ждёт вовсе: он пересекает спред и закрывает позицию немедленно. Это
+     * единственный инструмент, который ставит жёсткий потолок на время под
+     * позицией, а значит и на {@code σ√T}.
+     *
+     * <h2>Цена</h2>
+     *
+     * Мы купили на {@code δ_бид} ниже середины. Продаём по лучшему биду, то есть
+     * на полуспред ниже середины, и платим комиссию тейкера. Итог круга:
+     * {@code δ_бид − полуспред − комиссия}, и это ОТРИЦАТЕЛЬНО при наших числах.
+     *
+     * ⚠️ Комиссия тейкера ~9 б.п. со слов владельца; в наших данных её нет,
+     * потому что мы никогда не тейкали (задача A17). Проверить по тарифам.
+     */
+    private static String takerExit(TreeMap<Double, Double> lam, double tBid, double dBid,
+                                    double sigma, double halfSpreadBp) {
+        double fee = 9.0;
+        double dAsk = 8;
+        StringBuilder sb = new StringBuilder(String.format(Locale.ROOT,
+                "%n  ТЕЙКЕРСКИЙ ВЫХОД ПО ТАЙМЕРУ (полуспред %.1f б.п. + комиссия %.0f)%n",
+                halfSpreadBp, fee));
+        sb.append("  таймер | успели мейкером | захват | всего T | риск | ЗАХВ/РИСК\n");
+        double rate = lambdaAt(lam, dAsk) / 1440.0;
+        double takerCap = dBid - halfSpreadBp - fee;
+        for (double tMax : new double[]{5, 10, 20, 30, 60, 120, 1e9}) {
+            double pMaker = 1 - Math.exp(-rate * tMax);
+            // Среднее время исполнения мейкером ПРИ УСЛОВИИ, что успели.
+            double eTmaker = rate > 0
+                    ? (1 - Math.exp(-rate * tMax) * (1 + rate * tMax)) / (rate * pMaker)
+                    : tMax;
+            double askT = pMaker * eTmaker + (1 - pMaker) * tMax;
+            double cap = pMaker * (dBid + dAsk) + (1 - pMaker) * takerCap;
+            double totT = tBid + askT;
+            double risk = sigma * Math.sqrt(totT);
+            sb.append(String.format(Locale.ROOT,
+                    "  %6s | %14.0f%% | %6.1f | %6.0f м | %4.1f | %9.2f%n",
+                    tMax > 1e8 ? "нет" : String.format(Locale.ROOT, "%.0f м", tMax),
+                    100 * pMaker, cap, totT, risk, cap / risk));
+        }
+        sb.append("  ⚠️ тейкерский круг даёт ОТРИЦАТЕЛЬНЫЙ захват "
+                + String.format(Locale.ROOT, "%.1f", takerCap) + " б.п.:\n");
+        sb.append("  мы платим спред и комиссию за то, чтобы не ждать.\n");
+        return sb.toString();
+    }
+
+    /** Медианный полуспред книги, б.п. — цена пересечения для тейкера. */
+    private static double halfSpread(TreeMap<Long, Top> book) {
+        List<Double> v = new ArrayList<>();
+        for (Top t : book.values()) {
+            double mid = t.mid();
+            if (mid > 0 && t.ask() > t.bid()) {
+                v.add(1e4 * (t.ask() - t.bid()) / 2 / mid);
+            }
+        }
+        if (v.isEmpty()) {
+            return 0;
+        }
+        java.util.Collections.sort(v);
+        return v.get(v.size() / 2);
     }
 
     /** {@code λ} на произвольном δ — логарифмическая интерполяция по сетке. */
