@@ -60,4 +60,50 @@ class AskDecayTest {
         assertEquals(99.88, after.bid(), 1e-9);
         assertEquals(100.06, after.ask(), 1e-9);
     }
+
+    /**
+     * 🔑 ВОЗРАСТ ЛОТА, А НЕ ПОЗИЦИИ. Первая версия 12.09.2026 считала время с
+     * момента, когда счёт перестал быть пустым, — и при непустом счёте 71%
+     * времени аск оказывался прижат к справедливой цене навсегда (обход дал
+     * −238% годовых против −15%). Здесь проверяется правило очереди: продажа
+     * съедает партии с ГОЛОВЫ, и головная отметка — возраст того, что держим
+     * дольше всего.
+     */
+    @Test
+    void oldestLotAgeSurvivesTurnover() {
+        java.util.Deque<double[]> lots = new java.util.ArrayDeque<>();
+        lots.addLast(new double[]{0, 1});          // купили в 0
+        lots.addLast(new double[]{10, 1});         // купили в 10
+        lots.addLast(new double[]{20, 1});         // купили в 20
+        sell(lots, 1);                             // продали один — ушёл самый старый
+        assertEquals(10.0, lots.peekFirst()[0], 1e-9);
+        sell(lots, 1);
+        assertEquals(20.0, lots.peekFirst()[0], 1e-9);
+    }
+
+    /** Продажа крупнее партии съедает несколько подряд. */
+    @Test
+    void oneSellEatsSeveralLots() {
+        java.util.Deque<double[]> lots = new java.util.ArrayDeque<>();
+        lots.addLast(new double[]{0, 1});
+        lots.addLast(new double[]{10, 1});
+        lots.addLast(new double[]{20, 1});
+        sell(lots, 2.5);
+        assertEquals(20.0, lots.peekFirst()[0], 1e-9);
+        assertEquals(0.5, lots.peekFirst()[1], 1e-9);
+    }
+
+    /** Та же арифметика, что в {@code QuoteLoop.applyFill}. */
+    private static void sell(java.util.Deque<double[]> lots, double qty) {
+        double left = qty;
+        while (left > 1e-15 && !lots.isEmpty()) {
+            double[] head = lots.peekFirst();
+            double take = Math.min(left, head[1]);
+            head[1] -= take;
+            left -= take;
+            if (head[1] <= 1e-15) {
+                lots.pollFirst();
+            }
+        }
+    }
 }

@@ -5,6 +5,8 @@ import org.home.data.revx.sim.Side;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -510,11 +512,11 @@ public final class QuoteLoop implements Runnable {
      * поведение в точности прежнее. В бой — только после обхода на двух окнах.
      */
     private Quoter.Quotes decayAsk(Quoter.Quotes target, double price, double offset) {
-        if (ASK_DECAY_MIN <= 0 || positionOpenedMs <= 0
+        if (ASK_DECAY_MIN <= 0 || lotAges.isEmpty()
                 || !target.hasAsk() || !(target.ask() > 0) || !(price > 0)) {
             return target;
         }
-        double ageMin = (clock.now() - positionOpenedMs) / 60_000.0 - ASK_DECAY_AFTER;
+        double ageMin = (clock.now() - lotAges.peekFirst()[0]) / 60_000.0 - ASK_DECAY_AFTER;
         if (ageMin <= 0) {
             return target;
         }
@@ -552,8 +554,14 @@ public final class QuoteLoop implements Runnable {
     private static final double ASK_DECAY_FLOOR =
             Double.parseDouble(System.getProperty("revx.sim.ask-decay-floor", "0"));
 
-    /** Когда счёт перестал быть пустым; 0 — позиции нет. */
-    private long positionOpenedMs;
+    /**
+     * Очередь партий FIFO: {@code {отметка покупки, остаток количества}}.
+     *
+     * Нужна ровно для одного — возраста САМОГО СТАРОГО удерживаемого лота.
+     * Полноценный учёт партий живёт в {@link FifoLedger}, но он строится по
+     * журналу и котировщику недоступен на горячем пути.
+     */
+    private final Deque<double[]> lotAges = new ArrayDeque<>();
 
     private Quoter.Quotes pullFirstLot(Quoter.Quotes target, double price) {
         double firstLotBp = Double.parseDouble(
@@ -2964,20 +2972,38 @@ public final class QuoteLoop implements Runnable {
         if (!ownPosition) {
             return;
         }
-        boolean wasFlat = Math.abs(inventory) < dust;
         inventory += side.sign() * qty;
         if (Math.abs(inventory) < dust) {
             // Пыль ниже половины шага количества — не позиция, а ошибка сложения.
             inventory = 0;
         }
-        // ВОЗРАСТ ПОЗИЦИИ. Хвост убытка создаётся не размером позиции, а её
-        // временем под риском (A27), и скос по построению видит только размер.
-        // Отсчёт идёт от момента, когда счёт перестал быть пустым, и сбрасывается
-        // при возврате в ноль: «сколько уже держим то, что держим».
-        if (wasFlat && inventory != 0) {
-            positionOpenedMs = clock.now();
-        } else if (inventory == 0) {
-            positionOpenedMs = 0;
+        // ⚠️ ВОЗРАСТ САМОГО СТАРОГО ЛОТА, А НЕ ПОЗИЦИИ. Разница решающая, и первая
+        // версия 12.09.2026 была написана неверно: она считала время с момента,
+        // когда счёт перестал быть пустым. При потолке в семь лотов бот непустой
+        // 71% времени, лоты внутри оборачиваются, а «возраст позиции» растёт
+        // часами — и придвижение аска, включённое по нему, прижимало аск к
+        // справедливой цене навсегда. Обход показал −238% годовых против −15%.
+        //
+        // Замысел был про ЛОТ: «купили что-то и не разгрузились за N минут».
+        // Поэтому здесь очередь FIFO из отметок покупок: продажа съедает её с
+        // головы, и головная отметка и есть возраст того, что мы держим дольше
+        // всего.
+        if (side == Side.BUY) {
+            lotAges.addLast(new double[]{clock.now(), qty});
+        } else {
+            double left = qty;
+            while (left > 1e-15 && !lotAges.isEmpty()) {
+                double[] head = lotAges.peekFirst();
+                double take = Math.min(left, head[1]);
+                head[1] -= take;
+                left -= take;
+                if (head[1] <= 1e-15) {
+                    lotAges.pollFirst();
+                }
+            }
+        }
+        if (inventory == 0) {
+            lotAges.clear();
         }
         ownCash -= side.sign() * qty * price;
         journal.putState(STATE_POSITION, inventory);
