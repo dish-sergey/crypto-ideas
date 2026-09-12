@@ -204,6 +204,7 @@ public final class FlowMarkout {
         sb.append("«доля покупок» — предохранитель от беты: сильный перекос значит, что\n");
         sb.append("кривая меряет направление рынка, а не отбор.\n");
 
+        sb.append(payPerRisk(prints, days, fair));
         sb.append(kappa(lambda, days));
         sb.append(rollingKappa(prints, days, from, to));
         sb.append(slices(prints, fair));
@@ -272,6 +273,161 @@ public final class FlowMarkout {
             n++;
         }
         return n == 0 ? null : sum / n;
+    }
+
+    /**
+     * ПЛАТЯТ ЛИ ЗА РИСК — ПО ЛЕНТЕ, без единой сделки.
+     *
+     * <h2>Чем это лучше замера по нашим кругам</h2>
+     *
+     * Отношение {@code 2δ / σ√T} мы до сих пор считали по ЗАКРЫТЫМ парам живого
+     * бота. У такого замера три беды, и все уходят здесь:
+     * <ul>
+     *   <li>он зависит от нашего инвентаря, скоса и потолка — то есть меряет не
+     *       площадку, а конкретную настройку;</li>
+     *   <li>позиции, которые ВИСЯТ до сих пор, в него не попадают, а они и есть
+     *       худшие: время под риском systematically занижено;</li>
+     *   <li>наблюдений мало — у BTC 88 кругов в сутки против 925 принтов.</li>
+     * </ul>
+     *
+     * <h2>Как считается</h2>
+     *
+     * Круг требует исполнения на ОБЕИХ сторонах: сначала одна нога, потом
+     * противоположная. Ожидание каждой — величина, обратная частоте событий,
+     * дотянувшихся до δ с этой стороны:
+     *
+     * <pre>
+     *   T(δ) = 1/λ_бид(δ) + 1/λ_аск(δ)
+     *   риск = σ√T,  захват = 2δ,  отношение = 2δ / σ√T
+     * </pre>
+     *
+     * ⚠️ Стороны считаются ОТДЕЛЬНО намеренно. Если поток перекошен, одна нога
+     * ждёт дольше другой, и складывать надо именно два разных ожидания, а не
+     * удваивать одно. Замер 12.09.2026 показал, что от несмещённой середины книги
+     * поток симметричен (45–58%), но от НАШЕЙ опоры перекос доходил до 85% — то
+     * есть асимметрию создаёт смещение опоры, и она реальна для нас.
+     *
+     * ⚠️ Это ВЕРХНЯЯ оценка качества: предполагается, что до нашей заявки
+     * доходит каждое событие, дотянувшееся до δ. Очередь, видимость и то, что
+     * лот у нас один, могут только ухудшить.
+     */
+    private static String payPerRisk(List<Print> prints, double days,
+                                     TreeMap<Long, Double> fair) {
+        double sigma = volBpPerMin(fair);
+        if (!(sigma > 0)) {
+            return "\nотношение по ленте: волатильности не хватило данных\n";
+        }
+        StringBuilder sb = new StringBuilder(
+                "\nПЛАТЯТ ЛИ ЗА РИСК ПО ЛЕНТЕ (σ = " + String.format(Locale.ROOT, "%.2f", sigma)
+                        + " б.п./мин)\n");
+        sb.append("  δ,б.п. | бид/сут | аск/сут | ожидание круга | риск σ√T | захват | ЗАХВ/РИСК\n");
+        for (double dist : GRID) {
+            List<Print> ev = events(prints, dist);
+            long bid = ev.stream().filter(p -> p.aggressor() < 0).count();   // продавец бьёт наш бид
+            long ask = ev.stream().filter(p -> p.aggressor() > 0).count();
+            if (bid < 3 || ask < 3) {
+                continue;
+            }
+            double lamBid = bid / days;
+            double lamAsk = ask / days;
+            double tMin = (1 / lamBid + 1 / lamAsk) * 1440;                  // сутки → минуты
+            double risk = sigma * Math.sqrt(tMin);
+            double cap = 2 * dist;
+            sb.append(String.format(Locale.ROOT,
+                    "  %6.0f | %7.1f | %7.1f | %11.0f мин | %8.1f | %6.1f | %9.2f%s%n",
+                    dist, lamBid, lamAsk, tMin, risk, cap, cap / risk,
+                    cap / risk < 1 ? "  ⚠️" : ""));
+        }
+        sb.append("⚠️ ожидание круга = 1/λ_бид + 1/λ_аск: нужны обе ноги.\n");
+        sb.append("Это ВЕРХНЯЯ оценка — предполагает, что до нас доходит каждое событие.\n");
+        sb.append(skewSweep(prints, days, sigma));
+        return sb.toString();
+    }
+
+    /**
+     * СМЕЩЕНИЕ ОПОРЫ = РАЗНЫЕ ОТСТУПЫ НА СТОРОНАХ, и здесь оно считается по риску.
+     *
+     * <h2>Почему это одно и то же</h2>
+     *
+     * Сдвинуть опору вниз на {@code b} — значит поставить бид на {@code δ+b} от
+     * середины книги, а аск на {@code δ−b}. Никакой другой разницы нет: цена
+     * заявки определяется опорой и отступом, и их сумма — единственное, что
+     * видит рынок. Поэтому перебор по паре отступов отвечает на вопрос про
+     * смещение полностью.
+     *
+     * <h2>Почему по риску, а не по доходу</h2>
+     *
+     * По доходу смещение уже мерили (задача A13): на падающем окне оно помогает,
+     * на растущем мешает, сумма по двум режимам — ровно ноль. То есть доход
+     * показывает направленную ставку и ничего не говорит о том, лучше ли стала
+     * конструкция. Отношение захвата к риску от траектории не зависит и отвечает
+     * именно на это.
+     *
+     * ⚠️ Ожидание круга — СУММА двух ожиданий, и в ней командует бо́льшее
+     * слагаемое. Смещение делает одну ногу быстрее, другую медленнее, и
+     * медленная съедает выигрыш. Ожидать выигрыша от асимметрии поэтому не
+     * приходится — но проверить надо, интуиция в этом проекте подводила не раз.
+     */
+    private static String skewSweep(List<Print> prints, double days, double sigma) {
+        double[] biases = {0, 1, 2, 3, 4, 6};
+        double[] bases = {6, 8, 10, 12};
+        StringBuilder sb = new StringBuilder(
+                "\n  СМЕЩЕНИЕ ОПОРЫ: бид на δ+b, аск на δ−b (b вниз), отношение захв/риск\n");
+        sb.append("  база δ |");
+        for (double b : biases) {
+            sb.append(String.format(Locale.ROOT, " b=%-4.0f|", b));
+        }
+        sb.append('\n');
+        for (double base : bases) {
+            sb.append(String.format(Locale.ROOT, "  %6.0f |", base));
+            for (double b : biases) {
+                double dBid = base + b;
+                double dAsk = base - b;
+                if (dAsk < 1) {
+                    sb.append("   —   |");
+                    continue;
+                }
+                long nb = events(prints, dBid).stream().filter(p -> p.aggressor() < 0).count();
+                long na = events(prints, dAsk).stream().filter(p -> p.aggressor() > 0).count();
+                if (nb < 3 || na < 3) {
+                    sb.append("   —   |");
+                    continue;
+                }
+                double tMin = (days / nb + days / na) * 1440;
+                double risk = sigma * Math.sqrt(tMin);
+                // Захват круга — сумма обоих отступов: сколько мы взяли на
+                // покупке плюс сколько на продаже. Смещение её не меняет.
+                double cap = dBid + dAsk;
+                sb.append(String.format(Locale.ROOT, " %5.2f |", risk > 0 ? cap / risk : 0));
+            }
+            sb.append('\n');
+        }
+        sb.append("  ⚠️ захват круга (δ_бид + δ_аск) от смещения НЕ зависит — меняется только\n");
+        sb.append("  ожидание. Если лучший столбец b=0, асимметрия бесполезна и по риску тоже.\n");
+        return sb.toString();
+    }
+
+    /** СКО минутных приращений опоры, б.п. — та же величина, что в обходе. */
+    private static double volBpPerMin(TreeMap<Long, Double> fair) {
+        TreeMap<Long, Double> byMin = new TreeMap<>();
+        for (Map.Entry<Long, Double> e : fair.entrySet()) {
+            byMin.putIfAbsent(e.getKey() / 60_000, e.getValue());
+        }
+        List<Double> d = new ArrayList<>();
+        Long pk = null;
+        double pv = 0;
+        for (Map.Entry<Long, Double> e : byMin.entrySet()) {
+            if (pk != null && e.getKey() - pk == 1 && pv > 0) {
+                d.add(1e4 * (e.getValue() - pv) / pv);
+            }
+            pk = e.getKey();
+            pv = e.getValue();
+        }
+        if (d.size() < 10) {
+            return 0;
+        }
+        double m = d.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+        return Math.sqrt(d.stream().mapToDouble(x -> (x - m) * (x - m)).sum() / d.size());
     }
 
     /**
