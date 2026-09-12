@@ -154,6 +154,7 @@ public class HoldCheck {
 
         sb.append(little(journalPath, fills, fromMs, toMs, fifoMedian, fifoMean));
         sb.append(ratio(sigmaBpPerMin, offsetBp, fifoMedian, fifoMean));
+        sb.append(skew(journalPath, fromMs, toMs));
 
         write(out, sb.toString());
         log.info("\n{}", sb);
@@ -318,6 +319,151 @@ public class HoldCheck {
                 .append("исходу — круг длинный ИМЕННО потому, что цена ушла и встречная\n")
                 .append("заявка не исполнилась. Поэтому σ√T по медиане — верхняя оценка\n")
                 .append("отношения, а не его значение.\n");
+        return sb.toString();
+    }
+
+    /**
+     * КУДА СКОС ДВИГАЕТ ЦЕНУ НА САМОМ ДЕЛЕ — по живым тикам, а не по замыслу.
+     *
+     * Формула ({@code Quoter.skew} и {@code Quoter.quote}):
+     * <pre>
+     * skew = (инвентарь/потолок − цель) / max(цель, 1−цель),  зажат в [−1, 1]
+     * бид  = fair · (1 − отступ − k·skew)      → расстояние бида = отступ + k·skew
+     * аск  = fair · (1 + отступ − k·skew)      → расстояние аска = отступ − k·skew
+     * </pre>
+     *
+     * ⚠️ Скос вычитается из ОБЕИХ цен, поэтому НИЖЕ цели он работает не
+     * разгрузкой, а ПРИМАНКОЙ: {@code skew} отрицателен, бид подтягивается к
+     * справедливой цене, аск от неё отодвигается. Задуман он был как страховка
+     * от переполнения, а бо́льшую часть времени бот находится ниже цели, и
+     * действие у него ровно обратное задуманному.
+     *
+     * Цена вопроса зависит от цели квадратично через знаменатель: при цели 0.3
+     * пустой бот даёт {@code skew = −0.43}, при цели 0.5 — {@code −1.0}, то есть
+     * притягивание вдвое сильнее. Это важно, потому что боты d, e, f работают
+     * с целью 0.5 и самыми узкими отступами (6–8 б.п.).
+     *
+     * Графа «бид выше fair» — доля тиков, где {@code отступ + k·skew < 0}, то
+     * есть котировщик целится покупать ДОРОЖЕ справедливой цены, и от сделки
+     * по такой цене спасает только зажим по книге.
+     */
+    private String skew(String journalPath, long fromMs, long toMs) {
+        org.home.data.revx.replay.BootParams bp;
+        try (ExecJournal j = ExecJournal.readOnly(journalPath)) {
+            ExecJournal.Boot boot = j.lastBoot();
+            bp = boot == null ? null : org.home.data.revx.replay.BootParams.parse(boot.detail());
+        }
+        if (bp == null || !(bp.inventoryCap() > 0)) {
+            return "\n## Скос\n\nв журнале нет события `boot` с машинной частью — настройки неизвестны\n";
+        }
+        double cap = bp.inventoryCap();
+        double target = bp.skewTarget();
+        double k = bp.skewK();
+        double offBp = bp.offset() * 10_000;
+        double span = Math.max(target, 1 - target);
+
+        long ticks = 0;
+        long below = 0;
+        long crossing = 0;
+        double shiftSum = 0;
+        List<Double> shifts = new ArrayList<>();
+        // ⚠️ ФАКТИЧЕСКИЕ ЦЕНЫ, А НЕ ВЫВЕДЕННЫЕ ИЗ ФОРМУЛЫ. Бот пишет в каждый
+        // тик и справедливую цену, и то, что он реально выставил, — значит
+        // арифметику скоса можно не выводить, а СВЕРИТЬ. Если посчитанное
+        // расстояние разойдётся с записанным, ошибка в разборе, а не в боте.
+        // ⚠️ СРАВНИВАТЬ НАДО ПО ОДНИМ И ТЕМ ЖЕ ТИКАМ. Аск выставлен не всегда:
+        // при пустом инвентаре продавать нечего, и строки с ценой аска — это
+        // ровно те тики, где инвентарь ЕСТЬ, то есть где скос заведомо меньше
+        // по модулю. Считать формулу по всем тикам, а журнал по этой выборке
+        // значит сравнивать разные условия: у бота A аск есть в 42693 тиках из
+        // 83507, и «расхождение» 1.6 б.п. целиком объясняется отбором.
+        List<Double> bidBp = new ArrayList<>();
+        List<Double> askBp = new ArrayList<>();
+        List<Double> bidModel = new ArrayList<>();
+        List<Double> askModel = new ArrayList<>();
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:file:"
+                + Path.of(journalPath).toAbsolutePath() + "?mode=ro");
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT inventory, fair, bid, ask FROM exec_quote"
+                             + " WHERE ts_ms >= ? AND ts_ms < ?")) {
+            ps.setLong(1, fromMs);
+            ps.setLong(2, toMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    double fair = rs.getDouble(2);
+                    double bid = rs.getDouble(3);
+                    double ask = rs.getDouble(4);
+                    double s = Math.max(-1, Math.min(1, (rs.getDouble(1) / cap - target) / span));
+                    if (fair > 0 && bid > 0) {
+                        bidBp.add((fair - bid) / fair * 10_000);
+                        bidModel.add(offBp + k * s * 10_000);
+                    }
+                    if (fair > 0 && ask > 0) {
+                        askBp.add((ask - fair) / fair * 10_000);
+                        askModel.add(offBp - k * s * 10_000);
+                    }
+                    // Сдвиг ОБЕИХ цен: скос вычитается из них, поэтому знак
+                    // здесь обратный знаку skew. Плюс = цены вверх = набор.
+                    double shiftBp = -k * s * 10_000;
+                    ticks++;
+                    shiftSum += shiftBp;
+                    shifts.add(shiftBp);
+                    if (s < 0) {
+                        below++;
+                    }
+                    if (offBp - shiftBp < 0) {
+                        crossing++;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            return "\n## Скос\n\nне прочитались котировки: " + e.getMessage() + "\n";
+        }
+        if (ticks == 0) {
+            return "\n## Скос\n\nнет тиков в окне\n";
+        }
+        Collections.sort(shifts);
+        StringBuilder sb = new StringBuilder("\n## Скос: куда он двигает цену на живых тиках\n\n");
+        sb.append(String.format(Locale.ROOT,
+                "настройка: отступ %.1f б.п., k = %.4f, цель %.0f%% потолка "
+                        + "(знаменатель %.2f)%n%n", offBp, k, target * 100, span));
+        sb.append(String.format(Locale.ROOT,
+                "| величина | значение |%n|---|---:|%n"
+                        + "| тиков в окне | %d |%n"
+                        + "| **доля времени НИЖЕ цели (скос = приманка)** | **%.0f%%** |%n"
+                        + "| сдвиг обеих цен: медиана | %+.2f б.п. |%n"
+                        + "| сдвиг: 10%% / 90%% | %+.2f / %+.2f б.п. |%n"
+                        + "| среднее расстояние бида от fair | %.2f б.п. |%n"
+                        + "| среднее расстояние аска от fair | %.2f б.п. |%n"
+                        + "| ⚠️ бид целится ВЫШЕ справедливой цены | %.1f%% тиков |%n",
+                ticks, 100.0 * below / ticks,
+                quantile(shifts, 0.5), quantile(shifts, 0.1), quantile(shifts, 0.9),
+                offBp - shiftSum / ticks, offBp + shiftSum / ticks,
+                100.0 * crossing / ticks));
+        sb.append("\nПлюс в сдвиге = обе цены идут ВВЕРХ, то есть бот НАБИРАЕТ: бид ближе к\n")
+                .append("справедливой цене, аск дальше. Минус = разгрузка. Задуман скос ради\n")
+                .append("второго, а живёт бот преимущественно в первом.\n");
+
+        Collections.sort(bidBp);
+        Collections.sort(askBp);
+        Collections.sort(bidModel);
+        Collections.sort(askModel);
+        sb.append("\n**Сверка с фактически выставленными ценами** — по ОДНИМ И ТЕМ ЖЕ тикам:\n\n");
+        sb.append(String.format(Locale.ROOT,
+                "| сторона | формула (медиана) | журнал (медиана) | тиков с ценой | доля тиков |%n"
+                        + "|---|---:|---:|---:|---:|%n"
+                        + "| бид | %s б.п. | **%s** | %d | %.0f%% |%n"
+                        + "| аск | %s б.п. | **%s** | %d | %.0f%% |%n",
+                fmt(quantile(bidModel, 0.5)), fmt(quantile(bidBp, 0.5)), bidBp.size(),
+                100.0 * bidBp.size() / ticks,
+                fmt(quantile(askModel, 0.5)), fmt(quantile(askBp, 0.5)), askBp.size(),
+                100.0 * askBp.size() / ticks));
+        sb.append("\n⚠️ Доля тиков с аском — это и есть «половина конструкции работает»:\n")
+                .append("при пустом инвентаре продавать нечего, аска в книге НЕТ, и все\n")
+                .append("средние по аску посчитаны на выборке, где инвентарь есть.\n")
+                .append("\nОстаточное расхождение формулы с журналом — зажим по книге и по тику\n")
+                .append("плюс порог перевыставления: формула отвечает «куда бот целился»,\n")
+                .append("журнал — «что стояло в книге».\n");
         return sb.toString();
     }
 
