@@ -343,7 +343,7 @@ public final class FlowMarkout {
         sb.append("Это ВЕРХНЯЯ оценка — предполагает, что до нас доходит каждое событие.\n");
         sb.append(withQueue(prints, days, sigma, book));
         sb.append(skewSweep(prints, days, sigma));
-        sb.append(askSchedule(prints, days, sigma, halfSpreadBp));
+        sb.append(askSchedule(prints, days, sigma, halfSpreadBp, fair));
         return sb.toString();
     }
 
@@ -397,7 +397,7 @@ public final class FlowMarkout {
      * риск уже учтён через σ√T.
      */
     private static String askSchedule(List<Print> prints, double days, double sigma,
-                                      double halfSpreadBp) {
+                                      double halfSpreadBp, TreeMap<Long, Double> fair) {
         // λ_аск(δ) по сетке: сколько событий в сутки дотягивается до δ со
         // стороны покупателя (он бьёт наш аск).
         TreeMap<Double, Double> lam = new TreeMap<>();
@@ -474,7 +474,7 @@ public final class FlowMarkout {
         }
         sb.append("  ⚠️ захват круга = бид 8 + средний аск В МОМЕНТ исполнения.\n");
         sb.append("  Затухание платит захватом за время: вопрос в том, что дешевле.\n");
-        sb.append(ladder(lam, tBid, dBid, sigma, prints, days));
+        sb.append(ladder(lam, tBid, dBid, sigma, prints, days, fair));
         sb.append(takerExit(lam, tBid, dBid, sigma, halfSpreadBp));
         return sb.toString();
     }
@@ -502,7 +502,8 @@ public final class FlowMarkout {
      * рядом со средним печатается и хвост.
      */
     private static String ladder(TreeMap<Double, Double> lam, double tBid, double dBid,
-                                 double sigma, List<Print> prints, double days) {
+                                 double sigma, List<Print> prints, double days,
+                                 TreeMap<Long, Double> fairSeries) {
         record Rung(String name, double[] levels) {
         }
         List<Rung> rungs = List.of(
@@ -539,7 +540,7 @@ public final class FlowMarkout {
         }
         sb.append("  ⚠️ «худший ур.» — ожидание самого дальнего уровня: он и создаёт хвост,\n");
         sb.append("  потому что его доля позиции стареет дольше всех.\n");
-        sb.append(sweepThroughput(prints, days));
+        sb.append(sweepThroughput(prints, days, fairSeries));
         return sb.toString();
     }
 
@@ -572,7 +573,8 @@ public final class FlowMarkout {
      * выигрывать по обороту; что важнее, зависит от того, упёрты ли мы в потолок
      * инвентаря или в бюджет постановок.
      */
-    private static String sweepThroughput(List<Print> prints, double days) {
+    private static String sweepThroughput(List<Print> prints, double days,
+                                          TreeMap<Long, Double> fairSeries) {
         record Rung(String name, double[] levels) {
         }
         // ⚠️ РАВНОМЕРНЫЕ против ГЕОМЕТРИЧЕСКИХ. Владелец предложил ставить каждый
@@ -597,24 +599,47 @@ public final class FlowMarkout {
         }
         StringBuilder sb = new StringBuilder(
                 "\n  ПРОПУСКНАЯ СПОСОБНОСТЬ НА СВИПАХ (событие глубиной d берёт все уровни ≤ d)\n");
-        sb.append("  раскладка                   | лотов/сут | захват/сут, б.п. | лотов на событие\n");
+        // ⚠️ ГОЛЫЙ ЗАХВАТ ОБМАНЫВАЕТ, поэтому считается и ЧИСТЫЙ результат.
+        // Глубокие свипы дают больший захват, но они же самые токсичные: у BTC
+        // c(60с) на 14 б.п. равен +26 б.п. против +5.5 на шестёрке. Дальний
+        // уровень берёт больше спреда и больше отдаёт обратно, и по одному
+        // захвату решать нельзя.
+        //
+        // Профиль размера — вопрос владельца: может, дальним уровням давать
+        // лот побольше? Довод за: они берут больше спреда. Довод против: они
+        // нагружают нас там, где поток токсичнее всего. Считаем оба.
+        sb.append("  раскладка                   | профиль | лотов/сут | захват/сут"
+                + " | ЧИСТО/сут | лотов на событие\n");
+        String[] profNames = {"ровно", "растут", "убывают"};
+        Map<Double, Double> costCache = new LinkedHashMap<>();
         for (Rung r : rungs) {
-            double lots = 0;
-            double cap = 0;
-            for (Print p : ev) {
-                for (double d : r.levels()) {
-                    if (p.distBp() >= d) {
-                        lots++;
-                        cap += d;
+            for (int pi = 0; pi < profNames.length; pi++) {
+                if (r.levels().length == 1 && pi > 0) {
+                    continue;                     // у одного уровня профиля нет
+                }
+                double[] w = weights(r.levels().length, pi);
+                double lots = 0;
+                double cap = 0;
+                double net = 0;
+                for (Print p : ev) {
+                    for (int i = 0; i < r.levels().length; i++) {
+                        double d = r.levels()[i];
+                        if (p.distBp() >= d) {
+                            double c = costCache.computeIfAbsent(d, k -> costAt(ev, k, fairSeries));
+                            lots += w[i];
+                            cap += w[i] * d;
+                            net += w[i] * (d - c);
+                        }
                     }
                 }
+                if (lots == 0) {
+                    continue;
+                }
+                sb.append(String.format(Locale.ROOT,
+                        "  %-27s | %-7s | %9.1f | %10.0f | %9.0f | %16.2f%n",
+                        pi == 0 ? r.name() : "", profNames[pi], lots / days, cap / days,
+                        net / days, lots / ev.size()));
             }
-            if (lots == 0) {
-                continue;
-            }
-            sb.append(String.format(Locale.ROOT,
-                    "  %-27s | %9.1f | %16.0f | %16.2f%n",
-                    r.name(), lots / days, cap / days, lots / ev.size()));
         }
         sb.append("  ⚠️ верхняя оценка: требует, чтобы на каждом уровне лежал лот. При упёртом\n");
         sb.append("  потолке инвентаря лестница вырождается в одиночную заявку.\n");
@@ -708,6 +733,41 @@ public final class FlowMarkout {
         }
         java.util.Collections.sort(v);
         return v.get(v.size() / 2);
+    }
+
+    /**
+     * Доли капитала по уровням: ровно, растущие к дальним, убывающие.
+     *
+     * Сумма всегда единица — сравнивается ФОРМА раскладки при одном капитале, а
+     * не размер. Множитель 1.5 взят как заметный, но не крайний: при большем
+     * профиль вырождается в «весь капитал на один уровень», а это уже не
+     * лестница.
+     */
+    static double[] weights(int n, int profile) {
+        double[] w = new double[n];
+        double sum = 0;
+        for (int i = 0; i < n; i++) {
+            w[i] = switch (profile) {
+                case 1 -> Math.pow(1.5, i);       // растут к дальним уровням
+                case 2 -> Math.pow(1.5, n - 1 - i); // убывают
+                default -> 1;
+            };
+            sum += w[i];
+        }
+        for (int i = 0; i < n; i++) {
+            w[i] /= sum;
+        }
+        return w;
+    }
+
+    /**
+     * Стоимость отбора на расстоянии δ, горизонт 60 с — по событиям, дошедшим
+     * до δ. Та же величина, что в главной кривой, только запрашиваемая точечно.
+     */
+    private static double costAt(List<Print> ev, double dist, TreeMap<Long, Double> fair) {
+        List<Print> reach = ev.stream().filter(p -> p.distBp() >= dist).toList();
+        Double c = reach.isEmpty() ? null : cost(reach, fair, 60_000);
+        return c == null ? 0 : c;
     }
 
     /** {@code λ} на произвольном δ — логарифмическая интерполяция по сетке. */
