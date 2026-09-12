@@ -208,7 +208,92 @@ public final class StandFair implements FairSource {
                     (q[0] - q[1]) / midQ, (u[0] - u[1]) / midU, q[1], q[0], q[5], q[6], 0));
         }
         out.sort(java.util.Comparator.comparingLong(Slice::recvMs));
-        return smooth(out);
+        double freezeSec = Double.parseDouble(
+                System.getProperty("revx.fair.freeze-sec", "0"));
+        double smoothSec = Double.parseDouble(
+                System.getProperty("revx.fair.smooth-sec", "0"));
+        if (freezeSec > 0 && smoothSec > 0) {
+            throw new IllegalStateException(
+                    "revx.fair.freeze-sec и revx.fair.smooth-sec пишут в ОДНО поле "
+                            + "альтернативной опоры: включать можно только одно");
+        }
+        return freezeSec > 0
+                ? freeze(out, tradeTimes(c, b + "/USDC", fromMs, toMs), (long) (freezeSec * 1000))
+                : smooth(out);
+    }
+
+    /** Отметки сделок пары: вход для замороженной опоры. */
+    private static List<Long> tradeTimes(Connection c, String symbol, long from, long to) {
+        List<Long> out = new ArrayList<>();
+        String sql = "SELECT ts_ms FROM revx_trade WHERE symbol = ? AND ts_ms >= ? "
+                + "AND ts_ms <= ? ORDER BY ts_ms";
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, symbol);
+            ps.setLong(2, from);
+            ps.setLong(3, to);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(rs.getLong(1));
+                }
+            }
+        } catch (Exception e) {
+            log.error("не прочитались сделки {}: {}", symbol, e.getMessage());
+        }
+        return out;
+    }
+
+    /**
+     * ЗАМОРОЖЕННАЯ СЕРЕДИНА: опора не двигается {@code N} секунд после принта.
+     *
+     * <h2>Какой вопрос она решает</h2>
+     *
+     * К 12.09.2026 три объяснения преимущества межплощадочной опоры проверены и
+     * отвергнуты (ширина, асимметрия, вес микроцены), и оставалось одно —
+     * «в медиане по 23 активам есть межрыночная ИНФОРМАЦИЯ». Но список был
+     * неполон, и четвёртый механизм не требует никакой информации:
+     * **невосприимчивость к собственному потоку пары**.
+     *
+     * Середина книги механически двигается тем самым потоком, который нас
+     * исполняет: свип сносит биды → середина падает → котировка, привязанная к
+     * середине, уезжает вниз НАВСТРЕЧУ свипу. Медиана по 23 парам от свипа на
+     * ЭТОЙ паре не двигается, поэтому наш бид остаётся на месте.
+     *
+     * Замороженная середина даёт ровно это и НЕ даёт межрыночной информации.
+     * Значит опыт разделяющий: если она воспроизводит преимущество —
+     * дело в обратной связи; если нет — в медиане действительно есть сигнал.
+     *
+     * <h2>Как считается</h2>
+     *
+     * На приход принта опора фиксируется на значении, которое было ДО него, и
+     * держится {@code N} секунд. Новый принт внутри окна продлевает заморозку,
+     * но НЕ меняет удерживаемое значение: иначе пачка принтов одного свипа
+     * протащила бы опору за собой по шагу, то есть вернула бы ровно ту обратную
+     * связь, которую опыт убирает.
+     */
+    private static List<Slice> freeze(List<Slice> in, List<Long> trades, long holdMs) {
+        if (in.isEmpty()) {
+            return in;
+        }
+        List<Slice> out = new ArrayList<>(in.size());
+        int t = 0;
+        double held = in.get(0).midUsdc();
+        long heldUntil = Long.MIN_VALUE;
+        double prevMid = in.get(0).midUsdc();
+        for (Slice s : in) {
+            while (t < trades.size() && trades.get(t) <= s.recvMs()) {
+                long ts = trades.get(t);
+                if (ts > heldUntil) {
+                    held = prevMid;               // значение ДО принта
+                }
+                heldUntil = ts + holdMs;
+                t++;
+            }
+            double value = s.recvMs() < heldUntil ? held : s.midUsdc();
+            out.add(new Slice(s.recvMs(), s.midUsdc(), s.midUsd(), s.spreadUsdc(),
+                    s.spreadUsd(), s.bid(), s.ask(), s.bq(), s.aq(), value));
+            prevMid = s.midUsdc();
+        }
+        return out;
     }
 
     /** {@code snap_id → [ask, bid, _, skew, recv]}. */

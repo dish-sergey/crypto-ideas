@@ -20,6 +20,8 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * ВРЕМЯ ПОД ПОЗИЦИЕЙ, СВЕРЕННОЕ ТРЕМЯ СПОСОБАМИ. Команда {@code --revx-hold-check}.
@@ -77,10 +79,25 @@ public class HoldCheck {
 
     private static final Logger log = LoggerFactory.getLogger(HoldCheck.class);
 
-    /** Закрытая пара: когда открылась, когда закрылась, была ли передачей. */
-    private record Pair(long openedMs, long closedMs, boolean handover) {
+    /**
+     * Закрытая пара: когда открылась, когда закрылась, была ли передачей.
+     *
+     * @param entry цена входной ноги, {@code exit} — выходной; нужны, чтобы
+     *        считать результат круга в базисных пунктах, а не только время
+     * @param buyFirst вход был покупкой (обычный спотовый круг)
+     */
+    private record Pair(long openedMs, long closedMs, boolean handover,
+                        double entry, double exit, boolean buyFirst) {
         double minutes() {
             return (closedMs - openedMs) / 60_000.0;
+        }
+
+        /** Результат круга, б.п.: сколько заработано на паре ног. */
+        double bp() {
+            if (!(entry > 0) || !(exit > 0)) {
+                return 0;
+            }
+            return (buyFirst ? (exit - entry) / entry : (entry - exit) / entry) * 10_000;
         }
     }
 
@@ -89,18 +106,20 @@ public class HoldCheck {
         final long tsMs;
         double qty;
         final boolean handover;
+        final double price;
 
-        Lot(long tsMs, double qty, boolean handover) {
+        Lot(long tsMs, double qty, boolean handover, double price) {
             this.tsMs = tsMs;
             this.qty = qty;
             this.handover = handover;
+            this.price = price;
         }
     }
 
     private static final double EPS = 1e-15;
 
     public void run(String journalPath, long fromMs, long toMs,
-                    double sigmaBpPerMin, double offsetBp, String out) {
+                    double sigmaBpPerMin, double offsetBp, double takerCostBp, String out) {
         List<ExecJournal.FillRow> fills;
         try (ExecJournal journal = ExecJournal.readOnly(journalPath)) {
             fills = journal.fills();
@@ -155,6 +174,7 @@ public class HoldCheck {
         sb.append(little(journalPath, fills, fromMs, toMs, fifoMedian, fifoMean));
         sb.append(ratio(sigmaBpPerMin, offsetBp, fifoMedian, fifoMean));
         sb.append(skew(journalPath, fromMs, toMs));
+        sb.append(takerExit(journalPath, fills, fromMs, toMs, takerCostBp));
 
         write(out, sb.toString());
         log.info("\n{}", sb);
@@ -183,7 +203,8 @@ public class HoldCheck {
             while (left > EPS && !open.isEmpty() && sign * mine < 0) {
                 Lot lot = fifo ? open.peekFirst() : open.peekLast();
                 double take = Math.min(left, Math.abs(lot.qty));
-                out.add(new Pair(lot.tsMs, f.tsMs(), lot.handover || f.handover()));
+                out.add(new Pair(lot.tsMs, f.tsMs(), lot.handover || f.handover(),
+                        lot.price, f.price(), lot.qty > 0));
                 lot.qty -= Math.copySign(take, lot.qty);
                 left -= take;
                 if (Math.abs(lot.qty) <= EPS) {
@@ -198,7 +219,7 @@ public class HoldCheck {
                 }
             }
             if (left > EPS) {
-                open.addLast(new Lot(f.tsMs(), mine * left, f.handover()));
+                open.addLast(new Lot(f.tsMs(), mine * left, f.handover(), f.price()));
                 sign = mine;
             }
         }
@@ -464,6 +485,110 @@ public class HoldCheck {
                 .append("\nОстаточное расхождение формулы с журналом — зажим по книге и по тику\n")
                 .append("плюс порог перевыставления: формула отвечает «куда бот целился»,\n")
                 .append("журнал — «что стояло в книге».\n");
+        return sb.toString();
+    }
+
+    /**
+     * ТЕЙКЕРСКИЙ ВЫХОД ПО ВОЗРАСТУ КРУГА, оценённый по хвосту, а не по среднему.
+     *
+     * <h2>Зачем отдельная мерка</h2>
+     *
+     * Отношение {@code 2δ/σ√T} эту конструкцию одобрить НЕ МОЖЕТ по построению,
+     * и это не мнение, а арифметика. Выход тейкером меняет ЧИСЛИТЕЛЬ (захват
+     * превращается в минус полуспред минус комиссия), а убыток, от которого он
+     * страхует, сидит в ЗНАМЕНАТЕЛЕ — в {@code σ√T}, где его уменьшение ничего
+     * не даёт. Поэтому прежний вывод «отношение растёт монотонно с таймером,
+     * оптимум — не выходить вовсе» был свойством мерки, а не конструкции.
+     *
+     * Здесь считается то, ради чего выход и нужен: <b>условный убыток худших
+     * 10% кругов (CVaR)</b> и суммарный результат.
+     *
+     * <h2>Как считается</h2>
+     *
+     * Каждый круг, проживший дольше возраста {@code A}, закрывается заново — по
+     * справедливой цене в момент {@code вход + A} минус тейкерская пошлина
+     * (полуспред плюс комиссия). Круги короче {@code A} не трогаются.
+     *
+     * ⚠️ <b>Это верхняя оценка пользы.</b> Замена делается ЗАДНИМ ЧИСЛОМ на
+     * фактической истории: живой бот, закрывшись в момент {@code A}, освободил
+     * бы лот, поставил следующую заявку и дальше пошёл бы по другой траектории.
+     * Мы этого не моделируем. Читать можно ЗНАК и порядок, решать — обходом.
+     */
+    private String takerExit(String journalPath, List<ExecJournal.FillRow> fills,
+                             long fromMs, long toMs, double takerCostBp) {
+        List<Pair> pairs = new ArrayList<>();
+        for (Object o : match(fills, true, false)) {
+            Pair p = (Pair) o;
+            if (p.closedMs() >= fromMs && p.closedMs() < toMs && !p.handover()) {
+                pairs.add(p);
+            }
+        }
+        if (pairs.size() < 10) {
+            return "\n## Тейкерский выход\n\nкругов в окне меньше десяти — считать нечего\n";
+        }
+        TreeMap<Long, Double> fair = new TreeMap<>();
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:file:"
+                + Path.of(journalPath).toAbsolutePath() + "?mode=ro");
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT ts_ms, fair FROM exec_quote WHERE fair > 0 ORDER BY ts_ms");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                fair.put(rs.getLong(1), rs.getDouble(2));
+            }
+        } catch (Exception e) {
+            return "\n## Тейкерский выход\n\nне прочитались котировки: " + e.getMessage() + "\n";
+        }
+        if (fair.isEmpty()) {
+            return "\n## Тейкерский выход\n\nнет справедливых цен в журнале\n";
+        }
+
+        StringBuilder sb = new StringBuilder("\n## Тейкерский выход по возрасту круга\n\n");
+        sb.append(String.format(Locale.ROOT,
+                "тейкерская пошлина: %.1f б.п. (полуспред + комиссия)%n%n", takerCostBp));
+        sb.append("| возраст | тронуто кругов | средний круг | CVaR худших 10% | худший |\n");
+        sb.append("|---|---:|---:|---:|---:|\n");
+        double[] ages = {Double.POSITIVE_INFINITY, 120, 60, 30, 15, 5};
+        for (double ageMin : ages) {
+            List<Double> results = new ArrayList<>();
+            int touched = 0;
+            for (Pair p : pairs) {
+                Map.Entry<Long, Double> at = p.minutes() <= ageMin ? null
+                        : fair.floorEntry(p.openedMs() + (long) (ageMin * 60_000));
+                if (at == null || at.getValue() <= 0 || !(p.entry() > 0)) {
+                    results.add(p.bp());
+                    continue;
+                }
+                double moveBp = (p.buyFirst() ? at.getValue() - p.entry()
+                        : p.entry() - at.getValue()) / p.entry() * 10_000;
+                results.add(moveBp - takerCostBp);
+                touched++;
+            }
+            Collections.sort(results);
+            double sum = 0;
+            for (double v : results) {
+                sum += v;
+            }
+            int tail = Math.max(1, results.size() / 10);
+            double cvar = 0;
+            for (int i = 0; i < tail; i++) {
+                cvar += results.get(i);
+            }
+            sb.append(String.format(Locale.ROOT, "| %s | %d | %+.2f | %+.2f | %+.1f |%n",
+                    Double.isInfinite(ageMin) ? "**без выхода**"
+                            : String.format(Locale.ROOT, "%.0f мин", ageMin),
+                    touched, sum / results.size(), cvar / tail, results.get(0)));
+        }
+        sb.append(String.format(Locale.ROOT, "%nкругов в окне: %d%n", pairs.size()));
+        if (pairs.size() < 30) {
+            sb.append(String.format(Locale.ROOT,
+                    "%n⚠️ КОЛОНКУ CVaR ЧИТАТЬ НЕЛЬЗЯ: худшие 10%% — это %d круг(а),%n"
+                            + "то есть не условное среднее хвоста, а просто минимум.%n"
+                            + "Нужно хотя бы тридцать кругов в окне.%n",
+                    Math.max(1, pairs.size() / 10)));
+        }
+        sb.append("\n⚠️ Оценка ВЕРХНЯЯ: замена делается задним числом на фактической\n")
+                .append("истории, а живой бот после раннего закрытия пошёл бы по другой\n")
+                .append("траектории. Читать знак и порядок, решать обходом.\n");
         return sb.toString();
     }
 

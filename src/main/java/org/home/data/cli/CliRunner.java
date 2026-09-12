@@ -341,6 +341,10 @@ public class CliRunner implements ApplicationRunner {
                         to,
                         Double.parseDouble(firstOr(args, "sigma", "0")),
                         Double.parseDouble(firstOr(args, "offset-bp", "0")),
+                        // Полуспред 7.4 + комиссия тейкера 9 = 16.4 б.п.
+                        // ⚠️ Девять взяты СО СЛОВ владельца и по тарифам площадки
+                        // не сверены — на этом числе висит весь вывод про выход.
+                        Double.parseDouble(firstOr(args, "taker-cost-bp", "16.4")),
                         firstOr(args, "out", "reports/revx_hold.md"));
             }
             if (args.containsOption("revx-mirror")) {
