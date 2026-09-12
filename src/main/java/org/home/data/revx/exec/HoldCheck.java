@@ -174,6 +174,7 @@ public class HoldCheck {
         sb.append(little(journalPath, fills, fromMs, toMs, fifoMedian, fifoMean));
         sb.append(ratio(sigmaBpPerMin, offsetBp, fifoMedian, fifoMean));
         sb.append(skew(journalPath, fromMs, toMs));
+        sb.append(regime(journalPath, fills, fromMs, toMs, offsetBp));
         sb.append(takerExit(journalPath, fills, fromMs, toMs, takerCostBp));
 
         write(out, sb.toString());
@@ -487,6 +488,155 @@ public class HoldCheck {
                 .append("журнал — «что стояло в книге».\n");
         return sb.toString();
     }
+    /**
+     * РЕЖИМ РЫНКА: тихий против информативного.
+     *
+     * <h2>Вопрос</h2>
+     *
+     * Котировщик реагирует на «кто-то зашёл и купил немного» и на «пошёл
+     * информированный поток» одинаково: заявка стоит где стояла. Если результат
+     * в этих двух режимах разный по ЗНАКУ, то настраивать надо не отступ, а
+     * участие: в одном режиме торговать, в другом уходить.
+     *
+     * <h2>Как режим определяется</h2>
+     *
+     * По реализованной волатильности ЧАСА: СКО минутных приращений справедливой
+     * цены внутри часа. Порог адаптивный — {@code MULT} медиан по суткам, а не
+     * фиксированное число: у пар разная σ, и константа означала бы у BTC одно, а
+     * у SOL другое.
+     *
+     * ⚠️ Круг относится к режиму того часа, в котором он ЗАКРЫЛСЯ. Круги,
+     * пережившие смену режима, попадают в последний — это огрубление, и на
+     * длинных кругах оно смазывает границу.
+     *
+     * <h2>Что уже измерено (11–12.09.2026, задача A32)</h2>
+     *
+     * Бот A, четверо суток: в тихом режиме 155 кругов дали <b>+3.35 б.п.</b> в
+     * среднем, в информативном 87 кругов — <b>−17.4</b>. Подтверждается на трёх
+     * сутках из четырёх, причём двое из них (08 и 09.09) без макро-события.
+     *
+     * 🔑 И побочное, которое важнее: в информативном режиме закрывается
+     * БОЛЬШИНСТВО кругов (у бота A 43 из 50 за 11.09), хотя он занимает 4 часа
+     * из 24. Волатильность двигает справедливую цену, цена доходит до наших
+     * заявок, исполнений становится больше — то есть бот сам стягивает свою
+     * торговлю в худший режим. Отбор работает не только на сделке, но и на
+     * выборе момента.
+     */
+    private String regime(String journalPath, List<ExecJournal.FillRow> fills,
+                          long fromMs, long toMs, double offsetBp) {
+        TreeMap<Long, Double> byMinute = new TreeMap<>();
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:file:"
+                + Path.of(journalPath).toAbsolutePath() + "?mode=ro");
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT ts_ms / 60000, avg(fair) FROM exec_quote WHERE fair > 0"
+                             + " AND ts_ms >= ? AND ts_ms < ? GROUP BY 1 ORDER BY 1")) {
+            ps.setLong(1, fromMs);
+            ps.setLong(2, toMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    byMinute.put(rs.getLong(1), rs.getDouble(2));
+                }
+            }
+        } catch (Exception e) {
+            return "\n## Режим рынка\n\nне прочитались котировки: " + e.getMessage() + "\n";
+        }
+        if (byMinute.size() < 120) {
+            return "\n## Режим рынка\n\nминут в окне меньше двух часов — считать нечего\n";
+        }
+        // СКО минутных приращений внутри каждого часа.
+        Map<Long, List<Double>> byHour = new java.util.TreeMap<>();
+        Long prevKey = null;
+        double prevValue = 0;
+        for (Map.Entry<Long, Double> e : byMinute.entrySet()) {
+            if (prevKey != null && e.getKey() - prevKey == 1 && prevValue > 0) {
+                byHour.computeIfAbsent(e.getKey() / 60, k -> new ArrayList<>())
+                        .add((e.getValue() - prevValue) / prevValue * 10_000);
+            }
+            prevKey = e.getKey();
+            prevValue = e.getValue();
+        }
+        Map<Long, Double> sigma = new java.util.TreeMap<>();
+        for (Map.Entry<Long, List<Double>> e : byHour.entrySet()) {
+            if (e.getValue().size() < 20) {
+                continue;
+            }
+            double mean = 0;
+            for (double v : e.getValue()) {
+                mean += v;
+            }
+            mean /= e.getValue().size();
+            double var = 0;
+            for (double v : e.getValue()) {
+                var += (v - mean) * (v - mean);
+            }
+            sigma.put(e.getKey(), Math.sqrt(var / e.getValue().size()));
+        }
+        if (sigma.size() < 4) {
+            return "\n## Режим рынка\n\nчасов с котировками меньше четырёх\n";
+        }
+        List<Double> sorted = new ArrayList<>(sigma.values());
+        Collections.sort(sorted);
+        double median = quantile(sorted, 0.5);
+        double threshold = REGIME_MULT * median;
+
+        double[] sum = new double[2];
+        double[] hold = new double[2];
+        double[] sig = new double[2];
+        int[] cnt = new int[2];
+        for (Pair p : match(fills, true, false)) {
+            if (p.closedMs() < fromMs || p.closedMs() >= toMs || p.handover()) {
+                continue;
+            }
+            Double s = sigma.get(p.closedMs() / 3_600_000);
+            if (s == null) {
+                continue;
+            }
+            int r = s >= threshold ? 1 : 0;
+            sum[r] += p.bp();
+            hold[r] += p.minutes();
+            sig[r] += s;
+            cnt[r]++;
+        }
+        StringBuilder sb = new StringBuilder("\n## Режим рынка: тихий против информативного\n\n");
+        sb.append(String.format(Locale.ROOT,
+                "порог: %.1f × медианная часовая σ (%.2f) = **%.2f б.п./мин**; "
+                        + "часов в окне %d, из них информативных %d%n%n",
+                REGIME_MULT, median, threshold, sigma.size(),
+                sigma.values().stream().filter(v -> v >= threshold).count()));
+        sb.append("| режим | кругов | средний круг | всего | σ | держание | риск σ√T | ЗАХВ/РИСК |\n");
+        sb.append("|---|---:|---:|---:|---:|---:|---:|---:|\n");
+        for (int r = 0; r < 2; r++) {
+            if (cnt[r] == 0) {
+                continue;
+            }
+            double s = sig[r] / cnt[r];
+            double t = hold[r] / cnt[r];
+            double risk = s * Math.sqrt(t);
+            sb.append(String.format(Locale.ROOT,
+                    "| %s | %d | %+.1f | %+.1f | %.2f | %.0f мин | %.1f | %s |%n",
+                    r == 0 ? "тихий" : "**информативный**", cnt[r], sum[r] / cnt[r], sum[r],
+                    s, t, risk,
+                    offsetBp > 0 && risk > 0
+                            ? String.format(Locale.ROOT, "%.2f", 2 * offsetBp / risk) : "—"));
+        }
+        if (cnt[0] > 0 && cnt[1] > 0) {
+            sb.append(String.format(Locale.ROOT,
+                    "%nдоля кругов, закрывшихся в информативном режиме: **%.0f%%** "
+                            + "при его доле во времени %.0f%%%n",
+                    100.0 * cnt[1] / (cnt[0] + cnt[1]),
+                    100.0 * sigma.values().stream().filter(v -> v >= threshold).count()
+                            / sigma.size()));
+        }
+        sb.append("\n⚠️ Круг отнесён к режиму часа, в котором ЗАКРЫЛСЯ: круги, пережившие\n")
+                .append("смену режима, попадают в последний. На длинных кругах это смазывает\n")
+                .append("границу, и разделение надо читать как оценку, а не как разрез.\n");
+        return sb.toString();
+    }
+
+    /** Во сколько раз часовая σ должна превысить медианную, чтобы час считался информативным. */
+    private static final double REGIME_MULT =
+            Double.parseDouble(System.getProperty("revx.regime-mult", "2.0"));
+
 
     /**
      * ТЕЙКЕРСКИЙ ВЫХОД ПО ВОЗРАСТУ КРУГА, оценённый по хвосту, а не по среднему.

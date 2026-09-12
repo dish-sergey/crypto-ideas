@@ -480,6 +480,81 @@ public final class QuoteLoop implements Runnable {
      * задан: конструкция меняет риск на сделку, и включать её можно только
      * замера на обоих типах окон.
      */
+    /**
+     * ПРИДВИЖЕНИЕ АСКА ПО ВОЗРАСТУ ПОЗИЦИИ.
+     *
+     * <h2>Зачем</h2>
+     *
+     * Хвост убытка создаётся ВОЗРАСТОМ позиции, а не её размером: скос обусловлен
+     * размером и по построению возраста не видит (A28). Здесь отступ на продаже
+     * линейно стягивается к справедливой цене по мере старения лота.
+     *
+     * Замер по ленте 12.09.2026 объясняет, почему это дешевле тейкера: аск НА
+     * справедливой цене снимают за 5 минут у BTC (317 съёмов в сутки) и за 12–14
+     * у ETH и SOL, а стоит это ≈5 б.п. отбора против 16.4 б.п. тейкерской пошлины
+     * (полуспред 7.4 + комиссия 9). Разгрузиться придвижением втрое дешевле, чем
+     * ударить по рынку (A31).
+     *
+     * <h2>Правило</h2>
+     *
+     * <pre>
+     *   доля = max(floor, 1 − возраст / tau)
+     *   аск  = fair + доля · (аск_исходный − fair)
+     * </pre>
+     *
+     * То есть за {@code tau} минут аск проходит весь путь от своего отступа до
+     * {@code floor} долей от него. Бид не трогается: набирать быстрее оттого, что
+     * позиция стара, незачем.
+     *
+     * ⚠️ Ключи задают ОСЬ ОПЫТА, а не боевую настройку: по умолчанию tau = 0 и
+     * поведение в точности прежнее. В бой — только после обхода на двух окнах.
+     */
+    private Quoter.Quotes decayAsk(Quoter.Quotes target, double price, double offset) {
+        if (ASK_DECAY_MIN <= 0 || positionOpenedMs <= 0
+                || !target.hasAsk() || !(target.ask() > 0) || !(price > 0)) {
+            return target;
+        }
+        double ageMin = (clock.now() - positionOpenedMs) / 60_000.0 - ASK_DECAY_AFTER;
+        if (ageMin <= 0) {
+            return target;
+        }
+        double share = Math.max(ASK_DECAY_FLOOR, 1 - ageMin / ASK_DECAY_MIN);
+        if (share >= 1) {
+            return target;
+        }
+        double ask = price + share * (target.ask() - price);
+        return new Quoter.Quotes(target.bid(), ask);
+    }
+
+    /** За сколько минут аск доходит от своего отступа до пола; 0 — выключено. */
+    private static final double ASK_DECAY_MIN =
+            Double.parseDouble(System.getProperty("revx.sim.ask-decay-min", "0"));
+
+    /**
+     * ⚠️ СКОЛЬКО МИНУТ НЕ ТРОГАТЬ АСК ВООБЩЕ. Ключ добавлен после первого
+     * прогона 12.09.2026, где затухание считалось от момента открытия позиции и
+     * проиграло во всех клетках: BTC на свежем окне −259% годовых против −15%
+     * без затухания, доля ленты выросла с 17% до 22%.
+     *
+     * Причина в том, ЧТО с чем сравнивается. По ленте придвижение сопоставлялось
+     * с тейкерским выходом (−16.4 б.п.) и выходило втрое дешевле. Но в обходе
+     * оно сравнивается с «просто подождать на своём отступе», а большинство
+     * лотов разгружается само: продавая на справедливой цене вместо +δ, мы
+     * теряем захват на КАЖДОЙ разгрузке, а не только на застрявших.
+     *
+     * Замысел был другой — «если не разгрузились за N минут». Поэтому затухание
+     * должно включаться ПОСЛЕ порога возраста, а не с нуля.
+     */
+    private static final double ASK_DECAY_AFTER =
+            Double.parseDouble(System.getProperty("revx.sim.ask-decay-after", "0"));
+
+    /** Доля отступа, ниже которой аск не придвигается. 0 — вплоть до справедливой цены. */
+    private static final double ASK_DECAY_FLOOR =
+            Double.parseDouble(System.getProperty("revx.sim.ask-decay-floor", "0"));
+
+    /** Когда счёт перестал быть пустым; 0 — позиции нет. */
+    private long positionOpenedMs;
+
     private Quoter.Quotes pullFirstLot(Quoter.Quotes target, double price) {
         double firstLotBp = Double.parseDouble(
                 System.getProperty("revx.sim.first-lot-offset", "0"));
@@ -1395,6 +1470,7 @@ public final class QuoteLoop implements Runnable {
                 ? pressureFromRecord.applyAsDouble(clock.now()) : budgetPressure;
         target = widenForBudget(target, fair.price(), pressure);
         target = pullFirstLot(target, fair.price());
+        target = decayAsk(target, fair.price(), params.offset());
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
         //
@@ -2888,10 +2964,20 @@ public final class QuoteLoop implements Runnable {
         if (!ownPosition) {
             return;
         }
+        boolean wasFlat = Math.abs(inventory) < dust;
         inventory += side.sign() * qty;
         if (Math.abs(inventory) < dust) {
             // Пыль ниже половины шага количества — не позиция, а ошибка сложения.
             inventory = 0;
+        }
+        // ВОЗРАСТ ПОЗИЦИИ. Хвост убытка создаётся не размером позиции, а её
+        // временем под риском (A27), и скос по построению видит только размер.
+        // Отсчёт идёт от момента, когда счёт перестал быть пустым, и сбрасывается
+        // при возврате в ноль: «сколько уже держим то, что держим».
+        if (wasFlat && inventory != 0) {
+            positionOpenedMs = clock.now();
+        } else if (inventory == 0) {
+            positionOpenedMs = 0;
         }
         ownCash -= side.sign() * qty * price;
         journal.putState(STATE_POSITION, inventory);

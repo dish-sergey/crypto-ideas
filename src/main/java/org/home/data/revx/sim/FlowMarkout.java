@@ -206,6 +206,7 @@ public final class FlowMarkout {
 
         sb.append(costByHorizon(prints, fair));
         sb.append(unloadWait(prints, days, fair));
+        sb.append(afterSweep(prints, days, fair));
         sb.append(payPerRisk(prints, days, fair, halfSpread(book), book));
         sb.append(kappa(lambda, days));
         sb.append(rollingKappa(prints, days, from, to));
@@ -401,6 +402,117 @@ public final class FlowMarkout {
         sb.append("окнах: до 15 минут годны почти все клетки, после 30 минут — почти ни\n");
         sb.append("одной. Снос за два часа доходил до −27 б.п. при измеряемой величине в 8,\n");
         sb.append("то есть дальше получаса величина не «большая», а несуществующая.\n");
+        return sb.toString();
+    }
+
+    /** Свип как целое: одна рыночная заявка, разложенная на несколько принтов. */
+    private record Sweep(long tsMs, int side, double depthBp, double qty, int prints,
+                         double fair) {
+    }
+
+    /**
+     * ПОСЛЕ СВИПА: продолжение или возврат — и есть ли порог, где меняется знак.
+     *
+     * <h2>Вопрос</h2>
+     *
+     * «Кто-то зашёл и купил немного» и «пошёл информированный поток вниз» — для
+     * котировщика это два разных события, а он реагирует на них одинаково: бид
+     * стоит где стоял и ловит обе. Если мелкие свипы возвращаются, а крупные
+     * продолжаются, то существует ПОРОГ, выше которого нашу логику надо
+     * переворачивать: не подбирать, а сдавать инвентарь и отходить.
+     *
+     * <h2>Как считается</h2>
+     *
+     * Принты собираются обратно в свипы (одна отметка времени плюс окно
+     * {@link #BURST_MS}, одна сторона агрессора), у свипа берётся ГЛУБИНА —
+     * максимальное расстояние, на которое он утащил цену от справедливой. Дальше
+     * для каждой полосы глубины считается, куда ушла справедливая цена через
+     * 1/5/15/30 минут — <b>в пользу агрессора</b>.
+     *
+     * Знак читается так:
+     * <ul>
+     *   <li>плюс — цена ПРОДОЛЖИЛА движение свипа, то есть он нёс информацию, и
+     *       наша заявка на его пути была подобрана правильно им, а не нами;</li>
+     *   <li>минус — цена ВЕРНУЛАСЬ, свип был шумом, и подбирать его выгодно.</li>
+     * </ul>
+     *
+     * ⚠️ Стороны считаются ОТДЕЛЬНО, потому что общая величина на перекошенном
+     * потоке мерит снос рынка, а не свип (та же ловушка, что в {@code c(δ, H)}).
+     * Совпадение знака у обеих сторон — признак настоящего продолжения;
+     * противоположные знаки означают, что мы снова померяли направление рынка.
+     */
+    private static String afterSweep(List<Print> prints, double days,
+                                     TreeMap<Long, Double> fair) {
+        List<Sweep> sweeps = new ArrayList<>();
+        int i = 0;
+        while (i < prints.size()) {
+            Print p = prints.get(i);
+            double depth = p.distBp();
+            double qty = p.qty();
+            int n = 1;
+            int j = i + 1;
+            while (j < prints.size() && prints.get(j).aggressor() == p.aggressor()
+                    && prints.get(j).tsMs() - p.tsMs() <= BURST_MS) {
+                depth = Math.max(depth, prints.get(j).distBp());
+                qty += prints.get(j).qty();
+                n++;
+                j++;
+            }
+            sweeps.add(new Sweep(p.tsMs(), p.aggressor(), depth, qty, n, p.fair()));
+            i = j;
+        }
+        long last = fair.lastKey();
+        long[] horizons = {60_000, 300_000, 900_000, 1_800_000};
+        String[] labels = {"1м", "5м", "15м", "30м"};
+        double[] bands = {0, 4, 8, 12, 20, 1e9};
+        String[] bandNames = {"0–4", "4–8", "8–12", "12–20", "20+"};
+
+        StringBuilder sb = new StringBuilder(
+                "\nПОСЛЕ СВИПА: продолжение или возврат (Δfair В ПОЛЬЗУ АГРЕССОРА, б.п.)\n");
+        sb.append(String.format(Locale.ROOT, "свипов всего %d (%.0f в сутки)%n",
+                sweeps.size(), sweeps.size() / days));
+        for (int side : new int[]{-1, 1}) {
+            sb.append(side < 0 ? "\n  СВИПЫ ВНИЗ (агрессор продаёт — бьёт по нашему биду)\n"
+                    : "\n  СВИПЫ ВВЕРХ (агрессор покупает — бьёт по нашему аску)\n");
+            sb.append("  глубина | свипов | принтов |     1м |     5м |    15м |    30м\n");
+            for (int b = 0; b + 1 < bands.length; b++) {
+                final double lo = bands[b];
+                final double hi = bands[b + 1];
+                List<Sweep> in = sweeps.stream()
+                        .filter(s -> s.side() == side && s.depthBp() >= lo && s.depthBp() < hi)
+                        .toList();
+                if (in.size() < 20) {
+                    continue;
+                }
+                double medPrints = in.stream().mapToDouble(Sweep::prints).sum() / in.size();
+                StringBuilder row = new StringBuilder(String.format(Locale.ROOT,
+                        "  %7s | %6d | %7.2f", bandNames[b], in.size(), medPrints));
+                for (long h : horizons) {
+                    double sum = 0;
+                    int n = 0;
+                    for (Sweep s : in) {
+                        if (s.tsMs() + h > last || !(s.fair() > 0)) {
+                            continue;
+                        }
+                        Map.Entry<Long, Double> f = fair.floorEntry(s.tsMs() + h);
+                        if (f == null || f.getValue() <= 0) {
+                            continue;
+                        }
+                        sum += 1e4 * s.side() * (f.getValue() - s.fair()) / s.fair();
+                        n++;
+                    }
+                    row.append(n == 0 ? String.format(Locale.ROOT, " | %6s", "—")
+                            : String.format(Locale.ROOT, " | %+6.2f", sum / n));
+                }
+                sb.append(row).append('\n');
+            }
+        }
+        sb.append("\n⚠️ ПЛЮС = цена продолжила движение свипа (он нёс информацию, наша\n");
+        sb.append("заявка на его пути подобрана им, а не нами). МИНУС = вернулась,\n");
+        sb.append("свип был шумом, и подбирать его выгодно.\n");
+        sb.append("⚠️ Стороны считаются отдельно: на перекошенном потоке общая величина\n");
+        sb.append("мерит снос рынка, а не свип. Доверять можно только тому, что\n");
+        sb.append("подтверждается ОБЕИМИ сторонами.\n");
         return sb.toString();
     }
 
