@@ -204,7 +204,7 @@ public final class FlowMarkout {
         sb.append("«доля покупок» — предохранитель от беты: сильный перекос значит, что\n");
         sb.append("кривая меряет направление рынка, а не отбор.\n");
 
-        sb.append(payPerRisk(prints, days, fair, halfSpread(book)));
+        sb.append(payPerRisk(prints, days, fair, halfSpread(book), book));
         sb.append(kappa(lambda, days));
         sb.append(rollingKappa(prints, days, from, to));
         sb.append(slices(prints, fair));
@@ -312,7 +312,8 @@ public final class FlowMarkout {
      * лот у нас один, могут только ухудшить.
      */
     private static String payPerRisk(List<Print> prints, double days,
-                                     TreeMap<Long, Double> fair, double halfSpreadBp) {
+                                     TreeMap<Long, Double> fair, double halfSpreadBp,
+                                     TreeMap<Long, Top> book) {
         double sigma = volBpPerMin(fair);
         if (!(sigma > 0)) {
             return "\nотношение по ленте: волатильности не хватило данных\n";
@@ -340,6 +341,7 @@ public final class FlowMarkout {
         }
         sb.append("⚠️ ожидание круга = 1/λ_бид + 1/λ_аск: нужны обе ноги.\n");
         sb.append("Это ВЕРХНЯЯ оценка — предполагает, что до нас доходит каждое событие.\n");
+        sb.append(withQueue(prints, days, sigma, book));
         sb.append(skewSweep(prints, days, sigma));
         sb.append(askSchedule(prints, days, sigma, halfSpreadBp));
         return sb.toString();
@@ -506,11 +508,12 @@ public final class FlowMarkout {
         List<Rung> rungs = List.of(
                 new Rung("1 уровень: 8", new double[]{8}),
                 new Rung("1 уровень: 10", new double[]{10}),
-                new Rung("2 уровня: 6, 10", new double[]{6, 10}),
-                new Rung("3 уровня: 6, 8, 10", new double[]{6, 8, 10}),
-                new Rung("3 уровня: 4, 8, 12", new double[]{4, 8, 12}),
-                new Rung("3 уровня: 6, 10, 14", new double[]{6, 10, 14}),
-                new Rung("5 уровней: 4..12 шагом 2", new double[]{4, 6, 8, 10, 12}));
+                new Rung("3 равномерно: 6, 8, 10", new double[]{6, 8, 10}),
+                new Rung("3 геометр. x1.3", new double[]{6, 7.8, 10.14}),
+                new Rung("3 геометр. x1.5", new double[]{5, 7.5, 11.25}),
+                new Rung("5 равномерно: 4..12", new double[]{4, 6, 8, 10, 12}),
+                new Rung("5 геометр. x1.25", new double[]{4, 5, 6.25, 7.81, 9.77}),
+                new Rung("5 геометр. x1.4", new double[]{4, 5.6, 7.84, 10.98, 15.37}));
         StringBuilder sb = new StringBuilder(
                 "\n  ЛЕСТНИЦА АСКА (тот же капитал, разложенный по уровням)\n");
         sb.append("  раскладка                   | ждём аск | захват | всего T | риск | ЗАХВ/РИСК"
@@ -572,13 +575,21 @@ public final class FlowMarkout {
     private static String sweepThroughput(List<Print> prints, double days) {
         record Rung(String name, double[] levels) {
         }
+        // ⚠️ РАВНОМЕРНЫЕ против ГЕОМЕТРИЧЕСКИХ. Владелец предложил ставить каждый
+        // следующий уровень на n процентов дальше предыдущего. Смысл в том, что
+        // λ спадает с расстоянием ЭКСПОНЕНЦИАЛЬНО: равномерный шаг даёт уровни,
+        // различающиеся по частоте исполнения в разы, то есть ближний работает
+        // за всех, а дальний почти мёртв. Геометрический шаг сгущает уровни там,
+        // где поток есть, и разрежает там, где его нет.
         List<Rung> rungs = List.of(
                 new Rung("1 уровень: 8", new double[]{8}),
                 new Rung("1 уровень: 10", new double[]{10}),
-                new Rung("2 уровня: 6, 10", new double[]{6, 10}),
-                new Rung("3 уровня: 6, 8, 10", new double[]{6, 8, 10}),
-                new Rung("3 уровня: 6, 10, 14", new double[]{6, 10, 14}),
-                new Rung("5 уровней: 4..12 шагом 2", new double[]{4, 6, 8, 10, 12}));
+                new Rung("3 равномерно: 6, 8, 10", new double[]{6, 8, 10}),
+                new Rung("3 геометр. ×1.3: 6, 7.8, 10.1", new double[]{6, 7.8, 10.14}),
+                new Rung("3 геометр. ×1.5: 5, 7.5, 11.3", new double[]{5, 7.5, 11.25}),
+                new Rung("5 равномерно: 4..12 шагом 2", new double[]{4, 6, 8, 10, 12}),
+                new Rung("5 геометр. ×1.25: 4..9.8", new double[]{4, 5, 6.25, 7.81, 9.77}),
+                new Rung("5 геометр. ×1.4: 4..15.4", new double[]{4, 5.6, 7.84, 10.98, 15.37}));
         // События по стороне аска (покупатель бьёт наш аск), схлопнутые в пачки.
         List<Print> ev = events(prints, 2).stream().filter(p -> p.aggressor() > 0).toList();
         if (ev.size() < 20) {
@@ -660,6 +671,29 @@ public final class FlowMarkout {
         return sb.toString();
     }
 
+    /**
+     * Колонки глубины, если они есть в этой базе.
+     *
+     * ⚠️ Собранная база их может НЕ иметь: {@code StandAssembler} переносит
+     * ПЕРЕСЕЧЕНИЕ колонок, и если основа сборки старше 10.09.2026, глубина
+     * теряется целиком. Прибор обязан пережить это, а не падать: очередь тогда
+     * считается по лучшему уровню, что для тача почти не хуже — там и стоит
+     * основной объём.
+     */
+    private static String deepCols(Connection c) {
+        try (Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA table_info(revx_book)")) {
+            while (rs.next()) {
+                if ("deep_bids".equals(rs.getString("name"))) {
+                    return "deep_bids, deep_asks";
+                }
+            }
+        } catch (Exception ignored) {
+            // нет доступа к схеме — считаем, что глубины нет
+        }
+        return "NULL AS deep_bids, NULL AS deep_asks";
+    }
+
     /** Медианный полуспред книги, б.п. — цена пересечения для тейкера. */
     private static double halfSpread(TreeMap<Long, Top> book) {
         List<Double> v = new ArrayList<>();
@@ -731,6 +765,92 @@ public final class FlowMarkout {
         }
         sb.append("  ⚠️ захват круга (δ_бид + δ_аск) от смещения НЕ зависит — меняется только\n");
         sb.append("  ожидание. Если лучший столбец b=0, асимметрия бесполезна и по риску тоже.\n");
+        return sb.toString();
+    }
+
+    /**
+     * 🔑 ПОПРАВКА НА ОЧЕРЕДЬ — пункт 4.2 документа 151.
+     *
+     * <h2>Зачем</h2>
+     *
+     * Всё, что считалось выше, предполагает, что до нашей заявки доходит КАЖДОЕ
+     * событие, дотянувшееся до δ. Это заведомо неверно у тача: там перед нами
+     * стоит чужой объём, и событие сначала выбирает его. Причём ошибка растёт
+     * ровно туда, где мы хотели бы котировать — чем ближе к середине, тем толще
+     * книга.
+     *
+     * Документ 151 предлагал взять модель очереди из hftbacktest. Здесь она
+     * проще и считается по нашим же данным: у каждого события известен объём, у
+     * книги — сколько лежит на нашем расстоянии. Заявка исполняется, если объём
+     * события превысил очередь впереди.
+     *
+     * <h2>Ограничения, которые надо помнить</h2>
+     *
+     * ⚠️ Очередь берётся из снимка ПЕРЕД событием, а за время жизни заявки она
+     * меняется — кто-то отменяется, кто-то встаёт. Наша оценка поэтому
+     * ПЕССИМИСТИЧНА для долго стоящей заявки: чужие отмены её продвигают, а мы
+     * этого не видим. Обратная ошибка к прежней, и обе границы теперь есть.
+     *
+     * ⚠️ Мы считаем, что встали В КОНЕЦ очереди. Реально заявка, простоявшая
+     * час, стоит уже не в конце.
+     */
+    private static String withQueue(List<Print> prints, double days, double sigma,
+                                    TreeMap<Long, Top> book) {
+        if (book.isEmpty()) {
+            return "";
+        }
+        double lot = Double.parseDouble(System.getProperty("revx.flow.lot-base", "0.00003765"));
+        StringBuilder sb = new StringBuilder(
+                "\n  С ПОПРАВКОЙ НА ОЧЕРЕДЬ (лот " + lot + " базовой, встаём в конец)\n");
+        sb.append("  δ,б.п. | событий | из них дошло до нас | доля | ожидание | ЗАХВ/РИСК\n");
+        for (double dist : GRID) {
+            List<Print> ev = events(prints, dist);
+            if (ev.size() < 10) {
+                continue;
+            }
+            int fillsBid = 0;
+            int fillsAsk = 0;
+            int nb = 0;
+            int na = 0;
+            for (Print p : ev) {
+                boolean bidSide = p.aggressor() < 0;
+                if (bidSide) {
+                    nb++;
+                } else {
+                    na++;
+                }
+                Map.Entry<Long, Top> b = book.floorEntry(p.tsMs());
+                if (b == null) {
+                    continue;
+                }
+                double queue = b.getValue().queueAt(dist, bidSide);
+                // Событие выбирает очередь, потом нас. Наш лот исполнен хотя бы
+                // частично, если объёма хватило перешагнуть очередь.
+                if (p.qty() > queue) {
+                    if (bidSide) {
+                        fillsBid++;
+                    } else {
+                        fillsAsk++;
+                    }
+                }
+            }
+            if (fillsBid < 2 || fillsAsk < 2) {
+                sb.append(String.format(Locale.ROOT,
+                        "  %6.0f | %7d | %19s | %4.0f%% | %8s | %9s%n",
+                        dist, ev.size(), fillsBid + "/" + fillsAsk,
+                        100.0 * (fillsBid + fillsAsk) / ev.size(), "—", "—"));
+                continue;
+            }
+            double tMin = (days / fillsBid + days / fillsAsk) * 1440;
+            double risk = sigma * Math.sqrt(tMin);
+            double cap = 2 * dist;
+            sb.append(String.format(Locale.ROOT,
+                    "  %6.0f | %7d | %19s | %4.0f%% | %6.0f м | %9.2f%n",
+                    dist, ev.size(), fillsBid + "/" + fillsAsk,
+                    100.0 * (fillsBid + fillsAsk) / ev.size(), tMin, cap / risk));
+        }
+        sb.append("  ⚠️ очередь из снимка ПЕРЕД событием; чужие отмены её сокращают, а мы их\n");
+        sb.append("  не видим — значит это НИЖНЯЯ граница. Вместе с таблицей выше получается вилка.\n");
         return sb.toString();
     }
 
@@ -1036,7 +1156,48 @@ public final class FlowMarkout {
     }
 
     /** Лучший уровень книги: бид, аск и объёмы на них. */
-    record Top(double bid, double ask, double bq, double aq) {
+    record Top(double bid, double ask, double bq, double aq, String deepBids, String deepAsks) {
+
+        Top(double bid, double ask, double bq, double aq) {
+            this(bid, ask, bq, aq, null, null);
+        }
+
+        /**
+         * Сколько СТОИТ В КНИГЕ на расстоянии δ от середины, в базовой валюте.
+         *
+         * Это и есть очередь впереди нас: заявка, поставленная на уровень, где
+         * уже лежит чужой объём, исполнится только после него. Чем ближе к
+         * середине, тем очередь толще — поэтому оценка «до нас доходит каждое
+         * событие» вреднее всего именно у тача.
+         */
+        double queueAt(double distBp, boolean bidSide) {
+            double m = mid();
+            if (!(m > 0)) {
+                return 0;
+            }
+            double want = bidSide ? m * (1 - distBp / 1e4) : m * (1 + distBp / 1e4);
+            double sum = bidSide ? (bid >= want ? bq : 0) : (ask <= want ? aq : 0);
+            String deep = bidSide ? deepBids : deepAsks;
+            if (deep == null || deep.isEmpty()) {
+                return sum;
+            }
+            for (String s : deep.split(",")) {
+                int i = s.indexOf(58);
+                if (i <= 0) {
+                    continue;
+                }
+                try {
+                    double p = Double.parseDouble(s.substring(0, i));
+                    double q = Double.parseDouble(s.substring(i + 1));
+                    if (bidSide ? p >= want : p <= want) {
+                        sum += q;
+                    }
+                } catch (NumberFormatException ignored) {
+                    // мусорная запись уровня; пропускаем, а не роняем разбор
+                }
+            }
+            return sum;
+        }
 
         double mid() {
             return (bid + ask) / 2;
@@ -1090,13 +1251,14 @@ public final class FlowMarkout {
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + dbPath);
              Statement st = c.createStatement();
              ResultSet rs = st.executeQuery(
-                     "SELECT t_recv_ms, bp1, ap1, bq1, aq1 FROM revx_book WHERE symbol = '"
+                     "SELECT t_recv_ms, bp1, ap1, bq1, aq1, " + deepCols(c)
+                             + " FROM revx_book WHERE symbol = '"
                              + symbol + "' AND t_recv_ms >= " + from + " AND t_recv_ms <= " + to
                              + " AND bp1 > 0 AND ap1 > 0 AND bq1 > 0 AND aq1 > 0"
                              + " ORDER BY t_recv_ms")) {
             while (rs.next()) {
                 out.put(rs.getLong(1), new Top(rs.getDouble(2), rs.getDouble(3),
-                        rs.getDouble(4), rs.getDouble(5)));
+                        rs.getDouble(4), rs.getDouble(5), rs.getString(6), rs.getString(7)));
             }
         } catch (Exception e) {
             log.warn("книга {}: {}", symbol, e.toString());
