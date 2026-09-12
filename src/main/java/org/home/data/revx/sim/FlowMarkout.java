@@ -341,6 +341,7 @@ public final class FlowMarkout {
         sb.append("⚠️ ожидание круга = 1/λ_бид + 1/λ_аск: нужны обе ноги.\n");
         sb.append("Это ВЕРХНЯЯ оценка — предполагает, что до нас доходит каждое событие.\n");
         sb.append(skewSweep(prints, days, sigma));
+        sb.append(askSchedule(prints, days, sigma));
         return sb.toString();
     }
 
@@ -368,6 +369,130 @@ public final class FlowMarkout {
      * медленная съедает выигрыш. Ожидать выигрыша от асимметрии поэтому не
      * приходится — но проверить надо, интуиция в этом проекте подводила не раз.
      */
+    /**
+     * РАСПИСАНИЕ АСКА: чем платить за сокращение времени под позицией.
+     *
+     * <h2>Одна задача вместо трёх</h2>
+     *
+     * Принудительная разгрузка по таймеру, лестница уровней и затухающий отступ
+     * выглядят разными идеями, а на деле это одно: КАК менять цену продажи по
+     * мере старения позиции. Все три сводятся к расписанию {@code δ(t)}, и
+     * сравнивать их надо одной меркой.
+     *
+     * <h2>Как считается</h2>
+     *
+     * Из ленты известна интенсивность исполнения на каждом расстоянии — это та
+     * же {@code λ(δ)}, что и в таблице выше. Для расписания {@code δ(t)}
+     * вероятность дожить до момента {@code t} равна {@code exp(−∫λ(δ(s))ds)},
+     * и отсюда численно берутся ожидаемое время до продажи и ожидаемый захват В
+     * МОМЕНТ исполнения — а он у затухающего расписания меньше стартового.
+     *
+     * ⚠️ Захват круга считается как {@code δ_бид + E[δ_аск]}: покупка прошла по
+     * своей цене, продажа — по той, до которой расписание успело дойти.
+     *
+     * ⚠️ Модель не знает про цену, только про время. Она отвечает на вопрос
+     * «сколько ждать и сколько взять», а не «куда пойдёт рынок» — и это верно:
+     * риск уже учтён через σ√T.
+     */
+    private static String askSchedule(List<Print> prints, double days, double sigma) {
+        // λ_аск(δ) по сетке: сколько событий в сутки дотягивается до δ со
+        // стороны покупателя (он бьёт наш аск).
+        TreeMap<Double, Double> lam = new TreeMap<>();
+        for (double d : GRID) {
+            long n = events(prints, d).stream().filter(p -> p.aggressor() > 0).count();
+            if (n >= 3) {
+                lam.put(d, n / days);
+            }
+        }
+        if (lam.size() < 3) {
+            return "\n  расписание аска: данных мало\n";
+        }
+        double dBid = 8;
+        long nb = events(prints, dBid).stream().filter(p -> p.aggressor() < 0).count();
+        if (nb < 3) {
+            return "\n  расписание аска: покупок на 8 б.п. мало\n";
+        }
+        double tBid = days / nb * 1440;
+
+        StringBuilder sb = new StringBuilder(
+                "\n  РАСПИСАНИЕ АСКА при биде на 8 б.п. (ожидание покупки "
+                        + String.format(Locale.ROOT, "%.0f", tBid) + " мин)\n");
+        sb.append("  политика                    | ждём аск | захват | всего T | риск | ЗАХВ/РИСК\n");
+        record Policy(String name, double start, double floorBp, double halfLifeMin) {
+        }
+        List<Policy> policies = new ArrayList<>(List.of(
+                new Policy("постоянный 8 б.п.", 8, 8, 0),
+                new Policy("постоянный 12 б.п.", 12, 12, 0),
+                new Policy("затухание 12→8, полураспад 30м", 12, 8, 30),
+                new Policy("затухание 12→4, полураспад 30м", 12, 4, 30),
+                new Policy("затухание 12→2, полураспад 30м", 12, 2, 30),
+                new Policy("затухание 12→2, полураспад 10м", 12, 2, 10),
+                new Policy("затухание 8→2, полураспад 15м", 8, 2, 15)));
+        for (Policy p : policies) {
+            double survive = 1.0;
+            double eT = 0;
+            double eCap = 0;
+            double p90 = -1;                         // когда закрыто девять из десяти
+            double step = 0.5;                       // минуты
+            for (double t = 0; t < 4000 && survive > 1e-4; t += step) {
+                double d = p.halfLifeMin() <= 0 ? p.start()
+                        : p.floorBp() + (p.start() - p.floorBp())
+                                * Math.pow(0.5, t / p.halfLifeMin());
+                double rate = lambdaAt(lam, d) / 1440.0;     // в минуту
+                double pFill = survive * (1 - Math.exp(-rate * step));
+                eT += pFill * (t + step / 2);
+                eCap += pFill * d;
+                survive -= pFill;
+                if (p90 < 0 && survive <= 0.10) {
+                    p90 = t + step;
+                }
+            }
+            if (survive > 0.02) {
+                sb.append(String.format(Locale.ROOT, "  %-27s | не закрывается (%.0f%% висит)%n",
+                        p.name(), 100 * survive));
+                continue;
+            }
+            double closed = 1 - survive;
+            double askT = eT / closed;
+            double askCap = eCap / closed;
+            double totT = tBid + askT;
+            double risk = sigma * Math.sqrt(totT);
+            double cap = dBid + askCap;
+            // ⚠️ ХВОСТ ВАЖНЕЕ СРЕДНЕГО. У бота A шесть худших кругов из 62 отняли
+            // втрое больше, чем заработали остальные 56 (задача A15). Политика,
+            // у которой одинаковое среднее время, но обрезанный хвост, лучше — а
+            // по отношению, посчитанному через E[T], этого не видно.
+            double tail = p90 < 0 ? 4000 : p90;
+            double riskTail = sigma * Math.sqrt(tBid + tail);
+            sb.append(String.format(Locale.ROOT,
+                    "  %-27s | %6.0f м | %6.1f | %6.0f м | %4.1f | %9.2f | %7.0f м | %6.2f%s%n",
+                    p.name(), askT, cap, totT, risk, cap / risk, tail, cap / riskTail,
+                    cap / risk >= 1 ? "  ✓" : ""));
+        }
+        sb.append("  ⚠️ захват круга = бид 8 + средний аск В МОМЕНТ исполнения.\n");
+        sb.append("  Затухание платит захватом за время: вопрос в том, что дешевле.\n");
+        return sb.toString();
+    }
+
+    /** {@code λ} на произвольном δ — логарифмическая интерполяция по сетке. */
+    private static double lambdaAt(TreeMap<Double, Double> lam, double d) {
+        Map.Entry<Double, Double> lo = lam.floorEntry(d);
+        Map.Entry<Double, Double> hi = lam.ceilingEntry(d);
+        if (lo == null) {
+            return lam.firstEntry().getValue();      // ближе первой ступени — берём её
+        }
+        if (hi == null) {
+            return lam.lastEntry().getValue();
+        }
+        if (lo.getKey().equals(hi.getKey())) {
+            return lo.getValue();
+        }
+        // λ падает с расстоянием примерно экспоненциально, поэтому интерполяция
+        // идёт по логарифму: линейная занижала бы середину интервала.
+        double w = (d - lo.getKey()) / (hi.getKey() - lo.getKey());
+        return Math.exp(Math.log(lo.getValue()) * (1 - w) + Math.log(hi.getValue()) * w);
+    }
+
     private static String skewSweep(List<Print> prints, double days, double sigma) {
         double[] biases = {0, 1, 2, 3, 4, 6};
         double[] bases = {6, 8, 10, 12};
