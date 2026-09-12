@@ -988,7 +988,6 @@ public final class PairSweep {
                 best.stream().map(Best::base).toList()));
         sb.append(concentration(grid));
         sb.append(risk(grid));
-        sb.append(risk(grid));
         sb.append(occupancy(grid));
         sb.append(gatesTable(grid));
 
