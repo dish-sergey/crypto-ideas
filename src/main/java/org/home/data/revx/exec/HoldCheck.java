@@ -173,6 +173,7 @@ public class HoldCheck {
 
         sb.append(little(journalPath, fills, fromMs, toMs, fifoMedian, fifoMean));
         sb.append(ratio(sigmaBpPerMin, offsetBp, fifoMedian, fifoMean));
+        sb.append(conditional(journalPath, fills, fromMs, toMs, sigmaBpPerMin));
         sb.append(skew(journalPath, fromMs, toMs));
         sb.append(regime(journalPath, fills, fromMs, toMs, offsetBp));
         sb.append(takerExit(journalPath, fills, fromMs, toMs, takerCostBp));
@@ -192,7 +193,12 @@ public class HoldCheck {
      */
     private static List<Pair> match(List<ExecJournal.FillRow> fills, boolean fifo,
                                     boolean skipHandover) {
-        Deque<Lot> open = new ArrayDeque<>();
+        return match(fills, fifo, skipHandover, new ArrayDeque<>());
+    }
+
+    /** То же, но оставшиеся открытыми партии остаются в {@code open} для вызывающего. */
+    private static List<Pair> match(List<ExecJournal.FillRow> fills, boolean fifo,
+                                    boolean skipHandover, Deque<Lot> open) {
         List<Pair> out = new ArrayList<>();
         double sign = 0;
         for (ExecJournal.FillRow f : fills) {
@@ -342,6 +348,321 @@ public class HoldCheck {
                 .append("заявка не исполнилась. Поэтому σ√T по медиане — верхняя оценка\n")
                 .append("отношения, а не его значение.\n");
         return sb.toString();
+    }
+
+    /** Корзины времени держания, минуты: верхние границы. */
+    private static final double[] HOLD_BUCKETS = {5, 15, 30, 60, 120, Double.POSITIVE_INFINITY};
+
+    /**
+     * УСЛОВНЫЙ РИСК: {@code E[Δfair | T]} и {@code SD[Δfair | T]} вместо {@code σ√T}
+     * (док. 152, пункты 1.2 и 1.1).
+     *
+     * <h2>Почему σ√T — не тот риск</h2>
+     *
+     * {@code σ√T} — разброс цены за ЗАДАННОЕ время. А время держания задаёт
+     * рынок: круг длинный именно потому, что цена ушла от нас и встречная заявка
+     * не исполняется. Значит, длинные круги отобраны по неблагоприятному исходу,
+     * и у них должно быть два отличия от диффузии: СРЕДНЕЕ сдвига не ноль (снос
+     * против позиции), а разброс больше {@code σ√T}.
+     *
+     * <h2>Как считается</h2>
+     *
+     * Каждый круг FIFO (без передач, закрытый в окне) раскладывается тождественно:
+     * <pre>
+     * результат = вход (fair_откр − цена входа) + СНОС (fair_закр − fair_откр) + выход (цена выхода − fair_закр)
+     * </pre>
+     * все три — в б.п. от цены входа, со знаком позиции. Первое и третье — захват
+     * на ногах, среднее — ценовой риск круга. Сумма сходится с результатом круга
+     * до ошибки округления; расхождение печатается как контроль разбора.
+     *
+     * ⚠️ {@code fair} берётся из журнала на момент ИСПОЛНЕНИЯ по отметке бота, а
+     * узнаёт бот об исполнении на 2–5 с позже. На кругах от минуты это шум, на
+     * самых коротких — смещение в сторону отбора. Поэтому захват на ногах здесь
+     * чуть занижен, а снос чуть завышен, и в первой корзине это видно сильнее.
+     *
+     * <h2>Отношение за сутки (1.1)</h2>
+     *
+     * Отношение на круг порога 1 не несёт: игра повторяется. Честная суточная
+     * версия — {@code среднее / СКО × √(кругов в сутки)}, где СКО ФАКТИЧЕСКОЕ,
+     * с отбором внутри. Это переоценка, если круги коррелируют (идут подряд в
+     * одну сторону в сносе), поэтому рядом печатается и прямое суточное — по
+     * суммам дней, — пока дней мало, оно только для знака.
+     */
+    private String conditional(String journalPath, List<ExecJournal.FillRow> fills,
+                               long fromMs, long toMs, double sigmaParam) {
+        List<Pair> pairs = new ArrayList<>();
+        for (Pair p : match(fills, true, false)) {
+            if (p.closedMs() >= fromMs && p.closedMs() < toMs && !p.handover() && p.entry() > 0) {
+                pairs.add(p);
+            }
+        }
+        String head = "\n## Условный риск: E[Δfair | T] и SD[Δfair | T] вместо σ√T\n\n";
+        if (pairs.size() < 10) {
+            return head + "кругов в окне меньше десяти — считать нечего\n";
+        }
+        TreeMap<Long, Double> fair = new TreeMap<>();
+        TreeMap<Long, Double> byMinute = new TreeMap<>();
+        long firstOpen = pairs.stream().mapToLong(Pair::openedMs).min().orElse(fromMs);
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:file:"
+                + Path.of(journalPath).toAbsolutePath() + "?mode=ro");
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT ts_ms, fair FROM exec_quote WHERE fair > 0 AND ts_ms >= ? AND ts_ms < ?"
+                             + " ORDER BY ts_ms")) {
+            ps.setLong(1, Math.min(firstOpen, fromMs) - 600_000);
+            ps.setLong(2, toMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long ts = rs.getLong(1);
+                    fair.put(ts, rs.getDouble(2));
+                    if (ts >= fromMs) {
+                        byMinute.put(ts / 60_000, rs.getDouble(2));
+                    }
+                }
+            }
+        } catch (Exception e) {
+            return head + "не прочитались котировки: " + e.getMessage() + "\n";
+        }
+        // σ минутных приращений по окну: последняя fair каждой минуты, только
+        // соседние минуты — разрыв в журнале не должен сойти за одно большое движение.
+        List<Double> steps = new ArrayList<>();
+        Map.Entry<Long, Double> prev = null;
+        for (Map.Entry<Long, Double> e : byMinute.entrySet()) {
+            if (prev != null && e.getKey() - prev.getKey() == 1) {
+                steps.add((e.getValue() - prev.getValue()) / prev.getValue() * 10_000);
+            }
+            prev = e;
+        }
+        double sigmaMeasured = sd(steps);
+        double sigma = sigmaParam > 0 ? sigmaParam : sigmaMeasured;
+
+        int nb = HOLD_BUCKETS.length;
+        List<List<double[]>> buckets = new ArrayList<>();
+        for (int i = 0; i < nb; i++) {
+            buckets.add(new ArrayList<>());
+        }
+        double maxResidual = 0;
+        int skipped = 0;
+        for (Pair p : pairs) {
+            Map.Entry<Long, Double> fo = fair.floorEntry(p.openedMs());
+            Map.Entry<Long, Double> fc = fair.floorEntry(p.closedMs());
+            // Тик старше минуты — это не цена в момент исполнения, а дыра в журнале.
+            if (fo == null || fc == null || p.openedMs() - fo.getKey() > 60_000
+                    || p.closedMs() - fc.getKey() > 60_000) {
+                skipped++;
+                continue;
+            }
+            double sign = p.buyFirst() ? 1 : -1;
+            double in = sign * (fo.getValue() - p.entry()) / p.entry() * 10_000;
+            double drift = sign * (fc.getValue() - fo.getValue()) / p.entry() * 10_000;
+            double out = sign * (p.exit() - fc.getValue()) / p.entry() * 10_000;
+            maxResidual = Math.max(maxResidual, Math.abs(in + drift + out - p.bp()));
+            int b = 0;
+            while (p.minutes() > HOLD_BUCKETS[b]) {
+                b++;
+            }
+            buckets.get(b).add(new double[]{p.minutes(), in, drift, out, p.bp(), p.closedMs()});
+        }
+
+        StringBuilder sb = new StringBuilder(head);
+        sb.append(String.format(Locale.ROOT,
+                "σ минутная по окну: **%.2f б.п./мин** (%d приращений)%s%n%n",
+                sigmaMeasured, steps.size(),
+                sigmaParam > 0 ? String.format(Locale.ROOT, "; в σ√T идёт заданная --sigma %.2f", sigmaParam)
+                        : "; она же идёт в σ√T"));
+        sb.append("| T | кругов | эпизодов | T средн. | вход | **E[снос]** | рынок за T | **отбор** | **SD[снос]** | SD рынка за T | σ√T | SD/SD рынка | выход | круг | Σ круг |\n");
+        sb.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        double lo = 0;
+        List<Double> allDrift = new ArrayList<>();
+        List<Double> allRound = new ArrayList<>();
+        for (int b = 0; b < nb; b++) {
+            List<double[]> rows = buckets.get(b);
+            String label = Double.isInfinite(HOLD_BUCKETS[b])
+                    ? String.format(Locale.ROOT, "> %.0f", lo)
+                    : String.format(Locale.ROOT, "%.0f–%.0f", lo, HOLD_BUCKETS[b]);
+            lo = HOLD_BUCKETS[b];
+            if (rows.isEmpty()) {
+                continue;
+            }
+            List<Double> t = col(rows, 0);
+            List<Double> drift = col(rows, 2);
+            List<Double> round = col(rows, 4);
+            allDrift.addAll(drift);
+            allRound.addAll(round);
+            // σ√T по СРЕДНЕМУ корню, а не по корню среднего: у диффузии дисперсия
+            // сдвига линейна по T, значит ожидаемое SD корзины — √(σ²·E[T]).
+            double diffusion = sigma * Math.sqrt(mean(t));
+            double sdDrift = sd(drift);
+            // КОНТРОЛЬ: тот же сдвиг fair за то же время, но от КАЖДОЙ минуты окна,
+            // без отбора. Все круги спот-бота начинаются покупкой, поэтому падение
+            // рынка за окно даёт отрицательный снос любому кругу — это не отбор.
+            // И вторая половина: fair шумит сильнее книги и возвращается к
+            // среднему, так что σ√T по минутной σ завышает разброс на длинных T.
+            double[] market = unconditional(byMinute, (int) Math.max(1, Math.round(mean(t))));
+            sb.append(String.format(Locale.ROOT,
+                    "| %s мин | %d | %d | %.1f | %+.1f | **%+.1f** | %+.1f | **%+.1f** | **%s** | %.1f | %.1f | %s | %+.1f | %+.1f | %+.0f |%n",
+                    label, rows.size(), episodes(col(rows, 5)), mean(t),
+                    meanSigned(col(rows, 1)), meanSigned(drift),
+                    market[0], meanSigned(drift) - market[0],
+                    rows.size() > 1 ? String.format(Locale.ROOT, "%.1f", sdDrift) : "—",
+                    market[1], diffusion,
+                    rows.size() > 2 && market[1] > 0
+                            ? String.format(Locale.ROOT, "%.2f", sdDrift / market[1]) : "—",
+                    meanSigned(col(rows, 3)), meanSigned(round), sumOf(round)));
+        }
+        // ⚠️ ВЫЖИВШИЕ. В таблицу попадают только ЗАКРЫТЫЕ круги, а круг закрывается,
+        // когда цена вернулась к аску. Лот, от которого цена ушла и не вернулась,
+        // так и висит открытым — и выпадает из статистики ровно потому, что он
+        // худший. Поэтому открытые на конец окна партии досчитываются отдельно,
+        // по fair на конец окна.
+        Deque<Lot> left = new ArrayDeque<>();
+        match(fills.stream().filter(f -> f.tsMs() < toMs).toList(), true, false, left);
+        Map.Entry<Long, Double> fEnd = fair.floorEntry(toMs);
+        List<Double> openDrift = new ArrayList<>();
+        List<Double> openAge = new ArrayList<>();
+        int openHandover = 0;
+        for (Lot lot : left) {
+            Map.Entry<Long, Double> fo = fair.floorEntry(lot.tsMs);
+            if (lot.qty <= 0 || fEnd == null) {
+                continue;
+            }
+            if (lot.handover) {
+                // цена передачи — не наша сделка, fair на момент передачи честнее
+                openHandover++;
+            }
+            double base = lot.handover && fo != null ? fo.getValue() : lot.price;
+            double lots = lot.qty / Math.max(EPS, medianQty(fills));
+            // вес — число лотов: партия бывает остатком частичного исполнения
+            for (int i = 0; i < Math.max(1, Math.round(lots)); i++) {
+                openDrift.add((fEnd.getValue() - base) / base * 10_000);
+                openAge.add((toMs - lot.tsMs) / 60_000.0);
+            }
+        }
+        if (!openDrift.isEmpty()) {
+            sb.append(String.format(Locale.ROOT,
+                    "| **не закрыт к концу окна** | %d лот. | — | %.0f | — | **%+.1f** | — | — | %s | — | — | — | — | "
+                            + "%+.1f (по fair) | %+.0f |%n",
+                    openDrift.size(), meanSigned(openAge), meanSigned(openDrift),
+                    openDrift.size() > 1 ? String.format(Locale.ROOT, "%.1f", sd(openDrift)) : "—",
+                    meanSigned(openDrift), sumOf(openDrift)));
+            if (openHandover > 0) {
+                sb.append(String.format(Locale.ROOT,
+                        "%n(среди открытых %d переданных партий — для них отсчёт от fair на момент передачи)%n",
+                        openHandover));
+            }
+        }
+        sb.append(String.format(Locale.ROOT,
+                "%nконтроль разбора: |вход + снос + выход − круг| ≤ %.3f б.п.; "
+                        + "пропущено кругов без тика fair рядом: %d%n", maxResidual, skipped));
+        sb.append("\nЗнак у всех граф — со стороны позиции: плюс = в нашу пользу. «Вход» и\n")
+                .append("«выход» — захват на ногах относительно fair в момент исполнения,\n")
+                .append("«снос» — сколько fair ушла за время держания.\n");
+        sb.append("\n«Рынок за T» и «SD рынка за T» — сдвиг fair за то же время от каждой\n")
+                .append("минуты окна, без отбора; «отбор» = E[снос] − рынок за T.\n");
+        sb.append("\n⚠️ «Эпизодов» — круги, закрывшиеся в пределах 15 минут друг от друга,\n")
+                .append("считаются одним. Одно резкое движение закрывает несколько кругов разом,\n")
+                .append("и выборка в 27 кругов из трёх эпизодов — это три наблюдения, а не 27.\n");
+        sb.append("\n🔑 Если время держания не зависит от исхода, то отбор ≈ 0 и SD/SD рынка ≈ 1\n")
+                .append("во всех корзинах. Отбор по неблагоприятному исходу виден как отбор < 0\n")
+                .append("и SD/SD рынка > 1. ⚠️ σ√T сравнивать со SD рынка: если σ√T заметно\n")
+                .append("больше, fair на этом горизонте возвращается к среднему, и мерка σ√T\n")
+                .append("сама по себе завышена — независимо от всякого отбора.\n");
+
+        // 1.1: отношение за сутки.
+        // Сутки — по минутам, где fair ЕСТЬ, а не по длине окна: журнал может
+        // кончаться раньше окна, и темп кругов тогда занижен.
+        double days = Math.max(1, byMinute.size()) / 1440.0;
+        double perDay = allRound.size() / days;
+        double m = meanSigned(allRound);
+        double s = sd(allRound);
+        // Прямая суточная сумма: день по времени закрытия круга.
+        TreeMap<Long, Double> daily = new TreeMap<>();
+        for (Pair p : pairs) {
+            daily.merge(p.closedMs() / 86_400_000, p.bp(), Double::sum);
+        }
+        List<Double> dayValues = new ArrayList<>(daily.values());
+        sb.append("\n### Отношение за сутки (док. 152, п. 1.1)\n\n");
+        sb.append(String.format(Locale.ROOT,
+                "| величина | значение |%n|---|---:|%n"
+                        + "| кругов в сутки | %.1f |%n"
+                        + "| средний круг / СКО круга (фактическое, с отбором) | %+.2f / %.1f б.п. |%n"
+                        + "| на круг: среднее / СКО | %+.3f |%n"
+                        + "| **за сутки: × √(кругов в сутки)** | **%+.2f** |%n"
+                        + "| прямо по суммам дней: среднее / СКО (%d дн.) | %s |%n",
+                perDay, m, s, s > 0 ? m / s : 0, s > 0 ? m / s * Math.sqrt(perDay) : 0,
+                dayValues.size(),
+                dayValues.size() >= 3 && sd(dayValues) > 0
+                        ? String.format(Locale.ROOT, "%+.2f", meanSigned(dayValues) / sd(dayValues))
+                        : "— (меньше трёх дней)"));
+        sb.append("\n⚠️ Здесь в числителе ФАКТИЧЕСКИЙ средний круг, а не захват 2δ: снос уже\n")
+                .append("внутри. Поэтому величина может быть отрицательной — в отличие от\n")
+                .append("2δ/σ√T, которая положительна по построению и знака дохода не видит.\n")
+                .append("Корень из числа кругов предполагает их независимость; серия кругов,\n")
+                .append("проигравших один и тот же снос, делает оценку завышенной.\n");
+        return sb.toString();
+    }
+
+    /**
+     * Среднее и СКО сдвига fair за {@code h} минут от каждой минуты окна, б.п.
+     * Пары, у которых конечной минуты нет (разрыв журнала), пропускаются, а не
+     * подменяются ближайшей: иначе разрыв сошёл бы за движение другой длины.
+     */
+    /** Число эпизодов: моменты закрытия, разнесённые больше чем на 15 минут. */
+    static int episodes(List<Double> closedMs) {
+        List<Double> sorted = new ArrayList<>(closedMs);
+        Collections.sort(sorted);
+        int n = 0;
+        double last = Double.NEGATIVE_INFINITY;
+        for (double t : sorted) {
+            if (t - last > 15 * 60_000) {
+                n++;
+            }
+            last = t;
+        }
+        return n;
+    }
+
+    private static double[] unconditional(TreeMap<Long, Double> byMinute, int h) {
+        List<Double> d = new ArrayList<>();
+        for (Map.Entry<Long, Double> e : byMinute.entrySet()) {
+            Double end = byMinute.get(e.getKey() + h);
+            if (end != null && e.getValue() > 0) {
+                d.add((end - e.getValue()) / e.getValue() * 10_000);
+            }
+        }
+        return new double[]{meanSigned(d), sd(d)};
+    }
+
+    private static List<Double> col(List<double[]> rows, int i) {
+        List<Double> out = new ArrayList<>(rows.size());
+        for (double[] r : rows) {
+            out.add(r[i]);
+        }
+        return out;
+    }
+
+    /** Среднее, допускающее отрицательные значения (у {@link #mean} −1 значит «пусто»). */
+    private static double meanSigned(List<Double> values) {
+        return values.isEmpty() ? 0 : sumOf(values) / values.size();
+    }
+
+    private static double sumOf(List<Double> values) {
+        double s = 0;
+        for (double v : values) {
+            s += v;
+        }
+        return s;
+    }
+
+    private static double sd(List<Double> values) {
+        if (values.size() < 2) {
+            return 0;
+        }
+        double m = meanSigned(values);
+        double v = 0;
+        for (double x : values) {
+            v += (x - m) * (x - m);
+        }
+        return Math.sqrt(v / (values.size() - 1));
     }
 
     /**

@@ -956,7 +956,8 @@ public final class FlowMarkout {
         StringBuilder sb = new StringBuilder(
                 "\nПЛАТЯТ ЛИ ЗА РИСК ПО ЛЕНТЕ (σ = " + String.format(Locale.ROOT, "%.2f", sigma)
                         + " б.п./мин)\n");
-        sb.append("  δ,б.п. | бид/сут | аск/сут | ожидание круга | риск σ√T | захват | ЗАХВ/РИСК\n");
+        sb.append("  δ,б.п. | бид/сут | аск/сут | цикл | ЗАХВ/РИСК цикл | держание 1/λ_аск | "
+                + "ЗАХВ/РИСК держ. | T_держ/T_диф | за сутки\n");
         for (double dist : GRID) {
             List<Print> ev = events(prints, dist);
             long bid = ev.stream().filter(p -> p.aggressor() < 0).count();   // продавец бьёт наш бид
@@ -967,14 +968,28 @@ public final class FlowMarkout {
             double lamBid = bid / days;
             double lamAsk = ask / days;
             double tMin = (1 / lamBid + 1 / lamAsk) * 1440;                  // сутки → минуты
-            double risk = sigma * Math.sqrt(tMin);
+            double holdMin = 1440 / lamAsk;
             double cap = 2 * dist;
+            double perCycle = cap / (sigma * Math.sqrt(tMin));
+            double perHold = cap / (sigma * Math.sqrt(holdMin));
+            // Диффузионное время δ: сколько в среднем идти цене, чтобы пройти δ.
+            double tDiff = (dist / sigma) * (dist / sigma);
             sb.append(String.format(Locale.ROOT,
-                    "  %6.0f | %7.1f | %7.1f | %11.0f мин | %8.1f | %6.1f | %9.2f%s%n",
-                    dist, lamBid, lamAsk, tMin, risk, cap, cap / risk,
-                    cap / risk < 1 ? "  ⚠️" : ""));
+                    "  %6.0f | %7.1f | %7.1f | %4.0f м | %14.2f | %14.0f м | %15.2f%s | %12.1f | %8.2f%n",
+                    dist, lamBid, lamAsk, tMin, perCycle, holdMin, perHold,
+                    perHold < 1 ? " ⚠️" : "  ", holdMin / tDiff,
+                    // кругов в сутки ограничены ЦИКЛОМ, а риск круга несёт нога держания
+                    perHold * Math.sqrt(1440 / tMin)));
         }
-        sb.append("⚠️ ожидание круга = 1/λ_бид + 1/λ_аск: нужны обе ноги.\n");
+        sb.append("⚠️ Цикл = 1/λ_бид + 1/λ_аск — сколько идёт круг, и он задаёт число кругов в\n");
+        sb.append("сутки. Но ПОД РИСКОМ только нога держания 1/λ_аск: пока ждём покупку, позиции\n");
+        sb.append("нет (док. 152, §II). Поэтому риск круга — по держанию, темп — по циклу.\n");
+        sb.append("T_держ/T_диф: во сколько раз ждём дольше, чем цена проходит δ; отношение\n");
+        sb.append("держания = 2/√(T_держ/T_диф).\n");
+        sb.append("⚠️⚠️ ВСЕ ЭТИ ОТНОШЕНИЯ ЗНАКА ДОХОДА НЕ ВИДЯТ: σ√T считает риск круга\n");
+        sb.append("диффузией, а замер по живым кругам (`--revx-hold-check`, «Условный риск»,\n");
+        sb.append("13.09.2026) нашёл, что убыток сидит в СРЕДНЕМ сносе против позиции (отбор\n");
+        sb.append("−10…−25 б.п. на кругах 5–120 мин), а не в разбросе. Верхняя оценка качества.\n");
         sb.append("Это ВЕРХНЯЯ оценка — предполагает, что до нас доходит каждое событие.\n");
         sb.append(withQueue(prints, days, sigma, book));
         sb.append(skewSweep(prints, days, sigma));

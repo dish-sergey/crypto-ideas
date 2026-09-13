@@ -31,6 +31,19 @@ class HoldCheckTest {
 
     private static final long MIN = 60_000L;
 
+    /**
+     * Одно резкое движение закрывает несколько кругов разом — считать их надо
+     * одним наблюдением, иначе 27 кругов из трёх свипов выглядят как выборка.
+     */
+    @Test
+    void closesWithinFifteenMinutesAreOneEpisode() {
+        assertEquals(3, HoldCheck.episodes(List.of(
+                0.0, 2.0 * MIN, 14.0 * MIN,     // цепочка: каждый в 15 мин от предыдущего
+                40.0 * MIN,                     // отдельный
+                100.0 * MIN, 101.0 * MIN)));
+        assertEquals(0, HoldCheck.episodes(List.of()));
+    }
+
     /** {@code match} приватный: вызываем отражением, чтобы не расширять API ради теста. */
     @SuppressWarnings("unchecked")
     private static List<?> match(List<ExecJournal.FillRow> fills, boolean fifo,
