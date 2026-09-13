@@ -206,6 +206,39 @@ public final class AllocRegistry implements AutoCloseable {
         }
     }
 
+    /**
+     * Отдать ЧАСТЬ claim'а в общий котёл.
+     *
+     * Нужно для сведе́ния кассы: бот держит денег ровно на недостающую до потолка
+     * часть инвентаря, и когда инвентарь ПРИБАВЛЯЕТСЯ передачей (а не покупкой),
+     * лишние деньги обязаны вернуться в котёл. Иначе доля бота на общем счёте
+     * растёт с каждым захватом: монеты пришли, а деньги под них остались за ним
+     * — найдено владельцем 13.09.2026.
+     *
+     * @return сколько фактически отдано (не больше того, что есть)
+     */
+    public synchronized double releasePart(String botId, String currency, double qty,
+                                           double price, long nowMs) {
+        double own = own(botId, currency);
+        double give = Math.min(Math.max(0, qty), Math.max(0, own));
+        if (!(give > 0)) {
+            return 0;
+        }
+        try {
+            connection.setAutoCommit(false);
+            event(botId, currency, give, "release", price, "сведение кассы под потолок");
+            setQty(botId, currency, own - give, nowMs, sinceOf(botId, currency, nowMs));
+            connection.commit();
+            return give;
+        } catch (Exception e) {
+            rollback();
+            log.error("не выполнить частичное освобождение: {}", e.getMessage());
+            return 0;
+        } finally {
+            autoCommit();
+        }
+    }
+
     /** Отдать инвентарь в общий котёл. Заявки к этому моменту обязаны быть сняты. */
     public synchronized void release(String botId, String currency, double price, long nowMs) {
         double own = own(botId, currency);

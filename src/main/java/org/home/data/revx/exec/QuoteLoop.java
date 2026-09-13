@@ -1267,8 +1267,21 @@ public final class QuoteLoop implements Runnable {
         double need = Math.max(0, (params.inventoryCap() - inventory) * price);
         double have = alloc.own(tag.id(), quote);
         double want = Math.max(0, need - have);
+        // 🔑 КАССА СВОДИТСЯ В ОБЕ СТОРОНЫ, а не только добирается.
+        //
+        // Инвариант прост: за ботом стоит денег ровно на ту часть потолка, которую
+        // он ещё не держит монетой, то есть «монеты + касса = потолок». Покупка и
+        // продажа его держат сами (купил — потратил), а вот ПЕРЕДАЧА двигает
+        // монеты, не трогая денег: захватил лот — и остался с монетой плюс
+        // деньгами под неё же.
+        //
+        // ⚠️ Найдено владельцем 13.09.2026 на живом боте: e захватил лот BTC в
+        // 12:47, а касса осталась 6.75 USDC — деньги на все семь лотов потолка при
+        // одном лоте уже в монете. Доля бота на общем счёте выросла на стоимость
+        // лота, и эти деньги стали недоступны остальным, хотя потратить их он всё
+        // равно не может: покупку ограничивает потолок инвентаря.
         if (want <= 0) {
-            return null;
+            return giveBackCash(need, have, price, now);
         }
         double free = alloc.free(quote, quoteTotal, now).free();
         double take = Math.min(want, free);
@@ -1290,6 +1303,37 @@ public final class QuoteLoop implements Runnable {
                 "Взято %.2f %s (нужно было %.2f, свободно было %.2f).%s",
                 take, quote, want, free,
                 take + 1e-9 < want ? " Потолок инвентаря фактически ниже заданного." : "");
+    }
+
+    /**
+     * Вернуть в котёл деньги сверх потолка — вторая половина сведе́ния кассы.
+     *
+     * Отдаётся только ИЗЛИШЕК: то, что бот всё равно не может потратить, потому
+     * что покупку ограничивает потолок инвентаря. Мелочь ниже минимума заявки не
+     * трогаем — гонять по реестру центы дороже, чем они стоят.
+     */
+    private String giveBackCash(double need, double have, double price, long now) {
+        double give = have - need;
+        if (give <= Math.max(minNotional, 1e-9)) {
+            return null;
+        }
+        double gave = alloc.releasePart(tag.id(), quote, give, price, now);
+        if (!(gave > 0)) {
+            return null;
+        }
+        // Передача двигает и кассу, и ЕЁ точку отсчёта: иначе возврат лишнего
+        // выглядел бы убытком бота (на этом бот B однажды отчитался о −6.77 USDC,
+        // которых не было).
+        ownCash -= gave;
+        seedCash -= gave;
+        journal.putState(STATE_CASH, ownCash);
+        journal.putState(STATE_SEED_CASH, seedCash);
+        journal.event("release", String.format(java.util.Locale.ROOT,
+                "сведение кассы: возвращено %.2f %s (держал %.2f, под потолок нужно %.2f)",
+                gave, quote, have, need));
+        return String.format(java.util.Locale.ROOT,
+                "Возвращено в общий котёл %.2f %s: держал %.2f, а под потолок нужно %.2f "
+                        + "(остальное уже в монете).", gave, quote, have, need);
     }
 
     public String cannotStart() {
@@ -3400,6 +3444,13 @@ public final class QuoteLoop implements Runnable {
         seedCash += takeQuote;
         journal.putState(STATE_POSITION, inventory);
         journal.putState(STATE_SEED, seedPosition);
+        // 🔑 И СРАЗУ СВОДИМ КАССУ. Монеты пришли передачей, значит денег под них
+        // больше не нужно: «монеты + касса = потолок». Без этого захват молча
+        // увеличивал долю бота на общем счёте на стоимость захваченного, и лишнее
+        // оседало за ним мёртвым грузом (найдено владельцем 13.09.2026).
+        String gaveBack = giveBackCash(
+                Math.max(0, (params.inventoryCap() - inventory) * price),
+                alloc.own(tag.id(), quote), price, now);
         journal.putState(STATE_CASH, ownCash);
         journal.putState(STATE_SEED_CASH, seedCash);
         if (qty > 0) {
@@ -3414,8 +3465,10 @@ public final class QuoteLoop implements Runnable {
                 lots, qty, base, price, takeQuote, quote));
         return String.format(java.util.Locale.ROOT,
                 "Взято %.2f лота = %.8f %s по справедливой %.2f и %.2f %s.%n"
-                        + "Записано передачей (status=handover), в статистику сделок не идёт.%n%n%s",
-                lots, qty, base, price, takeQuote, quote, describeFree());
+                        + "Записано передачей (status=handover), в статистику сделок не идёт.%n"
+                        + "%s%n%s",
+                lots, qty, base, price, takeQuote, quote,
+                gaveBack == null ? "" : gaveBack + "\n", describeFree());
     }
 
     /** Отдать инвентарь в общий котёл. Заявки снимаются ДО освобождения. */

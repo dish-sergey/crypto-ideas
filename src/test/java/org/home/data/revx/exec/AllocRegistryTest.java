@@ -183,6 +183,39 @@ class AllocRegistryTest {
         }
     }
 
+    /**
+     * ЧАСТИЧНЫЙ ВОЗВРАТ: касса сводится к потолку, а не только добирается.
+     *
+     * ⚠️ Найдено владельцем 13.09.2026. Бот e захватил лот BTC передачей, и
+     * касса осталась прежней — деньги на все семь лотов потолка при одном лоте
+     * уже в монете. Доля бота на общем счёте выросла на стоимость лота, и эти
+     * деньги стали недоступны остальным, хотя потратить их он не может: покупку
+     * ограничивает потолок инвентаря.
+     */
+    @Test
+    void releasePartGivesBackOnlyTheSurplus(@TempDir Path dir) {
+        try (AllocRegistry r = open(dir)) {
+            r.claim("e", "USDC", 6.75, 100.0, 1, T0);
+            // Захватил лот монетой — под потолок нужно уже не 6.75, а 5.79.
+            assertEquals(0.96, r.releasePart("e", "USDC", 0.96, 1, T0), 1e-12);
+            assertEquals(5.79, r.own("e", "USDC"), 1e-12);
+            assertEquals(100.0 - 5.79, r.free("USDC", 100.0, T0).free(), 1e-12,
+                    "возвращённое обязано стать свободным для остальных");
+        }
+    }
+
+    @Test
+    void releasePartNeverGivesMoreThanItHas(@TempDir Path dir) {
+        try (AllocRegistry r = open(dir)) {
+            r.claim("a", "USDC", 3.0, 100.0, 1, T0);
+            assertEquals(3.0, r.releasePart("a", "USDC", 10.0, 1, T0), 1e-12,
+                    "просят больше, чем есть — отдаётся всё, что есть, и не больше");
+            assertEquals(0.0, r.own("a", "USDC"), 1e-12);
+            assertEquals(0.0, r.releasePart("a", "USDC", 1.0, 1, T0), 1e-12,
+                    "отдавать нечего — ноль, а не отрицательная претензия");
+        }
+    }
+
     @Test
     void survivesReopening(@TempDir Path dir) {
         try (AllocRegistry r = open(dir)) {
