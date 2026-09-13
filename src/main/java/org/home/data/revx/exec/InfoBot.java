@@ -81,10 +81,24 @@ public final class InfoBot implements Runnable {
     private final java.util.Set<String> hidden =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    /**
+     * Путь к общему реестру резерваций.
+     *
+     * ⚠️ Читается ТОЛЬКО на чтение и только с этой же машины: сводка не ходит на
+     * площадку и ключа не имеет — см. правило в CLAUDE.md.
+     */
+    private final String allocPath;
+
     public InfoBot(String token, long chatId, List<Watched> watched) {
+        this(token, chatId, watched,
+                System.getProperty("revx.info.alloc", "../revx-shared/alloc.db"));
+    }
+
+    public InfoBot(String token, long chatId, List<Watched> watched, String allocPath) {
         this.token = token;
         this.chatId = chatId;
         this.watched = watched;
+        this.allocPath = allocPath;
     }
 
     /**
@@ -166,6 +180,7 @@ public final class InfoBot implements Runnable {
         switch (command) {
             case "/all", "/status", "/start" -> send(all());
             case "/pnl" -> send(pnl());
+            case "/alloc", "/claims" -> send(alloc());
             case "/hide" -> send(visibility(args, true));
             case "/show" -> send(visibility(args, false));
             case "/help" -> send("""
@@ -173,6 +188,7 @@ public final class InfoBot implements Runnable {
 
                     /all — котирование, инвентарь, сделки и доход за сутки
                     /pnl — доход за 24 часа и за 7 суток, плюс нереализованное
+                    /alloc — кто что держит за собой и сколько ничейного
                     /hide d e f — убрать ботов из /all и /pnl
                     /show d — вернуть, /show all — вернуть всех
                     /hide и /show без меток — кто сейчас показан
@@ -401,6 +417,137 @@ public final class InfoBot implements Runnable {
         return sb.toString();
     }
 
+
+    /**
+     * РЕЗЕРВАЦИИ: кто из ботов что за собой держит.
+     *
+     * <h2>Зачем отдельная команда</h2>
+     *
+     * Счёт на площадке ОБЩИЙ, а делят его шесть ботов через реестр
+     * {@code alloc.db}. До сих пор увидеть раскладку можно было только запросом
+     * к базе руками, и это уже стоило времени: 12.09.2026 при переводе ботов на
+     * три уровня половина из них упёрлась в нехватку кассы, а понять это удалось
+     * не по сводке, а по счётчику {@code no_funds} в журналах.
+     *
+     * ⚠️ И ещё это ловит расхождение, которое иначе видно только по симптомам:
+     * бот показывает ноль монеты, а на счёте она есть — значит монета НИЧЕЙНАЯ
+     * (разбор 10.09.2026). Здесь такое видно сразу: сумма резерваций меньше
+     * остатка счёта.
+     *
+     * <h2>Откуда берутся числа</h2>
+     *
+     * Резервации — из {@code alloc.db}, который лежит на той же машине и
+     * открывается ТОЛЬКО НА ЧТЕНИЕ. Остаток счёта — из последнего ответа
+     * {@code GET /balances}, записанного любым из ботов в свой журнал.
+     *
+     * 🔑 Ключа у сводки по-прежнему нет и быть не должно: она не ходит на
+     * площадку вообще, а пользуется тем, что боты уже записали.
+     */
+    private String alloc() {
+        java.util.Map<String, java.util.Map<String, double[]>> byCurrency = new java.util.TreeMap<>();
+        long now = System.currentTimeMillis();
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                "jdbc:sqlite:file:" + allocPath + "?mode=ro");
+             java.sql.Statement st = c.createStatement();
+             java.sql.ResultSet rs = st.executeQuery(
+                     "SELECT bot_id, currency, qty, heartbeat_ms FROM claim ORDER BY currency, bot_id")) {
+            while (rs.next()) {
+                byCurrency.computeIfAbsent(rs.getString(2), k -> new java.util.TreeMap<>())
+                        .put(rs.getString(1), new double[]{rs.getDouble(3), rs.getLong(4)});
+            }
+        } catch (Exception e) {
+            return "Реестр резерваций не прочитался: " + e.getMessage()
+                    + "\n(ожидался " + allocPath + ")";
+        }
+        if (byCurrency.isEmpty()) {
+            return "Реестр резерваций пуст.";
+        }
+        java.util.Map<String, Double> onVenue = venueBalances();
+
+        StringBuilder sb = new StringBuilder("РЕЗЕРВАЦИИ\n\n");
+        for (var cur : byCurrency.entrySet()) {
+            double claimed = 0;
+            StringBuilder rows = new StringBuilder();
+            for (var bot : cur.getValue().entrySet()) {
+                double qty = bot.getValue()[0];
+                long beat = (long) bot.getValue()[1];
+                claimed += qty;
+                if (qty <= 0) {
+                    continue;                      // нулевые не показываем: их много и они пусты
+                }
+                // ⚠️ Мёртвый бот продолжает держать резервацию, пока её не
+                // распустят. Отметка времени показывает, жив ли он.
+                String stale = now - beat > 10 * 60_000L
+                        ? "  ⚠️ молчит " + ago(now - beat) : "";
+                rows.append(String.format(Locale.ROOT, "  %s  %s%s%n",
+                        bot.getKey().toUpperCase(Locale.ROOT), trim(qty), stale));
+            }
+            if (rows.isEmpty()) {
+                continue;
+            }
+            Double venue = onVenue.get(cur.getKey());
+            sb.append(cur.getKey()).append(':');
+            if (venue != null) {
+                double free = venue - claimed;
+                sb.append(String.format(Locale.ROOT,
+                        "  на счёте %s, разобрано %s, СВОБОДНО %s%s",
+                        trim(venue), trim(claimed), trim(free),
+                        free < -1e-9 ? "  ⚠️ разобрано БОЛЬШЕ, чем есть" : ""));
+            } else {
+                sb.append(String.format(Locale.ROOT, "  разобрано %s (остаток счёта неизвестен)",
+                        trim(claimed)));
+            }
+            sb.append('\n').append(rows).append('\n');
+        }
+        sb.append("⚠️ Свободное — это НИЧЕЙНОЕ: им никто не торгует, пока кто-нибудь\n")
+                .append("не заберёт его через /claim. Резервация мёртвого бота держится\n")
+                .append("до роспуска, поэтому «молчит» рядом с числом важнее самого числа.\n");
+        if (onVenue.isEmpty()) {
+            sb.append("\n⚠️ Остатков счёта нет: ни один журнал не содержит ответа /balances.\n");
+        }
+        return sb.toString();
+    }
+
+    /** Остатки счёта из последнего ответа {@code /balances} в журналах ботов. */
+    private java.util.Map<String, Double> venueBalances() {
+        java.util.Map<String, Double> out = new java.util.HashMap<>();
+        long best = 0;
+        for (Watched w : watched) {
+            try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                    "jdbc:sqlite:file:" + w.journalPath() + "?mode=ro");
+                 java.sql.Statement st = c.createStatement();
+                 java.sql.ResultSet rs = st.executeQuery(
+                         "SELECT ts_ms, response FROM exec_request WHERE path LIKE '%balances%'"
+                                 + " AND status = 200 ORDER BY ts_ms DESC LIMIT 1")) {
+                if (!rs.next() || rs.getLong(1) <= best) {
+                    continue;
+                }
+                // Берём САМЫЙ СВЕЖИЙ ответ из всех журналов: остаток общий, и
+                // старый снимок соврал бы ровно там, где важна точность.
+                best = rs.getLong(1);
+                out.clear();
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                        "\"currency\"\s*:\s*\"([A-Z]+)\"\s*,\s*\"available\"\s*:\s*\"([0-9.]+)\"")
+                        .matcher(rs.getString(2) == null ? "" : rs.getString(2));
+                while (m.find()) {
+                    out.put(m.group(1), Double.parseDouble(m.group(2)));
+                }
+            } catch (Exception ignore) {
+                // журнал недоступен — не беда, попробуем следующий
+            }
+        }
+        return out;
+    }
+
+    /** Короткая запись количества: монеты и деньги требуют разной точности. */
+    private static String trim(double v) {
+        double a = Math.abs(v);
+        if (a >= 100) {
+            return String.format(Locale.ROOT, "%.2f", v);
+        }
+        return a >= 0.01 ? String.format(Locale.ROOT, "%.4f", v)
+                : String.format(Locale.ROOT, "%.8f", v);
+    }
     private String pnl() {
         long now = System.currentTimeMillis();
         StringBuilder sb = new StringBuilder("ДОХОД ПО ИСПОЛНИТЕЛЯМ\n\n");
