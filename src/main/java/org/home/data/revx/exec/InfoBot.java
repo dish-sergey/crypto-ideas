@@ -414,7 +414,52 @@ public final class InfoBot implements Runnable {
         // ⚠️ Итоги считаются по ПОКАЗАННЫМ — иначе сумма не сходилась бы со
         // строками выше, а это худший вид неправды в отчёте.
         sb.append(hiddenNote());
+        sb.append(unownedNote());
         return sb.toString();
+    }
+
+    /**
+     * НИЧЕЙНОЕ — одной строкой в общей сводке.
+     *
+     * ⚠️ Это самая незаметная из поломок: монета лежит на счёте, ни один бот ею
+     * не торгует, и НИКТО об этом не сообщает. Владелец находит её глазами на
+     * сайте площадки — так было 10.09.2026 (лот пролежал ничейным восемь часов)
+     * и 13.09.2026 (по лоту на каждой из трёх пар после {@code /release}).
+     * Отдельная команда {@code /alloc} для этого не годится: чтобы её набрать,
+     * надо уже подозревать неладное.
+     *
+     * Показываются только валюты, где ничейного больше 1% остатка, — крошки
+     * округления и запаздывание снимка (реестр двигается на каждом исполнении, а
+     * остаток опрашивается раз в минуту) тревоги не стоят.
+     */
+    private String unownedNote() {
+        java.util.Map<String, Double> claimed = new java.util.TreeMap<>();
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                "jdbc:sqlite:file:" + allocPath + "?mode=ro");
+             java.sql.Statement st = c.createStatement();
+             java.sql.ResultSet rs = st.executeQuery(
+                     "SELECT currency, sum(qty) FROM claim GROUP BY currency")) {
+            while (rs.next()) {
+                claimed.put(rs.getString(1), rs.getDouble(2));
+            }
+        } catch (Exception e) {
+            return "";                    // реестра нет — молчим, /alloc объяснит подробно
+        }
+        Balances bal = venueBalances();
+        StringBuilder sb = new StringBuilder();
+        for (var e : bal.byCurrency().entrySet()) {
+            double total = e.getValue().total();
+            double free = total - claimed.getOrDefault(e.getKey(), 0.0);
+            if (total > 0 && free > 0.01 * total) {
+                sb.append(String.format(Locale.ROOT, " %s %s,", e.getKey(), trim(free)));
+            }
+        }
+        if (sb.isEmpty()) {
+            return "";
+        }
+        sb.setLength(sb.length() - 1);
+        return "\n\n⚠️ НИЧЕЙНОЕ (ни за кем не числится):" + sb
+                + "\nэтим никто не торгует — подробности /alloc";
     }
 
 
@@ -464,6 +509,7 @@ public final class InfoBot implements Runnable {
         }
         Balances bal = venueBalances();
         java.util.Map<String, Balance> onVenue = bal.byCurrency();
+        java.util.List<ActiveOrder> orders = venueOrders();
 
         StringBuilder sb = new StringBuilder("РЕЗЕРВАЦИИ\n");
         if (bal.tsMs() > 0) {
@@ -494,6 +540,7 @@ public final class InfoBot implements Runnable {
             sb.append(cur.getKey()).append(':');
             if (v != null) {
                 double free = v.total() - claimed;
+                double orphan = orphanLocked(cur.getKey(), orders, cur.getValue(), now);
                 // ⚠️ Тревога только при КРУПНОЙ недостаче. Реестр двигается на
                 // каждом исполнении, а остаток опрашивается раз в минуту, поэтому
                 // расхождение в один лот — это почти всегда запаздывание снимка.
@@ -505,6 +552,16 @@ public final class InfoBot implements Runnable {
                 sb.append(String.format(Locale.ROOT,
                         "  на счёте %s (в заявках %s), разобрано %s, СВОБОДНО %s%s",
                         trim(v.total()), trim(v.reserved()), trim(claimed), trim(free), note));
+                // ⚠️ Свободное свободному рознь. Монета, запертая в заявке БЕЗ
+                // живого хозяина, в остатке видна, но забрать её нельзя: заявка
+                // исполнится сама, и у нового владельца останется фантом.
+                if (orphan > 1e-12) {
+                    sb.append(String.format(Locale.ROOT,
+                            "%n  ⚠️ из них %s заперто в заявках без живого хозяина — "
+                                    + "сначала снять эти заявки", trim(orphan)));
+                } else if (free > 1e-12) {
+                    sb.append("\n  → забрать: /stop, затем /claim всё у нужного бота");
+                }
             } else {
                 sb.append(String.format(Locale.ROOT, "  разобрано %s (остаток счёта неизвестен)",
                         trim(claimed)));
@@ -519,6 +576,70 @@ public final class InfoBot implements Runnable {
             sb.append("\n⚠️ Остатков счёта нет: ни один журнал не содержит ответа /balances.\n");
         }
         return sb.toString();
+    }
+
+    /**
+     * Сколько монеты заперто в продажах, у которых НЕТ живого хозяина в реестре.
+     *
+     * Такая монета вдвойне обманчива: в остатке счёта она есть, резервацией не
+     * покрыта — то есть выглядит свободной, — а забрать её нельзя. Заявка стоит
+     * сама по себе (бот убит, а заявка осталась; или заявка досталась от версии
+     * без метки) и однажды исполнится, оставив нового владельца с фантомом.
+     *
+     * Хозяин определяется по метке в {@code client_order_id}: первые восемь
+     * знаков — {@link BotTag#prefix()} владельца. Заявка без метки хозяина не
+     * имеет по определению.
+     *
+     * @param claims строки реестра по этой валюте: {@code bot -> [qty, heartbeat]}
+     */
+    static double orphanLocked(String currency, java.util.List<ActiveOrder> orders,
+                                       java.util.Map<String, double[]> claims, long nowMs) {
+        double orphan = 0;
+        for (ActiveOrder o : orders) {
+            if (o.side() != org.home.data.revx.sim.Side.SELL || o.symbol() == null
+                    || !o.symbol().startsWith(currency + "/")) {
+                continue;                  // монету запирает только продажа
+            }
+            boolean liveOwner = false;
+            for (var claim : claims.entrySet()) {
+                boolean live = nowMs - (long) claim.getValue()[1] < AllocRegistry.LEASE_MS;
+                if (live && new BotTag(claim.getKey()).owns(o.clientId())) {
+                    liveOwner = true;
+                    break;
+                }
+            }
+            if (!liveOwner) {
+                orphan += Math.max(0, o.size());
+            }
+        }
+        return orphan;
+    }
+
+    /**
+     * Активные заявки из последнего ответа {@code GET /orders/active} в журналах.
+     *
+     * Список общий на весь счёт, поэтому годится ЛЮБОЙ журнал — берётся самый
+     * свежий. Ключа у сводки нет, на площадку она не ходит.
+     */
+    private java.util.List<ActiveOrder> venueOrders() {
+        java.util.List<ActiveOrder> best = java.util.List.of();
+        long bestMs = 0;
+        for (Watched w : watched) {
+            try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                    "jdbc:sqlite:file:" + w.journalPath() + "?mode=ro");
+                 java.sql.Statement st = c.createStatement();
+                 java.sql.ResultSet rs = st.executeQuery(
+                         "SELECT ts_ms, response FROM exec_request WHERE path LIKE '%orders/active%'"
+                                 + " AND status = 200 ORDER BY ts_ms DESC LIMIT 1")) {
+                if (rs.next() && rs.getLong(1) > bestMs) {
+                    bestMs = rs.getLong(1);
+                    best = ActiveOrder.parse(rs.getString(2));
+                }
+            } catch (Exception ignore) {
+                // журнал недоступен — не беда, попробуем следующий
+            }
+        }
+        return best;
     }
 
     /** Остаток одной валюты на счёте: что можно тратить, что заперто в заявках. */

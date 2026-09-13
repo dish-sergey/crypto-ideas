@@ -9,6 +9,7 @@ import java.sql.DriverManager;
 import java.sql.Statement;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -117,6 +118,68 @@ class InfoBotAllocTest {
         assertTrue(out.contains("разобрано БОЛЬШЕ"), out);
     }
 
+    /**
+     * ⚠️ ЖИВОЙ СЛУЧАЙ 13.09.2026. Владелец сделал {@code /release} и
+     * {@code /claim} на всех шести ботах и всё равно видел на счёте монеты,
+     * которых нет ни у кого: у BTC при остатке 0.00002529 за ботами числилось
+     * 0.00001256. Сводка обязана сказать об этом прямо и подсказать действие.
+     */
+    @Test
+    void ничейноеВидноИСказаноЧтоДелать(@TempDir Path dir) throws Exception {
+        Path db = dir.resolve("alloc.db");
+        registry(db, "e;BTC;0.00001256;0");
+        Path journal = dir.resolve("j.db");
+        balances(journal, "[{\"currency\":\"BTC\",\"available\":\"0.00001274\","
+                + "\"reserved\":\"0.00001255\",\"total\":\"0.00002529\"}]");
+        String out = alloc(new InfoBot("t", 1,
+                List.of(new InfoBot.Watched("e", "BTC/USDC", journal.toString())), db.toString()));
+        assertTrue(out.contains("СВОБОДНО"), out);
+        assertTrue(out.contains("/claim всё"), "подсказка действия обязательна: " + out);
+    }
+
+    /**
+     * 🔑 А вот это ничейное забрать НЕЛЬЗЯ: монета заперта в продаже, у которой
+     * нет живого хозяина (бот убит, заявка осталась). Забравший получил бы
+     * фантомный инвентарь — заявка исполнится сама.
+     */
+    @Test
+    void запертоеБезХозяинаНеПредлагаетсяЗабрать(@TempDir Path dir) throws Exception {
+        Path db = dir.resolve("alloc.db");
+        registry(db, "e;BTC;0.00000001;600000");          // сердцебиение десять минут назад
+        Path journal = dir.resolve("j.db");
+        balances(journal, "[{\"currency\":\"BTC\",\"available\":\"0.00000019\","
+                + "\"reserved\":\"0.00003764\",\"total\":\"0.00003783\"}]");
+        orders(journal, "{\"data\":[{\"id\":\"1\","
+                + "\"client_order_id\":\"eeeeeeee-fb87-4ec7-9acb-aba878f42c62\","
+                + "\"symbol\":\"BTC/USDC\",\"side\":\"sell\",\"quantity\":\"0.00003764\","
+                + "\"leaves_quantity\":\"0.00003764\",\"price\":\"77000.0\","
+                + "\"created_date\":1789290000000}]}");
+        String out = alloc(new InfoBot("t", 1,
+                List.of(new InfoBot.Watched("e", "BTC/USDC", journal.toString())), db.toString()));
+        assertTrue(out.contains("без живого хозяина"), out);
+        assertFalse(out.contains("/claim всё"), "забирать ловушку предлагать нельзя: " + out);
+    }
+
+    /** Разбор запертого сам по себе: чья заявка держит монету. */
+    @Test
+    void запертоеСчитаетсяТолькоПоПродажамИБезЖивогоХозяина() {
+        String book = "{\"data\":[{\"id\":\"1\",\"client_order_id\":\"eeeeeeee-1\","
+                + "\"symbol\":\"BTC/USDC\",\"side\":\"sell\",\"leaves_quantity\":\"0.00001255\","
+                + "\"price\":\"77000\",\"created_date\":1789290000000},"
+                + "{\"id\":\"2\",\"client_order_id\":\"eeeeeeee-2\",\"symbol\":\"BTC/USDC\","
+                + "\"side\":\"buy\",\"leaves_quantity\":\"0.00001255\",\"price\":\"76000\","
+                + "\"created_date\":1789290000000}]}";
+        long now = System.currentTimeMillis();
+        var orders = ActiveOrder.parse(book);
+
+        // хозяин жив — монета его, ловушки нет
+        assertEquals(0.0, InfoBot.orphanLocked("BTC", orders,
+                java.util.Map.of("e", new double[]{0.00001255, now}), now), 1e-12);
+        // хозяин молчит дольше аренды — монета заперта и ничья
+        assertEquals(0.00001255, InfoBot.orphanLocked("BTC", orders,
+                java.util.Map.of("e", new double[]{0.00001255, now - 10 * 60_000L}), now), 1e-12);
+    }
+
     private static void balances(Path file, String json) throws Exception {
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + file);
              Statement st = c.createStatement()) {
@@ -124,6 +187,15 @@ class InfoBotAllocTest {
                     + " body TEXT, status INTEGER, response TEXT, latency_ms INTEGER, error TEXT)");
             st.execute("INSERT INTO exec_request (ts_ms, method, path, status, response) VALUES ("
                     + System.currentTimeMillis() + ",'GET','/api/1.0/balances',200,'"
+                    + json.replace("'", "''") + "')");
+        }
+    }
+
+    private static void orders(Path file, String json) throws Exception {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + file);
+             Statement st = c.createStatement()) {
+            st.execute("INSERT INTO exec_request (ts_ms, method, path, status, response) VALUES ("
+                    + System.currentTimeMillis() + ",'GET','/api/1.0/orders/active',200,'"
                     + json.replace("'", "''") + "')");
         }
     }

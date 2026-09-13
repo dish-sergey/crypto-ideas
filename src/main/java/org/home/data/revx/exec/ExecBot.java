@@ -172,8 +172,15 @@ public final class ExecBot implements Runnable {
             case "/free" -> send(loop.describeFree());
             case "/claim" -> {
                 String[] parts = text.split("\s+");
-                send(parts.length < 2 ? "Сколько лотов? Например: /claim 8"
-                        : loop.claimLots(parseLots(parts[1])));
+                // «всё» берёт остаток ДО ПОСЛЕДНЕГО ЗНАКА. Круглое число лотов
+                // всегда оставляет хвост ничейным: после /release и частичных
+                // продаж на счёте лежат доли лота, и они копятся от раза к разу.
+                String arg = parts.length < 2 ? "" : parts[1].trim().toLowerCase();
+                send(switch (arg) {
+                    case "" -> "Сколько лотов? Например: /claim 8 или /claim всё";
+                    case "всё", "все", "all", "max" -> loop.claimAll();
+                    default -> loop.claimLots(parseLots(arg));
+                });
             }
             case "/release" -> send(loop.release());
             case "/pnl" -> send(PnlReport.render(journal, loop.stats().lastFair(),
@@ -251,6 +258,7 @@ public final class ExecBot implements Runnable {
                 /free   — сколько инвентаря свободно и кто чем владеет
                 /claim N — взять N свободных ЛОТОВ (только пока не котирует).
                            Деньги брать не нужно: /start берёт их сам
+                /claim всё — взять весь свободный остаток без округления до лотов
                 /release — отдать свой инвентарь и кассу в общий котёл
                 /help   — это сообщение
 
@@ -282,7 +290,7 @@ public final class ExecBot implements Runnable {
                     [{"command":"status","description":"состояние и инвентарь в % потолка"},
                      {"command":"pnl","description":"реализовано и нереализовано, окна 3ч-7дн"},
                      {"command":"free","description":"кто чем владеет и сколько свободно"},
-                     {"command":"claim","description":"взять N свободных лотов"},
+                     {"command":"claim","description":"взять N свободных лотов или всё"},
                      {"command":"release","description":"отдать свой инвентарь и кассу"},
                      {"command":"stats","description":"исполнения против предсказания"},
                      {"command":"start","description":"взять деньги и включить котирование"},

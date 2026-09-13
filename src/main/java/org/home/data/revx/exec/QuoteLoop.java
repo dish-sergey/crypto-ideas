@@ -994,6 +994,17 @@ public final class QuoteLoop implements Runnable {
 
     private volatile double inventory;
     private volatile double baseAvailable;
+    /**
+     * Остаток базовой валюты на СЧЁТЕ целиком — {@code available + reserved} из
+     * ответа площадки. Это и есть знаменатель реестра владения: монета, лежащая
+     * в выставленной заявке, никуда не делась, она просто заперта.
+     *
+     * ⚠️ Не путать с {@link #baseAvailable}: на неё можно ПОСТАВИТЬ, а эта —
+     * сколько монеты есть. Подмена одного другим стоила нам ничейных лотов —
+     * см. {@link #accountBase()}.
+     */
+    private volatile double baseTotalAccount = Double.NaN;
+    private volatile double baseReserved;
     private volatile double quoteBalance;
     private volatile double quoteTotal;
     private volatile double lastFair;
@@ -2982,6 +2993,8 @@ public final class QuoteLoop implements Runnable {
             double total = Double.parseDouble(matcher.group(4));
             if (base.equals(matcher.group(1))) {
                 baseTotal = total;
+                baseTotalAccount = total;     // сколько монеты есть вообще
+                baseReserved = Double.parseDouble(matcher.group(3));
                 baseAvailable = available;    // поставить можно только на это
                 if (!ownPosition) {
                     inventory = total;        // одинокий бот: вся позиция наша
@@ -3174,16 +3187,33 @@ public final class QuoteLoop implements Runnable {
         double lot = params.size();
         double cap = params.inventoryCap();
         double price = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
-        AllocRegistry.Free fb = alloc.free(base, baseTotal(), now);
+        Locked locked = lockedNow(now);
+        double orphan = locked == null ? 0 : locked.orphans();
+        AllocRegistry.Free fb = alloc.free(base, accountBase() - orphan, now);
         AllocRegistry.Free fq = alloc.free(quote, quoteTotal, now);
         double myBase = alloc.own(tag.id(), base);
         double myQuote = alloc.own(tag.id(), quote);
 
         StringBuilder sb = new StringBuilder();
         sb.append(String.format(java.util.Locale.ROOT,
-                "СЧЁТ%n  %s: %.8f = %.1f лота%n  %s: %.2f%n%n",
-                base, fb.venueTotal(), lot > 0 ? fb.venueTotal() / lot : 0,
+                "СЧЁТ%n  %s: %.8f = %.1f лота%n  %s: %.2f%n",
+                base, accountBase(), lot > 0 ? accountBase() / lot : 0,
                 quote, fq.venueTotal()));
+        // Где монета лежит физически. Без этой строки «на счёте вижу, а бот не
+        // видит» выглядит как поломка, хотя это заявки.
+        if (locked == null) {
+            sb.append("  ⚠️ список активных заявок не получен — что заперто, неизвестно\n");
+        } else if (locked.total() > 0) {
+            sb.append(String.format(java.util.Locale.ROOT,
+                    "  в заявках: %.8f (моих %.8f, соседей %.8f%s)%n",
+                    locked.total(), locked.mine(), locked.liveNeighbours(),
+                    locked.orphans() > 0
+                            ? String.format(java.util.Locale.ROOT,
+                                    ", ⚠️ БЕЗ ХОЗЯИНА %.8f в %d заявк(ах)",
+                                    locked.orphans(), locked.orphanOrders())
+                            : ""));
+        }
+        sb.append("\n");
 
         sb.append("ДЕРЖАТ БОТЫ\n");
         for (AllocRegistry.Claim c : alloc.claims(base, now)) {
@@ -3258,9 +3288,59 @@ public final class QuoteLoop implements Runnable {
             return "Нет доверенной справедливой цены — передачу оценить нечем. "
                     + "Подождите, пока опора заработает.";
         }
+        return claimQty(lots * params.size());
+    }
+
+    /**
+     * Взять ВСЁ свободное до последнего знака, а не круглое число лотов.
+     *
+     * Нужно потому, что ничейное редко оказывается целым числом лотов: после
+     * {@code /release} и частичных продаж на счёте остаётся хвост в доли лота, и
+     * захват «сколько-то лотов» оставляет его ничейным навсегда. Подсказка
+     * {@code /free} округляет ВНИЗ, чтобы её можно было скопировать, — а эта
+     * команда берёт остаток целиком.
+     */
+    public String claimAll() {
+        if (alloc == null) {
+            return "реестр владения не подключён";
+        }
+        if (quoting.get()) {
+            return "Захват запрещён при включённом котировании. Сначала /stop.";
+        }
         refreshBalances();
-        double qty = lots * params.size();
         long now = clock.now();
+        Locked locked = lockedNow(now);
+        if (locked == null) {
+            return "Отказ: список активных заявок не получен, "
+                    + "а без него нельзя отличить свободную монету от запертой в чужой заявке.";
+        }
+        double free = alloc.free(base, accountBase() - locked.orphans(), now).free();
+        if (!(free > 0)) {
+            return "Свободного нет.\n\n" + describeFree();
+        }
+        return claimQty(free);
+    }
+
+    private String claimQty(double qty) {
+        double price = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
+        if (!(price > 0)) {
+            return "Нет доверенной справедливой цены — передачу оценить нечем. "
+                    + "Подождите, пока опора заработает.";
+        }
+        refreshBalances();
+        long now = clock.now();
+
+        // ⚠️ Без списка активных заявок захват запрещён. Монета, запертая в
+        // заявке БЕЗ живого хозяина, выглядит в остатке счёта как свободная, но
+        // забравший её получит фантомный инвентарь: заявка исполнится сама, а
+        // реестр будет считать монету за новым владельцем. Один GET на команду,
+        // которая и так делается руками.
+        Locked locked = lockedNow(now);
+        if (locked == null) {
+            return "Отказ: список активных заявок не получен, "
+                    + "а без него нельзя отличить свободную монету от запертой в чужой заявке.";
+        }
+        double denominator = accountBase() - locked.orphans();
 
         // Деньги забираются ВМЕСТЕ с монетами, одной командой и по принципу
         // «либо всё, либо ничего». Смысл: бот должен уметь дойти до потолка, а
@@ -3278,7 +3358,7 @@ public final class QuoteLoop implements Runnable {
                             + "отказах по средствам.%n%n%s",
                     takeQuote, quote, freeQuote, describeFree());
         }
-        if (!alloc.claim(tag.id(), base, qty, baseTotal(), price, now)) {
+        if (!alloc.claim(tag.id(), base, qty, denominator, price, now)) {
             return "Отказ: свободных лотов меньше запрошенного.\n\n" + describeFree();
         }
         if (takeQuote > 0 && !alloc.claim(tag.id(), quote, takeQuote, quoteTotal, price, now)) {
@@ -3303,11 +3383,15 @@ public final class QuoteLoop implements Runnable {
         if (qty > 0) {
             journal.fill(null, "BUY", qty, price, price, 0, null, "handover");
         }
+        // Доли лота печатаются ДВУМЯ знаками: `/claim всё` берёт остаток целиком,
+        // и он почти никогда не круглый — с одним знаком «0.3 лота» скрывало бы,
+        // что взято 0.34, а именно эта разница и оставалась ничейной.
+        double lots = params.size() > 0 ? qty / params.size() : 0;
         journal.event("claim", String.format(java.util.Locale.ROOT,
-                "%.1f лота = %.8f %s по %.2f, плюс %.2f %s",
+                "%.2f лота = %.8f %s по %.2f, плюс %.2f %s",
                 lots, qty, base, price, takeQuote, quote));
         return String.format(java.util.Locale.ROOT,
-                "Взято %.1f лота = %.8f %s по справедливой %.2f и %.2f %s.%n"
+                "Взято %.2f лота = %.8f %s по справедливой %.2f и %.2f %s.%n"
                         + "Записано передачей (status=handover), в статистику сделок не идёт.%n%n%s",
                 lots, qty, base, price, takeQuote, quote, describeFree());
     }
@@ -3351,18 +3435,201 @@ public final class QuoteLoop implements Runnable {
         }
         journal.event("release", String.format(java.util.Locale.ROOT,
                 "%.8f %s и %.2f %s по %.2f", qty, base, cash, quote, price));
+        // ⚠️ Напоминание не вежливость, а защита от самого частого сценария:
+        // 13.09.2026 владелец освободил всех шестерых и захватил обратно меньше,
+        // чем отдал. Остаток стал ничейным — им никто не торгует, и виден он
+        // только на сайте площадки.
         return String.format(java.util.Locale.ROOT,
-                "Освобождено %.8f %s и %.2f %s по %.2f, закрыто по переоценке.%n%n%s",
+                "Освобождено %.8f %s и %.2f %s по %.2f, закрыто по переоценке.%n"
+                        + "⚠️ Теперь это НИЧЕЙНОЕ: пока кто-нибудь не сделает /claim, "
+                        + "монетой не торгует никто.%n%n%s",
                 qty, base, cash, quote, price, describeFree());
     }
 
-    /** Остаток счёта по базовой валюте — знаменатель для реестра. */
-    private double baseTotal() {
+    /**
+     * Остаток счёта по базовой валюте — знаменатель для реестра владения.
+     *
+     * ⚠️ ЗДЕСЬ БЫЛА ОШИБКА, ИЗ-ЗА КОТОРОЙ МОНЕТЫ СТАНОВИЛИСЬ НЕВИДИМЫМИ
+     * (13.09.2026). Считалось {@code baseAvailable + СВОИ стоящие аски}, то есть
+     * остаток счёта минус монеты, запертые в заявках ДРУГИХ ботов. А свободное
+     * реестр считает как {@code знаменатель − живые претензии}, и претензии
+     * соседа вычитались ВТОРОЙ раз: его монеты и в знаменатель не входили, и из
+     * него же вычитались.
+     *
+     * Пока на паре работал один бот, разницы не было. С 12.09.2026 ботов на паре
+     * ДВА (опыт «один уровень против трёх»), и ошибка стала постоянной: у BTC
+     * при остатке счёта 0.00002529 и соседском аске на 0.00001255 бот видел
+     * «свободно 0.00000018» вместо лота, а владелец видел монеты на счёте и не
+     * мог их забрать никаким {@code /claim}.
+     *
+     * Правильный знаменатель — остаток СЧЁТА: монета в выставленной заявке никуда
+     * не делась. Кто чем владеет, решают живые претензии реестра, а не остаток.
+     */
+    private double accountBase() {
+        if (!Double.isNaN(baseTotalAccount)) {
+            return baseTotalAccount;
+        }
+        // Остатки ещё не пришли — считаем по своим заявкам, как раньше.
         double reserved = 0;
         for (Resting r : asks) {
             reserved += r.venueId != null ? r.size : 0;
         }
         return baseAvailable + reserved;
+    }
+
+    /** Что заперто в заявках по этой паре и за кем числится. Всё в монетах. */
+    record Locked(double mine, double liveNeighbours, double orphans, int orphanOrders) {
+        double total() {
+            return mine + liveNeighbours + orphans;
+        }
+    }
+
+    /**
+     * РАЗБОР ЗАПЕРТОГО: чьи заявки держат монету.
+     *
+     * Монета в заявке соседа с ЖИВОЙ претензией — его, и она уже вычтена из
+     * свободного как его претензия. А вот монета в заявке, у которой живого
+     * хозяина нет (бот убит, а заявка осталась; или заявка досталась от старой
+     * версии без метки), — это ловушка: реестру она видна как свободная, но
+     * забравший её не сможет ни продать, ни удержать — заявка исполнится сама,
+     * и у нового хозяина останется фантомный инвентарь. Такие монеты из
+     * свободного вычитаются отдельно.
+     *
+     * Хозяин определяется по метке в {@code client_order_id} — первые восемь
+     * знаков ({@link BotTag#prefix()}). Заявка без метки считается чужой.
+     */
+    static Locked lockedInOrders(String symbol, BotTag tag, java.util.List<ActiveOrder> all,
+                                 java.util.List<AllocRegistry.Claim> claims) {
+        double mine = 0;
+        double live = 0;
+        double orphan = 0;
+        int orphanOrders = 0;
+        String mySymbol = ActiveOrder.normalize(symbol);
+        for (ActiveOrder o : all) {
+            if (o.side() != Side.SELL || !mySymbol.equals(o.symbol())) {
+                continue;                 // монету запирает только продажа
+            }
+            // ⚠️ Вычитать filled НЕ НАДО: {@link ActiveOrder} кладёт в size уже
+            // `leaves_quantity`, то есть то, что ещё стоит в книге и держит
+            // резерв. Первая версия вычитала исполненное второй раз и занижала
+            // запертое на частично исполненной заявке — поймано тестом.
+            double left = Math.max(0, o.size());
+            if (tag.owns(o.clientId())) {
+                mine += left;
+            } else if (hasLiveOwner(o.clientId(), claims)) {
+                live += left;
+            } else {
+                orphan += left;
+                orphanOrders++;
+            }
+        }
+        return new Locked(mine, live, orphan, orphanOrders);
+    }
+
+    /** Есть ли у метки заявки живой хозяин среди претензий реестра. */
+    private static boolean hasLiveOwner(String clientId, java.util.List<AllocRegistry.Claim> claims) {
+        if (clientId == null) {
+            return false;
+        }
+        for (AllocRegistry.Claim c : claims) {
+            if (c.live() && new BotTag(c.botId()).owns(clientId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Разбор запертого прямо сейчас, одним запросом к площадке.
+     *
+     * @return {@code null}, если список активных заявок получить не удалось. Не
+     *         зная списка, мы не знаем и о заявках-ловушках, поэтому захват в
+     *         этом случае запрещается целиком — см. {@link #claimLots}.
+     */
+    private Locked lockedNow(long now) {
+        Venue.Response active = client.activeOrders();
+        if (!active.ok() || active.body() == null) {
+            return null;
+        }
+        return lockedInOrders(symbol, tag, ActiveOrder.parse(active.body()),
+                alloc == null ? java.util.List.of() : alloc.claims(base, now));
+    }
+
+    /** Когда в последний раз кричали про расхождение реестра и про ничейное. */
+    private volatile long registryWarnedMs;
+    private volatile long unownedWarnedMs;
+
+    /**
+     * РЕЕСТР ПРОТИВ ЖУРНАЛА: они обязаны совпадать до пыли.
+     *
+     * Обе величины двигает один и тот же код: {@code applyFill} прибавляет к
+     * позиции в журнале и к претензии в реестре. Значит расхождение означает
+     * ровно одно — одна из двух записей не прошла. Реестр при ошибке записи
+     * только пишет в лог ({@code log.error}) и работает дальше, то есть тихо
+     * разъезжается с журналом, а замечается это через сутки по «на счёте монеты
+     * есть, а бот их не видит».
+     *
+     * ⚠️ Журнал — первоисточник, реестр — кэш. Поэтому здесь только ТРЕВОГА, и
+     * никакого самолечения: подгонять кэш под журнал молча значит стереть след
+     * настоящей поломки. Лечится перезахватом руками.
+     */
+    private void checkRegistryAgainstJournal(long now) {
+        double claimed = alloc.own(tag.id(), base);
+        double drift = Math.abs(claimed - inventory);
+        // Пыль: позиция и претензия считаются в double, и на длинной серии
+        // сделок последние знаки расходятся законно.
+        double dust = Math.max(1e-12, params.size() * 1e-6);
+        if (drift <= dust || now - registryWarnedMs < MISMATCH_REPEAT_MS) {
+            return;
+        }
+        registryWarnedMs = now;
+        String message = ("РЕЕСТР РАЗОШЁЛСЯ С ЖУРНАЛОМ: за мной числится %s %s, "
+                + "а по своим сделкам у меня %s. Реестр — кэш, журнал — истина; "
+                + "чинить перезахватом (/stop, /release, /claim всё), но сначала посмотреть, "
+                + "почему не прошла запись.")
+                .formatted(fmt(claimed), base, fmt(inventory));
+        log.error(message);
+        journal.event("registry_drift", message);
+        alert.accept(message);
+    }
+
+    /**
+     * НИЧЕЙНОЕ НА СЧЁТЕ: монета есть, а хозяина у неё нет.
+     *
+     * ⚠️ Это самая тихая из поломок. Ничейной монетой никто не торгует, ни один
+     * счётчик её не показывает, и узнаёт о ней владелец, случайно заглянув в
+     * приложение площадки. Так было 10.09.2026 (лот пролежал ничейным восемь
+     * часов) и 13.09.2026 (по лоту на каждой из трёх пар после {@code /release}
+     * без обратного захвата).
+     *
+     * Порог — ЛОТ: меньше лота ничем не торгуют, а запаздывание снимка остатков
+     * (раз в минуту) на лот и отличается. Повтор не чаще раза в час: тревога,
+     * которую видно каждую минуту, перестаёт быть тревогой.
+     */
+    private void checkUnowned(long now) {
+        if (!(params.size() > 0) || Double.isNaN(baseTotalAccount)
+                || now - unownedWarnedMs < 3_600_000L) {
+            return;
+        }
+        double free = alloc.free(base, baseTotalAccount, now).free();
+        if (free < params.size()) {
+            return;
+        }
+        // Заперто в заявке без живого хозяина — тоже ничейное, но забирать его
+        // нельзя, и в тревоге это надо различать: иначе совет «заберите» приведёт
+        // к фантомному инвентарю.
+        Locked locked = lockedNow(now);
+        double orphan = locked == null ? 0 : locked.orphans();
+        unownedWarnedMs = now;
+        String message = ("НИЧЕЙНОЕ: на счёте %s %s не числится ни за одним ботом (%.1f лота). %s")
+                .formatted(fmt(free), base, free / params.size(),
+                        orphan > params.size() * 0.01
+                                ? "Из них " + fmt(orphan) + " заперто в заявках без живого "
+                                        + "хозяина — их сначала надо снять."
+                                : "Забрать: /stop, затем /claim всё.");
+        log.warn(message);
+        journal.event("unowned", message);
+        alert.accept(message);
     }
 
     private void rollCounters() {
@@ -3374,6 +3641,8 @@ public final class QuoteLoop implements Runnable {
             // /stop на час претензию терять не должен, а убитый процесс — должен.
             if (alloc != null) {
                 alloc.heartbeat(tag.id(), now);
+                checkRegistryAgainstJournal(now);
+                checkUnowned(now);
             }
             // Остатки перечитываются раз в минуту: исполнение могло случиться молча.
             refreshBalances();
