@@ -82,4 +82,49 @@ class InfoBotAllocTest {
         String out = alloc(new InfoBot("t", 1, List.of(), dir.resolve("нет.db").toString()));
         assertTrue(out.contains("не прочитался") || out.contains("пуст"), out);
     }
+
+    /**
+     * 🔑 СЧИТАТЬ ПО {@code total}, А НЕ ПО {@code available}.
+     *
+     * Первая версия брала available и показывала «разобрано больше, чем есть» на
+     * КАЖДОЙ паре, где бот стоит в книге: монета в выставленной заявке лежит в
+     * reserved. У BTC 13.09.2026 было available 0.00000019 при reserved
+     * 0.00003764 — то есть вся позиция выглядела пропавшей.
+     */
+    @Test
+    void монетаВЗаявкеНеСчитаетсяПропавшей(@TempDir Path dir) throws Exception {
+        Path db = dir.resolve("alloc.db");
+        registry(db, "a;BTC;0.00003765;0");
+        Path journal = dir.resolve("j.db");
+        balances(journal, "[{\"currency\":\"BTC\",\"available\":\"0.00000019\","
+                + "\"reserved\":\"0.00003764\",\"total\":\"0.00003783\"}]");
+        String out = alloc(new InfoBot("t", 1,
+                List.of(new InfoBot.Watched("a", "BTC/USDC", journal.toString())), db.toString()));
+        assertFalse(out.contains("разобрано БОЛЬШЕ"), out);
+        assertTrue(out.contains("в заявках"), out);
+    }
+
+    /** Крупная недостача — настоящая тревога: у d осталась резервация ADA с прошлой пары. */
+    @Test
+    void крупнаяНедостачаКричит(@TempDir Path dir) throws Exception {
+        Path db = dir.resolve("alloc.db");
+        registry(db, "d;ADA;59.7754;0");
+        Path journal = dir.resolve("j.db");
+        balances(journal, "[{\"currency\":\"ADA\",\"available\":\"4.5981\","
+                + "\"reserved\":\"0.0000\",\"total\":\"4.5981\"}]");
+        String out = alloc(new InfoBot("t", 1,
+                List.of(new InfoBot.Watched("d", "ADA/USDC", journal.toString())), db.toString()));
+        assertTrue(out.contains("разобрано БОЛЬШЕ"), out);
+    }
+
+    private static void balances(Path file, String json) throws Exception {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + file);
+             Statement st = c.createStatement()) {
+            st.execute("CREATE TABLE exec_request (ts_ms INTEGER, method TEXT, path TEXT,"
+                    + " body TEXT, status INTEGER, response TEXT, latency_ms INTEGER, error TEXT)");
+            st.execute("INSERT INTO exec_request (ts_ms, method, path, status, response) VALUES ("
+                    + System.currentTimeMillis() + ",'GET','/api/1.0/balances',200,'"
+                    + json.replace("'", "''") + "')");
+        }
+    }
 }

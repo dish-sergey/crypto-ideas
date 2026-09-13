@@ -462,9 +462,14 @@ public final class InfoBot implements Runnable {
         if (byCurrency.isEmpty()) {
             return "Реестр резерваций пуст.";
         }
-        java.util.Map<String, Double> onVenue = venueBalances();
+        Balances bal = venueBalances();
+        java.util.Map<String, Balance> onVenue = bal.byCurrency();
 
-        StringBuilder sb = new StringBuilder("РЕЗЕРВАЦИИ\n\n");
+        StringBuilder sb = new StringBuilder("РЕЗЕРВАЦИИ\n");
+        if (bal.tsMs() > 0) {
+            sb.append("остаток счёта снят ").append(ago(now - bal.tsMs())).append('\n');
+        }
+        sb.append('\n');
         for (var cur : byCurrency.entrySet()) {
             double claimed = 0;
             StringBuilder rows = new StringBuilder();
@@ -485,14 +490,21 @@ public final class InfoBot implements Runnable {
             if (rows.isEmpty()) {
                 continue;
             }
-            Double venue = onVenue.get(cur.getKey());
+            Balance v = onVenue.get(cur.getKey());
             sb.append(cur.getKey()).append(':');
-            if (venue != null) {
-                double free = venue - claimed;
+            if (v != null) {
+                double free = v.total() - claimed;
+                // ⚠️ Тревога только при КРУПНОЙ недостаче. Реестр двигается на
+                // каждом исполнении, а остаток опрашивается раз в минуту, поэтому
+                // расхождение в один лот — это почти всегда запаздывание снимка.
+                // Кричать на него значит приучить не смотреть на предупреждения.
+                String note = free >= -1e-12 ? ""
+                        : (-free > 0.2 * Math.max(1e-12, claimed)
+                        ? "  ⚠️ разобрано БОЛЬШЕ, чем есть"
+                        : "  (снимок отстал — обычно ровно на лот)");
                 sb.append(String.format(Locale.ROOT,
-                        "  на счёте %s, разобрано %s, СВОБОДНО %s%s",
-                        trim(venue), trim(claimed), trim(free),
-                        free < -1e-9 ? "  ⚠️ разобрано БОЛЬШЕ, чем есть" : ""));
+                        "  на счёте %s (в заявках %s), разобрано %s, СВОБОДНО %s%s",
+                        trim(v.total()), trim(v.reserved()), trim(claimed), trim(free), note));
             } else {
                 sb.append(String.format(Locale.ROOT, "  разобрано %s (остаток счёта неизвестен)",
                         trim(claimed)));
@@ -501,16 +513,40 @@ public final class InfoBot implements Runnable {
         }
         sb.append("⚠️ Свободное — это НИЧЕЙНОЕ: им никто не торгует, пока кто-нибудь\n")
                 .append("не заберёт его через /claim. Резервация мёртвого бота держится\n")
-                .append("до роспуска, поэтому «молчит» рядом с числом важнее самого числа.\n");
+                .append("до роспуска, поэтому «молчит» рядом с числом важнее самого числа.\n")
+                .append("Считается по total: монета в выставленной заявке лежит в reserved.\n");
         if (onVenue.isEmpty()) {
             sb.append("\n⚠️ Остатков счёта нет: ни один журнал не содержит ответа /balances.\n");
         }
         return sb.toString();
     }
 
-    /** Остатки счёта из последнего ответа {@code /balances} в журналах ботов. */
-    private java.util.Map<String, Double> venueBalances() {
-        java.util.Map<String, Double> out = new java.util.HashMap<>();
+    /** Остаток одной валюты на счёте: что можно тратить, что заперто в заявках. */
+    private record Balance(double available, double reserved) {
+        double total() {
+            return available + reserved;
+        }
+    }
+
+    /**
+     * Остатки счёта из последнего ответа {@code /balances} в журналах ботов.
+     *
+     * ⚠️ СЧИТАТЬ НАДО ПО {@code total}, А НЕ ПО {@code available} — первая версия
+     * брала available и показывала «разобрано больше, чем есть» на КАЖДОЙ паре,
+     * где бот стоит в книге. Монета, лежащая в выставленной заявке, сидит в
+     * {@code reserved}: у BTC 13.09.2026 было available 0.00000019 при reserved
+     * 0.00003764. Резервация покрывает монету независимо от того, заперта она
+     * сейчас в заявке или нет.
+     *
+     * Возвращается и отметка времени снимка: остаток опрашивается раз в минуту, а
+     * реестр двигается на каждом исполнении, поэтому расхождение РОВНО В ЛОТ —
+     * это почти всегда запаздывание снимка, а не потеря.
+     */
+    private record Balances(java.util.Map<String, Balance> byCurrency, long tsMs) {
+    }
+
+    private Balances venueBalances() {
+        java.util.Map<String, Balance> out = new java.util.HashMap<>();
         long best = 0;
         for (Watched w : watched) {
             try (java.sql.Connection c = java.sql.DriverManager.getConnection(
@@ -527,16 +563,18 @@ public final class InfoBot implements Runnable {
                 best = rs.getLong(1);
                 out.clear();
                 java.util.regex.Matcher m = java.util.regex.Pattern.compile(
-                        "\"currency\"\s*:\s*\"([A-Z]+)\"\s*,\s*\"available\"\s*:\s*\"([0-9.]+)\"")
+                        "\"currency\"\\s*:\\s*\"([A-Z0-9]+)\"\\s*,\\s*\"available\"\\s*:\\s*\"([0-9.]+)\""
+                                + "\\s*,\\s*\"reserved\"\\s*:\\s*\"([0-9.]+)\"")
                         .matcher(rs.getString(2) == null ? "" : rs.getString(2));
                 while (m.find()) {
-                    out.put(m.group(1), Double.parseDouble(m.group(2)));
+                    out.put(m.group(1), new Balance(Double.parseDouble(m.group(2)),
+                            Double.parseDouble(m.group(3))));
                 }
             } catch (Exception ignore) {
                 // журнал недоступен — не беда, попробуем следующий
             }
         }
-        return out;
+        return new Balances(out, best);
     }
 
     /** Короткая запись количества: монеты и деньги требуют разной точности. */
