@@ -141,6 +141,7 @@ public final class InfoBot implements Runnable {
         dropBacklog();
         send("Сводка запущена. Наблюдаю " + watched.size() + " исполнителей.\n"
                 + "/all — состояние всех, /pnl — доход за сутки и неделю.\n"
+                + "/alloc — кто что держит за собой и сколько ничейного.\n"
                 + "/hide d e f — убрать лишних с глаз, /show all — вернуть.");
         while (alive) {
             try {
@@ -186,9 +187,13 @@ public final class InfoBot implements Runnable {
             case "/help" -> send("""
                     Сводка по всем исполнителям. Только смотрит, ничего не меняет.
 
-                    /all — котирование, инвентарь, сделки и доход за сутки
+                    /all — котирование, форма сетки, инвентарь, сделки и доход
                     /pnl — доход за 24 часа и за 7 суток, плюс нереализованное
                     /alloc — кто что держит за собой и сколько ничейного
+
+                    Ничейное — монета, не записанная ни за одним ботом: ею никто
+                    не торгует, пока кто-нибудь не сделает /claim в своём чате.
+                    Строкой оно показывается и в конце /all.
                     /hide d e f — убрать ботов из /all и /pnl
                     /show d — вернуть, /show all — вернуть всех
                     /hide и /show без меток — кто сейчас показан
@@ -317,11 +322,39 @@ public final class InfoBot implements Runnable {
     }
 
     /** Состояние одного исполнителя, собранное из его журнала. */
+    /**
+     * @param form форма сетки из события {@code boot}: «1 ур.» или «3 ур. × 2.0 б.п.».
+     *             ⚠️ С 12.09.2026 три бота из шести работают на трёх уровнях
+     *             (опыт A39), и по сводке их было НЕ ОТЛИЧИТЬ от одноуровневых —
+     *             а сравниваем мы именно формы. Берётся из журнала, как и всё
+     *             остальное здесь: сводка на площадку не ходит.
+     */
     private record Snapshot(String botId, String symbol, boolean quoting, boolean trading,
                             String pausedReason, long parks1h, long lastEventMs,
                             double position, double fair, int fills24, double realised24,
                             double notional24,
-                            long placements24, long cap, String note) {
+                            long placements24, long cap, String note, String form) {
+    }
+
+    /** Форма сетки бота из последнего {@code boot}; пусто, если настройки не записаны. */
+    private static String formOf(ExecJournal journal) {
+        try {
+            ExecJournal.Boot boot = journal.lastBoot();
+            if (boot == null) {
+                return "";
+            }
+            org.home.data.revx.replay.BootParams p =
+                    org.home.data.revx.replay.BootParams.parse(boot.detail());
+            if (p == null) {
+                return "";
+            }
+            return p.levels() > 1
+                    ? String.format(Locale.ROOT, "%d ур. × %.1f б.п.",
+                            p.levels(), p.levelStep() * 10_000)
+                    : "1 ур.";
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     private Snapshot read(Watched w) {
@@ -342,12 +375,12 @@ public final class InfoBot implements Runnable {
                     ledger.tradingRealisedSince(now - 86_400_000L),
                     ledger.tradingClosedNotionalSince(now - 86_400_000L),
                     j.placementsSince(now - 86_400_000L),
-                    ExecLimits.maxPlacementsPerDay(w.botId()), null);
+                    ExecLimits.maxPlacementsPerDay(w.botId()), null, formOf(j));
         } catch (Exception e) {
             // Недоступный журнал — это САМ ПО СЕБЕ результат: бот не запускался
             // или упал так, что файла нет. Молчать об этом нельзя.
             return new Snapshot(w.botId(), w.symbol(), false, false, null, 0, 0, 0, 0, 0, 0, 0, 0,
-                    ExecLimits.maxPlacementsPerDay(w.botId()), "журнал недоступен");
+                    ExecLimits.maxPlacementsPerDay(w.botId()), "журнал недоступен", "");
         }
     }
 
@@ -393,11 +426,12 @@ public final class InfoBot implements Runnable {
             boolean stale = !s.quoting() && now - s.lastEventMs() > 5 * 60_000L;
             long pct = s.cap() > 0 ? 100 * s.placements24() / s.cap() : 0;
             sb.append(String.format(Locale.ROOT,
-                    "%s %s  %s — %s%n  закрытых пар 24ч %d, доход %+.4f USDC%n"
+                    "%s %s  %s%s — %s%n  закрытых пар 24ч %d, доход %+.4f USDC%n"
                             + "  инвентарь %.2f USDC%s, постановок %d из %d (%d%%)%n"
                             + "  оборот 24ч %.2f USDC, доход %+.1f б.п. оборота%n"
                             + "  отводов за час %d, тик %s%s%n%n",
-                    mark, s.botId().toUpperCase(Locale.ROOT), s.symbol(), what,
+                    mark, s.botId().toUpperCase(Locale.ROOT), s.symbol(),
+                    s.form() == null || s.form().isEmpty() ? "" : " · " + s.form(), what,
                     s.fills24(), s.realised24(), s.position() * s.fair(),
                     stale ? " — СНИМОК на момент остановки, НЕ ПРОВЕРЕНО" : "",
                     s.placements24(), s.cap(), pct,
