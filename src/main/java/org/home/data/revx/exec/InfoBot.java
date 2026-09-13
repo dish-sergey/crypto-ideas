@@ -637,6 +637,7 @@ public final class InfoBot implements Runnable {
             String response = call("setMyCommands", "commands=" + URLEncoder.encode("""
                     [{"command":"all","description":"состояние всех исполнителей"},
                      {"command":"pnl","description":"доход за 24 часа и 7 суток"},
+                     {"command":"alloc","description":"кто что держит и сколько ничейного"},
                      {"command":"hide","description":"убрать ботов из сводок: /hide d e f"},
                      {"command":"show","description":"вернуть: /show d или /show all"},
                      {"command":"help","description":"что тут есть"}]"""

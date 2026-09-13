@@ -127,4 +127,33 @@ class InfoBotAllocTest {
                     + json.replace("'", "''") + "')");
         }
     }
+
+    /**
+     * ⚠️ МЕНЮ TELEGRAM И {@code /help} — ДВА РАЗНЫХ СПИСКА, и они разъезжаются.
+     *
+     * 13.09.2026 команда {@code /alloc} была добавлена в текст {@code /help}, но
+     * не в {@code setMyCommands}, и в кнопке «/» её не было — со стороны это
+     * выглядело как «команду не добавили». Тест сторожит, чтобы всякая команда,
+     * названная в справке, попадала и в меню.
+     */
+    @Test
+    void менюСовпадаетСоСправкой() throws Exception {
+        String src = java.nio.file.Files.readString(java.nio.file.Path.of(
+                "src/main/java/org/home/data/revx/exec/InfoBot.java"));
+        java.util.Set<String> inHelp = new java.util.TreeSet<>();
+        java.util.regex.Matcher h = java.util.regex.Pattern
+                .compile("(?m)^\s+/([a-z]+) —").matcher(src);
+        while (h.find()) {
+            inHelp.add(h.group(1));
+        }
+        java.util.Set<String> inMenu = new java.util.TreeSet<>();
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("[{]\"command\":\"([a-z]+)\"").matcher(src);
+        while (m.find()) {
+            inMenu.add(m.group(1));
+        }
+        inHelp.removeAll(inMenu);
+        assertTrue(inHelp.isEmpty(),
+                "в справке есть, а в меню Telegram нет: " + inHelp);
+    }
 }
