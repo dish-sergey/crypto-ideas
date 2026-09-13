@@ -2768,10 +2768,87 @@ public final class QuoteLoop implements Runnable {
     private String inspectGoneOrder(Side side, String venueId) {
         Venue.Response order = client.order(venueId);
         if (!order.ok() || order.body() == null) {
-            fills++;                      // судьбу не выяснили, но заявки нет
+            // ⚠️ СУДЬБА НЕИЗВЕСТНА — И ЗАБЫВАТЬ ЭТОТ ВОПРОС НЕЛЬЗЯ.
+            //
+            // Прежде здесь стояло `fills++` и возврат: счётчик прибавлялся, а
+            // позиция, касса и реестр оставались прежними НАВСЕГДА. Если заявка
+            // на самом деле исполнилась, бот про это не узнавал никогда.
+            //
+            // Так и случилось 13.09.2026 в 22:06 UTC: с края пришёл залп 429
+            // (тело HTML, не JSON площадки), три повтора `GET /orders/{id}`
+            // получили отказ подряд, и продажа лота BTC у бота e потерялась.
+            // Монета ушла со счёта, а в журнале осталась — через минуту сторож
+            // расхождения позиции закричал, и правильно сделал.
+            //
+            // Теперь вопрос попадает в очередь и повторяется раз в минуту, пока
+            // площадка не ответит. Повторный учёт не страшен: {@link #book}
+            // записывает РАЗНИЦУ по {@code bookedByOrder}, поэтому один и тот же
+            // ответ дважды инвентарь не сдвинет.
+            if (unknownFate.putIfAbsent(venueId, new UnknownFate(side, clock.now())) == null) {
+                journal.event("fate_unknown", String.format(java.util.Locale.ROOT,
+                        "%s %s: площадка не ответила о судьбе (%d), спрошу ещё",
+                        side, venueId, order.status()));
+                log.warn("судьба заявки {} неизвестна (ответ {}) — вопрос поставлен в очередь",
+                        venueId, order.status());
+            }
             return null;
         }
+        unknownFate.remove(venueId);
         return book(side, venueId, order.body());
+    }
+
+    /** Заявка, исчезнувшая из книги, о судьбе которой площадка не ответила. */
+    private static final class UnknownFate {
+        final Side side;
+        final long sinceMs;
+        volatile boolean warned;
+
+        UnknownFate(Side side, long sinceMs) {
+            this.side = side;
+            this.sinceMs = sinceMs;
+        }
+    }
+
+    private final java.util.Map<String, UnknownFate> unknownFate =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Сколько ждать ответа, прежде чем кричать. */
+    private static final long FATE_ALERT_MS = 5 * 60_000L;
+
+    /**
+     * ПЕРЕСПРОСИТЬ ПРО ЗАЯВКИ С НЕИЗВЕСТНОЙ СУДЬБОЙ. Раз в минуту.
+     *
+     * Минута, а не каждый тик, намеренно: вопрос возникает ровно тогда, когда
+     * площадка режет запросы, и долбиться в неё в этот момент — сделать хуже.
+     * Один GET на заявку в минуту стоит пренебрежимо мало при лимите 100/с.
+     */
+    private void retryUnknownFates(long now) {
+        for (java.util.Map.Entry<String, UnknownFate> e : unknownFate.entrySet()) {
+            String venueId = e.getKey();
+            UnknownFate fate = e.getValue();
+            Venue.Response order = client.order(venueId);
+            if (order.ok() && order.body() != null) {
+                unknownFate.remove(venueId);
+                String status = book(fate.side, venueId, order.body());
+                String message = String.format(java.util.Locale.ROOT,
+                        "%s %s: судьба выяснена через %d с — %s",
+                        fate.side, venueId, (now - fate.sinceMs) / 1000, status);
+                log.warn(message);
+                journal.event("fate_resolved", message);
+                continue;
+            }
+            if (!fate.warned && now - fate.sinceMs > FATE_ALERT_MS) {
+                fate.warned = true;
+                String message = ("НЕ ЗНАЮ СУДЬБУ ЗАЯВКИ %s (%s) уже %d мин: площадка не "
+                        + "отвечает (%d). Пока не ответит, позиция может быть неверна — "
+                        + "продолжаю спрашивать раз в минуту.")
+                        .formatted(venueId, fate.side, (now - fate.sinceMs) / 60_000,
+                                order.status());
+                log.error(message);
+                journal.event("fate_stuck", message);
+                alert.accept(message);
+            }
+        }
     }
 
     /**
@@ -3113,9 +3190,17 @@ public final class QuoteLoop implements Runnable {
             return;
         }
         mismatchWarnedMs = now;
+        // ⚠️ Если есть заявки с невыясненной судьбой, причина расхождения почти
+        // наверняка в них, и человеку надо сказать именно это: бот продолжает
+        // спрашивать площадку и может починиться сам.
+        String pending = unknownFate.isEmpty() ? ""
+                : String.format(java.util.Locale.ROOT,
+                        " Жду ответа площадки по %d заявке(ам) — вероятно, дело в них.",
+                        unknownFate.size());
         String message = ("РАСХОЖДЕНИЕ: своя позиция %s больше остатка аккаунта %s уже "
-                + "%d с. Либо потеряно исполнение, либо позицию тронули извне.")
-                .formatted(fmt(inventory), fmt(baseTotal), (now - mismatchSinceMs) / 1000);
+                + "%d с. Либо потеряно исполнение, либо позицию тронули извне.%s")
+                .formatted(fmt(inventory), fmt(baseTotal), (now - mismatchSinceMs) / 1000,
+                        pending);
         log.error(message);
         journal.event("position_mismatch", message);
         alert.accept(message);
@@ -3714,6 +3799,10 @@ public final class QuoteLoop implements Runnable {
             replacesThisMinute = 0;
             // Аренда продлевается, пока ЖИВ ПРОЦЕСС, а не пока идёт котирование:
             // /stop на час претензию терять не должен, а убитый процесс — должен.
+            // Сначала переспрашиваем про повисшие заявки: расхождение позиции
+            // чаще всего именно этим и объясняется, и кричать о нём, не задав
+            // вопрос ещё раз, значит будить человека зря.
+            retryUnknownFates(now);
             if (alloc != null) {
                 alloc.heartbeat(tag.id(), now);
                 checkRegistryAgainstJournal(now);
