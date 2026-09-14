@@ -2382,7 +2382,7 @@ public final class QuoteLoop implements Runnable {
             // превращала его в серию: 09.09.2026 бот A получил по одной заявке
             // восемь таких отказов за 84 секунды. Спрашиваем судьбу сразу — один
             // запрос вместо семи лишних.
-            resolveNotNew(side, resting, response.body());
+            String fate = resolveNotNew(side, resting, response.body());
             // ⚠️ ПОДОЗРЕВАЕМЫЙ НАСЛЕДНИК. Замена могла ПРОЙТИ, а ответ не дойти
             // (док. 111): наследник создан, его venue_order_id не вернулся, и
             // спросить о нём площадку НЕЧЕМ — зонд 14.09.2026 показал, что заявка
@@ -2393,8 +2393,19 @@ public final class QuoteLoop implements Runnable {
             // Запоминаем, ЧТО именно мы пытались поставить: сторону, размер,
             // цену и свой клиентский идентификатор. Дальше этим занимается
             // {@link #claimHeirIfEvidenceMatches}.
-            if (response.status() == 422) {
-                heir = new Heir(side, size, price, heirClientId, clock.now());
+            // ⚠️ ПОДОЗРЕНИЕ ЗАВОДИТСЯ, ТОЛЬКО ЕСЛИ НАСЛЕДНИК ВОЗМОЖЕН.
+            //
+            // «filled» и «partially_filled» означают, что исполнилась САМА заявка:
+            // никакой замены не произошло, наследника нет, и исполнение уже
+            // проведено в resolveNotNew. Первая версия заводила подозрение на
+            // ЛЮБОЙ 422, и живой бот C 14.09.2026 в 10:03:50 сразу после продажи
+            // выдал ложную тревогу про наследника.
+            boolean heirPossible = fate == null
+                    || (!"filled".equalsIgnoreCase(fate) && !"partially_filled".equalsIgnoreCase(fate));
+            if (response.status() == 422 && heirPossible) {
+                // Запоминаем и СВОБОДНУЮ КАССУ в котле на этот момент: уликой
+                // служит её ИЗМЕНЕНИЕ, а не размер — см. claimHeirIfEvidenceMatches.
+                heir = new Heir(side, size, price, heirClientId, clock.now(), freePot(clock.now()));
                 heirEvidence = 0;
             }
             // Пауза на сторону: без неё каждый отказ тянет за собой четыре запроса
@@ -2435,7 +2446,13 @@ public final class QuoteLoop implements Runnable {
      * Цена — один GET на отказ, при лимите 100/с и 1000/мин. Взамен исчезает
      * серия из PUT, GET активных и GET остатков на каждой попытке.
      */
-    private void resolveNotNew(Side side, Resting resting, String body) {
+    /**
+     * @return статус, который назвала площадка, либо {@code null}, если не ответила.
+     *         По нему решается, заводить ли подозрение о наследнике: «filled» и
+     *         «partially_filled» означают, что исполнилась САМА заявка и никакого
+     *         наследника нет.
+     */
+    private String resolveNotNew(Side side, Resting resting, String body) {
         // ⚠️ СУДЬБУ СПРАШИВАЕМ НА ЛЮБОЙ 422, А НЕ ТОЛЬКО НА «не в состоянии NEW».
         //
         // Раньше здесь стояла проверка текста, а «Could not replace order with
@@ -2454,12 +2471,12 @@ public final class QuoteLoop implements Runnable {
         // с ценой потерянного исполнения: бот узнаёт о сделке ТОЛЬКО так, и
         // незамеченная сделка не восстанавливается уже никогда.
         if (resting.venueId == null) {
-            return;
+            return null;
         }
         String id = resting.venueId;
         Venue.Response order = client.order(id);
         if (!order.ok() || order.body() == null) {
-            return;                       // не знаем — оставляем всё как было
+            return null;                  // не знаем — оставляем всё как было
         }
         String status = field(order.body(), "status");
         // ⚠️ Ответ передаётся дальше, а не запрашивается заново. Первая версия
@@ -2480,6 +2497,7 @@ public final class QuoteLoop implements Runnable {
         }
         // Прочие состояния (cancelled/replaced) разбирает сверка: судьбу заявки
         // нельзя выводить из её собственного статуса — только из списка активных.
+        return status;
     }
 
     /**
@@ -2818,7 +2836,8 @@ public final class QuoteLoop implements Runnable {
      *
      * @param clientId наш {@code client_order_id} — единственное, чем мы её знаем
      */
-    private record Heir(Side side, double size, double price, String clientId, long sinceMs) {
+    private record Heir(Side side, double size, double price, String clientId, long sinceMs,
+                        double freePot) {
     }
 
     private volatile Heir heir;
@@ -2842,6 +2861,15 @@ public final class QuoteLoop implements Runnable {
     private static final double CASH_CEILING = 3.0;
 
     private volatile long heirAlarmMs;
+
+    /**
+     * Свободная касса в общем котле: остаток счёта минус живые претензии всех
+     * ботов. Покупка её забирает, продажа приносит — поэтому уликой служит её
+     * ИЗМЕНЕНИЕ за время подозрения, а не величина.
+     */
+    private double freePot(long now) {
+        return alloc == null ? 0 : quoteTotal - alloc.free(quote, quoteTotal, now).claimedLive();
+    }
 
     /** Чем кончилось сличение улик по подозреваемому наследнику. */
     enum HeirVerdict {
@@ -2923,10 +2951,21 @@ public final class QuoteLoop implements Runnable {
             return;
         }
         AllocRegistry.Free fb = alloc.free(base, baseTotalAccount, now);
-        AllocRegistry.Free fq = alloc.free(quote, quoteTotal, now);
         double notional = h.size() * h.price();
-        // Денег не хватает: разобрано больше, чем есть на счёте.
-        double cashGap = fq.claimedLive() - fq.venueTotal();
+        // ⚠️ УЛИКА ПО ДЕНЬГАМ — ЭТО ИЗМЕНЕНИЕ СВОБОДНОЙ КАССЫ, А НЕ ЕЁ РАЗМЕР.
+        //
+        // Первая версия смотрела на абсолютную величину: для покупки «разобрано
+        // больше, чем есть на счёте», для продажи — наоборот. Для покупки это
+        // верно, а для продажи бессмысленно: свободная касса в котле велика
+        // всегда (у нас там 63 USDC ничьих), и условие выполнялось само собой.
+        // На живом боте C 14.09.2026 это дало тревогу «нехватка кассы 66.23 при
+        // ожидаемой 3.05 — кратно больше»: сравнивались разные величины.
+        //
+        // Правильная улика одна на обе стороны: покупка ЗАБИРАЕТ деньги из котла
+        // (свободная касса падает на стоимость сделки), продажа их ПРИНОСИТ.
+        // Считаем от снимка, сделанного в момент подозрения.
+        double potDelta = freePot(now) - h.freePot();
+        double cashGap = h.side() == Side.BUY ? -potDelta : potDelta;
         // Монеты, не записанной ни за кем (для продажи — нехватка монеты).
         double coinGap = h.side() == Side.BUY
                 ? fb.free()
@@ -2938,7 +2977,7 @@ public final class QuoteLoop implements Runnable {
         // Нижняя граница защищает от «похоже, но мало», верхняя — от «слишком
         // много»: если нехватка кассы кратно больше нашей сделки, это уже не наш
         // случай, а что-то покрупнее, и записывать по догадке нельзя.
-        double cash = h.side() == Side.BUY ? cashGap : -cashGap;  // продажа: денег СТАЛО больше
+        double cash = cashGap;            // уже приведена к знаку «в нашу пользу»
         HeirVerdict verdict = heirVerdict(h.size(), notional, coinGap, cash);
         if (verdict != HeirVerdict.СОВПАЛО) {
             if (heirEvidence > 0) {
@@ -2950,10 +2989,13 @@ public final class QuoteLoop implements Runnable {
             // расхождение покрупнее: о нём кричит инвариант реестра, и подменять
             // его догадкой нельзя.
             if (verdict == HeirVerdict.СЛИШКОМ_МНОГО) {
-                String alarm = ("⚠️ Нехватка кассы %s при ожидаемой по наследнику %s — "
-                        + "кратно больше. По догадке НЕ записываю, разбирайтесь глазами: "
-                        + "/alloc в сводке и приложение площадки.")
-                        .formatted(fmt(cash), fmt(notional));
+                String alarm = ("⚠️ Свободная касса котла изменилась на %s с тех пор, как "
+                        + "площадка не вернула идентификатор заявки (%s %s по %s, это %s). "
+                        + "Изменение кратно больше сделки — значит дело не в ней: так двигают "
+                        + "котёл /claim и /release соседей. По догадке НЕ записываю, "
+                        + "смотрите /alloc в сводке и приложение площадки.")
+                        .formatted(fmt(cash), h.side(), fmt(h.size()), fmt(h.price()),
+                                fmt(notional));
                 if (now - heirAlarmMs > MISMATCH_REPEAT_MS) {
                     heirAlarmMs = now;
                     log.error(alarm);
@@ -2972,7 +3014,8 @@ public final class QuoteLoop implements Runnable {
         applyFill(h.side(), h.size(), h.price());
         String message = ("ЗАПИСАНО ПО ДОГАДКЕ: %s %s по %s. Площадка не вернула "
                 + "идентификатор наследника заявки (наш %s), спросить её нечем. Улики: "
-                + "ничейной монеты %s (нужно %s), нехватка кассы %s (нужно %s). "
+                + "монеты без хозяина %s (сделка %s), касса котла сдвинулась на %s "
+                + "(стоимость сделки %s). "
                 + "Позиция стала %s. ⚠️ Это единственная запись в боте, сделанная НЕ по "
                 + "ответу площадки — сверьте с приложением.")
                 .formatted(h.side(), fmt(h.size()), fmt(h.price()), h.clientId(),
