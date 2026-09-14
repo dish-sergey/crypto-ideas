@@ -2328,10 +2328,11 @@ public final class QuoteLoop implements Runnable {
             // встроенный и модульный — сюда сходятся, поэтому проверка здесь.
             return;
         }
+        String heirClientId = tag.newClientOrderId();
         String body = """
                 {"client_order_id":"%s","base_size":"%s","price":"%s",
                  "execution_instructions":["post_only"]}"""
-                .formatted(tag.newClientOrderId(), fmtSize(size), fmt(price))
+                .formatted(heirClientId, fmtSize(size), fmt(price))
                 .replaceAll("\\s*\\n\\s*", "");
         Venue.Response response = client.replace(resting.venueId, body);
         replaces++;
@@ -2382,6 +2383,20 @@ public final class QuoteLoop implements Runnable {
             // восемь таких отказов за 84 секунды. Спрашиваем судьбу сразу — один
             // запрос вместо семи лишних.
             resolveNotNew(side, resting, response.body());
+            // ⚠️ ПОДОЗРЕВАЕМЫЙ НАСЛЕДНИК. Замена могла ПРОЙТИ, а ответ не дойти
+            // (док. 111): наследник создан, его venue_order_id не вернулся, и
+            // спросить о нём площадку НЕЧЕМ — зонд 14.09.2026 показал, что заявка
+            // адресуется только по venue_order_id, а истории заявок у площадки
+            // нет. Обычно наследника находит сверка в книге; если он успел
+            // исполниться раньше — исполнение теряется (бот A, 06:31:54).
+            //
+            // Запоминаем, ЧТО именно мы пытались поставить: сторону, размер,
+            // цену и свой клиентский идентификатор. Дальше этим занимается
+            // {@link #claimHeirIfEvidenceMatches}.
+            if (response.status() == 422) {
+                heir = new Heir(side, size, price, heirClientId, clock.now());
+                heirEvidence = 0;
+            }
             // Пауза на сторону: без неё каждый отказ тянет за собой четыре запроса
             // (замена, статус, остатки, активные), и на устойчивом отказе это
             // 8 запросов в секунду по кругу — наблюдалось 01.09.2026.
@@ -2796,6 +2811,176 @@ public final class QuoteLoop implements Runnable {
         }
         unknownFate.remove(venueId);
         return book(side, venueId, order.body());
+    }
+
+    /**
+     * Заявка, которую площадка, возможно, создала, не вернув идентификатора.
+     *
+     * @param clientId наш {@code client_order_id} — единственное, чем мы её знаем
+     */
+    private record Heir(Side side, double size, double price, String clientId, long sinceMs) {
+    }
+
+    private volatile Heir heir;
+    /** Сколько минутных проверок подряд улики сходятся. */
+    private volatile int heirEvidence;
+
+    /** Сколько ждём наследника, прежде чем забыть о нём. */
+    private static final long HEIR_WINDOW_MS = 30 * 60_000L;
+    /** Сколько минут подряд улики должны сходиться, прежде чем записывать сделку. */
+    private static final int HEIR_EVIDENCE_TICKS = 2;
+
+    /**
+     * Допуски совпадения улик. Точного равенства не бывает: на счёте лежит пыль,
+     * цена наследника могла отличаться на тик, касса шевелится сделками соседа по
+     * паре. Монету допускаем на 5% меньше ожидаемой, кассу — на 20%; сверху
+     * кассовая нехватка ограничена втрое, и всё, что больше, идёт в тревогу, а не
+     * в запись.
+     */
+    private static final double COIN_TOLERANCE = 0.95;
+    private static final double CASH_TOLERANCE = 0.8;
+    private static final double CASH_CEILING = 3.0;
+
+    private volatile long heirAlarmMs;
+
+    /** Чем кончилось сличение улик по подозреваемому наследнику. */
+    enum HeirVerdict {
+        /** Монета появилась и денег не хватает — ровно столько, сколько ожидалось. */
+        СОВПАЛО,
+        /** Улик нет или они малы: ждём дальше, ничего не записываем. */
+        НЕ_СОВПАЛО,
+        /** Нехватка кассы кратно больше нашей сделки: это не наш наследник. */
+        СЛИШКОМ_МНОГО
+    }
+
+    /**
+     * Сличение улик — чистая функция, потому что цена ошибки здесь высока, а
+     * проверять её на живом боте нечем.
+     *
+     * @param size     сколько монеты бот пытался купить или продать
+     * @param notional сколько это стоит в кассе
+     * @param coinGap  сколько монеты на счёте не записано ни за кем (для продажи —
+     *                 насколько наши претензии превышают остаток)
+     * @param cash     насколько не хватает кассы (для продажи — насколько её больше)
+     */
+    static HeirVerdict heirVerdict(double size, double notional, double coinGap, double cash) {
+        if (cash > notional * CASH_CEILING) {
+            return HeirVerdict.СЛИШКОМ_МНОГО;
+        }
+        boolean coinOk = coinGap >= size * COIN_TOLERANCE;
+        boolean cashOk = cash >= notional * CASH_TOLERANCE;
+        return coinOk && cashOk ? HeirVerdict.СОВПАЛО : HeirVerdict.НЕ_СОВПАЛО;
+    }
+
+    /**
+     * 🔑 ЗАПИСЬ ИСПОЛНЕНИЯ ПО ДВУМ УЛИКАМ, А НЕ ПО ОТВЕТУ ПЛОЩАДКИ.
+     *
+     * <h2>Почему это исключение из главного правила</h2>
+     *
+     * Всё остальное в боте проводится ТОЛЬКО по ответу площадки. Здесь ответа
+     * нет и быть не может: наследник создан, идентификатора мы не получили, а
+     * спросить по своему клиентскому идентификатору нельзя — проверено зондом
+     * 14.09.2026 (все формы 401/404, истории заявок нет). Либо догадка, либо
+     * исполнение теряется навсегда.
+     *
+     * <h2>Почему догадка безопасна ровно здесь</h2>
+     *
+     * Требуются ДВЕ независимые улики, и обе должны сойтись по величине с тем,
+     * что бот пытался поставить:
+     *
+     * <ol>
+     *   <li><b>монета</b>: на счёте появилось не меньше нашего размера монеты,
+     *       которая не числится НИ ЗА ОДНИМ ботом (для продажи — наоборот,
+     *       монеты не хватает против наших претензий);</li>
+     *   <li><b>деньги</b>: ровно на стоимость этой монеты не хватает денег —
+     *       сумма живых претензий на кассу превышает остаток счёта. Это и значит
+     *       «площадка списала за покупку, а записи о ней нет».</li>
+     * </ol>
+     *
+     * Плюс три ограничителя: улики держатся {@link #HEIR_EVIDENCE_TICKS} минуты
+     * подряд, подозрение живёт не дольше {@link #HEIR_WINDOW_MS}, и размеры
+     * ботов на одной паре различаются втрое, так что перепутать соседа нельзя.
+     *
+     * ⚠️ Если наследник на самом деле жив и стоит в книге, обе улики не сойдутся:
+     * монета появится, только когда он исполнится, а пока он стоит — не появится.
+     * Если сверка усыновит его и проведёт как обычно, монета станет нашей, и
+     * первая улика исчезнет сама. Догадка самоотменяется.
+     *
+     * Запись помечается статусом {@code inferred} — чтобы всякий будущий разбор
+     * мог отделить её от сделок, подтверждённых площадкой.
+     */
+    private void claimHeirIfEvidenceMatches(long now) {
+        Heir h = heir;
+        if (h == null || alloc == null) {
+            return;
+        }
+        if (now - h.sinceMs() > HEIR_WINDOW_MS) {
+            heir = null;
+            heirEvidence = 0;
+            return;
+        }
+        if (Double.isNaN(baseTotalAccount) || !(h.price() > 0)) {
+            return;
+        }
+        AllocRegistry.Free fb = alloc.free(base, baseTotalAccount, now);
+        AllocRegistry.Free fq = alloc.free(quote, quoteTotal, now);
+        double notional = h.size() * h.price();
+        // Денег не хватает: разобрано больше, чем есть на счёте.
+        double cashGap = fq.claimedLive() - fq.venueTotal();
+        // Монеты, не записанной ни за кем (для продажи — нехватка монеты).
+        double coinGap = h.side() == Side.BUY
+                ? fb.free()
+                : alloc.claims(base, now).stream().filter(AllocRegistry.Claim::live)
+                        .mapToDouble(AllocRegistry.Claim::qty).sum() - fb.venueTotal();
+        // ⚠️ СРАВНИВАЕМ ПОЛОСОЙ, А НЕ РАВЕНСТВОМ. Точных совпадений тут не бывает:
+        // на счёте лежит пыль от прошлых остатков, цена наследника могла отличаться
+        // от последней нашей на тик, а касса шевелится сделками соседей по паре.
+        // Нижняя граница защищает от «похоже, но мало», верхняя — от «слишком
+        // много»: если нехватка кассы кратно больше нашей сделки, это уже не наш
+        // случай, а что-то покрупнее, и записывать по догадке нельзя.
+        double cash = h.side() == Side.BUY ? cashGap : -cashGap;  // продажа: денег СТАЛО больше
+        HeirVerdict verdict = heirVerdict(h.size(), notional, coinGap, cash);
+        if (verdict != HeirVerdict.СОВПАЛО) {
+            if (heirEvidence > 0) {
+                log.info("наследник {}: улики разошлись (монета {} из {}, касса {} из {})",
+                        h.clientId(), fmt(coinGap), fmt(h.size()), fmt(cash), fmt(notional));
+            }
+            heirEvidence = 0;
+            // Нехватка кассы КРАТНО больше нашей сделки — это не наш наследник, а
+            // расхождение покрупнее: о нём кричит инвариант реестра, и подменять
+            // его догадкой нельзя.
+            if (verdict == HeirVerdict.СЛИШКОМ_МНОГО) {
+                String alarm = ("⚠️ Нехватка кассы %s при ожидаемой по наследнику %s — "
+                        + "кратно больше. По догадке НЕ записываю, разбирайтесь глазами: "
+                        + "/alloc в сводке и приложение площадки.")
+                        .formatted(fmt(cash), fmt(notional));
+                if (now - heirAlarmMs > MISMATCH_REPEAT_MS) {
+                    heirAlarmMs = now;
+                    log.error(alarm);
+                    journal.event("heir_gap_too_big", alarm);
+                    alert.accept(alarm);
+                }
+            }
+            return;
+        }
+        if (++heirEvidence < HEIR_EVIDENCE_TICKS) {
+            return;                       // подождём ещё минуту: улики должны устояться
+        }
+        heir = null;
+        heirEvidence = 0;
+        journal.fill(null, h.side().name(), h.size(), h.price(), lastFair, 0, null, "inferred");
+        applyFill(h.side(), h.size(), h.price());
+        String message = ("ЗАПИСАНО ПО ДОГАДКЕ: %s %s по %s. Площадка не вернула "
+                + "идентификатор наследника заявки (наш %s), спросить её нечем. Улики: "
+                + "ничейной монеты %s (нужно %s), нехватка кассы %s (нужно %s). "
+                + "Позиция стала %s. ⚠️ Это единственная запись в боте, сделанная НЕ по "
+                + "ответу площадки — сверьте с приложением.")
+                .formatted(h.side(), fmt(h.size()), fmt(h.price()), h.clientId(),
+                        fmt(coinGap), fmt(h.size()), fmt(Math.abs(cashGap)), fmt(notional),
+                        fmt(inventory));
+        log.error(message);
+        journal.event("inferred_fill", message);
+        alert.accept(message);
     }
 
     /** Как далеко назад смотреть при восстановлении и сколько заявок спрашивать. */
@@ -3898,6 +4083,7 @@ public final class QuoteLoop implements Runnable {
             if (alloc != null) {
                 alloc.heartbeat(tag.id(), now);
                 checkRegistryAgainstJournal(now);
+                claimHeirIfEvidenceMatches(now);
                 checkUnowned(now);
             }
             // Остатки перечитываются раз в минуту: исполнение могло случиться молча.
