@@ -77,6 +77,7 @@ public class CliRunner implements ApplicationRunner {
     /** Проверка торгового ключа — тоже лениво: без переменных окружения бин упадёт. */
     private final ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck;
     private final ObjectProvider<org.home.data.revx.exec.FateProbe> fateProbe;
+    private final ObjectProvider<org.home.data.revx.RateCheck> rateCheck;
     private final ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe;
     private final ObjectProvider<org.home.data.revx.exec.Panic> panic;
     private final ObjectProvider<org.home.data.revx.exec.ManualOrder> manualOrder;
@@ -104,6 +105,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.theory.TheoryCommands> theory,
                      ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck,
                      ObjectProvider<org.home.data.revx.exec.FateProbe> fateProbe,
+                     ObjectProvider<org.home.data.revx.RateCheck> rateCheck,
                      ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe,
                      ObjectProvider<org.home.data.revx.exec.Panic> panic,
                      ObjectProvider<org.home.data.revx.exec.ManualOrder> manualOrder,
@@ -138,6 +140,7 @@ public class CliRunner implements ApplicationRunner {
         this.theory = theory;
         this.tradeCheck = tradeCheck;
         this.fateProbe = fateProbe;
+        this.rateCheck = rateCheck;
         this.orderProbe = orderProbe;
         this.panic = panic;
         this.manualOrder = manualOrder;
@@ -217,6 +220,17 @@ public class CliRunner implements ApplicationRunner {
             }
             if (args.containsOption("revx-trade-check")) {
                 tradeCheck.getObject().run();
+            }
+            if (args.containsOption("revx-rate-check")) {
+                long to = java.time.Instant.parse(firstOr(args, "to",
+                        java.time.Instant.now().toString())).toEpochMilli();
+                rateCheck.getObject().run(
+                        firstOr(args, "db", "data/revx.db"),
+                        java.time.Instant.parse(firstOr(args, "from",
+                                java.time.Instant.ofEpochMilli(to - 86_400_000L).toString()))
+                                .toEpochMilli(),
+                        to,
+                        firstOr(args, "out", "reports/revx_rate_check.md"));
             }
             if (args.containsOption("revx-fate-probe")) {
                 // Только GET: ищем способ спросить заявку по нашему client_order_id.
