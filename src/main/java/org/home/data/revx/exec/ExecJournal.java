@@ -419,6 +419,94 @@ public final class ExecJournal implements AutoCloseable {
      * партий по построению требует ВСЮ историю — остаток сегодня объясняется
      * покупками произвольной давности.
      */
+    /**
+     * СКОЛЬКО ПО КАЖДОЙ ЗАЯВКЕ УЖЕ ЗАПИСАНО — чтобы после перезапуска не
+     * записать то же исполнение второй раз.
+     *
+     * ⚠️ Котировщик помнит это в памяти ({@code bookedByOrder}) и пишет РАЗНИЦУ
+     * между тем, что площадка называет исполненным, и тем, что уже проведено.
+     * Перезапуск память обнуляет, и повторный вопрос о старой заявке провёл бы
+     * её исполнение заново — инвентарь бота сместился бы навсегда. Пока бот
+     * старые заявки не переспрашивал, это не стреляло; с появлением
+     * восстановления при старте вопрос задаётся намеренно, поэтому память
+     * восстанавливается отсюда.
+     *
+     * Передачи ({@code venue_id IS NULL}) сюда не попадают: у них нет заявки.
+     */
+    public synchronized java.util.Map<String, Double> bookedByOrder() {
+        java.util.Map<String, Double> out = new java.util.HashMap<>();
+        try (Statement st = connection.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT venue_id, sum(qty) FROM exec_fill WHERE venue_id IS NOT NULL"
+                             + " GROUP BY venue_id")) {
+            while (rs.next()) {
+                out.put(rs.getString(1), rs.getDouble(2));
+            }
+        } catch (Exception e) {
+            log.error("не прочиталось учтённое по заявкам: {}", e.getMessage());
+        }
+        return out;
+    }
+
+    /**
+     * ХВОСТЫ ЦЕПОЧЕК ЗАЯВОК за последнее время: идентификаторы, которые мы
+     * создали и больше не заменяли.
+     *
+     * Замена создаёт НОВУЮ заявку, и цепочка связана полем
+     * {@code previous_order_id}. Живых хвостов у бота единицы (по одному на
+     * уровень и сторону), а промежуточные звенья спрашивать незачем: их судьба
+     * известна — заменены.
+     *
+     * Нужно для восстановления после перезапуска: заявка, исполнившаяся в те
+     * секунды, пока процесса не было, не попадает ни в один список — в книге её
+     * уже нет, а в памяти бота ещё нет. Единственный способ узнать о ней —
+     * спросить площадку по идентификатору из СВОЕГО ЖЕ журнала.
+     *
+     * @param sinceMs с какого момента смотреть
+     * @param cap     сколько хвостов вернуть максимум (новые первыми)
+     */
+    public synchronized List<String> recentOrderTails(long sinceMs, int cap) {
+        java.util.LinkedHashSet<String> created = new java.util.LinkedHashSet<>();
+        java.util.Set<String> superseded = new java.util.HashSet<>();
+        java.util.regex.Pattern venue = java.util.regex.Pattern
+                .compile("\"venue_order_id\"\\s*:\\s*\"([^\"]+)\"");
+        java.util.regex.Pattern previous = java.util.regex.Pattern
+                .compile("\"previous_order_id\"\\s*:\\s*\"([^\"]+)\"");
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT response FROM exec_request WHERE ts_ms >= ? AND status = 200"
+                        + " AND (method = 'POST' OR method = 'PUT') ORDER BY ts_ms DESC")) {
+            ps.setLong(1, sinceMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String body = rs.getString(1);
+                    if (body == null) {
+                        continue;
+                    }
+                    java.util.regex.Matcher m = venue.matcher(body);
+                    if (m.find()) {
+                        created.add(m.group(1));
+                    }
+                    java.util.regex.Matcher p = previous.matcher(body);
+                    while (p.find()) {
+                        superseded.add(p.group(1));
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.error("не прочитались хвосты цепочек заявок: {}", e.getMessage());
+        }
+        List<String> out = new ArrayList<>();
+        for (String id : created) {
+            if (!superseded.contains(id)) {
+                out.add(id);
+            }
+            if (out.size() >= cap) {
+                break;
+            }
+        }
+        return out;
+    }
+
     public synchronized List<FillRow> fills() {
         List<FillRow> out = new ArrayList<>();
         try (Statement st = connection.createStatement();

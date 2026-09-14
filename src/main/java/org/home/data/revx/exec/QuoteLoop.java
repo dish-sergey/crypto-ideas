@@ -1523,6 +1523,7 @@ public final class QuoteLoop implements Runnable {
     @Override
     public void run() {
         restorePosition();
+        recoverMissedFills();
         refreshBalances();
         // Стартуем остановленными, значит и книга должна быть пуста: заявки
         // переживают наш процесс, и оставшиеся после падения — уже не наши.
@@ -2795,6 +2796,97 @@ public final class QuoteLoop implements Runnable {
         }
         unknownFate.remove(venueId);
         return book(side, venueId, order.body());
+    }
+
+    /** Как далеко назад смотреть при восстановлении и сколько заявок спрашивать. */
+    private static final long RECOVER_WINDOW_MS = 30 * 60_000L;
+    private static final int RECOVER_MAX_ORDERS = 24;
+
+    /**
+     * ВОССТАНОВЛЕНИЕ ПРИ СТАРТЕ: спросить площадку про свои заявки, которых нет
+     * ни в книге, ни в журнале исполнений.
+     *
+     * <h2>Дыра, которую это закрывает</h2>
+     *
+     * Бот узнаёт о сделке единственным способом: заметив, что его заявки не
+     * стало, и спросив о ней площадку. Пока процесса нет, замечать некому.
+     *
+     * 13.09.2026 в 22:28 бот C остановился на выкатку, за тринадцать секунд
+     * паузы его аск исполнился, и новый процесс об этом не узнал: в книге заявки
+     * уже нет, в памяти ещё нет. Через минуту закричал сторож расхождения —
+     * единственное, что сработало. То же самое бывает при падении процесса и при
+     * {@code /stop} с последующим стартом.
+     *
+     * <h2>Как</h2>
+     *
+     * Идентификаторы берутся из СВОЕГО ЖЕ журнала: каждая постановка и замена
+     * записаны вместе с ответом площадки, а цепочки замен связаны полем
+     * {@code previous_order_id}, поэтому живых хвостов — единицы. Те, что стоят
+     * в книге, пропускаем: ими займётся обычная сверка. Про остальные
+     * спрашиваем, и что исполнилось — записываем.
+     *
+     * ⚠️ Сначала восстанавливается память об уже учтённом
+     * ({@link ExecJournal#bookedByOrder}), иначе повторный вопрос о старой
+     * заявке провёл бы её исполнение ВТОРОЙ раз: {@link #book} пишет разницу, а
+     * карта живёт в памяти процесса и перезапуск её обнуляет.
+     *
+     * ⚠️ Сторона берётся из ответа площадки, а не выводится из наших тел
+     * запросов: в теле {@code PUT} стороны нет вовсе, и попытка вывести её из
+     * цепочки замен уже стоила нам суток неверных чисел (сверка 09.09.2026).
+     */
+    private void recoverMissedFills() {
+        bookedByOrder.putAll(journal.bookedByOrder());
+        java.util.List<String> tails = journal.recentOrderTails(
+                clock.now() - RECOVER_WINDOW_MS, RECOVER_MAX_ORDERS);
+        if (tails.isEmpty()) {
+            return;
+        }
+        java.util.Set<String> alive = new java.util.HashSet<>();
+        Venue.Response active = client.activeOrders();
+        if (active.ok() && active.body() != null) {
+            for (ActiveOrder o : ActiveOrder.parse(active.body())) {
+                alive.add(o.id());
+            }
+        } else {
+            // Списка нет — спрашиваем про все хвосты. Лишний вопрос стоит один
+            // GET, а пропущенное исполнение не восстанавливается уже никогда.
+            log.warn("восстановление: список активных заявок недоступен ({})", active.status());
+        }
+        int asked = 0;
+        int booked = 0;
+        for (String id : tails) {
+            if (alive.contains(id)) {
+                continue;                 // стоит в книге — это забота сверки
+            }
+            Venue.Response order = client.order(id);
+            asked++;
+            if (!order.ok() || order.body() == null) {
+                unknownFate.putIfAbsent(id, new UnknownFate(Side.BUY, clock.now()));
+                continue;                 // переспросим через минуту
+            }
+            String status = field(order.body(), "status");
+            if (!"filled".equalsIgnoreCase(status)
+                    && !"partially_filled".equalsIgnoreCase(status)) {
+                continue;                 // отменена или заменена — записывать нечего
+            }
+            Side side = "sell".equalsIgnoreCase(field(order.body(), "side"))
+                    ? Side.SELL : Side.BUY;
+            double before = inventory;
+            book(side, id, order.body());
+            if (Math.abs(inventory - before) > 1e-15) {
+                booked++;
+                String message = String.format(java.util.Locale.ROOT,
+                        "восстановлено при старте: %s %s, позиция %s → %s",
+                        side, id, fmt(before), fmt(inventory));
+                log.warn(message);
+                journal.event("recovered_fill", message);
+                alert.accept(message);
+            }
+        }
+        if (asked > 0) {
+            log.info("восстановление при старте: спрошено {} заявок, записано {} исполнений",
+                    asked, booked);
+        }
     }
 
     /** Заявка, исчезнувшая из книги, о судьбе которой площадка не ответила. */

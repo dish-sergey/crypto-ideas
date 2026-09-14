@@ -76,6 +76,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.theory.TheoryCommands> theory;
     /** Проверка торгового ключа — тоже лениво: без переменных окружения бин упадёт. */
     private final ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck;
+    private final ObjectProvider<org.home.data.revx.exec.FateProbe> fateProbe;
     private final ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe;
     private final ObjectProvider<org.home.data.revx.exec.Panic> panic;
     private final ObjectProvider<org.home.data.revx.exec.ManualOrder> manualOrder;
@@ -102,6 +103,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<RevxCommands> revx,
                      ObjectProvider<org.home.data.theory.TheoryCommands> theory,
                      ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck,
+                     ObjectProvider<org.home.data.revx.exec.FateProbe> fateProbe,
                      ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe,
                      ObjectProvider<org.home.data.revx.exec.Panic> panic,
                      ObjectProvider<org.home.data.revx.exec.ManualOrder> manualOrder,
@@ -135,6 +137,7 @@ public class CliRunner implements ApplicationRunner {
         this.revx = revx;
         this.theory = theory;
         this.tradeCheck = tradeCheck;
+        this.fateProbe = fateProbe;
         this.orderProbe = orderProbe;
         this.panic = panic;
         this.manualOrder = manualOrder;
@@ -214,6 +217,11 @@ public class CliRunner implements ApplicationRunner {
             }
             if (args.containsOption("revx-trade-check")) {
                 tradeCheck.getObject().run();
+            }
+            if (args.containsOption("revx-fate-probe")) {
+                // Только GET: ищем способ спросить заявку по нашему client_order_id.
+                fateProbe.getObject().run(firstOr(args, "order-id", ""),
+                        firstOr(args, "client-id", ""));
             }
             if (args.containsOption("revx-replay")) {
                 executor.getObject().replay(firstOr(args, "journal", "state/exec.db"),
