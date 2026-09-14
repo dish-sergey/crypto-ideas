@@ -120,6 +120,45 @@ public class RevxCollectorDaemon {
         return kept;
     }
 
+    /**
+     * ЕСЛИ КЛЮЧ ОБЯЗАТЕЛЕН — ПРОВЕРИТЬ ЕГО И НЕ ЗАПУСКАТЬСЯ БЕЗ НЕГО.
+     *
+     * <h2>Зачем отдельный флаг</h2>
+     *
+     * Обычному сбору ключ не обязателен: нет ключа — работаем по публичному
+     * пути, так задумано. Но там, где ключ ЕСТЬ и на нём держится смысл машины
+     * (глубина 50 уровней, параллельные ноги, секундный шаг), тихий переход на
+     * публичный путь — худшее из возможного: данные идут, таблицы растут, никто
+     * не кричит, а на деле собирается труха.
+     *
+     * Так у нас уже терялись 12 пар хвоста: публичный путь давал перекос ног
+     * 1250 мс при пороге 250, и КАЖДЫЙ их снимок молча отбрасывался расчётом
+     * курса. Обнаружили это спустя дни и случайно.
+     *
+     * Поэтому на таких машинах ставится {@code revx.auth.required=true}, и тогда
+     * «ключа нет» либо «ключ не принят» — причина НЕ ЗАПУСКАТЬСЯ. Systemd
+     * покажет failed, а это видно, в отличие от молчаливой деградации.
+     */
+    private void requireKeyIfAsked() {
+        if (!cfg.authRequired()) {
+            return;
+        }
+        String problem = http.auth().verify(symbol -> {
+            RevxHttp.Response response = http.get(endpoints.book(symbol, cfg.bookDepthDeep()));
+            return response == null ? null : response.body();
+        });
+        if (problem == null) {
+            return;
+        }
+        String message = "КЛЮЧ ОБЯЗАТЕЛЕН (revx.auth.required=true), но " + problem
+                + ". Сбор НЕ ЗАПУЩЕН: молча уйти на публичный путь значит писать "
+                + "труху в те же таблицы. Положите ключ в " + cfg.authKeyHint()
+                + " и перезапустите.";
+        log.error(message);
+        anomalies.record("auth_required", "старт", message);
+        throw new IllegalStateException(message);
+    }
+
     /** Разовый обход всей вселенной: книги по всем парам + сделки. Для проверки. */
     public void collectOnce() {
         List<PairsCatalog.Leg> universe = restrict(catalog.universe());
@@ -157,6 +196,7 @@ public class RevxCollectorDaemon {
     public void run() {
         running = true;
         Runtime.getRuntime().addShutdownHook(new Thread(this::stop, "revx-shutdown"));
+        requireKeyIfAsked();
 
         PriorityQueue<Task> queue = buildTasks();
         int workers = endpoints.workers();

@@ -21,6 +21,14 @@ public class RevxConfig {
     private final String region;
     private final int bookDepth;
     private final int bookDepthDeep;
+    /**
+     * Там, где ключ ЕСТЬ и на нём держится смысл сбора, его отсутствие — причина
+     * не запускаться, а не тихо уйти на публичный путь. См. требование в
+     * {@code RevxCollectorDaemon.requireKeyIfAsked}.
+     */
+    private final boolean authRequired;
+    /** Куда класть ключ — чтобы отказ запускаться сразу говорил, что делать. */
+    private final String authKeyHint;
     private final double maxRequestsPerSecond;
     private final int burstCapacity;
     private final double authMaxRequestsPerSecond;
@@ -151,6 +159,8 @@ public class RevxConfig {
             @Value("${revx.region}") String region,
             @Value("${revx.book-depth}") int bookDepth,
             @Value("${revx.book-depth-deep}") int bookDepthDeep,
+            @Value("${revx.auth.required:false}") boolean authRequired,
+            @Value("${revx.auth.api-key-file}") String authKeyHint,
             @Value("${revx.max-requests-per-second}") double maxRequestsPerSecond,
             @Value("${revx.burst-capacity}") int burstCapacity,
             @Value("${revx.auth.max-requests-per-second}") double authMaxRequestsPerSecond,
@@ -275,6 +285,8 @@ public class RevxConfig {
         this.region = region;
         this.bookDepth = bookDepth;
         this.bookDepthDeep = bookDepthDeep;
+        this.authRequired = authRequired;
+        this.authKeyHint = authKeyHint;
         this.maxRequestsPerSecond = maxRequestsPerSecond;
         this.burstCapacity = burstCapacity;
         this.authMaxRequestsPerSecond = authMaxRequestsPerSecond;
@@ -509,6 +521,16 @@ public class RevxConfig {
      */
     public int bookDepthDeep() {
         return bookDepthDeep;
+    }
+
+    /** Требовать рабочий ключ при старте сбора (ставится там, где он обязателен). */
+    public boolean authRequired() {
+        return authRequired;
+    }
+
+    /** Путь к файлу API-ключа — чтобы отказ запускаться сразу говорил, что делать. */
+    public String authKeyHint() {
+        return authKeyHint;
     }
 
     public List<String> fastPairs() {

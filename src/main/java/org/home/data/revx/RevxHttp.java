@@ -50,6 +50,11 @@ public class RevxHttp {
     private final AtomicLong failures = new AtomicLong();
     private final AtomicLong retries = new AtomicLong();
 
+    /** Ключ — чтобы сборщик мог проверить, что путь действительно авторизованный. */
+    public RevxAuth auth() {
+        return auth;
+    }
+
     public RevxHttp(RevxConfig cfg, RevxEndpoints endpoints, RevxAuth auth) {
         this.cfg = cfg;
         this.auth = auth;
