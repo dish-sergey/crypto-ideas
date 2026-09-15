@@ -2283,6 +2283,11 @@ public final class QuoteLoop implements Runnable {
         if (response.ok()) {
             resting.venueId = extract(response.body());
             rememberLevel(side, resting);
+            // 🔑 ИДЕНТИФИКАТОР НА ДИСК СРАЗУ. Пока он жил только в поле объекта,
+            // конец процесса стирал его вместе с заявкой: исполнение в момент
+            // перезапуска терялось навсегда (13.09.2026, продажа dc4d7e77).
+            journal.openOrder(resting.venueId, side.name(), levelOf(side, resting),
+                    price, size, clock.now());
             resting.price = price;
             resting.size = size;
             resting.sinceMs = clock.now();
@@ -2356,7 +2361,13 @@ public final class QuoteLoop implements Runnable {
             String newId = extract(response.body());
             resting.venueId = newId != null ? newId : resting.venueId;
             rememberLevel(side, resting);
+            // Наследник — на диск, предшественник — закрыт: замена УБИВАЕТ
+            // старую заявку, и держать её в списке незакрытых значит спрашивать
+            // о ней площадку при каждом старте.
+            journal.openOrder(resting.venueId, side.name(), levelOf(side, resting),
+                    price, size, clock.now());
             if (oldId != null && !oldId.equals(resting.venueId)) {
+                journal.closeOrder(oldId, "replaced", clock.now());
                 inspectGoneOrder(side, oldId);
             }
             resting.price = price;
@@ -2720,6 +2731,27 @@ public final class QuoteLoop implements Runnable {
             boolean fresh = clock.now() - resting.sinceMs < ADOPT_GRACE_MS;
             if (resting.venueId != null && !fresh) {
                 String status = inspectGoneOrder(side, resting.venueId);
+                // 🔑 «НЕТ В СПИСКЕ АКТИВНЫХ» НЕ ЗНАЧИТ «ЗАЯВКИ НЕТ».
+                //
+                // Прежде слот очищался при ЛЮБОМ ответе, и если площадка
+                // говорила `new` — то есть заявка жива, просто не попала в
+                // список, — бот забывал её навсегда. Такая заявка остаётся в
+                // книге, её никто не заменит и не снимет, а её резерв делает
+                // монету неотчуждаемой: 15.09.2026 на счёте так зависли ВСЕ
+                // ETH, BTC и SOL (`available` ноль при непустом остатке), и
+                // боты перестали продавать вовсе.
+                //
+                // Теперь живую заявку слот удерживает: следующий тик заменит её
+                // как обычно. Неизвестную судьбу (ответа нет) тоже удерживаем —
+                // её добьёт очередь `unknownFate`.
+                if (status != null && !terminal(status)) {
+                    if (clock.now() - resting.sinceMs > 60_000) {
+                        journal.event("kept_alive", side + " " + resting.venueId
+                                + ": нет в списке активных, но площадка говорит «" + status
+                                + "» — заявку держу, не забываю");
+                    }
+                    return;
+                }
                 closePartial(resting, "filled".equalsIgnoreCase(status)
                         ? "добрана" : "ушла из книги (" + status + ")");
                 resting.venueId = null;
@@ -2786,6 +2818,9 @@ public final class QuoteLoop implements Runnable {
                 order.price(), why, response.status());
         journal.event("stray_cancel", order.side() + " " + order.id() + " по "
                 + fmt(order.price()) + " (" + why + ") → " + response.status());
+        if (response.ok()) {
+            journal.closeOrder(order.id(), "cancelled", clock.now());
+        }
     }
 
     /**
@@ -3115,7 +3150,101 @@ public final class QuoteLoop implements Runnable {
             log.info("восстановление при старте: спрошено {} заявок, записано {} исполнений",
                     asked, booked);
         }
+        recoverOpenOrders(alive);
     }
+
+    /**
+     * 🔑 ЗАЯВКИ ИЗ ПРОШЛОЙ ЖИЗНИ — ПО ЗАПИСИ НА ДИСКЕ, А НЕ ПО СПИСКУ АКТИВНЫХ.
+     *
+     * <h2>Зачем этого не хватало</h2>
+     *
+     * Восстановление выше берёт идентификаторы из ТЕЛ ЗАПРОСОВ за последние
+     * полчаса и только чтобы записать пропущенные исполнения. Две дыры оно не
+     * закрывает:
+     * <ul>
+     *   <li>заявка старше окна — например, поставленная перед долгим простоем;</li>
+     *   <li>заявка ЖИВА, но её нет в списке активных. Прежде такую просто
+     *       пропускали («отменена или заменена — записывать нечего»), и она
+     *       оставалась в книге навсегда, держа резерв: 15.09.2026 из-за этого на
+     *       счёте зависли все ETH, BTC и SOL.</li>
+     * </ul>
+     *
+     * Теперь источник — {@code exec_open_order}: туда пишется КАЖДАЯ постановка
+     * и замена, и запись закрывается только выясненной судьбой. При старте бот
+     * спрашивает площадку про каждую незакрытую.
+     *
+     * ⚠️ Живую заявку из прошлой жизни СНИМАЕМ, а не усыновляем. Бот стартует с
+     * выключенным котированием, и правило «наших заявок в книге быть не должно»
+     * действует и здесь; усыновлять её в слот вслепую нельзя — мы не знаем, чем
+     * она была, а вторая заявка поверх живой уже удваивала резерв (01.09.2026).
+     */
+    private void recoverOpenOrders(java.util.Set<String> alive) {
+        java.util.List<ExecJournal.OpenOrder> open =
+                journal.openOrders(clock.now() - OPEN_ORDER_WINDOW_MS);
+        if (open.isEmpty()) {
+            return;
+        }
+        int asked = 0;
+        int cancelled = 0;
+        int booked = 0;
+        for (ExecJournal.OpenOrder o : open) {
+            if (alive.contains(o.venueId())) {
+                continue;                 // стоит в книге — этим займётся сверка
+            }
+            Venue.Response order = client.order(o.venueId());
+            asked++;
+            if (!order.ok() || order.body() == null) {
+                // Судьба неизвестна: запись НЕ закрываем, спросим при следующем
+                // старте или через очередь unknownFate.
+                continue;
+            }
+            Side side = "SELL".equalsIgnoreCase(o.side()) ? Side.SELL : Side.BUY;
+            String status = field(order.body(), "status");
+            double before = inventory;
+            book(side, o.venueId(), order.body());
+            if (Math.abs(inventory - before) > 1e-15) {
+                booked++;
+                String message = String.format(java.util.Locale.ROOT,
+                        "восстановлено по записи заявки: %s %s, позиция %s → %s",
+                        side, o.venueId(), fmt(before), fmt(inventory));
+                log.warn(message);
+                journal.event("recovered_fill", message);
+                alert.accept(message);
+            }
+            if (!terminal(status)) {
+                // Живая, но невидимая в списке активных — снимаем поимённо.
+                Venue.Response cancel = client.cancel(o.venueId());
+                cancels++;
+                String message = String.format(java.util.Locale.ROOT,
+                        "ЗАЯВКА ИЗ ПРОШЛОЙ ЖИЗНИ: %s %s (%s %s по %s) жива, но в списке "
+                                + "активных её нет — снял, ответ %d",
+                        side, o.venueId(), status, fmt(o.size()), fmt(o.price()),
+                        cancel.status());
+                log.warn(message);
+                journal.event("orphan_cancel", message);
+                alert.accept(message);
+                if (cancel.ok()) {
+                    journal.closeOrder(o.venueId(), "cancelled", clock.now());
+                    cancelled++;
+                }
+                refreshBalances();
+            }
+        }
+        if (asked > 0) {
+            log.warn("незакрытых заявок в журнале: {}, спрошено {}, записано исполнений {}, "
+                    + "снято живых {}", open.size(), asked, booked, cancelled);
+        }
+    }
+
+    /**
+     * Насколько назад смотреть незакрытые заявки при старте.
+     *
+     * Неделя: за это время любая наша заявка либо исполнилась, либо снята, а
+     * спрашивать про каждую из тысяч — это часы GET-ов при общем лимите в
+     * тысячу в минуту. Незакрытые записи старше просто остаются в журнале как
+     * след: их видно прибором сверки (`--revx-audit`).
+     */
+    private static final long OPEN_ORDER_WINDOW_MS = 7 * 24 * 3600_000L;
 
     /** Заявка, исчезнувшая из книги, о судьбе которой площадка не ответила. */
     private static final class UnknownFate {
@@ -3231,7 +3360,30 @@ public final class QuoteLoop implements Runnable {
             alert.accept(message);
             stopQuoting();
         }
+        // Судьба выяснена площадкой — закрываем запись, если она окончательная.
+        // Живую (`new`, `partially_filled`) НЕ закрываем: она ещё стоит в книге,
+        // и при следующем старте её надо снова найти.
+        if (terminal(status)) {
+            journal.closeOrder(venueId, status, clock.now());
+        }
         return status;
+    }
+
+    /**
+     * Окончательна ли судьба заявки.
+     *
+     * ⚠️ Всё, что не в этом списке, считается ЖИВЫМ. Ошибиться в эту сторону
+     * дёшево — лишний вопрос площадке при старте; ошибиться в другую значит
+     * забыть стоящую заявку, а её резерв делает монету неотчуждаемой.
+     */
+    private static boolean terminal(String status) {
+        if (status == null) {
+            return false;
+        }
+        return switch (status.toLowerCase(java.util.Locale.ROOT)) {
+            case "filled", "cancelled", "canceled", "rejected", "expired", "replaced" -> true;
+            default -> false;
+        };
     }
 
     /**
@@ -3322,7 +3474,9 @@ public final class QuoteLoop implements Runnable {
         Venue.Response response = client.cancel(dead);
         cancels++;
         journal.event("cancel", side + " " + dead + " (" + why + ") → " + response.status());
-        if (!response.ok()) {
+        if (response.ok()) {
+            journal.closeOrder(dead, "cancelled", clock.now());
+        } else {
             log.info("отмена {} не прошла ({}), выясняю судьбу заявки", side, response.status());
             inspectGoneOrder(side, dead);
             refreshBalances();

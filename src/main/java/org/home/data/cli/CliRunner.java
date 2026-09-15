@@ -77,6 +77,7 @@ public class CliRunner implements ApplicationRunner {
     /** Проверка торгового ключа — тоже лениво: без переменных окружения бин упадёт. */
     private final ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck;
     private final ObjectProvider<org.home.data.revx.exec.FateProbe> fateProbe;
+    private final ObjectProvider<org.home.data.revx.exec.Audit> audit;
     private final ObjectProvider<org.home.data.revx.RateCheck> rateCheck;
     private final ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe;
     private final ObjectProvider<org.home.data.revx.exec.Panic> panic;
@@ -105,6 +106,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.theory.TheoryCommands> theory,
                      ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck,
                      ObjectProvider<org.home.data.revx.exec.FateProbe> fateProbe,
+                     ObjectProvider<org.home.data.revx.exec.Audit> audit,
                      ObjectProvider<org.home.data.revx.RateCheck> rateCheck,
                      ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe,
                      ObjectProvider<org.home.data.revx.exec.Panic> panic,
@@ -140,6 +142,7 @@ public class CliRunner implements ApplicationRunner {
         this.theory = theory;
         this.tradeCheck = tradeCheck;
         this.fateProbe = fateProbe;
+        this.audit = audit;
         this.rateCheck = rateCheck;
         this.orderProbe = orderProbe;
         this.panic = panic;
@@ -236,6 +239,15 @@ public class CliRunner implements ApplicationRunner {
                 // Только GET: ищем способ спросить заявку по нашему client_order_id.
                 fateProbe.getObject().run(firstOr(args, "order-id", ""),
                         firstOr(args, "client-id", ""));
+            }
+            if (args.containsOption("revx-order-status")) {
+                // Только GET: спросить площадку про конкретные заявки целиком.
+                fateProbe.getObject().status(firstOr(args, "order-id", ""));
+            }
+            if (args.containsOption("revx-audit")) {
+                // Только GET: сводит площадку, реестр и журналы ботов.
+                audit.getObject().run(firstOr(args, "alloc", ""),
+                        firstOr(args, "out", ""));
             }
             if (args.containsOption("revx-replay")) {
                 executor.getObject().replay(firstOr(args, "journal", "state/exec.db"),

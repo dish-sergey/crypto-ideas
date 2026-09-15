@@ -139,6 +139,61 @@ public class FateProbe {
         log.info(report.toString());
     }
 
+    /**
+     * {@code --revx-order-status --order-id=id1,id2,…}: СПРОСИТЬ ПЛОЩАДКУ ПРО
+     * КОНКРЕТНЫЕ ЗАЯВКИ и напечатать ответ целиком. Только GET.
+     *
+     * <h2>Зачем отдельная команда</h2>
+     *
+     * Судьбу заявки нельзя выводить ни из её собственного статуса в нашем
+     * журнале, ни из отсутствия в списке активных: у площадки это РАЗНЫЕ
+     * источники, и они расходятся. 15.09.2026 нашлись две заявки, которых нет в
+     * {@code /orders/active}, но чей резерв площадка держит — и единственный
+     * способ узнать, живы они или нет, это спросить по идентификатору.
+     *
+     * ⚠️ Печатается ВЕСЬ ответ. Зонд {@link #run} режет тело до 150 символов,
+     * чтобы не таскать в журнал остатки счёта, — а здесь важен именно
+     * {@code status} и {@code leaves_quantity}, которые стоят в конце.
+     */
+    public void status(String ids) {
+        if (ids == null || ids.isBlank()) {
+            log.error("нужен --order-id=<venue_order_id>[,<venue_order_id>…]");
+            return;
+        }
+        TradeAuth auth = TradeAuth.fromEnvironment();
+        log.info("торговый ключ загружен ({}), спрашиваю статусы — ТОЛЬКО GET",
+                auth.keyFingerprint());
+        HttpClient http = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
+                .connectTimeout(Duration.ofSeconds(15))
+                .build();
+        StringBuilder report = new StringBuilder("\n=== Статусы заявок по идентификаторам ===\n");
+        for (String id : ids.split(",")) {
+            String orderId = id.trim();
+            if (orderId.isEmpty()) {
+                continue;
+            }
+            URI uri = URI.create(cfg.baseUrl() + "/api/1.0/orders/" + orderId);
+            try {
+                HttpRequest.Builder request = HttpRequest.newBuilder(uri)
+                        .timeout(Duration.ofSeconds(20))
+                        .GET();
+                auth.headers("GET", uri, "").forEach(request::header);
+                HttpResponse<String> response = http.send(request.build(),
+                        HttpResponse.BodyHandlers.ofString());
+                report.append(orderId).append("  ").append(response.statusCode()).append('\n')
+                        .append("  ").append(response.body().replaceAll("\\s+", " ")).append("\n\n");
+                Thread.sleep(300);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (Exception e) {
+                report.append(orderId).append("  — ошибка: ").append(e.getMessage()).append('\n');
+            }
+        }
+        log.info(report.toString());
+    }
+
     /** Тело урезается: в ответе бывают остатки счёта, а в журнале это лишнее. */
     private static String summarize(String body) {
         if (body == null || body.isBlank()) {

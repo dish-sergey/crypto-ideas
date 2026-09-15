@@ -78,6 +78,17 @@ public final class ExecJournal implements AutoCloseable {
                 value  REAL NOT NULL,
                 ts_ms  INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS exec_open_order (
+                venue_id  TEXT PRIMARY KEY,
+                side      TEXT    NOT NULL,
+                level     INTEGER,
+                price     REAL,
+                size      REAL,
+                opened_ms INTEGER NOT NULL,
+                closed_ms INTEGER,
+                status    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_exec_open_order ON exec_open_order(closed_ms);
             """;
 
     private final Connection connection;
@@ -171,6 +182,102 @@ public final class ExecJournal implements AutoCloseable {
         } catch (Exception e) {
             throw new IllegalStateException("не открыть журнал исполнителя " + path, e);
         }
+    }
+
+    /** Заявка, которую мы поставили и чья судьба ещё не выяснена. */
+    public record OpenOrder(String venueId, String side, int level, double price, double size,
+                            long openedMs) {
+    }
+
+    /**
+     * 🔑 ЖИВАЯ ЗАЯВКА ЗАПИСЫВАЕТСЯ НА ДИСК, А НЕ ТОЛЬКО В ПАМЯТЬ.
+     *
+     * <h2>Зачем</h2>
+     *
+     * Идентификатор стоящей заявки жил в поле объекта, и с концом процесса он
+     * исчезал. Дальше новый процесс спрашивал {@code /orders/active} и усыновлял
+     * то, что там видит, — но у этого списка есть две дыры, и обе стоили нам
+     * денег:
+     * <ul>
+     *   <li><b>заявка успела исполниться в момент перезапуска.</b> В списке её
+     *       уже нет, идентификатор забыт, спросить не о чем — исполнение
+     *       теряется навсегда. Так 13.09.2026 в 22:28:33 исполнилась продажа
+     *       {@code dc4d7e77} на 0.00120795 ETH: площадка до сих пор отвечает
+     *       {@code filled}, а в журнале бота этой сделки нет;</li>
+     *   <li><b>заявка жива, но в списке её нет.</b> Тогда она остаётся в книге
+     *       навсегда: никто её не заменит и не снимет, а её резерв делает
+     *       монету неотчуждаемой — площадка показывает {@code available} ноль
+     *       при непустом остатке.</li>
+     * </ul>
+     *
+     * Поэтому каждая постановка и замена пишет идентификатор СЮДА, а закрывает
+     * запись только выясненная судьба (исполнена, снята, заменена). При старте
+     * бот читает незакрытые и спрашивает площадку о каждой поимённо.
+     *
+     * ⚠️ Запись идёт ПОСЛЕ ответа площадки, но ДО любого учёта: если процесс
+     * умрёт между ними, останется лишний вопрос при старте, а не потерянная
+     * заявка. Обратный порядок терял бы именно её.
+     */
+    public synchronized void openOrder(String venueId, String side, int level,
+                                       double price, double size, long tsMs) {
+        if (venueId == null || venueId.isBlank()) {
+            return;
+        }
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT INTO exec_open_order(venue_id, side, level, price, size, opened_ms)"
+                        + " VALUES(?,?,?,?,?,?) ON CONFLICT(venue_id) DO UPDATE SET"
+                        + " price = excluded.price, size = excluded.size")) {
+            ps.setString(1, venueId);
+            ps.setString(2, side);
+            ps.setInt(3, level);
+            ps.setDouble(4, price);
+            ps.setDouble(5, size);
+            ps.setLong(6, tsMs);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.error("не записать открытую заявку {}: {}", venueId, e.getMessage());
+        }
+    }
+
+    /** Судьба выяснена: заявка исполнена, снята или заменена. */
+    public synchronized void closeOrder(String venueId, String status, long tsMs) {
+        if (venueId == null || venueId.isBlank()) {
+            return;
+        }
+        try (PreparedStatement ps = connection.prepareStatement(
+                "UPDATE exec_open_order SET closed_ms = ?, status = ? WHERE venue_id = ?")) {
+            ps.setLong(1, tsMs);
+            ps.setString(2, status);
+            ps.setString(3, venueId);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.error("не закрыть открытую заявку {}: {}", venueId, e.getMessage());
+        }
+    }
+
+    /**
+     * Заявки, чья судьба не выяснена, — от самой старой.
+     *
+     * ⚠️ Хвост обрезается по возрасту: заявка, поставленная неделю назад и не
+     * закрытая, почти наверняка уже неактуальна, а спрашивать площадку про
+     * каждую из тысяч — это часы GET-ов при общем лимите в тысячу в минуту.
+     */
+    public synchronized List<OpenOrder> openOrders(long sinceMs) {
+        List<OpenOrder> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT venue_id, side, level, price, size, opened_ms FROM exec_open_order"
+                        + " WHERE closed_ms IS NULL AND opened_ms >= ? ORDER BY opened_ms")) {
+            ps.setLong(1, sinceMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(new OpenOrder(rs.getString(1), rs.getString(2), rs.getInt(3),
+                            rs.getDouble(4), rs.getDouble(5), rs.getLong(6)));
+                }
+            }
+        } catch (Exception e) {
+            log.error("не прочитать открытые заявки: {}", e.getMessage());
+        }
+        return out;
     }
 
     /**
