@@ -153,6 +153,8 @@ public class Audit {
         sb.append("которой нет в /orders/active. Такую монету нельзя ни продать, ни забрать:\n");
         sb.append("`available` по ней ноль, а снять нечего — идентификатор неизвестен.\n");
 
+        sb.append(hunt(http, auth, balances, orders));
+
         // 3: за кем монета числится.
         sb.append("\nВЛАДЕНИЕ: всего у площадки / Σ претензий в реестре / ничейное\n");
         java.util.Set<String> currencies = new java.util.TreeSet<>(balances.keySet());
@@ -208,6 +210,81 @@ public class Audit {
                 log.warn("не записалось в {}: {}", outPath, ex.toString());
             }
         }
+    }
+
+    /**
+     * ОХОТА ЗА НЕВИДИМОЙ ЗАЯВКОЙ: те же активные заявки, но спрошенные иначе.
+     *
+     * <h2>Зачем</h2>
+     *
+     * Если резерв площадки не объясняется ни одной видимой заявкой, есть ровно
+     * две возможности: либо заявка существует и список её не показывает, либо
+     * резерв залип внутри площадки. Отличить их можно только одним способом —
+     * спросить список ДРУГИМ запросом.
+     *
+     * Основания подозревать фильтр есть: у этой площадки уже встречалось, что
+     * один и тот же адрес ведёт себя по-разному в зависимости от формы запроса
+     * («символ в ПУТИ, а не в query» — 19.08.2026, там `?symbol=` отвечал 401,
+     * будто дело в подписи). Поэтому перебираются формы, а не гадается.
+     *
+     * ⚠️ Только GET и только когда расхождение уже найдено: лишние запросы к
+     * списку заявок стоят из общего лимита в 1000/мин на весь счёт.
+     */
+    private String hunt(HttpClient http, TradeAuth auth, Map<String, Balance> balances,
+                        List<Order> orders) {
+        boolean phantom = false;
+        for (var e : balances.entrySet()) {
+            double byOrders = 0;
+            for (Order o : orders) {
+                if ("sell".equalsIgnoreCase(o.side()) && o.base().equals(e.getKey())) {
+                    byOrders += o.leaves();
+                } else if ("buy".equalsIgnoreCase(o.side()) && o.quote().equals(e.getKey())) {
+                    byOrders += o.leaves() * o.price();
+                }
+            }
+            if (e.getValue().reserved() - byOrders > 1e-8) {
+                phantom = true;
+            }
+        }
+        if (!phantom) {
+            return "";
+        }
+        List<String> paths = List.of(
+                "/api/1.0/orders/active",
+                "/api/1.0/orders/active?limit=200",
+                "/api/1.0/orders/active?symbol=ETH-USDC",
+                "/api/1.0/orders/active?symbol=ETH/USDC",
+                "/api/1.0/orders/active/ETH-USDC",
+                "/api/1.0/orders/active?side=sell",
+                "/api/1.0/orders/active?status=new",
+                "/api/1.0/orders/active?status=partially_filled",
+                "/api/1.0/orders/active?include_pending=true",
+                "/api/1.0/orders/open",
+                "/api/1.0/orders/pending");
+        StringBuilder sb = new StringBuilder(
+                "\nОХОТА ЗА НЕВИДИМОЙ ЗАЯВКОЙ (резерв не сошёлся — спрашиваю список иначе)\n");
+        for (String path : paths) {
+            String body = get(http, auth, path);
+            if (body == null) {
+                sb.append(String.format(Locale.ROOT, "  %-44s — не ответил%n", path));
+                continue;
+            }
+            int count = 0;
+            Matcher m = Pattern.compile("\"client_order_id\"").matcher(body);
+            while (m.find()) {
+                count++;
+            }
+            sb.append(String.format(Locale.ROOT, "  %-44s заявок %d%n", path, count));
+            try {
+                Thread.sleep(300);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        sb.append("  ⚠️ Если все формы дают одно и то же, заявки нет НИ В ОДНОМ представлении:\n");
+        sb.append("  значит резерв держится внутри самой площадки, и снять его нам нечем.\n");
+        return sb.toString();
     }
 
     private Map<String, Balance> balances(HttpClient http, TradeAuth auth) {

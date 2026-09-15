@@ -4192,6 +4192,75 @@ public final class QuoteLoop implements Runnable {
     /** Когда в последний раз кричали про расхождение реестра и про ничейное. */
     private volatile long registryWarnedMs;
     private volatile long unownedWarnedMs;
+    private volatile long frozenWarnedMs;
+    /** Когда впервые заметили запертую монету без заявки; 0 — не замечали. */
+    private volatile long frozenSinceMs;
+
+    /**
+     * 🔑 ЗАПЕРТО, А ЗАЯВКИ НЕТ: четвёртый сторож, которого не хватало.
+     *
+     * <h2>Зачем</h2>
+     *
+     * Три прежних сторожа проверяют НАШИ книги друг против друга: позиция
+     * против остатка, реестр против журнала, ничейное против претензий. Ни один
+     * не смотрел на то, чем монета ЗАПЕРТА, — и эта беда пряталась дольше всех.
+     *
+     * 15.09.2026 на счёте оказались заперты ВСЕ ETH, BTC и SOL: площадка держала
+     * их в {@code reserved}, не показывая по ним ни одной заявки. Проверено при
+     * остановленных ботах и при снятых через приложение заявках — резерв не
+     * сдвинулся. Пока он есть, {@code available} ноль, и бот физически не может
+     * продать: ETH-боты неделю только покупали, и это выглядело как «нет
+     * потока», а не как поломка.
+     *
+     * <h2>Почему это отдельная тревога</h2>
+     *
+     * Её причина вне нас, и лечение тоже вне нас: снять заявку, которой не
+     * видно, нельзя — идентификатора у неё нет. Поэтому сторож не чинит, а
+     * НАЗЫВАЕТ: сколько заперто, сколько из этого объясняется видимыми
+     * заявками, и с какого момента это длится.
+     *
+     * ⚠️ Порог — лот и пять минут. Мгновенное расхождение штатно: остатки и
+     * список активных читаются РАЗНЫМИ запросами, и между ними успевает пройти
+     * замена. Беда — когда расхождение держится.
+     */
+    private void checkFrozen(long now) {
+        if (!(params.size() > 0) || baseReserved <= 0) {
+            frozenSinceMs = 0;
+            return;
+        }
+        Venue.Response active = client.activeOrders();
+        if (!active.ok() || active.body() == null) {
+            return;                       // не знаем состояние — молчим
+        }
+        double visible = 0;
+        for (ActiveOrder o : ActiveOrder.parse(active.body())) {
+            if (o.side() == Side.SELL && ActiveOrder.normalize(symbol).equals(o.symbol())) {
+                visible += o.size();
+            }
+        }
+        double frozen = baseReserved - visible;
+        if (frozen < params.size()) {
+            frozenSinceMs = 0;
+            return;
+        }
+        if (frozenSinceMs == 0) {
+            frozenSinceMs = now;
+            return;
+        }
+        if (now - frozenSinceMs < 5 * 60_000L || now - frozenWarnedMs < 3_600_000L) {
+            return;
+        }
+        frozenWarnedMs = now;
+        String message = ("ЗАПЕРТО БЕЗ ЗАЯВКИ: площадка держит %s %s в резерве, а видимые "
+                + "заявки объясняют только %s. Разница %s (%.1f лота) не отпускается уже "
+                + "%d мин: продать эту монету нельзя, снять нечего — идентификатора у неё "
+                + "нет. Это сторона площадки; прибор для разбора — --revx-audit.")
+                .formatted(fmt(baseReserved), base, fmt(visible), fmt(frozen),
+                        frozen / params.size(), (now - frozenSinceMs) / 60_000);
+        log.error(message);
+        journal.event("frozen_reserve", message);
+        alert.accept(message);
+    }
 
     /**
      * РЕЕСТР ПРОТИВ ЖУРНАЛА: они обязаны совпадать до пыли.
@@ -4283,6 +4352,9 @@ public final class QuoteLoop implements Runnable {
                 claimHeirIfEvidenceMatches(now);
                 checkUnowned(now);
             }
+            // Сторож запертого без заявки работает и без реестра: он сверяет
+            // остаток площадки с её же списком заявок.
+            checkFrozen(now);
             // Остатки перечитываются раз в минуту: исполнение могло случиться молча.
             refreshBalances();
             if (budget != null) {
