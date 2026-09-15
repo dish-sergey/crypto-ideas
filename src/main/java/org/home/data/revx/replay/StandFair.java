@@ -65,6 +65,47 @@ public final class StandFair implements FairSource {
     private final Map<String, List<Slice>> byPair = new LinkedHashMap<>();
     private final Map<String, Integer> cursor = new HashMap<>();
 
+    /**
+     * ОТКУДА БРАТЬ КУРС USDC/USD — прибор под задачу A45, а не боевая настройка.
+     *
+     * Курс считается медианой подразумеваемых оценок по парам, а у площадки есть
+     * ПРЯМАЯ книга {@code USDC/USD} со спредом в один базисный пункт. Замер за
+     * четверо суток (34 382 точки): наша медиана лежит на <b>5.31 б.п. НИЖЕ</b>
+     * прямой книги, и это устойчиво по суткам; а шаг за минуту у медианы
+     * 1.77 б.п. против <b>нуля</b> у прямой книги.
+     *
+     * Отсюда два РАЗНЫХ вопроса, и разделять их обязательно:
+     * <ul>
+     *   <li><b>шум</b> — чинится сглаживанием самого курса, уровень не меняется,
+     *       риска первого порядка нет ({@code SMOOTH});</li>
+     *   <li><b>уровень</b> — смена основания котирования на прямую книгу
+     *       ({@code DIRECT}). Сдвиг всех {@code fair} вниз на 5–6 б.п.: бид
+     *       дальше от рынка, аск ближе. Цена ошибки известна — 10.09.2026 сдвиг
+     *       курса на 1.1 б.п. изменил число сделок BTC на 40%.</li>
+     * </ul>
+     *
+     * ⚠️ Подменяется ТОЛЬКО делитель цены. Медиана, разброс, остатки и все три
+     * гейта считаются по-прежнему — иначе опыт менял бы две вещи разом и
+     * «сдвинулась цена» было бы не отличить от «иначе сработали гейты».
+     */
+    private enum RateSource { MEDIAN, DIRECT, SMOOTH }
+
+    private final RateSource rateSource = RateSource.valueOf(
+            System.getProperty("revx.fair.rate-source", "MEDIAN").toUpperCase(java.util.Locale.ROOT));
+
+    /** Полупериод сглаживания курса, секунды (для {@code SMOOTH}). */
+    private final double rateSmoothSec =
+            Double.parseDouble(System.getProperty("revx.fair.rate-smooth-sec", "60"));
+
+    /** Прямая книга USDC/USD: отметка → середина. */
+    private final List<long[]> directRateTs = new ArrayList<>();
+    private final List<Double> directRateMid = new ArrayList<>();
+    private int directCursor;
+
+    /** Сглаживание курса: общий код с живым чтением. */
+    private final org.home.data.revx.sim.RateSmoother smoother =
+            new org.home.data.revx.sim.RateSmoother(rateSmoothSec);
+
     public StandFair(String standDbPath, String base, FairPrice.Limits limits,
                      java.util.Collection<String> memecoins, long maxSkewMs, Clock clock,
                      long fromMs, long toMs) {
@@ -146,6 +187,11 @@ public final class StandFair implements FairSource {
         } finally {
             replaceClock(saved);
             cursor.clear();
+            // ⚠️ Вместе с курсорами пар сбрасываются курсор прямой книги и
+            // состояние сглаживания: следующий вызов начнётся с начала окна, и
+            // курс, «запомненный» с прошлой пары, испортил бы первые тики.
+            directCursor = 0;
+            smoother.reset();
         }
         return out;
     }
@@ -176,15 +222,68 @@ public final class StandFair implements FairSource {
                     byPair.put(b, slices);
                 }
             }
-            log.warn("справедливая цена из записи: пар {}, снимков у {} — {}",
+            if (rateSource != RateSource.MEDIAN) {
+                loadDirectRate(c, fromMs, toMs);
+            }
+            log.warn("справедливая цена из записи: пар {}, снимков у {} — {}; курс {}",
                     byPair.size(), base,
-                    byPair.containsKey(base) ? byPair.get(base).size() : 0);
+                    byPair.containsKey(base) ? byPair.get(base).size() : 0,
+                    rateSource == RateSource.MEDIAN ? "медианой по парам"
+                            : rateSource == RateSource.DIRECT
+                                    ? "ПРЯМОЙ книгой USDC/USD (" + directRateMid.size() + " снимков)"
+                                    : "СГЛАЖЕННОЙ медианой, полупериод "
+                                            + rateSmoothSec + " с");
         } catch (Exception e) {
             log.error("не прочиталась книга стенда: {}", e.toString());
         }
     }
 
-    /** Сшить USDC- и USD-ноги одной пары по {@code snap_id}. */
+    /**
+     * ПРЯМАЯ КНИГА КУРСА. Собирается с 10.09.2026 раз в 10 с (задача A45).
+     *
+     * ⚠️ На окнах до 10.09 её просто нет, и прогон с {@code DIRECT} тогда
+     * молча выродился бы в медианный — поэтому пустая книга это громкая
+     * ошибка, а не тихий откат.
+     */
+    private void loadDirectRate(Connection c, long fromMs, long toMs) {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT t_recv_ms, bp1, ap1 FROM revx_book WHERE symbol = 'USDC/USD'"
+                        + " AND t_recv_ms >= ? AND t_recv_ms <= ? AND bp1 > 0 AND ap1 > 0"
+                        + " ORDER BY t_recv_ms")) {
+            ps.setLong(1, fromMs);
+            ps.setLong(2, toMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    directRateTs.add(new long[]{rs.getLong(1)});
+                    directRateMid.add((rs.getDouble(2) + rs.getDouble(3)) / 2);
+                }
+            }
+        } catch (Exception e) {
+            log.error("не прочиталась прямая книга курса: {}", e.toString());
+        }
+        if (rateSource == RateSource.DIRECT && directRateMid.isEmpty()) {
+            throw new IllegalStateException(
+                    "revx.fair.rate-source=DIRECT, а книги USDC/USD в этом окне нет "
+                            + "(собирается с 10.09.2026) — прогон был бы медианным и молча");
+        }
+    }
+
+    /** Курс прямой книги на момент {@code ts}; 0 — снимок протух или его нет. */
+    private double directRate(long ts) {
+        if (directRateMid.isEmpty() || directRateTs.get(0)[0] > ts) {
+            return 0;
+        }
+        while (directCursor + 1 < directRateTs.size()
+                && directRateTs.get(directCursor + 1)[0] <= ts) {
+            directCursor++;
+        }
+        // ⚠️ Свежесть та же, что у корзины курса: снимок старше 30 с в расчёт
+        // не идёт. Иначе на простое сбора курс замирал бы, а цены пар — нет.
+        return ts - directRateTs.get(directCursor)[0] > 30_000 ? 0
+                : directRateMid.get(directCursor);
+    }
+
+        /** Сшить USDC- и USD-ноги одной пары по {@code snap_id}. */
     private List<Slice> stitch(Connection c, String b, long fromMs, long toMs) {
         Map<Long, double[]> usdc = legs(c, b + "/USDC", fromMs, toMs);
         Map<Long, double[]> usd = legs(c, b + "/USD", fromMs, toMs);
@@ -397,7 +496,19 @@ public final class StandFair implements FairSource {
             return new StandReader.Fair(0, false,
                     "пары " + askedBase + " нет в срезе", asOf, quotes.size());
         }
-        return new StandReader.Fair(state.fairUsdc(), state.quotable(), state.pausedReason(),
+        // ⚠️ ПОДМЕНА КУРСА — ТОЛЬКО ДЕЛИТЕЛЬ ЦЕНЫ, и потому она делается здесь,
+        // а не внутри FairPrice: гейты по разбросу и остатку обязаны остаться на
+        // медиане. `fair = mid_usd / курс`, значит замена курса — это множитель
+        // `курс_медианы / курс_новый`, применённый к готовой цене.
+        double price = state.fairUsdc();
+        if (rateSource != RateSource.MEDIAN && result.rate() > 0 && price > 0) {
+            double swapped = rateSource == RateSource.DIRECT
+                    ? directRate(now) : smoother.next(now, result.rate());
+            if (swapped > 0) {
+                price *= result.rate() / swapped;
+            }
+        }
+        return new StandReader.Fair(price, state.quotable(), state.pausedReason(),
                 asOf, quotes.size(),
                 own == null ? 0 : own.bid(), own == null ? 0 : own.ask(),
                 state.referenceSpreadPct());

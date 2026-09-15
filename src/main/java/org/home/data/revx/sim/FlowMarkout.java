@@ -2266,7 +2266,8 @@ public final class FlowMarkout {
         }
         StringBuilder sb = new StringBuilder(
                 "\nСРАВНЕНИЕ ОПОР (чем ниже ошибка прогноза и чем ближе перекос к 50%, тем лучше)\n");
-        sb.append("  опора | принтов выше опоры | ошибка прогноза | без сдвига, б.п.\n");
+        sb.append("  опора | принтов выше опоры | ошибка прогноза | без сдвига, б.п. |"
+                + " сдвиг к середине книги\n");
         for (Ref ref : Ref.values()) {
             int above = 0;
             int n = 0;
@@ -2301,10 +2302,23 @@ public final class FlowMarkout {
                 raw += Math.abs(x);
                 net += Math.abs(x - bias);
             }
-            sb.append(String.format(Locale.ROOT, "  %-5s | %17.1f%% | %14.2f | %13.2f%n",
+            // 🔑 Смещение опоры от середины книги, в которой мы ТОРГУЕМ. Это не
+            // то же, что ошибка прогноза: опора может точно предсказывать
+            // будущее и при этом стоять на 5 б.п. в стороне — и тогда бид с
+            // аском встают несимметрично, а лестница отступов подписана неверно.
+            List<Double> off = new ArrayList<>();
+            for (Map.Entry<Long, Top> e : book.entrySet()) {
+                Double a = anchor(ref, e.getKey(), fair, book);
+                if (a != null && a > 0 && e.getValue().mid() > 0) {
+                    off.add(1e4 * (a - e.getValue().mid()) / e.getValue().mid());
+                }
+            }
+            java.util.Collections.sort(off);
+            sb.append(String.format(Locale.ROOT,
+                    "  %-5s | %17.1f%% | %14.2f | %13.2f | %+21.2f%n",
                     ref, n == 0 ? 0 : 100.0 * above / n,
                     errs.isEmpty() ? 0 : raw / errs.size(),
-                    errs.isEmpty() ? 0 : net / errs.size()));
+                    errs.isEmpty() ? 0 : net / errs.size(), q(off, 0.5)));
         }
         sb.append(deepAnchors(md, book));
         sb.append(betaSweep(book));

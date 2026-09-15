@@ -79,8 +79,8 @@ public final class Forecast {
                             double atCapShare, double lotNotional, int buys, int sells,
                             java.util.List<Day> days_, double emptyShare, long[] lotHist,
                             double holdMedMin, double holdP90Min, double volBpPerMin,
-                            double roundMeanBp, double roundSdBp, double roundsPerDay,
-                            double marketBp) {
+                            double roundSumBp, double roundSumSqBp, double roundCount,
+                            double marketSumBp, double unrealisedBpPerDay) {
 
         /**
          * 🔑 СУТОЧНОЕ ОТНОШЕНИЕ — мерка сравнения настроек (док. 154 §I).
@@ -98,8 +98,22 @@ public final class Forecast {
          * что у результата.
          */
         public double ratioPerDay() {
-            return roundSdBp > 0 && roundsPerDay > 0
-                    ? roundMeanBp / roundSdBp * Math.sqrt(roundsPerDay) : 0;
+            double sd = roundSdBp();
+            return sd > 0 && roundCount > 1 && days > 0
+                    ? roundSumBp / roundCount / sd * Math.sqrt(roundCount / days) : 0;
+        }
+
+        public double roundMeanBp() {
+            return roundCount > 0 ? roundSumBp / roundCount : 0;
+        }
+
+        public double roundSdBp() {
+            if (!(roundCount > 1)) {
+                return 0;
+            }
+            double mean = roundSumBp / roundCount;
+            double var = (roundSumSqBp - roundCount * mean * mean) / (roundCount - 1);
+            return var > 0 ? Math.sqrt(var) : 0;
         }
 
         /**
@@ -519,7 +533,7 @@ public final class Forecast {
         // придвижение аска сравнивались до этой правки, и их числа надо читать с
         // поправкой на то, сколько лотов осталось на руках.
         double unrealised = ledger.position().unrealised(st.lastFair());
-        double[] rounds = roundsNetOfMarket(ledger, ticks);
+        double[] rounds = roundsNetOfMarket(ledger, ticks, spec.size());
         return new BotResult(spec.botId(), spec.offset() * 10_000, fills,
                 ledger.tradingRealisedSince(0) + unrealised,
                 spec.size() > 0 ? st.inventory() / spec.size() : 0,
@@ -533,7 +547,14 @@ public final class Forecast {
                 spec.size() * st.lastFair(), buys, sells, byDay(ledger, ticks),
                 tickCount > 0 ? (double) st.ticksEmpty() / tickCount : 0, st.lotHist(),
                 ledger.holdMinutes(0)[0], ledger.holdMinutes(0)[1], volBpPerMin(ticks),
-                rounds[0], rounds[1], days > 0 ? rounds[2] / days : 0, rounds[3]);
+                rounds[0], rounds[1], rounds[2], rounds[3],
+                // 🔑 ПЕРЕОЦЕНКА ОСТАТКА рядом с кругами. Суточное отношение
+                // считается по ЗАКРЫТЫМ кругам, а закрытый круг — выживший:
+                // позиция, в которой цена ушла и не вернулась, в него не
+                // попадает и сидит в остатке. Без этой колонки «настройка
+                // хорошая, а денег нет» остаётся необъяснённым.
+                days > 0 && spec.size() * st.lastFair() > 0
+                        ? unrealised / (spec.size() * st.lastFair()) * 10_000 / days : 0);
     }
 
     /**
@@ -549,7 +570,8 @@ public final class Forecast {
      * сторону — незакрытый круг и есть тот, где цена ушла и не вернулась.
      * Величина этого смещения видна в «занятости инвентаря».
      */
-    private static double[] roundsNetOfMarket(FifoLedger ledger, List<ReplayFair.Tick> ticks) {
+    private static double[] roundsNetOfMarket(FifoLedger ledger, List<ReplayFair.Tick> ticks,
+                                              double lotSize) {
         java.util.TreeMap<Long, Double> byMinute = new java.util.TreeMap<>();
         for (ReplayFair.Tick t : ticks) {
             if (t.fair() > 0) {
@@ -557,27 +579,68 @@ public final class Forecast {
             }
         }
         List<Double> net = new ArrayList<>();
+        List<Double> weights = new ArrayList<>();
         double marketSum = 0;
+        int shorts = 0;
         for (FifoLedger.Realisation r : ledger.realisations()) {
-            if (r.handover() || !(r.entry() > 0) || !(r.exit() > 0)) {
+            if (r.handover() || !(r.entry() > 0) || !(r.exit() > 0) || !(r.qty() > 0)) {
                 continue;
             }
-            double bp = (r.exit() - r.entry()) / r.entry() * 10_000;
+            // 🔑 РЕЗУЛЬТАТ БЕРЁТСЯ ИЗ `pnl`, А НЕ ВЫЧИСЛЯЕТСЯ ИЗ ЦЕН.
+            //
+            // Первая версия считала `(выход − вход)/вход` и тем самым объявляла
+            // ЛОНГОМ каждую пару. А книга партий открывает и КОРОТКИЕ: продажа
+            // сверх инвентаря (расхождение с площадкой, затравка, обнуление на
+            // границе суток) кладёт отрицательную партию, и у такой пары знак
+            // обратный. На окне 10–14.09 это дало BTC @6 отношение +2.84 при
+            // фактических годовых −65%: половина «прибыльных кругов» была
+            // короткими парами с перевёрнутым знаком. Это ровно та ошибка,
+            // которая уже описана в javadoc FifoLedger и стоила восьми дней
+            // (медиана 209 минут вместо 8.5).
+            double bp = r.pnl() / (r.qty() * r.entry()) * 10_000;
+            boolean isLong = Math.abs(r.pnl() - (r.exit() - r.entry()) * r.qty())
+                    <= 1e-9 * Math.max(1, Math.abs(r.pnl()));
+            if (!isLong) {
+                shorts++;
+                continue;              // короткие пары — артефакт учёта, не наша торговля
+            }
             int mins = (int) Math.max(1, Math.round(r.heldMs() / 60_000.0));
             double market = marketDrift(byMinute, mins);
-            marketSum += market;
+            // ⚠️ ВЕС — ДОЛЯ ЛОТА, А НЕ ЕДИНИЦА.
+            //
+            // Одна продажа закрывает несколько частично набранных партий, и
+            // тогда у одного круга появляется две-три записи. Считать их
+            // поштучно значит дать надкусанному кругу тот же вес, что целому:
+            // на сутках 11.09 записей 176 при 92 продажах. Вес в долях лота
+            // возвращает мерке денежный смысл.
+            double w = lotSize > 0 ? r.qty() / lotSize : 1;
+            marketSum += market * w;
+            weights.add(w);
             net.add(bp - market);
         }
-        if (net.isEmpty()) {
-            return new double[]{0, 0, 0, 0};
+        if (shorts > 0) {
+            log.warn("мерка настройки: коротких пар {} из {} — выброшены (спот-бот в шорт "
+                    + "не ходит, значит это расхождение учёта)", shorts,
+                    shorts + net.size());
         }
-        double mean = net.stream().mapToDouble(Double::doubleValue).average().orElse(0);
-        double var = 0;
-        for (double x : net) {
-            var += (x - mean) * (x - mean);
+        // 🔑 ВОЗВРАЩАЮТСЯ СУММЫ, А НЕ СРЕДНИЕ.
+        //
+        // Обход считает каждые сутки отдельным прогоном и складывает клетки.
+        // Если складывать средние и делить на число суток, получится среднее
+        // средних: сутки с тремя кругами весят столько же, сколько сутки с
+        // тремястами. Так и вышло расхождение «отношение +2.84 при годовых
+        // −65%» на окне 10–14.09 — знак решали редкие сутки.
+        double sum = 0;
+        double sumSq = 0;
+        double count = 0;
+        for (int i = 0; i < net.size(); i++) {
+            double x = net.get(i);
+            double w = weights.get(i);
+            sum += x * w;
+            sumSq += x * x * w;
+            count += w;
         }
-        double sd = net.size() > 1 ? Math.sqrt(var / (net.size() - 1)) : 0;
-        return new double[]{mean, sd, net.size(), marketSum / net.size()};
+        return new double[]{sum, sumSq, count, marketSum};
     }
 
     /** Средний ход опоры за {@code h} минут от каждой минуты окна, б.п. */

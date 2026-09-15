@@ -142,14 +142,21 @@ public final class PairSweep {
         double holdMedMin;
         double volBpPerMin;
         /**
-         * Круги за вычетом рынка: средний, СКО, сколько их в сутки и сам рынок.
-         * Из них считается суточное отношение — мерка сравнения настроек
-         * (док. 154 §I). Суммируются по суткам, делятся на {@link #daysHeld}.
+         * Круги за вычетом рынка — СУММАМИ, а не средними.
+         *
+         * ⚠️ Складывать средние по суткам и делить на число суток нельзя: сутки
+         * с тремя кругами весили бы столько же, сколько сутки с тремястами.
+         * Именно так получилось расхождение «отношение +2.84 при годовых −65%»
+         * на окне 10–14.09.2026 — знак решали редкие сутки с малым числом
+         * кругов. Здесь копятся суммы, а среднее и СКО считаются один раз по
+         * всему окну.
          */
-        double roundMeanBp;
-        double roundSdBp;
-        double roundsPerDay;
-        double marketBp;
+        double roundSumBp;
+        double roundSumSqBp;
+        double roundCount;
+        double marketSumBp;
+        /** Переоценка НЕЗАКРЫТОГО остатка, б.п. одного лота в сутки. */
+        double unrealisedBp;
         /** Сумма гистограмм по суткам: сколько тиков инвентарь стоял на N лотах. */
         long[] lotHist = new long[0];
         int daysHeld;
@@ -506,10 +513,11 @@ public final class PairSweep {
             cell.volBpPerMin += q.volBpPerMin();
             // Круги за вычетом рынка (док. 154 §I): суммируем по суткам, делим
             // при печати на daysHeld — как и остальные величины этой ячейки.
-            cell.roundMeanBp += q.roundMeanBp();
-            cell.roundSdBp += q.roundSdBp();
-            cell.roundsPerDay += q.roundsPerDay();
-            cell.marketBp += q.marketBp();
+            cell.roundSumBp += q.roundSumBp();
+            cell.roundSumSqBp += q.roundSumSqBp();
+            cell.roundCount += q.roundCount();
+            cell.marketSumBp += q.marketSumBp();
+            cell.unrealisedBp += q.unrealisedBpPerDay();
             if (q.lotHist() != null) {
                 if (cell.lotHist.length < q.lotHist().length) {
                     cell.lotHist = java.util.Arrays.copyOf(cell.lotHist, q.lotHist().length);
@@ -803,7 +811,7 @@ public final class PairSweep {
         StringBuilder sb = new StringBuilder(
                 "\n\n=== 🔑 МЕРКА НАСТРОЙКИ: суточное отношение за вычетом рынка ===\n\n");
         sb.append("пара     | ступень | кругов/сут | круг−рынок | рынок |  СКО | ОТНОШЕНИЕ/сут |"
-                + " держ,мин | 2δ/σ√T\n");
+                + " ОСТАТОК | держ,мин | 2δ/σ√T\n");
         for (var e : grid.entrySet()) {
             for (var o : e.getValue().entrySet()) {
                 Cell c = o.getValue();
@@ -814,16 +822,22 @@ public final class PairSweep {
                 double vol = c.volBpPerMin / c.daysHeld;
                 double riskBp = vol * Math.sqrt(Math.max(0, hold));
                 double capBp = 2 * o.getKey().offBp();
-                double mean = c.roundMeanBp / c.daysHeld;
-                double sd = c.roundSdBp / c.daysHeld;
-                double lam = c.roundsPerDay / c.daysHeld;
+                double n = c.roundCount;
+                double mean = n > 0 ? c.roundSumBp / n : 0;
+                double sd = n > 1
+                        ? Math.sqrt(Math.max(0, (c.roundSumSqBp - n * mean * mean) / (n - 1))) : 0;
+                double lam = c.days > 0 ? n / c.days : 0;
+                double unreal = c.unrealisedBp / c.daysHeld;
+                double ratio = sd > 0 && lam > 0 ? mean / sd * Math.sqrt(lam) : 0;
                 sb.append(String.format(Locale.ROOT,
-                        "%-8s | %7s | %10.1f | %+10.2f | %+5.2f | %4.1f | %13.2f | %8.0f |"
-                                + " %6.2f%s%n",
-                        e.getKey(), o.getKey().label(), lam, mean, c.marketBp / c.daysHeld, sd,
-                        sd > 0 && lam > 0 ? mean / sd * Math.sqrt(lam) : 0, hold,
+                        "%-8s | %7s | %10.1f | %+10.2f | %+5.2f | %4.1f | %13.2f | %+7.0f |"
+                                + " %8.0f | %6.2f%s%n",
+                        e.getKey(), o.getKey().label(), lam, mean, n > 0 ? c.marketSumBp / n : 0, sd,
+                        ratio, unreal, hold,
                         riskBp > 0 ? capBp / riskBp : 0,
-                        riskBp > 0 && capBp / riskBp < 1 ? "  ⚠️" : ""));
+                        // Отношение в плюсе, а остаток съедает больше, чем круги
+                        // приносят, — значит выживших мы посчитали, а невыживших нет.
+                        ratio > 0 && unreal < -lam * mean ? "  ⚠️ остаток съедает круги" : ""));
             }
         }
         sb.append("\n🔑 РЕШАТЬ ПО КОЛОНКЕ «ОТНОШЕНИЕ/сут» (док. 154 §I): в числителе\n");
@@ -833,8 +847,13 @@ public final class PairSweep {
         sb.append("⚠️ Колонка 2δ/σ√T оставлена для сверки со старыми отчётами и решением НЕ\n");
         sb.append("является (задача A40): числитель 2δ положителен по построению и сноса\n");
         sb.append("против позиции не видит, поэтому она бывает больше единицы у бота в минусе.\n");
-        sb.append("⚠️ Круги с незакрытыми на конец окна партиями в отношение не входят —\n");
-        sb.append("смещение в лучшую сторону; его величину показывает занятость инвентаря.\n");
+        sb.append("🔑 ⚠️ КОЛОНКА «ОСТАТОК» — ЦЕНА ЭТОГО ВЫЧЕТА, и читать её обязательно.\n");
+        sb.append("Отношение считается по ЗАКРЫТЫМ кругам, а закрытый круг — выживший:\n");
+        sb.append("позиция, в которой цена ушла и не вернулась, в него не попала и лежит в\n");
+        sb.append("остатке. Замер 15.09.2026 на падающем окне 10–14.09: у BTC @6 отношение\n");
+        sb.append("+2.84 при ГОДОВЫХ −65%. Разницу и показывает эта колонка (переоценка\n");
+        sb.append("остатка, б.п. одного лота в сутки). Если она отрицательна и по модулю\n");
+        sb.append("больше, чем круги приносят за сутки, решать по отношению НЕЛЬЗЯ.\n");
         return sb.toString();
     }
 

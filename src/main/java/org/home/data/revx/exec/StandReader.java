@@ -219,10 +219,76 @@ public final class StandReader implements FairSource, AutoCloseable {
             return new Fair(0, false, "пары " + base + " нет в последнем срезе", asOf, quotes.size());
         }
         Leg own = ownBook.get(base);
-        return new Fair(state.fairUsdc(), state.quotable(), state.pausedReason(),
+        return new Fair(withRateSource(state.fairUsdc(), result.rate(), asOf),
+                state.quotable(), state.pausedReason(),
                 asOf, quotes.size(),
                 own == null ? 0 : own.bid(), own == null ? 0 : own.ask(),
                 state.referenceSpreadPct());
+    }
+
+    /**
+     * ОТКУДА БРАТЬ КУРС USDC/USD (задача A45). По умолчанию — как всегда,
+     * медианой подразумеваемых оценок по парам.
+     *
+     * <ul>
+     *   <li>{@code MEDIAN} — прежнее поведение, ничего не меняется;</li>
+     *   <li>{@code SMOOTH} — та же медиана, сглаженная по времени. УРОВЕНЬ ТОТ
+     *       ЖЕ, уходит только дёрганье: замер 14.09.2026 дал шаг курса
+     *       1.77 б.п. за минуту против НУЛЯ у прямой книги площадки, и каждый
+     *       такой скачок заставляет ботов переставлять заявки вслед за
+     *       движением, которого ни в одной книге нет;</li>
+     *   <li>{@code DIRECT} — прямая книга {@code USDC/USD}. ⚠️ Это СМЕНА УРОВНЯ
+     *       на 5–6 б.п., то есть настройка первого порядка: бид уходит дальше от
+     *       рынка, аск ближе. Обход 10–14.09 показал, что так опора отъезжает от
+     *       середины книги, в которой мы торгуем, вдвое дальше (−7.7 б.п. против
+     *       −2.4 у BTC), а доля односторонних событий растёт с 60% до 87%.
+     *       Включать только сознательно и с проверкой.</li>
+     * </ul>
+     *
+     * ⚠️ Подменяется ТОЛЬКО делитель цены: медиана, разброс, остатки и все три
+     * гейта считаются по-прежнему.
+     */
+    private enum RateSource { MEDIAN, DIRECT, SMOOTH }
+
+    private final RateSource rateSource = RateSource.valueOf(
+            System.getProperty("revx.fair.rate-source", "MEDIAN").toUpperCase(java.util.Locale.ROOT));
+
+    /** Полупериод сглаживания курса, секунды. */
+    private final double rateSmoothSec =
+            Double.parseDouble(System.getProperty("revx.fair.rate-smooth-sec", "60"));
+
+    private final org.home.data.revx.sim.RateSmoother smoother =
+            new org.home.data.revx.sim.RateSmoother(rateSmoothSec);
+
+    /**
+     * Цена после подмены курса. {@code fair = mid_usd / курс}, поэтому замена
+     * курса — это множитель {@code курс_медианы / курс_новый}.
+     */
+    private double withRateSource(double fair, double medianRate, long asOf) {
+        if (rateSource == RateSource.MEDIAN || !(fair > 0) || !(medianRate > 0)) {
+            return fair;
+        }
+        double swapped = rateSource == RateSource.DIRECT ? directRate(asOf)
+                : smoother.next(asOf <= 0 ? System.currentTimeMillis() : asOf, medianRate);
+        return swapped > 0 ? fair * medianRate / swapped : fair;
+    }
+
+    /** Курс из прямой книги площадки; 0 — снимка нет или он протух. */
+    private double directRate(long asOf) {
+        Map<Long, Leg> legs = legs("USDC/USD", System.currentTimeMillis() - 30_000);
+        double best = 0;
+        long bestTs = 0;
+        for (Leg l : legs.values()) {
+            if (l.recvMs() > bestTs && l.mid() > 0) {
+                bestTs = l.recvMs();
+                best = l.mid();
+            }
+        }
+        if (best <= 0) {
+            log.warn("revx.fair.rate-source=DIRECT, а свежей книги USDC/USD нет — "
+                    + "цена считается медианой");
+        }
+        return best;
     }
 
     /** Одна нога последнего снимка символа. */
