@@ -204,6 +204,21 @@ public final class FlowMarkout {
         sb.append("«доля покупок» — предохранитель от беты: сильный перекос значит, что\n");
         sb.append("кривая меряет направление рынка, а не отбор.\n");
 
+        // ⚠️ Безусловный контроль обязан считаться по ТОЙ ЖЕ опоре, от которой
+        // считаются круги: иначе из круга по одной цене вычитается рынок по
+        // другой, и разность содержит их расхождение.
+        TreeMap<Long, Double> anchorSeries = new TreeMap<>();
+        if (ref == Ref.FAIR) {
+            anchorSeries = fair;
+        } else {
+            for (Long ts : book.keySet()) {
+                Double a = anchor(ref, ts, fair, book);
+                if (a != null && a > 0) {
+                    anchorSeries.put(ts, a);
+                }
+            }
+        }
+        sb.append(settingMetric(prints, days, anchorSeries, lambda));
         sb.append(costByHorizon(prints, fair));
         sb.append(unloadWait(prints, days, fair));
         sb.append(afterSweep(prints, days, fair));
@@ -279,6 +294,467 @@ public final class FlowMarkout {
             n++;
         }
         return n == 0 ? null : sum / n;
+    }
+
+    /**
+     * 🔑 МЕРКА НАСТРОЙКИ ПО ЛЕНТЕ — синтетические круги (док. 154 §I, блок 1).
+     *
+     * <h2>Вопрос, на который она отвечает</h2>
+     *
+     * Нужна величина, которая (а) не зависит от попавшейся траектории и (б)
+     * видит средний снос. Суточное отношение по живым кругам снос видит, но на
+     * трёх сутках его разброс шире эффекта; {@code 2δ/σ√T} от траектории не
+     * зависит, но сноса не видит по построению (задача A40).
+     *
+     * Разбор 154 указывает выход: траектория сидит ровно в ОДНОМ слагаемом
+     * тождества {@code круг = вход + снос + выход}, а именно в рыночном ходе за
+     * время круга. Его надо вычесть безусловным контролем — тем же, что уже
+     * считает {@code --revx-hold-check}, — а не пытаться усреднить.
+     *
+     * <h2>Как строится круг БЕЗ ТОРГОВЛИ</h2>
+     *
+     * По ленте, для каждого δ:
+     * <pre>
+     *   пусто  + событие, дотянувшееся до δ со стороны ПРОДАВЦА → купили
+     *   в лонге + событие, дотянувшееся до δ со стороны ПОКУПАТЕЛЯ → продали
+     *   круг = 2δ + (fair_закр − fair_откр)/fair_откр
+     * </pre>
+     * То есть это ровно тот же круг, что у живого бота, только исполнения
+     * берутся из ленты, а не из наших сделок. Выигрыш — в данных: на BTC
+     * принтов в сутки в десять раз больше, чем наших исполнений, и мерить можно
+     * настройку, которая никогда не стояла.
+     *
+     * <h2>Что печатается</h2>
+     *
+     * <ul>
+     *   <li>{@code λ} — кругов в сутки: сколько раз настройка успевает
+     *       обернуться. Считается по ПАРАМ событий, а не по принтам;</li>
+     *   <li>средний круг — сырой, вместе с рынком;</li>
+     *   <li>{@code рынок} — безусловный контроль: средний ход опоры за ТО ЖЕ
+     *       время, посчитанный от каждой минуты окна. Это и есть траектория;</li>
+     *   <li>{@code 2δ − c} — круг за вычетом рынка, то есть захват минус отбор.
+     *       Величина из §I, которая от траектории не зависит;</li>
+     *   <li>СКО круга и суточное отношение {@code √λ·(2δ − c)/СКО}.</li>
+     * </ul>
+     *
+     * <h2>⚠️ Чего она не знает</h2>
+     *
+     * Очереди, видимости и того, что лот у нас один: предполагается, что каждое
+     * дотянувшееся событие — наше исполнение. Это ВЕРХНЯЯ оценка λ, и потому
+     * верхняя оценка отношения. Зато она одинаково верхняя для всех δ, а
+     * сравниваем мы настройки между собой.
+     *
+     * ⚠️ И второе: круг здесь закрывается ПЕРВЫМ встречным событием, то есть
+     * без скоса, потолка и уровней. Это мерка ПЛОЩАДКИ при данной настройке
+     * отступа, а не мерка бота целиком.
+     */
+    /**
+     * Сколько кругов нужно ступени, чтобы её можно было читать.
+     *
+     * Тридцать — не круглое число, а порог, ниже которого одна многочасовая
+     * позиция решает всю строку: у SOL на δ = 28 кругов тринадцать, и один из
+     * них с ходом опоры в 80 б.п. выносит эту ступень на первое место по
+     * отношению. Ступени ниже порога печатаются с пометкой «?» и в выбор
+     * оптимума не идут.
+     */
+    private static final int MIN_ROUNDS = 30;
+
+    private static String settingMetric(List<Print> prints, double days,
+                                        TreeMap<Long, Double> fair, Map<Double, Double> lambda) {
+        TreeMap<Long, Double> byMinute = new TreeMap<>();
+        for (Map.Entry<Long, Double> e : fair.entrySet()) {
+            byMinute.putIfAbsent(e.getKey() / 60_000, e.getValue());
+        }
+        if (byMinute.size() < 60) {
+            return "\nМЕРКА НАСТРОЙКИ: опоры меньше часа — не считаю\n";
+        }
+        StringBuilder sb = new StringBuilder(
+                "\n🔑 МЕРКА НАСТРОЙКИ: синтетические круги по ленте (док. 154 §I)\n");
+        sb.append("  δ,б.п. | кругов/сут | круг сырой | рынок | ЗА ВЫЧЕТОМ РЫНКА | c |  СКО |"
+                + " T медиана | в позиции | б.п./сут | ОТНОШЕНИЕ/сут\n");
+        Map<Double, double[]> byDelta = new LinkedHashMap<>();
+        for (double dist : GRID) {
+            List<Round> rounds = rounds(prints, dist, fair);
+            if (rounds.size() < 10) {
+                continue;
+            }
+            List<Double> raw = new ArrayList<>();
+            List<Double> net = new ArrayList<>();
+            List<Double> hold = new ArrayList<>();
+            double marketSum = 0;
+            for (Round r : rounds) {
+                double mins = (r.closeMs() - r.openMs()) / 60_000.0;
+                double market = marketDrift(byMinute, (int) Math.max(1, Math.round(mins)));
+                raw.add(r.valueBp());
+                net.add(r.valueBp() - market);
+                hold.add(mins);
+                marketSum += market;
+            }
+            double lam = rounds.size() / days;
+            double mean = mean(net);
+            double sd = sd(net);
+            double ratio = sd > 0 ? mean / sd * Math.sqrt(lam) : Double.NaN;
+            List<Double> sorted = new ArrayList<>(hold);
+            java.util.Collections.sort(sorted);
+            // Доля времени под позицией — закон Литтла на этих же кругах:
+            // средний инвентарь (у нас он 0 или 1 лот) = λ × держание.
+            double inPosition = Math.min(1, lam * mean(hold) / 1440);
+            // ⚠️ Ступень с горсткой кругов читать нельзя, и молчать об этом
+            // тоже: у SOL на δ = 28 кругов всего тринадцать, среди них один
+            // многочасовой с ходом в 80 б.п., — и по «лучшему отношению» такая
+            // строка выигрывает у всей таблицы.
+            boolean thin = rounds.size() < MIN_ROUNDS;
+            sb.append(String.format(Locale.ROOT,
+                    "  %6.0f | %10.1f | %+10.2f | %+5.2f | %+16.2f | %+5.2f | %4.1f | %9.0f м |"
+                            + " %8.0f%% | %+8.1f | %13.2f%s%n",
+                    dist, lam, mean(raw), marketSum / rounds.size(), mean, 2 * dist - mean,
+                    sd, q(sorted, 0.5), 100 * inPosition, lam * mean, ratio,
+                    thin ? " ? (кругов " + rounds.size() + ")" : ""));
+            byDelta.put(dist, new double[]{lam, mean, sd, ratio, 2 * dist - mean, rounds.size()});
+        }
+        if (byDelta.isEmpty()) {
+            return sb.append("  кругов не набралось ни на одной ступени\n").toString();
+        }
+        sb.append("«круг сырой» = 2δ + ход опоры за круг; «рынок» — тот же ход, но от КАЖДОЙ\n");
+        sb.append("минуты окна (безусловный контроль). Их разность и есть величина §I: она\n");
+        sb.append("не зависит от того, росло ли в эти сутки. c = 2δ − (круг за вычетом рынка).\n");
+        sb.append("⚠️ ВЕРХНЯЯ оценка: считается, что каждое дотянувшееся событие — наше\n");
+        sb.append("исполнение. Очередь, видимость и единственный лот могут только ухудшить.\n");
+        sb.append(optimum(byDelta, lambda, days));
+        // Гейты считаются на той ступени, где кругов больше всего: там у
+        // сравнения вариантов наибольшая разрешающая способность.
+        double best = byDelta.entrySet().stream()
+                .max(Comparator.comparingDouble(e -> e.getValue()[0]))
+                .map(Map.Entry::getKey).orElse(6.0);
+        sb.append(gates(prints, fair, byMinute, Math.max(best, 6), days));
+        return sb.toString();
+    }
+
+    /** Синтетический круг: открылся, закрылся, сколько дал в б.п. */
+    record Round(long openMs, long closeMs, double valueBp) {
+    }
+
+    /**
+     * ГЕЙТЫ ПО СОСТОЯНИЮ ПОТОКА — блок 3 разбора 154, меркой из блока 1.
+     *
+     * <h2>Почему именно поток, а не календарь</h2>
+     *
+     * Гейт по волатильности часа проверен обходом и не окупился (задача A32).
+     * Разбор 154 объясняет, почему: волатильность — СЛАБЫЙ посредник между
+     * причиной и следствием. Сильные предикторы у нас уже измерены разрезами
+     * той же кривой — пауза с прошлого принта (разброс {@code c} в 6.6 раза) и
+     * перекос книги.
+     *
+     * <h2>⚠️ Свип гейтом быть НЕ МОЖЕТ</h2>
+     *
+     * Разрез «свип против одиночного принта» показывает большую разницу в
+     * {@code c}, но пользоваться ею нельзя: свип — это и есть событие, которое
+     * нас исполняет. Узнать, что принт окажется частью пачки, можно только
+     * когда пачка уже пришла, то есть ПОСЛЕ сделки. Гейтом может быть лишь то,
+     * что известно ДО неё: пауза с прошлого принта и перекос книги.
+     *
+     * <h2>⚠️ Порог выбирается на ПЕРВОЙ половине окна, оценка — на второй</h2>
+     *
+     * Иначе гейт выбирается и проверяется на одних данных, и любой шум
+     * превращается в выигрыш. Разделение грубое (пополам), но оно отделяет
+     * «правило работает» от «правило подогнано».
+     */
+    private static String gates(List<Print> prints, TreeMap<Long, Double> fair,
+                                TreeMap<Long, Double> byMinute, double dist, double days) {
+        if (prints.size() < 200) {
+            return "";
+        }
+        long mid = prints.get(prints.size() / 2).tsMs();
+        List<Print> first = prints.stream().filter(p -> p.tsMs() < mid).toList();
+        List<Print> second = prints.stream().filter(p -> p.tsMs() >= mid).toList();
+        double halfDays = days / 2;
+        List<Print> ev = events(first, dist);
+        List<Print> buys = ev.stream().filter(p -> p.aggressor() > 0).toList();
+        List<Print> sells = ev.stream().filter(p -> p.aggressor() < 0).toList();
+        if (sells.size() < 30 || buys.size() < 30) {
+            return "";
+        }
+        // Пороги: медиана величины на первой половине и та её сторона, где
+        // отбор МЕНЬШЕ. Сторона выбирается данными, а не нашим ожиданием.
+        double gapCut = median(sells.stream().filter(p -> p.gapMs() >= 0)
+                .map(p -> (double) p.gapMs()).toList());
+        boolean gapLowBetter = better(sells, fair, p -> p.gapMs() >= 0 && p.gapMs() <= gapCut,
+                p -> p.gapMs() > gapCut);
+        double imbCutBuy = median(buys.stream().filter(p -> !Double.isNaN(p.imbalance()))
+                .map(Print::imbalance).toList());
+        double imbCutSell = median(sells.stream().filter(p -> !Double.isNaN(p.imbalance()))
+                .map(Print::imbalance).toList());
+        boolean imbLowBetterSell = better(sells, fair, p -> p.imbalance() <= imbCutSell,
+                p -> p.imbalance() > imbCutSell);
+        boolean imbLowBetterBuy = better(buys, fair, p -> p.imbalance() <= imbCutBuy,
+                p -> p.imbalance() > imbCutBuy);
+
+        java.util.function.Predicate<Print> all = p -> true;
+        java.util.function.Predicate<Print> byGap = p -> p.gapMs() < 0
+                || (gapLowBetter ? p.gapMs() <= gapCut : p.gapMs() > gapCut);
+        java.util.function.Predicate<Print> imbSell = p -> Double.isNaN(p.imbalance())
+                || (imbLowBetterSell ? p.imbalance() <= imbCutSell : p.imbalance() > imbCutSell);
+        java.util.function.Predicate<Print> imbBuy = p -> Double.isNaN(p.imbalance())
+                || (imbLowBetterBuy ? p.imbalance() <= imbCutBuy : p.imbalance() > imbCutBuy);
+
+        StringBuilder sb = new StringBuilder(String.format(Locale.ROOT,
+                "%nГЕЙТЫ ПО СОСТОЯНИЮ ПОТОКА при δ = %.0f б.п. (док. 154 §VI)%n", dist));
+        sb.append(String.format(Locale.ROOT,
+                "порог паузы %.0f мс (лучше %s), перекоса: покупки %.2f (%s), продажи %.2f (%s)"
+                        + " — выбраны на ПЕРВОЙ половине окна%n",
+                gapCut, gapLowBetter ? "короткая" : "длинная",
+                imbCutBuy, imbLowBetterBuy ? "ниже" : "выше",
+                imbCutSell, imbLowBetterSell ? "ниже" : "выше"));
+        sb.append("  вариант | кругов/сут | круг за вычетом рынка | СКО | ОТНОШЕНИЕ/сут\n");
+        sb.append(gateRow(second, fair, byMinute, dist, halfDays, "база (вторая половина)",
+                all, all));
+        sb.append(gateRow(second, fair, byMinute, dist, halfDays, "гейт по паузе (вход)",
+                byGap, all));
+        sb.append(gateRow(second, fair, byMinute, dist, halfDays, "гейт по перекосу (вход)",
+                imbSell, all));
+        sb.append(gateRow(second, fair, byMinute, dist, halfDays,
+                "односторонняя котировка (вход и выход по перекосу)", imbSell, imbBuy));
+        sb.append(gateRow(second, fair, byMinute, dist, halfDays, "пауза + перекос на входе",
+                p -> byGap.test(p) && imbSell.test(p), all));
+        sb.append("⚠️ Гейт меняет и λ, и c сразу, поэтому сравнивать варианты можно только\n");
+        sb.append("суточным отношением: по доходу они неразделимы.\n");
+        sb.append("⚠️ «Не котировать» — это не бесплатно: круг, который не открылся, не\n");
+        sb.append("открылся и в хорошем состоянии тоже. Цена видна в графе «кругов/сут».\n");
+        return sb.toString();
+    }
+
+    /** Строка таблицы гейтов: круги с фильтрами на вход и выход. */
+    private static String gateRow(List<Print> prints, TreeMap<Long, Double> fair,
+                                  TreeMap<Long, Double> byMinute, double dist, double days,
+                                  String name, java.util.function.Predicate<Print> open,
+                                  java.util.function.Predicate<Print> close) {
+        List<Round> rounds = rounds(prints, dist, open, close);
+        if (rounds.size() < 5) {
+            return String.format(Locale.ROOT, "  %-50s | кругов мало (%d)%n", name, rounds.size());
+        }
+        List<Double> net = new ArrayList<>();
+        for (Round r : rounds) {
+            double mins = (r.closeMs() - r.openMs()) / 60_000.0;
+            net.add(r.valueBp() - marketDrift(byMinute, (int) Math.max(1, Math.round(mins))));
+        }
+        double lam = rounds.size() / days;
+        double sd = sd(net);
+        return String.format(Locale.ROOT, "  %-50s | %10.1f | %21.2f | %4.1f | %13.2f%n",
+                name, lam, mean(net), sd, sd > 0 ? mean(net) / sd * Math.sqrt(lam) : Double.NaN);
+    }
+
+    /** Какая половина разреза лучше: где отбор {@code c} меньше. */
+    private static boolean better(List<Print> side, TreeMap<Long, Double> fair,
+                                  java.util.function.Predicate<Print> low,
+                                  java.util.function.Predicate<Print> high) {
+        Double cl = cost(side.stream().filter(low::test).toList(), fair, 900_000);
+        Double ch = cost(side.stream().filter(high::test).toList(), fair, 900_000);
+        return cl == null || ch == null || cl <= ch;
+    }
+
+    private static double median(List<Double> v) {
+        if (v.isEmpty()) {
+            return 0;
+        }
+        List<Double> s = new ArrayList<>(v);
+        java.util.Collections.sort(s);
+        return s.get(s.size() / 2);
+    }
+
+    /**
+     * Круги из ленты: покупка по первому событию, дотянувшемуся до δ со стороны
+     * продавца, продажа — по первому встречному со стороны покупателя.
+     *
+     * ⚠️ Одновременно держится РОВНО ОДИН лот. Это сделано намеренно: величина
+     * должна мерить площадку при данном отступе, а не нашу раскладку капитала.
+     * Сетка, потолок и скос меняют и λ, и распределение T, и сравнивать их надо
+     * обходом, где всё это есть.
+     */
+    static List<Round> rounds(List<Print> prints, double dist,
+                                      TreeMap<Long, Double> fair) {
+        return rounds(prints, dist, p -> true, p -> true);
+    }
+
+    /**
+     * То же, но с фильтрами: {@code open} решает, котируем ли мы бид в этом
+     * состоянии, {@code close} — аск. Это и есть гейт по состоянию потока
+     * (блок 3 разбора 154): отказ от котировки не создаёт круга вовсе.
+     */
+    static List<Round> rounds(List<Print> prints, double dist,
+                                      java.util.function.Predicate<Print> open,
+                                      java.util.function.Predicate<Print> close) {
+        List<Round> out = new ArrayList<>();
+        long openMs = 0;
+        double openFair = 0;
+        for (Print p : events(prints, dist)) {
+            if (openFair == 0) {
+                if (p.aggressor() < 0 && p.fair() > 0 && open.test(p)) {   // продавец бьёт наш бид
+                    openMs = p.tsMs();
+                    openFair = p.fair();
+                }
+            } else if (p.aggressor() > 0 && p.fair() > 0 && close.test(p)) { // покупатель бьёт аск
+                out.add(new Round(openMs, p.tsMs(),
+                        2 * dist + 1e4 * (p.fair() - openFair) / openFair));
+                openFair = 0;
+            }
+        }
+        return out;
+    }
+
+    /**
+     * БЕЗУСЛОВНЫЙ КОНТРОЛЬ: средний ход опоры за {@code h} минут, посчитанный от
+     * КАЖДОЙ минуты окна.
+     *
+     * Без него отрицательный снос ничего не значит: спот-бот всегда начинает с
+     * покупки, и падающий рынок даёт минус любому кругу независимо от настройки.
+     */
+    static double marketDrift(TreeMap<Long, Double> byMinute, int h) {
+        double sum = 0;
+        int n = 0;
+        for (Map.Entry<Long, Double> e : byMinute.entrySet()) {
+            Double later = byMinute.get(e.getKey() + h);
+            if (later == null || e.getValue() <= 0) {
+                continue;
+            }
+            sum += 1e4 * (later - e.getValue()) / e.getValue();
+            n++;
+        }
+        return n == 0 ? 0 : sum / n;
+    }
+
+    /**
+     * ОПТИМАЛЬНЫЙ ОТСТУП по формулам 154 §I.1.
+     *
+     * При {@code λ = A·e^{−κδ}} максимум дохода {@code λ·(2δ − c)} достигается
+     * при {@code 2δ − c = 2/κ}, максимум отношения {@code √λ·(2δ − c)} — при
+     * {@code 2δ − c = 4/κ}. Отсюда {@code δ* = c/2 + 1/κ} и {@code c/2 + 2/κ}:
+     * риск-взвешенный оптимум ровно на {@code 1/κ} ШИРЕ доходного, и это та
+     * самая поправка за разброс, которую мы искали руками.
+     *
+     * ⚠️ {@code c} сама зависит от δ, поэтому решается неподвижной точкой: берём
+     * {@code c} на текущем δ, получаем новое δ, повторяем. Расходится — значит
+     * формула на этих данных неприменима, и это честнее, чем печатать первое
+     * приближение.
+     */
+    private static String optimum(Map<Double, double[]> byDelta, Map<Double, Double> lambda,
+                                  double days) {
+        TreeMap<Double, Double> c = new TreeMap<>();
+        for (var e : byDelta.entrySet()) {
+            c.put(e.getKey(), e.getValue()[4]);
+        }
+        // κ по тем же кругам: наклон ln(кругов в сутки) по δ.
+        List<double[]> pts = new ArrayList<>();
+        for (var e : byDelta.entrySet()) {
+            if (e.getValue()[0] > 0) {
+                pts.add(new double[]{e.getKey(), Math.log(e.getValue()[0])});
+            }
+        }
+        if (pts.size() < 3) {
+            return "  δ*: ступеней мало\n";
+        }
+        double mx = pts.stream().mapToDouble(p -> p[0]).average().orElse(0);
+        double my = pts.stream().mapToDouble(p -> p[1]).average().orElse(0);
+        double num = 0;
+        double den = 0;
+        for (double[] p : pts) {
+            num += (p[0] - mx) * (p[1] - my);
+            den += (p[0] - mx) * (p[0] - mx);
+        }
+        double kappa = den == 0 ? 0 : -num / den;
+        if (!(kappa > 0)) {
+            return "  δ*: κ по кругам неположительна — формула неприменима\n";
+        }
+        // 🔑 ПРЯМОЙ ОТВЕТ — по таблице, а не по формуле. Формула нужна там, где
+        // между ступенями надо интерполировать; сама таблица уже содержит и
+        // доход, и отношение на каждой измеренной ступени.
+        double bestIncome = 0;
+        double bestIncomeVal = Double.NEGATIVE_INFINITY;
+        double bestRatio = 0;
+        double bestRatioVal = Double.NEGATIVE_INFINITY;
+        for (var e : byDelta.entrySet()) {
+            if (e.getValue()[5] < MIN_ROUNDS) {
+                continue;                  // ступень с горсткой кругов в выбор не идёт
+            }
+            double income = e.getValue()[0] * e.getValue()[1];
+            if (income > bestIncomeVal) {
+                bestIncomeVal = income;
+                bestIncome = e.getKey();
+            }
+            if (e.getValue()[3] > bestRatioVal) {
+                bestRatioVal = e.getValue()[3];
+                bestRatio = e.getKey();
+            }
+        }
+        if (bestIncomeVal == Double.NEGATIVE_INFINITY) {
+            return "  ПО ТАБЛИЦЕ: ни на одной ступени не набралось " + MIN_ROUNDS + " кругов\n";
+        }
+        StringBuilder sb = new StringBuilder(String.format(Locale.ROOT,
+                "  ПО ТАБЛИЦЕ (только ступени от %d кругов): лучший доход при δ = %.0f"
+                        + " (%.1f б.п./сут), лучшее отношение при δ = %.0f (%.2f)%n",
+                MIN_ROUNDS, bestIncome, bestIncomeVal, bestRatio, bestRatioVal));
+        sb.append(String.format(Locale.ROOT,
+                "  κ по КРУГАМ: %.3f на б.п. (1/κ = %.2f б.п.)%n", kappa, 1 / kappa));
+        for (int k = 0; k < 2; k++) {
+            double d = 10;
+            boolean ok = true;
+            for (int i = 0; i < 20; i++) {
+                double cd = interp(c, d);
+                double next = cd / 2 + (k + 1) / kappa;
+                if (!(next > 0) || next > 100) {
+                    ok = false;
+                    break;
+                }
+                if (Math.abs(next - d) < 0.05) {
+                    d = next;
+                    break;
+                }
+                d = next;
+            }
+            sb.append(String.format(Locale.ROOT, "  δ* по %s: %s%n",
+                    k == 0 ? "ДОХОДУ (c/2 + 1/κ)" : "ОТНОШЕНИЮ (c/2 + 2/κ)",
+                    ok ? String.format(Locale.ROOT, "%.1f б.п. (c там %.1f)", d, interp(c, d))
+                            : "не сошлось"));
+        }
+        sb.append("  ⚠️ Формула 154 §I.1 выведена при c, НЕ ЗАВИСЯЩЕЙ от δ. На наших данных\n");
+        sb.append("  c растёт с δ (BTC 7.6 при δ=2 против 15.6 при δ=12), и тогда у\n");
+        sb.append("  неподвижной точки δ = c(δ)/2 + m/κ решений бывает несколько, а\n");
+        sb.append("  «риск-взвешенный шире доходного на 1/κ» перестаёт выполняться.\n");
+        sb.append("  Читать надо строку ПО ТАБЛИЦЕ: она без допущений.\n");
+        return sb.toString();
+    }
+
+    /** Линейная интерполяция {@code c(δ)} по посчитанным ступеням. */
+    private static double interp(TreeMap<Double, Double> c, double d) {
+        var lo = c.floorEntry(d);
+        var hi = c.ceilingEntry(d);
+        if (lo == null) {
+            return hi == null ? 0 : hi.getValue();
+        }
+        if (hi == null || hi.getKey().equals(lo.getKey())) {
+            return lo.getValue();
+        }
+        double w = (d - lo.getKey()) / (hi.getKey() - lo.getKey());
+        return lo.getValue() * (1 - w) + hi.getValue() * w;
+    }
+
+    private static double mean(List<Double> v) {
+        double s = 0;
+        for (double x : v) {
+            s += x;
+        }
+        return v.isEmpty() ? 0 : s / v.size();
+    }
+
+    private static double sd(List<Double> v) {
+        if (v.size() < 2) {
+            return 0;
+        }
+        double m = mean(v);
+        double s = 0;
+        for (double x : v) {
+            s += (x - m) * (x - m);
+        }
+        return Math.sqrt(s / (v.size() - 1));
     }
 
     /** Горизонты для {@code c(δ, H)}: от боевой минуты до двух часов держания. */
@@ -1742,8 +2218,30 @@ public final class FlowMarkout {
         if (b == null) {
             return null;
         }
-        return ref == Ref.MID ? b.getValue().mid() : b.getValue().micro();
+        return switch (ref) {
+            case MID -> b.getValue().mid();
+            case MICRO -> b.getValue().micro();
+            case DEEP -> {
+                double d = b.getValue().deepMid(DEEP_USD);
+                yield Double.isNaN(d) ? null : d;
+            }
+            default -> b.getValue().mid();
+        };
     }
+
+    /**
+     * Сколько денег набирать с каждой стороны для глубокой середины.
+     *
+     * Умолчание — $5000: у BTC это примерно полоса в 10 б.п. (лучший уровень
+     * держит ~$2500, до 10 б.п. набирается ~$7500), у ETH и SOL книга тоньше.
+     * Сравнение нескольких величин печатается в таблице опор, и выбирать надо
+     * по ней, а не по этому умолчанию.
+     */
+    private static final double DEEP_USD =
+            Double.parseDouble(System.getProperty("revx.flow.deep-usd", "5000"));
+
+    /** Величины глубины для сравнения опор, USD. */
+    private static final double[] DEEP_GRID = {1500, 5000, 15000, 50000};
 
     /**
      * СРАВНЕНИЕ ОПОР — главный вывод прибора для задачи «улучшить опору».
@@ -1768,7 +2266,7 @@ public final class FlowMarkout {
         }
         StringBuilder sb = new StringBuilder(
                 "\nСРАВНЕНИЕ ОПОР (чем ниже ошибка прогноза и чем ближе перекос к 50%, тем лучше)\n");
-        sb.append("  опора | принтов выше опоры | ошибка прогноза середины через 60 с, б.п.\n");
+        sb.append("  опора | принтов выше опоры | ошибка прогноза | без сдвига, б.п.\n");
         for (Ref ref : Ref.values()) {
             int above = 0;
             int n = 0;
@@ -1782,9 +2280,8 @@ public final class FlowMarkout {
                     above++;
                 }
             }
-            // Ошибка прогноза: |опора(t) − середина(t+60с)|, по снимкам книги.
-            double err = 0;
-            int m = 0;
+            // Ошибка прогноза: опора(t) против середины(t+60с), по снимкам книги.
+            List<Double> errs = new ArrayList<>();
             long last = book.lastKey();
             for (Map.Entry<Long, Top> e : book.entrySet()) {
                 if (e.getKey() + 60_000 > last) {
@@ -1795,14 +2292,172 @@ public final class FlowMarkout {
                 if (a == null || a <= 0 || fut == null) {
                     continue;
                 }
-                err += Math.abs(1e4 * (a - fut.getValue().mid()) / fut.getValue().mid());
-                m++;
+                errs.add(1e4 * (a - fut.getValue().mid()) / fut.getValue().mid());
             }
-            sb.append(String.format(Locale.ROOT, "  %-5s | %17.1f%% | %38.2f%n",
-                    ref, n == 0 ? 0 : 100.0 * above / n, m == 0 ? 0 : err / m));
+            double bias = errs.isEmpty() ? 0 : mean(errs);
+            double raw = 0;
+            double net = 0;
+            for (double x : errs) {
+                raw += Math.abs(x);
+                net += Math.abs(x - bias);
+            }
+            sb.append(String.format(Locale.ROOT, "  %-5s | %17.1f%% | %14.2f | %13.2f%n",
+                    ref, n == 0 ? 0 : 100.0 * above / n,
+                    errs.isEmpty() ? 0 : raw / errs.size(),
+                    errs.isEmpty() ? 0 : net / errs.size()));
         }
+        sb.append(deepAnchors(md, book));
         sb.append(betaSweep(book));
         return sb.toString();
+    }
+
+    /**
+     * ГЛУБОКАЯ СЕРЕДИНА как опора — блок 4 разбора 154.
+     *
+     * Меряется тремя величинами, и все три без единой сделки:
+     * <ul>
+     *   <li><b>ошибка прогноза</b> середины через 60 с — тот же критерий, что у
+     *       остальных опор;</li>
+     *   <li><b>собственный шум</b>: СКО минутных приращений самой опоры. Ради
+     *       него всё и затевается — заявка переставляется вслед за шумом опоры,
+     *       а переставлять её на движении, которого в книге нет, бессмысленно
+     *       и стоит постановок;</li>
+     *   <li><b>доля снимков, где опора определена</b>: на тонкой книге нужных
+     *       денег может не набраться, и тогда опоры просто нет.</li>
+     * </ul>
+     *
+     * ⚠️ Глубина есть только с 10.09.2026 — до неё собирались пять уровней, и
+     * на старых окнах таблица будет пустой. Это не поломка.
+     */
+    private static String deepAnchors(MarketData md, TreeMap<Long, Top> book) {
+        StringBuilder sb = new StringBuilder(
+                "\n  ГЛУБОКАЯ СЕРЕДИНА (док. 154 §IV): опора по цене, где набирается D денег\n");
+        sb.append("     D, USD | определена | принтов выше | ошибка 60 с | без сдвига |"
+                + " свой шум, б.п./мин | сдвиг к середине\n");
+        long last = book.lastKey();
+        // Шум самой середины книги — база для сравнения.
+        double[] midErr = forecastErr(book, Top::mid, last);
+        sb.append(String.format(Locale.ROOT,
+                "  %10s | %10s | %12s | %11.2f | %10.2f | %18.2f | %16s%n",
+                "середина", "—", "—", midErr[0], midErr[1], noise(book, Top::mid), "—"));
+        for (double usd : DEEP_GRID) {
+            java.util.function.ToDoubleFunction<Top> f = t -> t.deepMid(usd);
+            int defined = 0;
+            for (Top t : book.values()) {
+                if (!Double.isNaN(t.deepMid(usd))) {
+                    defined++;
+                }
+            }
+            if (defined < book.size() / 10) {
+                sb.append(String.format(Locale.ROOT, "  %10.0f | %9.0f%% | книга тоньше%n",
+                        usd, 100.0 * defined / book.size()));
+                continue;
+            }
+            int above = 0;
+            int n = 0;
+            for (MarketTrade t : md.trades()) {
+                Map.Entry<Long, Top> b = book.floorEntry(t.tsMs());
+                if (b == null) {
+                    continue;
+                }
+                double a = b.getValue().deepMid(usd);
+                if (Double.isNaN(a) || a <= 0) {
+                    continue;
+                }
+                n++;
+                if (t.price() > a) {
+                    above++;
+                }
+            }
+            double shift = 0;
+            int k = 0;
+            for (Top t : book.values()) {
+                double a = t.deepMid(usd);
+                if (!Double.isNaN(a) && t.mid() > 0) {
+                    shift += 1e4 * (a - t.mid()) / t.mid();
+                    k++;
+                }
+            }
+            double[] err = forecastErr(book, f, last);
+            sb.append(String.format(Locale.ROOT,
+                    "  %10.0f | %9.0f%% | %11.1f%% | %11.2f | %10.2f | %18.2f | %+15.2f%n",
+                    usd, 100.0 * defined / book.size(), n == 0 ? 0 : 100.0 * above / n,
+                    err[0], err[1], noise(book, f), k == 0 ? 0 : shift / k));
+            // Та же глубина, но средневзвешенной ценой: без ступенек уровня.
+            java.util.function.ToDoubleFunction<Top> g = t -> t.deepVwapMid(usd);
+            double[] verr = forecastErr(book, g, last);
+            sb.append(String.format(Locale.ROOT,
+                    "  %10s | %10s | %12s | %11.2f | %10.2f | %18.2f | %15s%n",
+                    "  ↳ ср.взв.", "", "", verr[0], verr[1], noise(book, g), ""));
+        }
+        sb.append("  ⚠️ «Свой шум» — СКО минутных приращений САМОЙ опоры. Наша межплощадочная\n");
+        sb.append("  fair шумит в 2.4–3.9 раза сильнее середины книги, и это прямой расход\n");
+        sb.append("  постановок. Глубокая середина обязана шуметь МЕНЬШЕ середины: в этом\n");
+        sb.append("  вся мысль. Если не меньше — механизм пуст.\n");
+        return sb.toString();
+    }
+
+    /**
+     * Ошибка прогноза середины через 60 с: {@code {сырая, без сдвига}}, б.п.
+     *
+     * ⚠️ Две величины, и смешивать их нельзя. Сырая содержит систематический
+     * сдвиг опоры — он чинится вычитанием константы и потому дёшев. «Без
+     * сдвига» — это шум, и он не чинится ничем. Опора со сдвигом 4 б.п. и
+     * нулевым шумом лучше опоры без сдвига и с шумом 4 б.п., хотя сырая мерка у
+     * них одинаковая.
+     */
+    private static double[] forecastErr(TreeMap<Long, Top> book,
+                                        java.util.function.ToDoubleFunction<Top> f, long last) {
+        List<Double> errs = new ArrayList<>();
+        for (Map.Entry<Long, Top> e : book.entrySet()) {
+            if (e.getKey() + 60_000 > last) {
+                break;
+            }
+            double a = f.applyAsDouble(e.getValue());
+            Map.Entry<Long, Top> fut = book.floorEntry(e.getKey() + 60_000);
+            if (Double.isNaN(a) || a <= 0 || fut == null || fut.getValue().mid() <= 0) {
+                continue;
+            }
+            errs.add(1e4 * (a - fut.getValue().mid()) / fut.getValue().mid());
+        }
+        if (errs.isEmpty()) {
+            return new double[]{0, 0};
+        }
+        double raw = 0;
+        double bias = mean(errs);
+        double net = 0;
+        for (double x : errs) {
+            raw += Math.abs(x);
+            net += Math.abs(x - bias);
+        }
+        return new double[]{raw / errs.size(), net / errs.size()};
+    }
+
+    /** СКО минутных приращений опоры, б.п./мин. */
+    private static double noise(TreeMap<Long, Top> book,
+                                java.util.function.ToDoubleFunction<Top> f) {
+        TreeMap<Long, Double> byMin = new TreeMap<>();
+        for (Map.Entry<Long, Top> e : book.entrySet()) {
+            double v = f.applyAsDouble(e.getValue());
+            if (!Double.isNaN(v) && v > 0) {
+                byMin.putIfAbsent(e.getKey() / 60_000, v);
+            }
+        }
+        List<Double> d = new ArrayList<>();
+        Long pk = null;
+        double pv = 0;
+        for (Map.Entry<Long, Double> e : byMin.entrySet()) {
+            if (pk != null && e.getKey() - pk == 1 && pv > 0) {
+                d.add(1e4 * (e.getValue() - pv) / pv);
+            }
+            pk = e.getKey();
+            pv = e.getValue();
+        }
+        if (d.size() < 10) {
+            return 0;
+        }
+        double m = d.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+        return Math.sqrt(d.stream().mapToDouble(x -> (x - m) * (x - m)).sum() / d.size());
     }
 
     /**
@@ -1914,6 +2569,113 @@ public final class FlowMarkout {
         }
 
         /**
+         * ГЛУБОКАЯ СЕРЕДИНА: полусумма цен, на которых с каждой стороны
+         * набирается {@code usd} денег (док. 154 §IV).
+         *
+         * <h2>Зачем она</h2>
+         *
+         * Опыт с заморозкой опоры (FROZEN) проверял «невосприимчивость к
+         * собственному потоку» вместе с несвежестью и проиграл на второй.
+         * Глубокая середина даёт первое без второго: она пересчитывается каждый
+         * тик, но мелкий свип, съедающий лучший уровень, её почти не двигает —
+         * объём {@code usd} набирается на тех же уровнях, что и до свипа.
+         *
+         * ⚠️ Возвращает {@code NaN}, если денег в книге меньше {@code usd}: это
+         * не ноль и не середина, и подменять его тихо нельзя — на тонкой книге
+         * такая опора просто не определена.
+         */
+        double deepMid(double usd) {
+            double b = deepSide(usd, true);
+            double a = deepSide(usd, false);
+            return b > 0 && a > 0 ? (b + a) / 2 : Double.NaN;
+        }
+
+        /**
+         * ГЛУБОКАЯ СЕРЕДИНА, СГЛАЖЕННАЯ: полусумма средневзвешенных цен, по
+         * которым с каждой стороны исполнится {@code usd} денег.
+         *
+         * ⚠️ Разница с {@link #deepMid} не косметическая. Та возвращает цену
+         * УРОВНЯ, то есть ступеньку: опора прыгает на целый тик, когда объёма на
+         * уровне перестаёт хватать, и добавляет шум самим способом счёта.
+         * Средневзвешенная цена меняется непрерывно и потому честнее проверяет
+         * мысль 154 §IV: «опора, которой мелкий свип безразличен».
+         */
+        double deepVwapMid(double usd) {
+            double b = vwapSide(usd, true);
+            double a = vwapSide(usd, false);
+            return b > 0 && a > 0 ? (b + a) / 2 : Double.NaN;
+        }
+
+        private double vwapSide(double usd, boolean bidSide) {
+            double best = bidSide ? bid : ask;
+            double money = 0;
+            double qty = 0;
+            double q0 = bidSide ? bq : aq;
+            double take = Math.min(q0, usd / best);
+            money += take * best;
+            qty += take;
+            if (money >= usd - 1e-9) {
+                return money / qty;
+            }
+            for (double[] l : levels(bidSide, best)) {
+                double need = (usd - money) / l[0];
+                double t = Math.min(l[1], need);
+                money += t * l[0];
+                qty += t;
+                if (money >= usd - 1e-9) {
+                    return money / qty;
+                }
+            }
+            return 0;                      // денег в книге меньше, чем просят
+        }
+
+        /** Уровни глубины этой стороны, отсортированные от рынка. */
+        private List<double[]> levels(boolean bidSide, double best) {
+            List<double[]> levels = new ArrayList<>();
+            String deep = bidSide ? deepBids : deepAsks;
+            if (deep == null || deep.isEmpty()) {
+                return levels;
+            }
+            for (String s : deep.split(",")) {
+                int i = s.indexOf(58);
+                if (i <= 0) {
+                    continue;
+                }
+                try {
+                    double p = Double.parseDouble(s.substring(0, i));
+                    double q = Double.parseDouble(s.substring(i + 1));
+                    if (p > 0 && q > 0 && (bidSide ? p < best : p > best)) {
+                        levels.add(new double[]{p, q});
+                    }
+                } catch (NumberFormatException ignored) {
+                    // мусорная запись уровня; пропускаем, а не роняем разбор
+                }
+            }
+            levels.sort((x, y) -> bidSide ? Double.compare(y[0], x[0]) : Double.compare(x[0], y[0]));
+            return levels;
+        }
+
+        /** Цена, на которой с этой стороны накопится {@code usd} денег. */
+        private double deepSide(double usd, boolean bidSide) {
+            double best = bidSide ? bid : ask;
+            double sum = (bidSide ? bq : aq) * best;
+            if (sum >= usd) {
+                return best;
+            }
+            // ⚠️ Уровни СОРТИРУЕМ САМИ. Площадка отдаёт аски в убывающем
+            // порядке (проверено на 324 снимках из 324), и наивный проход по
+            // строке начинал бы с худшего уровня — глубокая середина тогда
+            // считалась бы по краю книги, а не по её началу.
+            for (double[] l : levels(bidSide, best)) {
+                sum += l[0] * l[1];
+                if (sum >= usd) {
+                    return l[0];
+                }
+            }
+            return 0;                      // денег в книге меньше, чем просят
+        }
+
+        /**
          * Микроцена: середина, взвешенная ОБРАТНО объёмам.
          *
          * Мысль Stoikov в одну строку: если на биде стоит втрое больше, чем на
@@ -1949,7 +2711,9 @@ public final class FlowMarkout {
         /** Середина собственной книги пары. */
         MID,
         /** Микроцена: середина, взвешенная перекосом объёмов. */
-        MICRO
+        MICRO,
+        /** Глубокая середина: цены, на которых набирается заданный объём денег. */
+        DEEP
     }
 
     /**

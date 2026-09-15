@@ -78,7 +78,29 @@ public final class Forecast {
                             long placementCap, double days, String state, long lossStops,
                             double atCapShare, double lotNotional, int buys, int sells,
                             java.util.List<Day> days_, double emptyShare, long[] lotHist,
-                            double holdMedMin, double holdP90Min, double volBpPerMin) {
+                            double holdMedMin, double holdP90Min, double volBpPerMin,
+                            double roundMeanBp, double roundSdBp, double roundsPerDay,
+                            double marketBp) {
+
+        /**
+         * 🔑 СУТОЧНОЕ ОТНОШЕНИЕ — мерка сравнения настроек (док. 154 §I).
+         *
+         * {@code средний круг / СКО круга × √(кругов в сутки)}, где средний круг
+         * посчитан ЗА ВЫЧЕТОМ РЫНКА: из каждого круга вычтен средний ход опоры
+         * за то же время, взятый от каждой минуты окна (безусловный контроль).
+         * Именно этот вычет убирает траекторию — единственное слагаемое
+         * тождества «круг = вход + снос + выход», которое зависит от того, какое
+         * окно попалось.
+         *
+         * ⚠️ Отличие от {@link #payPerRisk()}: там в числителе стоит {@code 2δ},
+         * положительный по построению и не видящий сноса против позиции. Здесь
+         * числитель — ФАКТИЧЕСКИЙ средний круг, поэтому знак у отношения тот же,
+         * что у результата.
+         */
+        public double ratioPerDay() {
+            return roundSdBp > 0 && roundsPerDay > 0
+                    ? roundMeanBp / roundSdBp * Math.sqrt(roundsPerDay) : 0;
+        }
 
         /**
          * РИСК ЗА ВРЕМЯ УДЕРЖАНИЯ, б.п.: σ√T.
@@ -497,6 +519,7 @@ public final class Forecast {
         // придвижение аска сравнивались до этой правки, и их числа надо читать с
         // поправкой на то, сколько лотов осталось на руках.
         double unrealised = ledger.position().unrealised(st.lastFair());
+        double[] rounds = roundsNetOfMarket(ledger, ticks);
         return new BotResult(spec.botId(), spec.offset() * 10_000, fills,
                 ledger.tradingRealisedSince(0) + unrealised,
                 spec.size() > 0 ? st.inventory() / spec.size() : 0,
@@ -509,7 +532,67 @@ public final class Forecast {
                 // печатался как 788.
                 spec.size() * st.lastFair(), buys, sells, byDay(ledger, ticks),
                 tickCount > 0 ? (double) st.ticksEmpty() / tickCount : 0, st.lotHist(),
-                ledger.holdMinutes(0)[0], ledger.holdMinutes(0)[1], volBpPerMin(ticks));
+                ledger.holdMinutes(0)[0], ledger.holdMinutes(0)[1], volBpPerMin(ticks),
+                rounds[0], rounds[1], days > 0 ? rounds[2] / days : 0, rounds[3]);
+    }
+
+    /**
+     * КРУГИ ЗА ВЫЧЕТОМ РЫНКА: {@code {средний, СКО, сколько их, средний рынок}}.
+     *
+     * Из каждого закрытого круга вычитается средний ход опоры за ТО ЖЕ время,
+     * посчитанный от КАЖДОЙ минуты окна. Это безусловный контроль: без него
+     * отрицательный результат ничего не значит — спот-бот всегда начинает с
+     * покупки, и падающее окно даёт минус любой настройке.
+     *
+     * ⚠️ Круги с передачами выброшены: подаренный лот заработком не является.
+     * ⚠️ Открытые к концу окна партии сюда не входят, и это смещение в лучшую
+     * сторону — незакрытый круг и есть тот, где цена ушла и не вернулась.
+     * Величина этого смещения видна в «занятости инвентаря».
+     */
+    private static double[] roundsNetOfMarket(FifoLedger ledger, List<ReplayFair.Tick> ticks) {
+        java.util.TreeMap<Long, Double> byMinute = new java.util.TreeMap<>();
+        for (ReplayFair.Tick t : ticks) {
+            if (t.fair() > 0) {
+                byMinute.putIfAbsent(t.tsMs() / 60_000, t.fair());
+            }
+        }
+        List<Double> net = new ArrayList<>();
+        double marketSum = 0;
+        for (FifoLedger.Realisation r : ledger.realisations()) {
+            if (r.handover() || !(r.entry() > 0) || !(r.exit() > 0)) {
+                continue;
+            }
+            double bp = (r.exit() - r.entry()) / r.entry() * 10_000;
+            int mins = (int) Math.max(1, Math.round(r.heldMs() / 60_000.0));
+            double market = marketDrift(byMinute, mins);
+            marketSum += market;
+            net.add(bp - market);
+        }
+        if (net.isEmpty()) {
+            return new double[]{0, 0, 0, 0};
+        }
+        double mean = net.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+        double var = 0;
+        for (double x : net) {
+            var += (x - mean) * (x - mean);
+        }
+        double sd = net.size() > 1 ? Math.sqrt(var / (net.size() - 1)) : 0;
+        return new double[]{mean, sd, net.size(), marketSum / net.size()};
+    }
+
+    /** Средний ход опоры за {@code h} минут от каждой минуты окна, б.п. */
+    private static double marketDrift(java.util.TreeMap<Long, Double> byMinute, int h) {
+        double sum = 0;
+        int n = 0;
+        for (java.util.Map.Entry<Long, Double> e : byMinute.entrySet()) {
+            Double later = byMinute.get(e.getKey() + h);
+            if (later == null || e.getValue() <= 0) {
+                continue;
+            }
+            sum += 10_000 * (later - e.getValue()) / e.getValue();
+            n++;
+        }
+        return n == 0 ? 0 : sum / n;
     }
 
     /**

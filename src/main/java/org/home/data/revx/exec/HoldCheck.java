@@ -138,9 +138,17 @@ public class HoldCheck {
                 .append("ЗАКРЫВШИЕСЯ в окне: остаток сегодня объясняется покупками произвольной\n")
                 .append("давности, и обрезать историю по краю окна нельзя.\n\n");
 
+        // 🔑 ФАКТЫ ЛИТТЛА СЧИТАЮТСЯ ДО ТАБЛИЦЫ и приписываются к КАЖДОЙ строке
+        // (док. 154 §III). Внутри одного отчёта 153 жили три разных T по одному
+        // боту — 30.8, 75 и 109 минут, — и ни в одной строке не было видно, что
+        // две из них несовместимы с долей пустоты в 67%. Теперь несовместимость
+        // не может проехать незамеченной: рядом с каждым T стоит инвентарь,
+        // который из него следует, и инвентарь, который бот видел у себя.
+        Little facts = littleFacts(journalPath, fills, fromMs, toMs);
         sb.append("## 1–2. Прямой замер: FIFO против LIFO\n\n");
-        sb.append("| правило | передачи | кругов | медиана | среднее | p90 | максимум |\n");
-        sb.append("|---|---|---:|---:|---:|---:|---:|\n");
+        sb.append("| правило | передачи | кругов | медиана | среднее | p90 | максимум |")
+                .append(" инвентарь по Литтлу | факт | сходится |\n");
+        sb.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---|\n");
         double fifoMedian = -1;
         double fifoMean = -1;
         for (boolean fifo : new boolean[]{true, false}) {
@@ -157,10 +165,29 @@ public class HoldCheck {
                     held.add(p.minutes());
                 }
                 Collections.sort(held);
-                sb.append(String.format(Locale.ROOT, "| %s | %s | %d | %s | %s | %s | %s |%n",
+                // Литтл: средний инвентарь = ТЕМП ПОКУПОК × среднее держание.
+                //
+                // ⚠️ Темп берётся по покупкам в окне, а не по числу закрытых
+                // кругов: круг мог открыться до начала окна, и тогда его лот
+                // приехал в инвентарь раньше. Разница между этими двумя
+                // счётчиками сама по себе диагностична — она значит, что за
+                // окно бот распродал больше, чем купил, или наоборот.
+                double impliedLots = facts == null || facts.spanMin() <= 0 ? Double.NaN
+                        : facts.buys() / facts.spanMin() * mean(held);
+                String verdict = facts == null || Double.isNaN(impliedLots)
+                        || !(facts.meanInvLots() > 0) ? "—"
+                        : ratioOf(impliedLots, facts.meanInvLots()) < 1.5 ? "да"
+                                : "⚠️ нет";
+                sb.append(String.format(Locale.ROOT,
+                        "| %s | %s | %d | %s | %s | %s | %s | %s | %s | %s |%n",
                         fifo ? "FIFO" : "LIFO", policy, held.size(),
                         fmt(quantile(held, 0.5)), fmt(mean(held)),
-                        fmt(quantile(held, 0.9)), fmt(quantile(held, 1.0))));
+                        fmt(quantile(held, 0.9)), fmt(quantile(held, 1.0)),
+                        Double.isNaN(impliedLots) ? "—"
+                                : String.format(Locale.ROOT, "%.2f", impliedLots),
+                        facts == null ? "—"
+                                : String.format(Locale.ROOT, "%.2f", facts.meanInvLots()),
+                        verdict));
                 if (fifo && "все".equals(policy)) {
                     fifoMedian = quantile(held, 0.5);
                     fifoMean = mean(held);
@@ -170,6 +197,18 @@ public class HoldCheck {
         sb.append("\n⚠️ Истинное время под позицией лежит МЕЖДУ FIFO и LIFO. ")
                 .append("Расхождение больше чем вдвое означает, что величина не определена\n")
                 .append("однозначно, и выводы по ней преждевременны.\n\n");
+        if (facts != null) {
+            sb.append(String.format(Locale.ROOT,
+                    "🔑 Проверка Литтла приписана к КАЖДОЙ строке: «инвентарь по Литтлу» —"
+                            + " это%nсколько лотов должно лежать при таком T и темпе покупок"
+                            + " (%d покупок за %.1f ч),%n«факт» — сколько бот видел у себя в"
+                            + " `exec_quote` (%.2f лота, пусто %.0f%% времени).%nСтрока с"
+                            + " пометкой «⚠️ нет» означает, что её T несовместимо с"
+                            + " наблюдённым%nинвентарём — числа из такой строки в документы"
+                            + " не переносить.%n%n",
+                    facts.buys(), facts.spanMin() / 60, facts.meanInvLots(),
+                    100 * facts.emptyShare()));
+        }
 
         sb.append(little(journalPath, fills, fromMs, toMs, fifoMedian, fifoMean));
         sb.append(ratio(sigmaBpPerMin, offsetBp, fifoMedian, fifoMean));
@@ -244,6 +283,71 @@ public class HoldCheck {
      * Среднее взвешивается ВРЕМЕНЕМ между тиками, а не числом тиков: тики идут
      * неравномерно, и простое среднее по строкам дало бы вес плотным участкам.
      */
+    /**
+     * Факты закона Литтла по окну: лот, средний инвентарь, доля пустоты, темп
+     * покупок и длина окна с тиками.
+     *
+     * Считаются ОДИН раз и подставляются и в таблицу прямого замера, и в раздел
+     * Литтла: два разных подсчёта одного и того же — это ровно тот способ,
+     * которым в отчёт попадают три несовместимых числа.
+     */
+    private record Little(double lot, double meanInvLots, double emptyShare, double spanMin,
+                          long buys) {
+    }
+
+    private Little littleFacts(String journalPath, List<ExecJournal.FillRow> fills,
+                               long fromMs, long toMs) {
+        double area = 0;
+        double emptyMs = 0;
+        double span = 0;
+        long prev = -1;
+        double prevInv = 0;
+        double lot = medianQty(fills.stream()
+                .filter(f -> f.tsMs() >= fromMs && f.tsMs() < toMs).toList());
+        if (!(lot > 0)) {
+            lot = medianQty(fills);
+        }
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:file:"
+                + Path.of(journalPath).toAbsolutePath() + "?mode=ro");
+             PreparedStatement ps = c.prepareStatement(
+                     "SELECT ts_ms, inventory FROM exec_quote WHERE ts_ms >= ? AND ts_ms < ?"
+                             + " ORDER BY ts_ms")) {
+            ps.setLong(1, fromMs);
+            ps.setLong(2, toMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long ts = rs.getLong(1);
+                    double inv = rs.getDouble(2);
+                    if (prev > 0) {
+                        double dt = Math.min(ts - prev, 300_000);
+                        area += prevInv * dt;
+                        span += dt;
+                        if (prevInv < lot * 0.5) {
+                            emptyMs += dt;
+                        }
+                    }
+                    prev = ts;
+                    prevInv = inv;
+                }
+            }
+        } catch (Exception e) {
+            return null;
+        }
+        if (span <= 0 || !(lot > 0)) {
+            return null;
+        }
+        long buys = fills.stream()
+                .filter(f -> f.buy() && f.tsMs() >= fromMs && f.tsMs() < toMs).count();
+        return new Little(lot, area / span / lot, emptyMs / span, span / 60_000.0, buys);
+    }
+
+    /** Отношение большего к меньшему — во сколько раз числа расходятся. */
+    private static double ratioOf(double a, double b) {
+        double lo = Math.min(Math.abs(a), Math.abs(b));
+        double hi = Math.max(Math.abs(a), Math.abs(b));
+        return lo <= 1e-9 ? Double.POSITIVE_INFINITY : hi / lo;
+    }
+
     private String little(String journalPath, List<ExecJournal.FillRow> fills,
                           long fromMs, long toMs, double fifoMedian, double fifoMean) {
         double area = 0;

@@ -141,6 +141,15 @@ public final class PairSweep {
         /** Медиана времени под позицией и волатильность — для мерки «захват/риск». */
         double holdMedMin;
         double volBpPerMin;
+        /**
+         * Круги за вычетом рынка: средний, СКО, сколько их в сутки и сам рынок.
+         * Из них считается суточное отношение — мерка сравнения настроек
+         * (док. 154 §I). Суммируются по суткам, делятся на {@link #daysHeld}.
+         */
+        double roundMeanBp;
+        double roundSdBp;
+        double roundsPerDay;
+        double marketBp;
         /** Сумма гистограмм по суткам: сколько тиков инвентарь стоял на N лотах. */
         long[] lotHist = new long[0];
         int daysHeld;
@@ -495,6 +504,12 @@ public final class PairSweep {
             cell.atCapShare += q.atCapShare();
             cell.holdMedMin += q.holdMedMin();
             cell.volBpPerMin += q.volBpPerMin();
+            // Круги за вычетом рынка (док. 154 §I): суммируем по суткам, делим
+            // при печати на daysHeld — как и остальные величины этой ячейки.
+            cell.roundMeanBp += q.roundMeanBp();
+            cell.roundSdBp += q.roundSdBp();
+            cell.roundsPerDay += q.roundsPerDay();
+            cell.marketBp += q.marketBp();
             if (q.lotHist() != null) {
                 if (cell.lotHist.length < q.lotHist().length) {
                     cell.lotHist = java.util.Arrays.copyOf(cell.lotHist, q.lotHist().length);
@@ -786,8 +801,9 @@ public final class PairSweep {
      */
     private static String risk(Map<String, Map<Variant, Cell>> grid) {
         StringBuilder sb = new StringBuilder(
-                "\n\n=== ПЛАТЯТ ЛИ ЗА РИСК: захват 2δ против σ√T ===\n\n");
-        sb.append("пара     | ступень | держ,мин | сигма,б.п./мин | риск | захват | ЗАХВ/РИСК\n");
+                "\n\n=== 🔑 МЕРКА НАСТРОЙКИ: суточное отношение за вычетом рынка ===\n\n");
+        sb.append("пара     | ступень | кругов/сут | круг−рынок | рынок |  СКО | ОТНОШЕНИЕ/сут |"
+                + " держ,мин | 2δ/σ√T\n");
         for (var e : grid.entrySet()) {
             for (var o : e.getValue().entrySet()) {
                 Cell c = o.getValue();
@@ -798,18 +814,27 @@ public final class PairSweep {
                 double vol = c.volBpPerMin / c.daysHeld;
                 double riskBp = vol * Math.sqrt(Math.max(0, hold));
                 double capBp = 2 * o.getKey().offBp();
+                double mean = c.roundMeanBp / c.daysHeld;
+                double sd = c.roundSdBp / c.daysHeld;
+                double lam = c.roundsPerDay / c.daysHeld;
                 sb.append(String.format(Locale.ROOT,
-                        "%-8s | %7s | %8.0f | %14.2f | %4.1f | %6.1f | %9.2f%s%n",
-                        e.getKey(), o.getKey().label(), hold, vol, riskBp, capBp,
+                        "%-8s | %7s | %10.1f | %+10.2f | %+5.2f | %4.1f | %13.2f | %8.0f |"
+                                + " %6.2f%s%n",
+                        e.getKey(), o.getKey().label(), lam, mean, c.marketBp / c.daysHeld, sd,
+                        sd > 0 && lam > 0 ? mean / sd * Math.sqrt(lam) : 0, hold,
                         riskBp > 0 ? capBp / riskBp : 0,
-                        riskBp > 0 && capBp / riskBp < 1 ? "  ⚠️ дешевле стоимости" : ""));
+                        riskBp > 0 && capBp / riskBp < 1 ? "  ⚠️" : ""));
             }
         }
-        sb.append("\n⚠️ отношение ниже единицы — риск за время удержания превышает захват.\n");
-        sb.append("⚠️ Решать по этой колонке НЕЛЬЗЯ (задача A40): захват 2δ положителен по\n");
-        sb.append("построению и не видит среднего сноса против позиции, а убыток сидит именно\n");
-        sb.append("в нём. Колонка — верхняя оценка качества. Сравнивать настройки по доходу\n");
-        sb.append("на НЕСКОЛЬКИХ окнах и по числу побед в клетках.\n");
+        sb.append("\n🔑 РЕШАТЬ ПО КОЛОНКЕ «ОТНОШЕНИЕ/сут» (док. 154 §I): в числителе\n");
+        sb.append("ФАКТИЧЕСКИЙ средний круг, из которого вычтен средний ход опоры за то же\n");
+        sb.append("время от каждой минуты окна. Вычет убирает траекторию — единственное\n");
+        sb.append("слагаемое круга, которое зависит от того, какое окно попалось.\n");
+        sb.append("⚠️ Колонка 2δ/σ√T оставлена для сверки со старыми отчётами и решением НЕ\n");
+        sb.append("является (задача A40): числитель 2δ положителен по построению и сноса\n");
+        sb.append("против позиции не видит, поэтому она бывает больше единицы у бота в минусе.\n");
+        sb.append("⚠️ Круги с незакрытыми на конец окна партиями в отношение не входят —\n");
+        sb.append("смещение в лучшую сторону; его величину показывает занятость инвентаря.\n");
         return sb.toString();
     }
 

@@ -369,6 +369,25 @@ public class CliRunner implements ApplicationRunner {
                         Double.parseDouble(firstOr(args, "taker-cost-bp", "16.4")),
                         firstOr(args, "out", "reports/revx_hold.md"));
             }
+            if (args.containsOption("revx-offset-axis")) {
+                org.home.data.revx.exec.OffsetAxis.run(
+                        firstOr(args, "journals", ""),
+                        firstOr(args, "placed", ""),
+                        firstOr(args, "from", ""),
+                        firstOr(args, "to", ""),
+                        firstOr(args, "out", "reports/revx_offset_axis.md"));
+            }
+            if (args.containsOption("revx-paired")) {
+                org.home.data.revx.exec.PairedDiff.run(
+                        firstOr(args, "a", ""),
+                        firstOr(args, "b", ""),
+                        firstOr(args, "name-a", "A"),
+                        firstOr(args, "name-b", "B"),
+                        firstOr(args, "from", ""),
+                        firstOr(args, "to", ""),
+                        Integer.parseInt(firstOr(args, "segment", "180")),
+                        firstOr(args, "out", "reports/revx_paired.md"));
+            }
             if (args.containsOption("revx-mirror")) {
                 revx.getObject().mirror(
                         Integer.parseInt(firstOr(args, "hours", "120")),
