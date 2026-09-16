@@ -45,6 +45,7 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun --args='--revx-paired --a=<журнал> --b=<журнал> --segment=180 --out=<файл>'  # ПАРНЫЙ ОПЫТ: разность по совпадающим отрезкам времени с ошибкой
 ./gradlew bootRun --args='--revx-audit'  # СВЕРКА УЧЁТА: площадка ↔ реестр ↔ журналы, только GET
 ./gradlew bootRun --args='--revx-order-status --order-id=<id>[,<id>]'  # что площадка говорит о конкретной заявке
+./gradlew bootRun --args='--revx-release-stale --bot=d --currency=ADA --journal=<путь>'  # снять претензию на монету, которую бот больше не торгует
 ```
 
 ⚠️ **ВРЕМЯ ПОД ПОЗИЦИЕЙ СЧИТАТЬ ТОЛЬКО ЧЕРЕЗ `--revx-hold-check`.** Разовый
