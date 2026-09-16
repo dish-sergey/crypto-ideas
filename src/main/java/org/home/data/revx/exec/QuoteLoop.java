@@ -1621,6 +1621,17 @@ public final class QuoteLoop implements Runnable {
             pausedReason = "не запущен";
             return;
         }
+        // Две паузы, обе про площадку, а не про рынок: пока она тормозит на
+        // заменах, мы плодим неснимаемый резерв; пока он не отпущен, продать
+        // монету всё равно нельзя. В обоих случаях лучшее действие — никакого.
+        String venuePause = venuePauseReason();
+        if (venuePause != null) {
+            pausedReason = venuePause;
+            countTick();
+            journal.quote(fair.price(), null, null, inventory, false, pausedReason);
+            standAside(pausedReason);
+            return;
+        }
         // ⚠️ ДИНАМИЧЕСКИЙ ОТСТУП вместо бинарного гейта — опыт, а не умолчание.
         //
         // Гейт по ширине опорной книги останавливает котирование целиком, и у
@@ -2342,6 +2353,7 @@ public final class QuoteLoop implements Runnable {
         Venue.Response response = client.replace(resting.venueId, body);
         replaces++;
         replacesThisMinute++;
+        noteVenueStall(response.latencyMs());
         if (response.ok()) {
             // ⚠️ ПРЕДШЕСТВЕННИКА НАДО ДОПРОСИТЬ, ПОКА ЕГО ЕЩЁ ЕСТЬ О ЧЁМ
             // СПРОСИТЬ. Замена создаёт другую заявку, старый идентификатор
@@ -2594,6 +2606,7 @@ public final class QuoteLoop implements Runnable {
         if (foreign > 0) {
             log.debug("в книге {} чужих заявок по {} — не трогаю", foreign, symbol);
         }
+        forgetHeirIfVisible(orders);
         if (!quoting.get()) {
             // Правило 1: пока котирование выключено, наших ТОРГУЮЩИХ заявок в
             // книге быть не должно.
@@ -2875,6 +2888,150 @@ public final class QuoteLoop implements Runnable {
                         double freePot) {
     }
 
+    /**
+     * Замена дольше этого — признак затыка площадки, на котором рождаются
+     * призраки.
+     *
+     * Порог взят по измерению 14–15.09.2026, а не на глаз: медиана нормальной
+     * замены — 170 мс на 291 729 запросах шести ботов, а у сорока замен,
+     * оставивших неснимаемый резерв, медиана 3004 мс, и 27 из 40 лежат в полосе
+     * 2.5–3.3 с. Между 170 мс и 2.5 с пустота, так что секунда разделяет два
+     * режима с запасом в обе стороны.
+     */
+    static final long SLOW_REPLACE_MS = 1_000;
+
+    /**
+     * Сколько стоим в стороне после затыка.
+     *
+     * Призраки приходят ПАЧКАМИ: 40 штук за двое суток уместились примерно в
+     * дюжину всплесков, и внутри всплеска все шесть ботов получали отказ в одну
+     * и ту же секунду (чаще всего HH:38:32). Значит смысл паузы — переждать
+     * всплеск целиком, а не отдельный отказ; минуты на это хватает, а стоит она
+     * при отступе 12 б.п. немногого.
+     */
+    static final long STALL_STAND_ASIDE_MS = 60_000;
+
+    /** До этого момента не котируем: площадка отвечает на замены слишком долго. */
+    private volatile long stallUntilMs;
+
+    /** Сколько призраков насчитали за жизнь процесса. */
+    private volatile int ghosts;
+
+    /**
+     * 🔑 ЗАТЫК ПЛОЩАДКИ: отойти в сторону, а не продолжать замены.
+     *
+     * Призрак — неснимаемый резерв — рождается только на медленной замене:
+     * площадка успевает отменить исходную заявку и создать наследника, а потом
+     * упирается в свой трёхсекундный таймаут и возвращает 422 БЕЗ
+     * идентификатора наследника (задача A48). Наследник держит монету, а снять
+     * его нечем: по {@code client_order_id} площадка спрашивать не даёт.
+     *
+     * Отсюда единственная профилактика, доступная нам: заметив первую медленную
+     * замену, перестать их слать. Убрать замены вовсе нельзя — их 291 729 за
+     * двое суток при лимите постановок 1000 в сутки, то есть схема «отменить и
+     * поставить заново» невозможна в двести раз.
+     *
+     * ⚠️ Отходим В СТОРОНУ, а не просто замолкаем: оставить заявку в книге на
+     * минуту затыка значит держать несвежую котировку ровно тогда, когда
+     * площадка ведёт себя странно. {@link #standAside} уводит её из зоны
+     * исполнения.
+     */
+    /**
+     * Почему не котируем по вине площадки, либо {@code null}, если котируем.
+     *
+     * Вынесено отдельно, чтобы причину можно было проверить тестом, не поднимая
+     * весь цикл: обе паузы — про состояние, а не про поток событий.
+     */
+    String venuePauseReason() {
+        return venuePause(frozenPaused, clock.now(), stallUntilMs);
+    }
+
+    /**
+     * ⚠️ Порядок причин не случаен: заморозка важнее затыка.
+     *
+     * Затык проходит за минуту, заморозка держится часами, и если вернуть
+     * человеку «площадка тормозит» там, где на самом деле заперта монета, он
+     * будет ждать минуту вместо того, чтобы смотреть {@code --revx-audit}.
+     */
+    static String venuePause(boolean frozen, long now, long stallUntilMs) {
+        if (frozen) {
+            return "монета заперта без заявки — жду, пока площадка отпустит";
+        }
+        if (now < stallUntilMs) {
+            return "площадка тормозит на заменах — стою в стороне";
+        }
+        return null;
+    }
+
+    private void noteVenueStall(long latencyMs) {
+        if (latencyMs < SLOW_REPLACE_MS) {
+            return;
+        }
+        long now = clock.now();
+        boolean fresh = now >= stallUntilMs;
+        stallUntilMs = now + STALL_STAND_ASIDE_MS;
+        if (!fresh) {
+            return;                       // всплеск продолжается — окно продлили, шуметь незачем
+        }
+        String message = ("площадка отвечает на замену %d мс при обычных ~170 — "
+                + "отхожу в сторону на %d с, чтобы не плодить неснимаемый резерв")
+                .formatted(latencyMs, STALL_STAND_ASIDE_MS / 1000);
+        log.warn(message);
+        journal.event("venue_stall", message);
+    }
+
+    /**
+     * Призрак опознан: наследник не нашёлся ни в книге, ни по остаткам.
+     *
+     * Вызывается по истечении {@link #HEIR_WINDOW_MS}. К этому моменту проверены
+     * оба способа: заявка с клиентским идентификатором наследника не появилась в
+     * списке активных (тогда {@code heir} был бы снят в сверке), и остатки не
+     * показали исполнения (тогда его записал бы {@link
+     * #claimHeirIfEvidenceMatches}). Остаётся третий случай — наследник есть, но
+     * невидим, и его резерв запирает монету.
+     *
+     * Запись нужна затем, что сумму запертого она даёт СРАЗУ и с разбивкой по
+     * стороне, тогда как сторож {@link #checkFrozen} выводит её из остатков и
+     * только через пять минут.
+     */
+    /**
+     * Наследник НАШЁЛСЯ в книге — значит призраком он не был.
+     *
+     * ⚠️ Без этого снятия подозрения любая удавшаяся замена через полчаса
+     * записывалась бы призраком: {@code heir} заводится на КАЖДОМ 422, а
+     * снимался он до 16.09.2026 только по уликам исполнения. Между тем чаще
+     * всего наследник вполне видим — площадка создала его и показывает в
+     * списке активных, просто идентификатор пришёл не в ответе, а в сверке.
+     * Узнаём его по клиентскому идентификатору: он НАШ, мы сами его выдали.
+     */
+    private void forgetHeirIfVisible(java.util.List<ActiveOrder> orders) {
+        Heir h = heir;
+        if (h == null) {
+            return;
+        }
+        for (ActiveOrder o : orders) {
+            if (h.clientId().equals(o.clientId())) {
+                heir = null;
+                heirEvidence = 0;
+                log.debug("наследник {} нашёлся в книге — подозрение снято", h.clientId());
+                return;
+            }
+        }
+    }
+
+    private void noteGhost(Heir h, long now) {
+        ghosts++;
+        String message = ("ПРИЗРАК ЗАМЕНЫ: наследник %s %s по %s (%s) не нашёлся за %d мин — "
+                + "площадка его создала, а идентификатор не вернула. %s заперто до её "
+                + "собственной уборки (наблюдалось от 2 до 32 ч). Призраков за запуск: %d")
+                .formatted(h.side(), fmt(h.size()), fmt(h.price()), h.clientId(),
+                        HEIR_WINDOW_MS / 60_000,
+                        h.side() == Side.SELL ? base : quote, ghosts);
+        log.error(message);
+        journal.event("ghost_replace", message);
+        alert.accept(message);
+    }
+
     private volatile Heir heir;
     /** Сколько минутных проверок подряд улики сходятся. */
     private volatile int heirEvidence;
@@ -2978,6 +3135,10 @@ public final class QuoteLoop implements Runnable {
             return;
         }
         if (now - h.sinceMs() > HEIR_WINDOW_MS) {
+            // Раньше наследника здесь просто забывали. Забыть его можно, а
+            // промолчать — нет: именно эти невидимые наследники за полтора суток
+            // заперли ВСЕ ETH, BTC и SOL на счёте (A48).
+            noteGhost(h, now);
             heir = null;
             heirEvidence = 0;
             return;
@@ -4195,6 +4356,16 @@ public final class QuoteLoop implements Runnable {
     private volatile long frozenWarnedMs;
     /** Когда впервые заметили запертую монету без заявки; 0 — не замечали. */
     private volatile long frozenSinceMs;
+    /**
+     * Пока true — не котируем: монета заперта призраком, продать её нельзя.
+     *
+     * ⚠️ Пауза, а не поправка к инвентарю, и это решение владельца от 16.09.2026.
+     * Соблазн был вычесть замороженное из инвентаря и торговать свободной
+     * частью — тогда бот не простаивает. Но продавать он всё равно не может, а
+     * покупать продолжит, то есть накопит инвентарь СВЕРХ потолка на паре, где
+     * выход закрыт. Это ровно тот крен в покупку, который отвергнут в A49.
+     */
+    private volatile boolean frozenPaused;
 
     /**
      * 🔑 ЗАПЕРТО, А ЗАЯВКИ НЕТ: четвёртый сторож, которого не хватало.
@@ -4225,7 +4396,12 @@ public final class QuoteLoop implements Runnable {
      */
     private void checkFrozen(long now) {
         if (!(params.size() > 0) || baseReserved <= 0) {
+            // ⚠️ СНЯТЬ ПАУЗУ НАДО И ЗДЕСЬ, а не только ниже по расчёту разницы.
+            // Полное освобождение резерва обнуляет baseReserved, то есть выходит
+            // ровно этой веткой — и первая версия правки оставляла бота в паузе
+            // навсегда в тот единственный момент, ради которого пауза и заведена.
             frozenSinceMs = 0;
+            resumeAfterFrozen(now);
             return;
         }
         Venue.Response active = client.activeOrders();
@@ -4241,13 +4417,27 @@ public final class QuoteLoop implements Runnable {
         double frozen = baseReserved - visible;
         if (frozen < params.size()) {
             frozenSinceMs = 0;
+            resumeAfterFrozen(now);
             return;
         }
         if (frozenSinceMs == 0) {
             frozenSinceMs = now;
             return;
         }
-        if (now - frozenSinceMs < 5 * 60_000L || now - frozenWarnedMs < 3_600_000L) {
+        if (now - frozenSinceMs < 5 * 60_000L) {
+            return;
+        }
+        // ⚠️ ПАУЗА СТАВИТСЯ РАНЬШЕ ТРЕВОГИ И НЕ ЗАВИСИТ ОТ ЕЁ ПОВТОРА.
+        //
+        // Тревога повторяется не чаще раза в час, чтобы не будить человека
+        // каждую минуту. Если привязать к ней и паузу, то бот, у которого
+        // заморозка длится третий час, окажется НЕ на паузе: условие про час не
+        // выполнено, и до самой паузы дело не дойдёт.
+        if (!frozenPaused) {
+            frozenPaused = true;
+            standAside("монета заперта без заявки");
+        }
+        if (now - frozenWarnedMs < 3_600_000L) {
             return;
         }
         frozenWarnedMs = now;
@@ -4259,6 +4449,28 @@ public final class QuoteLoop implements Runnable {
                         frozen / params.size(), (now - frozenSinceMs) / 60_000);
         log.error(message);
         journal.event("frozen_reserve", message);
+        alert.accept(message);
+    }
+
+    /**
+     * Возврат в работу, когда площадка отпустила резерв.
+     *
+     * Ждать человека здесь нечего: замер 14–16.09.2026 показал, что площадка
+     * убирает призраков сама, но с непредсказуемой задержкой — от двух часов
+     * (призрак 15.09 01:38 ушёл до 06:00) до тридцати двух (призрак 14.09 15:38
+     * дожил до 15.09 23:50). Все выжившие отпустились ОДНОЙ минутой, то есть
+     * это сверка по счёту, а не таймаут на заявку, и предсказать её нельзя.
+     * Значит единственная разумная политика — ждать и вернуться самому.
+     */
+    private void resumeAfterFrozen(long now) {
+        if (!frozenPaused) {
+            return;
+        }
+        frozenPaused = false;
+        frozenWarnedMs = 0;
+        String message = "резерв отпущен — возвращаюсь в работу по " + symbol;
+        log.warn(message);
+        journal.event("frozen_released", message);
         alert.accept(message);
     }
 
