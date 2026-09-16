@@ -540,6 +540,31 @@ public final class ExecJournal implements AutoCloseable {
      *
      * Передачи ({@code venue_id IS NULL}) сюда не попадают: у них нет заявки.
      */
+    /**
+     * Сколько уже записано по ОДНОЙ заявке.
+     *
+     * ⚠️ Нужен потому, что карта в памяти — LRU на 512 записей, а заявок в
+     * журнале втрое больше, и промах по ней ничего не говорит о том, была ли
+     * заявка учтена. 16.09.2026 такой промах провёл одну продажу дважды и увёл
+     * позицию спотового бота в минус.
+     */
+    public synchronized double bookedFor(String venueId) {
+        if (venueId == null) {
+            return 0;
+        }
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT ifnull(sum(qty), 0) FROM exec_fill WHERE venue_id = ?")) {
+            ps.setString(1, venueId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getDouble(1) : 0;
+            }
+        } catch (Exception e) {
+            // Молча вернуть ноль нельзя: это означало бы «не учтено» и привело
+            // бы ровно к тому двойному счёту, от которого мы защищаемся.
+            throw new IllegalStateException("не прочиталось учтённое по заявке " + venueId, e);
+        }
+    }
+
     public synchronized java.util.Map<String, Double> bookedByOrder() {
         java.util.Map<String, Double> out = new java.util.HashMap<>();
         try (Statement st = connection.createStatement();
