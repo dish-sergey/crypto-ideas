@@ -1,0 +1,13 @@
+[Unit]
+Description=Binance bookTicker capture (BTC/ETH/SOL vs USDC)
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/home/ubuntu/bin/bnb-collect.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
