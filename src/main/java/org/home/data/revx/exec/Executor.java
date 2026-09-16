@@ -456,6 +456,7 @@ public class Executor {
                         model.describe(), results));
                 out.append(org.home.data.revx.replay.Forecast.renderDays(
                         model.describe(), results));
+                out.append(org.home.data.revx.replay.Forecast.renderHold(ticks, bots));
             }
             log.info("\n=== Прогноз: вилка по двум моделям исполнения ==={}", out);
         } catch (Exception e) {

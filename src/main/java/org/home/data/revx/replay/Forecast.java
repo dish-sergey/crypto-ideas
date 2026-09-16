@@ -225,7 +225,7 @@ public final class Forecast {
         }
         double quoteStart = bots.stream().mapToDouble(BotSpec::inventoryCap).sum()
                 * refPrice * 1.2;
-        double startBase = ticks.get(0).inventory();
+        double startBase = startInventory(ticks, bots);
         SimVenue venue = new SimVenue(clock, model, base.symbol(),
                 startBase, quoteStart, base.minNotional());
 
@@ -781,6 +781,88 @@ public final class Forecast {
         }
         sb.append(lotHistogram(results));
         return sb.toString();
+    }
+
+    /**
+     * 🔑 С ЧЕГО НАЧИНАТЬ ОКНО, И ПОЧЕМУ ЭТО НЕ МЕЛОЧЬ.
+     *
+     * По умолчанию берётся ФАКТИЧЕСКИЙ инвентарь живого бота на первом тике —
+     * так прогон продолжает запись с того места, где она началась. Это верно,
+     * когда окно вырезано из жизни одного бота с одной настройкой.
+     *
+     * ⚠️ Но когда в одном прогоне сравниваются РАЗНЫЕ отступы, фактический
+     * инвентарь принадлежит только одному из них: бот, весь предыдущий день
+     * работавший на четырёх базисных пунктах, пришёл бы к полуночи с другим
+     * запасом, чем боевой с двенадцатью. Смещение одинаково у всех ступеней и
+     * потому почти не трогает их РАЗНОСТЬ, но уровни между ступенями сравнивать
+     * из-за него хуже.
+     *
+     * {@code revx.forecast.start-inventory}:
+     * <ul>
+     *   <li>пусто — как было, инвентарь из записи;</li>
+     *   <li>{@code target} — цель скоса, то есть та позиция, к которой бот и так
+     *       стремится. Снимает переходный процесс: иначе первые часы короткого
+     *       окна бот просто набирает запас, и этот разгон заслоняет всё
+     *       остальное;</li>
+     *   <li>число — доля суммарного потолка.</li>
+     * </ul>
+     */
+    private static double startInventory(List<ReplayFair.Tick> ticks, List<BotSpec> bots) {
+        String mode = System.getProperty("revx.forecast.start-inventory", "").trim();
+        if (mode.isEmpty()) {
+            return ticks.get(0).inventory();
+        }
+        if ("target".equalsIgnoreCase(mode)) {
+            // Цель у ступеней может различаться — складываем их собственные цели.
+            double sum = 0;
+            for (BotSpec b : bots) {
+                sum += b.inventoryCap() * b.skewTarget();
+            }
+            return sum;
+        }
+        double capAll = bots.stream().mapToDouble(BotSpec::inventoryCap).sum();
+        return capAll * Double.parseDouble(mode);
+    }
+
+    /**
+     * Сколько дал бы ПРОСТОЙ ДЕРЖАТЕЛЬ: стартовый запас и ни одной сделки.
+     *
+     * Предложение владельца 16.09.2026, и оно закрывает дыру в чтении прогона.
+     * Доход за окно складывается из двух разных вещей: из торговли и из того,
+     * что инвентарь подорожал или подешевел сам. На падающем окне вторая
+     * величина заслоняет первую целиком — все ступени в минусе, и без этой
+     * строки непонятно, торговля ли виновата.
+     *
+     * Считается как {@code запас × (цена в конце − цена в начале)}. Разность
+     * «бот минус держатель» и есть вклад САМОЙ торговли.
+     *
+     * ⚠️ Это не то же самое, что «рынок» в мерке настройки (задача A46): там
+     * вычитается средний ход опоры за то же время от КАЖДОЙ минуты окна, здесь —
+     * ровно один путь от начала до конца. Первое — безусловный контроль,
+     * второе — фактическая альтернатива «не торговать».
+     */
+    public static String renderHold(List<ReplayFair.Tick> ticks, List<BotSpec> bots) {
+        double first = 0;
+        for (ReplayFair.Tick t : ticks) {
+            if (t.fair() > 0) {
+                first = t.fair();
+                break;
+            }
+        }
+        double last = 0;
+        for (int i = ticks.size() - 1; i >= 0; i--) {
+            if (ticks.get(i).fair() > 0) {
+                last = ticks.get(i).fair();
+                break;
+            }
+        }
+        double startBase = startInventory(ticks, bots);
+        double hold = (first > 0 && last > 0) ? startBase * (last - first) : 0;
+        return String.format(Locale.ROOT,
+                "%nБЕЗ ТОРГОВЛИ: запас %.8f, цена %.2f → %.2f (%+.2f%%), итог %+.4f USDC.%n"
+                        + "Разность «бот минус эта строка» и есть вклад самой торговли.%n",
+                startBase, first, last,
+                first > 0 ? 100 * (last - first) / first : 0, hold);
     }
 
     /**
