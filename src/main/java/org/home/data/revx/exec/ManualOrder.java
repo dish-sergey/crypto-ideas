@@ -9,7 +9,6 @@ import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.util.UUID;
 
 /**
  * {@code --revx-order}: поставить ОДНУ лимитную заявку руками и выйти.
@@ -101,7 +100,7 @@ public class ManualOrder {
             String body = """
                     {"client_order_id":"%s","symbol":"%s","side":"%s",
                      "order_configuration":{"limit":{"base_size":"%s","price":"%s"%s}}}"""
-                    .formatted(UUID.randomUUID(), venueSymbol, side.toLowerCase(),
+                    .formatted(ManualTag.newClientOrderId(), venueSymbol, side.toLowerCase(),
                             fmt(size), fmt(price),
                             postOnly ? ",\"execution_instructions\":[\"post_only\"]" : "")
                     .replaceAll("\\s*\\n\\s*", "");

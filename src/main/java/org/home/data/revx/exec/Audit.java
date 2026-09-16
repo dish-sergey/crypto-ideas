@@ -95,8 +95,17 @@ public class Audit {
     private record Order(String id, String clientId, String symbol, String side,
                          double leaves, double price) {
 
-        /** Первый символ нашего идентификатора — метка бота (см. {@link BotTag}). */
+        /**
+         * Первый символ нашего идентификатора — метка бота (см. {@link BotTag}).
+         *
+         * Ручная заявка называется словом, а не цифрой: в разборе 15.09.2026
+         * такие заявки попадали в графу «?» рядом с легаси-хвостами площадки, и
+         * отличить «я сам поставил час назад» от «висит с августа» было нечем.
+         */
         String owner() {
+            if (ManualTag.is(clientId)) {
+                return "ручная";
+            }
             return clientId == null || clientId.isEmpty() ? "?" : clientId.substring(0, 1);
         }
 
