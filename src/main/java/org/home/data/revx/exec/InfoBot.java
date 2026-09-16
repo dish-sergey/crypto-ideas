@@ -89,6 +89,16 @@ public final class InfoBot implements Runnable {
      */
     private final String allocPath;
 
+    /**
+     * База сборщика — ТОЛЬКО ради цен, и только на чтение.
+     *
+     * Сводке нужен курс монеты в USDC, чтобы «ничейное» можно было прочесть
+     * деньгами, а не количеством: 7250 PEPE и 0.0472 SOL — числа несравнимые,
+     * пока не переведены в одну единицу. Своего источника цены у сводки нет и
+     * быть не должно: ключа она не имеет по построению.
+     */
+    private final String bookPath;
+
     public InfoBot(String token, long chatId, List<Watched> watched) {
         this(token, chatId, watched,
                 System.getProperty("revx.info.alloc", "../revx-shared/alloc.db"));
@@ -99,6 +109,7 @@ public final class InfoBot implements Runnable {
         this.chatId = chatId;
         this.watched = watched;
         this.allocPath = allocPath;
+        this.bookPath = System.getProperty("revx.info.book", "../revx/data/revx.db");
     }
 
     /**
@@ -480,20 +491,93 @@ public final class InfoBot implements Runnable {
             return "";                    // реестра нет — молчим, /alloc объяснит подробно
         }
         Balances bal = venueBalances();
-        StringBuilder sb = new StringBuilder();
+        // Складываем в список, чтобы отсортировать по ДЕНЬГАМ: количество само по
+        // себе несравнимо (7250 PEPE против 0.0472 SOL), а сверху списка должно
+        // стоять то, чего жалко.
+        record Row(String currency, double qty, double usd) { }
+        java.util.Map<String, Double> qty = new java.util.LinkedHashMap<>();
         for (var e : bal.byCurrency().entrySet()) {
             double total = e.getValue().total();
             double free = total - claimed.getOrDefault(e.getKey(), 0.0);
             if (total > 0 && free > 0.01 * total) {
-                sb.append(String.format(Locale.ROOT, " %s %s,", e.getKey(), trim(free)));
+                qty.put(e.getKey(), free);
             }
         }
-        if (sb.isEmpty()) {
+        if (qty.isEmpty()) {
             return "";
         }
-        sb.setLength(sb.length() - 1);
+        // Цены спрашиваем ТОЛЬКО про то, что попало в список: ответ остатков
+        // содержит четыре десятка валют, почти все с нулём, и платить за них
+        // запросом к базе сборщика незачем.
+        java.util.Map<String, Double> px = prices(qty.keySet());
+        java.util.List<Row> rows = new java.util.ArrayList<>();
+        qty.forEach((currency, free) -> {
+            Double p = px.get(currency);
+            rows.add(new Row(currency, free, p == null ? Double.NaN : free * p));
+        });
+        rows.sort((x, y) -> Double.compare(Double.isNaN(y.usd()) ? -1 : y.usd(),
+                Double.isNaN(x.usd()) ? -1 : x.usd()));
+        StringBuilder sb = new StringBuilder();
+        double sum = 0;
+        boolean gaps = false;
+        for (Row r : rows) {
+            sb.append(String.format(Locale.ROOT, "\n  %-5s %12s", r.currency(), trim(r.qty())));
+            if (Double.isNaN(r.usd())) {
+                // Цены нет — молчим о ней прямо, а не показываем ноль: ноль здесь
+                // читался бы как «ничего не стоит».
+                sb.append("  (цены нет)");
+                gaps = true;
+            } else {
+                sb.append(String.format(Locale.ROOT, "  %8.2f USDC", r.usd()));
+                sum += r.usd();
+            }
+        }
         return "\n\n⚠️ НИЧЕЙНОЕ (ни за кем не числится):" + sb
+                + String.format(Locale.ROOT, "\n  всего %.2f USDC%s", sum,
+                        gaps ? " (без тех, у кого нет цены)" : "")
                 + "\nэтим никто не торгует — подробности /alloc";
+    }
+
+    /**
+     * Курс монет в USDC из базы сборщика: середина последнего снимка книги.
+     *
+     * ⚠️ СПРАШИВАТЬ НАДО ПО ОДНОЙ ПАРЕ, и это не стилистика. База сборщика
+     * весит 7.7 ГБ, и запрос «последняя цена всех пар» через {@code GROUP BY
+     * symbol} сканирует индекс целиком — замерено на живой базе, **64 секунды**.
+     * Тот же ответ по одной паре через {@code ORDER BY t_recv_ms DESC LIMIT 1}
+     * ложится на индекс {@code (symbol, t_recv_ms)} и занимает **2 мс**. Сводка
+     * собирается по запросу человека, ей минута ожидания недопустима.
+     *
+     * Свежесть НЕ проверяется намеренно: если сборщик встал, честнее показать
+     * цену часовой давности, чем не показать ничего. Ничейное читают, чтобы
+     * понять порядок величины, а не чтобы торговать по этой цене.
+     *
+     * USDC сам себе цена: без этого он выпал бы из суммы, а его в ничейном
+     * обычно больше всего.
+     */
+    private java.util.Map<String, Double> prices(java.util.Collection<String> currencies) {
+        java.util.Map<String, Double> out = new java.util.HashMap<>();
+        out.put("USDC", 1.0);
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                "jdbc:sqlite:file:" + bookPath + "?mode=ro");
+             java.sql.PreparedStatement ps = c.prepareStatement(
+                     "SELECT bp1, ap1 FROM revx_book WHERE symbol = ?"
+                             + " ORDER BY t_recv_ms DESC LIMIT 1")) {
+            for (String currency : currencies) {
+                if (out.containsKey(currency)) {
+                    continue;
+                }
+                ps.setString(1, currency + "/USDC");
+                try (java.sql.ResultSet rs = ps.executeQuery()) {
+                    if (rs.next() && rs.getDouble(1) > 0 && rs.getDouble(2) > 0) {
+                        out.put(currency, (rs.getDouble(1) + rs.getDouble(2)) / 2);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("цены недоступны ({}): покажем ничейное без денег", e.toString());
+        }
+        return out;
     }
 
 
