@@ -1346,15 +1346,26 @@ public final class QuoteLoop implements Runnable {
         }
         double have = alloc.own(tag.id(), quote);
         double oneLot = params.size() * price;
-        if (have + 1e-9 < Math.max(oneLot, minNotional)) {
-            return String.format(java.util.Locale.ROOT,
-                    "Не хватает своей кассы: за ботом числится %.2f %s, на одну заявку "
-                            + "нужно %.2f.",
-                    have, quote, Math.max(oneLot, minNotional));
-        }
+        // ⚠️ СНАЧАЛА «СКОЛЬКО ВООБЩЕ НУЖНО», И ТОЛЬКО ПОТОМ «ХВАТАЕТ ЛИ».
+        //
+        // Порядок был обратный, и 16.09.2026 это не пустило бота `c`: потолок у
+        // него 2.33 лота, держал он 2, докупать оставалось на 0.96 USDC — а
+        // числилось 0.97, то есть хватало. Гейт же требовал ПОЛНЫЙ лот, 2.90,
+        // и отказывал.
+        //
+        // Цена ошибки больше, чем кажется: не пустив бота, мы лишаем его
+        // возможности ПРОДАВАТЬ, хотя у потолка это ровно то, что ему нужно.
+        // Касса нужна под покупки, а покупок у него почти не осталось.
         double need = Math.max(0, (params.inventoryCap() - inventory) * price);
         if (need <= 0) {
             return null;                  // инвентарь уже у потолка, покупать не на что
+        }
+        double required = Math.min(Math.max(oneLot, minNotional), need);
+        if (have + 1e-9 < required) {
+            return String.format(java.util.Locale.ROOT,
+                    "Не хватает своей кассы: за ботом числится %.2f %s, а до потолка "
+                            + "нужно ещё %.2f (на одну заявку %.2f).",
+                    have, quote, required, Math.max(oneLot, minNotional));
         }
         // Порог покрытия. Требовать ПОЛНОГО покрытия нельзя: 04.09.2026 на счёте
         // было $46.21 при сумме потолков трёх ботов $49.13, и строгий гейт не
@@ -4536,17 +4547,50 @@ public final class QuoteLoop implements Runnable {
             return;                       // не знаем состояние — молчим
         }
         double visible = 0;
+        // 🔑 ЗАПЕРТОЕ НАШИМИ ЖЕ ЗАЯВКАМИ — ДОСЯГАЕМО, и это не тонкость.
+        //
+        // `available` не включает монету под нашей стоящей продажей, но эта
+        // монета никуда не делась: заявка исполнится или снимется, и монета
+        // вернётся. Считать покрытие по одному `available` значит наказывать
+        // бота за то, что он работает.
+        //
+        // 16.09.2026 это сразу дало ложную распродажу: бот доложил «доступного
+        // хватает лишь на 67%», имея при этом полное покрытие — недостающее
+        // лежало в его собственных заявках. Поэтому в числителе не `available`,
+        // а `available + наши видимые заявки`, что по тождеству площадки равно
+        // «всего минус по-настоящему недосягаемое».
+        //
+        // USDC считается по ВСЕМ парам: котируемая валюта общая, и покупка
+        // соседа запирает её так же, как наша.
+        double visibleBuysQuote = 0;
         for (ActiveOrder o : ActiveOrder.parse(active.body())) {
             if (o.side() == Side.SELL && ActiveOrder.normalize(symbol).equals(o.symbol())) {
                 visible += o.size();
             }
+            if (o.side() == Side.BUY && o.symbol() != null && o.symbol().endsWith("/" + quote)) {
+                visibleBuysQuote += o.size() * o.price();
+            }
         }
         double frozen = baseReserved - visible;
-        if (frozen < params.size()) {
+
+        // 🔑 ЛЕСТНИЦА СЧИТАЕТСЯ ПО ПОКРЫТИЮ, А НЕ ПО РАЗМЕРУ ЛОТА.
+        //
+        // Здесь стояло условие «заперто ≥ лота ЭТОГО бота», и оно тихо вернуло
+        // ровно ту зависимость, которую мерка покрытия и убирала: 16.09.2026
+        // заперло 0.00040265 ETH, у бота `d` это ровно лот — он лестницу прошёл,
+        // а у соседа `c` лот втрое крупнее, и до проверки покрытия он не дошёл
+        // вовсе. Одна заморозка, один счёт, разное поведение — признак того, что
+        // мерка смотрит не туда.
+        double cover = Math.min(
+                coverage(baseAvailable + visible, claimedAll(base, now)),
+                coverage(quoteBalance + visibleBuysQuote, claimedAll(quote, now)));
+        if (cover >= COVERAGE_UNWIND) {
             frozenSinceMs = 0;
             maybeResume(now);
             return;
         }
+        // Пять минут выдержки: остатки и список заявок читаются РАЗНЫМИ
+        // запросами, и мгновенное расхождение между ними штатно.
         if (frozenSinceMs == 0) {
             frozenSinceMs = now;
             return;
@@ -4563,9 +4607,6 @@ public final class QuoteLoop implements Runnable {
         //
         // Первая ступень: пока ДОСТУПНОГО хватает на то, что за ботами числится,
         // торгуем. Буфером работает свободный остаток, а не отдельная куча.
-        double cover = Math.min(
-                coverage(baseAvailable, claimedAll(base, now)),
-                coverage(quoteBalance, claimedAll(quote, now)));
         if (cover < COVERAGE_UNWIND && !frozenUnwind) {
             frozenUnwind = true;
             String msg = ("РАСПРОДАЖА: доступного хватает лишь на %.0f%% того, что "
@@ -4630,9 +4671,23 @@ public final class QuoteLoop implements Runnable {
         if (!frozenPaused && !frozenUnwind) {
             return;
         }
+        Venue.Response active = client.activeOrders();
+        if (!active.ok() || active.body() == null) {
+            return;                       // не знаем состояние — не возвращаемся вслепую
+        }
+        double visible = 0;
+        double visibleBuysQuote = 0;
+        for (ActiveOrder o : ActiveOrder.parse(active.body())) {
+            if (o.side() == Side.SELL && ActiveOrder.normalize(symbol).equals(o.symbol())) {
+                visible += o.size();
+            }
+            if (o.side() == Side.BUY && o.symbol() != null && o.symbol().endsWith("/" + quote)) {
+                visibleBuysQuote += o.size() * o.price();
+            }
+        }
         double cover = Math.min(
-                coverage(baseAvailable, claimedAll(base, now)),
-                coverage(quoteBalance, claimedAll(quote, now)));
+                coverage(baseAvailable + visible, claimedAll(base, now)),
+                coverage(quoteBalance + visibleBuysQuote, claimedAll(quote, now)));
         if (cover < COVERAGE_RESUME) {
             return;
         }
