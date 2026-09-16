@@ -4353,6 +4353,8 @@ public final class QuoteLoop implements Runnable {
     /** Когда в последний раз кричали про расхождение реестра и про ничейное. */
     private volatile long registryWarnedMs;
     private volatile long unownedWarnedMs;
+    /** Какую величину ничейного уже называли; 0 — не называли. */
+    private volatile double unownedReported;
     private volatile long frozenWarnedMs;
     /** Когда впервые заметили запертую монету без заявки; 0 — не замечали. */
     private volatile long frozenSinceMs;
@@ -4521,13 +4523,52 @@ public final class QuoteLoop implements Runnable {
      * (раз в минуту) на лот и отличается. Повтор не чаще раза в час: тревога,
      * которую видно каждую минуту, перестаёт быть тревогой.
      */
+    /**
+     * Новость ли это, или уже названное.
+     *
+     * @param free     сколько ничейного сейчас
+     * @param reported сколько называли в прошлый раз; 0 — не называли
+     * @param lot      размер лота: шаг, которым приходит новая беда
+     */
+    static boolean unownedIsNews(double free, double reported, double lot) {
+        // ⚠️ Допуск обязателен, и это не педантизм: РОВНО лот сверху — канонический
+        // случай новой беды (пришло одно исполнение и не нашло хозяина), а на
+        // двоичной арифметике 6×0.00944 оказывается чуть меньше 5×0.00944 + 0.00944.
+        // Без допуска сторож промолчал бы именно там, где обязан кричать.
+        double dust = Math.max(1e-12, lot * 1e-6);
+        return reported <= 0 || free >= reported + lot - dust;
+    }
+
     private void checkUnowned(long now) {
         if (!(params.size() > 0) || Double.isNaN(baseTotalAccount)
                 || now - unownedWarnedMs < 3_600_000L) {
             return;
         }
+        // ⚠️ ОСТАНОВЛЕННОМУ БОТУ ЭТО ГОВОРИТЬ НЕЗАЧЕМ, и совет в самой тревоге
+        // это выдаёт: «/stop, затем /claim» обращён к работающему. Молчание тут
+        // не потеря сторожа, а его точность: пока котирование выключено, человек
+        // и так стоит руками у счёта, а ничейное чаще всего сам же и сделал
+        // через /release. 16.09.2026 это дало шесть тревог в час на нарочное
+        // состояние.
+        if (!quoting.get()) {
+            return;
+        }
         double free = alloc.free(base, baseTotalAccount, now).free();
         if (free < params.size()) {
+            unownedReported = 0;          // ничейное разобрали — следующее будет новостью
+            return;
+        }
+        // 🔑 СООБЩАЕМ НОВОСТЬ, А НЕ СОСТОЯНИЕ.
+        //
+        // Ничейный остаток бывает ДОЛГИМ и осознанным: владелец освободил
+        // претензии, чтобы начать с нуля, и остаток будет лежать, пока его не
+        // продадут. Повторять про него каждый час значит приучить не читать
+        // тревоги — а следующая будет про потерянное исполнение.
+        //
+        // Поэтому молчим, пока ничейное не ВЫРАСТЕТ ещё на лот: именно так
+        // выглядит новая беда (лот пришёл и хозяина не нашёл), тогда как
+        // неизменная величина — это уже известное.
+        if (!unownedIsNews(free, unownedReported, params.size())) {
             return;
         }
         // Заперто в заявке без живого хозяина — тоже ничейное, но забирать его
@@ -4536,6 +4577,7 @@ public final class QuoteLoop implements Runnable {
         Locked locked = lockedNow(now);
         double orphan = locked == null ? 0 : locked.orphans();
         unownedWarnedMs = now;
+        unownedReported = free;
         String message = ("НИЧЕЙНОЕ: на счёте %s %s не числится ни за одним ботом (%.1f лота). %s")
                 .formatted(fmt(free), base, free / params.size(),
                         orphan > params.size() * 0.01
