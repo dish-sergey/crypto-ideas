@@ -156,7 +156,7 @@ public class Audit {
             double phantom = b.reserved() - byOrders;
             sb.append(String.format(Locale.ROOT, "  %-5s %14.8f | %14.8f | %14.8f | %+14.8f%s%n",
                     cur, b.total(), b.reserved(), byOrders, phantom,
-                    Math.abs(phantom) > 1e-8 ? "  ⚠️ заперто НЕВИДИМЫМ" : ""));
+                    Math.abs(phantom) > dust(b.reserved()) ? "  ⚠️ заперто НЕВИДИМЫМ" : ""));
         }
         sb.append("⚠️ Разница в этой графе значит, что площадка держит резерв под заявку,\n");
         sb.append("которой нет в /orders/active. Такую монету нельзя ни продать, ни забрать:\n");
@@ -239,6 +239,25 @@ public class Audit {
      * ⚠️ Только GET и только когда расхождение уже найдено: лишние запросы к
      * списку заявок стоят из общего лимита в 1000/мин на весь счёт.
      */
+    /**
+     * Допуск сходимости резерва — ОТНОСИТЕЛЬНЫЙ, а не абсолютный.
+     *
+     * ⚠️ Стоял 1e-8, и на торгующих ботах это оказалось ниже собственной точности
+     * расчёта. Запертое по бидам считается как сумма произведений
+     * {@code остаток × цена} по всем заявкам, а остатки и список заявок читаются
+     * РАЗНЫМИ запросами: 16.09.2026 на двенадцати живых заявках расхождение
+     * составило 7.5e-6 USDC при резерве 16.9 — то есть шесть знаков, честная
+     * крошка. Аудит на неё поднимал «охоту за невидимой заявкой» и тратил
+     * одиннадцать лишних запросов на пустом месте.
+     *
+     * Настоящая беда выглядит иначе: 15.09.2026 это были 33.42 USDC и целые лоты
+     * монет, то есть на шесть порядков больше допуска. Та же ошибка с абсолютным
+     * допуском уже ловилась 11.09.2026 в {@link AllocRegistry#claim}.
+     */
+    private static double dust(double reserved) {
+        return Math.max(1e-8, Math.abs(reserved) * 1e-6);
+    }
+
     private String hunt(HttpClient http, TradeAuth auth, Map<String, Balance> balances,
                         List<Order> orders) {
         boolean phantom = false;
@@ -251,7 +270,7 @@ public class Audit {
                     byOrders += o.leaves() * o.price();
                 }
             }
-            if (e.getValue().reserved() - byOrders > 1e-8) {
+            if (e.getValue().reserved() - byOrders > dust(e.getValue().reserved())) {
                 phantom = true;
             }
         }

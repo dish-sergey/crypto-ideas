@@ -48,6 +48,15 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun --args='--revx-release-stale --bot=d --currency=ADA --journal=<путь>'  # снять претензию на монету, которую бот больше не торгует
 ```
 
+
+⚠️ **ПРИБОРЫ ЗАПУСКАТЬ ИЗ `~/revx-tools/app.jar`, А НЕ ИЗ КАТАЛОГА БОТА**
+(bot-arm, с 16.09.2026). Перезапись jar под работающим процессом роняет его
+`NoClassDefFoundError` — Spring грузит классы из файла лениво. Отдельный каталог
+позволяет обновлять приборы, не трогая торгующих:
+```
+sudo bash -c 'set -a; . /etc/revx-exec.env; set +a; cd ~/revx-tools && \
+  /home/ubuntu/jre25/bin/java -jar app.jar --revx-audit --alloc=/home/ubuntu/revx-shared/alloc.db'
+```
 ⚠️ **ВРЕМЯ ПОД ПОЗИЦИЕЙ СЧИТАТЬ ТОЛЬКО ЧЕРЕЗ `--revx-hold-check`.** Разовый
 скрипт 11.09.2026 выкинул передачи и затравку ИЗ книги партий — позицию они
 ОТКРЫВАЮТ, поэтому книга ушла в шорт, и «удержанием» стало расстояние от
