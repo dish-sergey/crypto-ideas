@@ -27,7 +27,8 @@ import java.util.UUID;
  * {@code client_order_id} только как валидный UUID (закреплено в
  * {@code OrderProbeIdsTest}), а в UUID допустимы лишь цифры {@code 0-9a-f}.
  * Буквы {@code a}–{@code f} заняты шестью ботами, поэтому свободны только
- * цифры; {@code 9} выбрана как заметная глазу и ни с кем не пересекающаяся.
+ * цифры; {@code 0} выбран владельцем 16.09.2026: восемь нулей ни с одним ботом не
+ * пересекаются и в случайном UUID практически не встречаются.
  *
  * ⚠️ Владелец 16.09.2026 просил префикс {@code zzzzzzzzz-}; он невозможен по
  * этой же причине — {@code z} не шестнадцатеричная цифра, и такая заявка до
@@ -37,7 +38,7 @@ import java.util.UUID;
 public final class ManualTag {
 
     /** Первый блок UUID у ручной заявки. */
-    public static final String PREFIX = "99999999";
+    public static final String PREFIX = "00000000";
 
     private ManualTag() {
     }
