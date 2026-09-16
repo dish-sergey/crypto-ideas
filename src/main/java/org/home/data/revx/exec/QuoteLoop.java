@@ -4482,6 +4482,45 @@ public final class QuoteLoop implements Runnable {
      * список активных читаются РАЗНЫМИ запросами, и между ними успевает пройти
      * замена. Беда — когда расхождение держится.
      */
+    /**
+     * 🔑 ПОКРЫТИЕ: хватает ли ДОСТУПНОГО на то, что за ботами ЧИСЛИТСЯ.
+     *
+     * Решение владельца 16.09.2026, и оно точнее двух прежних попыток. Мерить
+     * «сколько заперто» относительно потолка неправильно: потолок — это
+     * разрешение торговать, а не обязательство иметь. Важно другое — может ли
+     * бот забрать из доступного то, что записано за ним в реестре.
+     *
+     * Считается по ВСЕМ ботам сразу и по обеим валютам: счёт общий, и заморозка
+     * у соседа отнимает доступное у всех.
+     *
+     * @return доля покрытия; 1.0 и больше — хватает с запасом, 0.5 — доступного
+     *         вдвое меньше, чем числится. Если не числится ничего, покрытие
+     *         полное: нечего покрывать.
+     */
+    static double coverage(double available, double claimed) {
+        if (!(claimed > 0)) {
+            return 1.0;
+        }
+        return Math.max(0, available) / claimed;
+    }
+
+    /** Ниже этого покрытия уходим в распродажу. */
+    static final double COVERAGE_UNWIND = 0.7;
+    /** Возврат в работу — только при полном покрытии, без всяких «почти». */
+    static final double COVERAGE_RESUME = 1.0;
+
+    /** Сумма претензий ВСЕХ ботов по валюте. */
+    private double claimedAll(String currency, long now) {
+        if (alloc == null) {
+            return 0;
+        }
+        double sum = 0;
+        for (AllocRegistry.Claim c : alloc.claims(currency, now)) {
+            sum += c.qty();
+        }
+        return sum;
+    }
+
     private void checkFrozen(long now) {
         if (!(params.size() > 0) || baseReserved <= 0) {
             // ⚠️ СНЯТЬ ПАУЗУ НАДО И ЗДЕСЬ, а не только ниже по расчёту разницы.
@@ -4489,7 +4528,7 @@ public final class QuoteLoop implements Runnable {
             // ровно этой веткой — и первая версия правки оставляла бота в паузе
             // навсегда в тот единственный момент, ради которого пауза и заведена.
             frozenSinceMs = 0;
-            resumeAfterFrozen(now);
+            maybeResume(now);
             return;
         }
         Venue.Response active = client.activeOrders();
@@ -4505,7 +4544,7 @@ public final class QuoteLoop implements Runnable {
         double frozen = baseReserved - visible;
         if (frozen < params.size()) {
             frozenSinceMs = 0;
-            resumeAfterFrozen(now);
+            maybeResume(now);
             return;
         }
         if (frozenSinceMs == 0) {
@@ -4522,14 +4561,17 @@ public final class QuoteLoop implements Runnable {
         // заморозка длится третий час, окажется НЕ остановлен: условие про час
         // не выполнено, и до самой остановки дело не дойдёт.
         //
-        // Первая ступень: заперто меньше половины потолка — продолжаем торговать
-        // тем, что осталось свободным. Это и есть «буфер», только не отдельный,
-        // а тот же инвентарь.
-        if (frozen >= params.inventoryCap() / 2 && !frozenUnwind) {
+        // Первая ступень: пока ДОСТУПНОГО хватает на то, что за ботами числится,
+        // торгуем. Буфером работает свободный остаток, а не отдельная куча.
+        double cover = Math.min(
+                coverage(baseAvailable, claimedAll(base, now)),
+                coverage(quoteBalance, claimedAll(quote, now)));
+        if (cover < COVERAGE_UNWIND && !frozenUnwind) {
             frozenUnwind = true;
-            String msg = ("РАСПРОДАЖА: заперто %s %s — больше половины потолка %s. "
-                    + "Цель скоса в ноль, покупки прекращаю, свожу инвентарь к нулю.")
-                    .formatted(fmt(frozen), base, fmt(params.inventoryCap()));
+            String msg = ("РАСПРОДАЖА: доступного хватает лишь на %.0f%% того, что "
+                    + "числится за ботами (заперто %s %s). Цель скоса в ноль, "
+                    + "покупки прекращаю, свожу инвентарь к нулю.")
+                    .formatted(cover * 100, fmt(frozen), base);
             log.error(msg);
             journal.event("frozen_unwind", msg);
             alert.accept(msg);
@@ -4575,6 +4617,28 @@ public final class QuoteLoop implements Runnable {
      * это сверка по счёту, а не таймаут на заявку, и предсказать её нельзя.
      * Значит единственная разумная политика — ждать и вернуться самому.
      */
+    /**
+     * Возврат в работу — ТОЛЬКО при полном покрытии.
+     *
+     * ⚠️ Порог возврата выше порога ухода (1.0 против 0.7) намеренно. Совпади
+     * они — бот дёргался бы туда-сюда на границе, а каждый заход в распродажу
+     * стоит сведённой позиции и потерянного оборота. Разные пороги дают
+     * гистерезис: уходим при заметной нехватке, возвращаемся, когда хватает
+     * всего и всем.
+     */
+    private void maybeResume(long now) {
+        if (!frozenPaused && !frozenUnwind) {
+            return;
+        }
+        double cover = Math.min(
+                coverage(baseAvailable, claimedAll(base, now)),
+                coverage(quoteBalance, claimedAll(quote, now)));
+        if (cover < COVERAGE_RESUME) {
+            return;
+        }
+        resumeAfterFrozen(now);
+    }
+
     private void resumeAfterFrozen(long now) {
         if (!frozenPaused && !frozenUnwind) {
             return;

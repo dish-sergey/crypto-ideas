@@ -288,6 +288,25 @@ public final class ExecJournal implements AutoCloseable {
      * своим исполнениям, и хранит здесь, чтобы пережить перезапуск. Остатки
      * остаются контролем: наша позиция не может превышать общую.
      */
+    /**
+     * Убрать ОДНУ строку исполнения — ту, что записана повторно.
+     *
+     * ⚠️ Удаляется строго по паре «заявка + отметка времени», а не по заявке:
+     * у частичного исполнения строк по одной заявке несколько, и все они
+     * законные. Ошибиться здесь значит потерять настоящую сделку.
+     */
+    public synchronized void deleteFill(String venueId, long tsMs) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "DELETE FROM exec_fill WHERE venue_id = ? AND ts_ms = ?")) {
+            ps.setString(1, venueId);
+            ps.setLong(2, tsMs);
+            int n = ps.executeUpdate();
+            log.warn("убрана лишняя запись исполнения {} в {}: строк {}", venueId, tsMs, n);
+        } catch (Exception e) {
+            throw new IllegalStateException("не убрать запись исполнения " + venueId, e);
+        }
+    }
+
     public synchronized void putState(String key, double value) {
         try (PreparedStatement ps = connection.prepareStatement(
                 "INSERT INTO exec_state(key, value, ts_ms) VALUES(?,?,?) "

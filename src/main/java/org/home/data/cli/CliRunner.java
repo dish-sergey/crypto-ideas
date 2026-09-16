@@ -79,6 +79,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.FateProbe> fateProbe;
     private final ObjectProvider<org.home.data.revx.exec.Audit> audit;
     private final ObjectProvider<org.home.data.revx.exec.ReleaseStale> releaseStale;
+    private final ObjectProvider<org.home.data.revx.exec.Unbook> unbook;
     private final ObjectProvider<org.home.data.revx.RateCheck> rateCheck;
     private final ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe;
     private final ObjectProvider<org.home.data.revx.exec.Panic> panic;
@@ -109,6 +110,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.FateProbe> fateProbe,
                      ObjectProvider<org.home.data.revx.exec.Audit> audit,
                      ObjectProvider<org.home.data.revx.exec.ReleaseStale> releaseStale,
+                     ObjectProvider<org.home.data.revx.exec.Unbook> unbook,
                      ObjectProvider<org.home.data.revx.RateCheck> rateCheck,
                      ObjectProvider<org.home.data.revx.exec.OrderProbe> orderProbe,
                      ObjectProvider<org.home.data.revx.exec.Panic> panic,
@@ -146,6 +148,7 @@ public class CliRunner implements ApplicationRunner {
         this.fateProbe = fateProbe;
         this.audit = audit;
         this.releaseStale = releaseStale;
+        this.unbook = unbook;
         this.rateCheck = rateCheck;
         this.orderProbe = orderProbe;
         this.panic = panic;
@@ -251,6 +254,13 @@ public class CliRunner implements ApplicationRunner {
                 // Только GET: сводит площадку, реестр и журналы ботов.
                 audit.getObject().run(firstOr(args, "alloc", ""),
                         firstOr(args, "out", ""));
+            }
+            if (args.containsOption("revx-unbook")) {
+                // Убирает повторно записанное исполнение; без --apply только показывает.
+                unbook.getObject().run(firstOr(args, "journal", ""),
+                        firstOr(args, "bot", ""), firstOr(args, "currency", ""),
+                        firstOr(args, "alloc", ""), firstOr(args, "from", ""),
+                        args.containsOption("apply"));
             }
             if (args.containsOption("revx-release-stale")) {
                 // Снимает претензию на монету, которую бот больше не торгует.

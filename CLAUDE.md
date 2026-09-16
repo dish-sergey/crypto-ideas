@@ -46,6 +46,7 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun --args='--revx-audit'  # СВЕРКА УЧЁТА: площадка ↔ реестр ↔ журналы, только GET
 ./gradlew bootRun --args='--revx-order-status --order-id=<id>[,<id>]'  # что площадка говорит о конкретной заявке
 ./gradlew bootRun --args='--revx-release-stale --bot=d --currency=ADA --journal=<путь>'  # снять претензию на монету, которую бот больше не торгует
+./gradlew bootRun --args='--revx-unbook --journal=<путь> --from=<ISO> [--bot=a --currency=BTC --apply]'  # убрать повторно записанное исполнение
 ```
 
 
