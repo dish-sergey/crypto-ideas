@@ -99,6 +99,24 @@ public final class InfoBot implements Runnable {
      */
     private final String bookPath;
 
+    /**
+     * ⚠️ СКОЛЬКО МОЛЧАНИЯ ЗНАЧИТ «ПОТОК КОТИРОВАНИЯ МЁРТВ» (задача A64).
+     *
+     * Тик пишется примерно раз в секунду и пишется ВО ВСЕХ известных паузах:
+     * и когда закрыт гейт по опоре, и при отводе на затыке площадки
+     * ({@code venue_stall}), и при заморозке резерва — там меняется только
+     * {@code reason}, а запись остаётся. Поэтому у ВКЛЮЧЁННОГО бота молчание
+     * дольше нескольких минут не бывает штатным: это мёртвый поток.
+     *
+     * Три минуты, а не одна: перезапуск процесса гасит котирование
+     * ({@code boot} считается выключением), значит пауза на выкатку под порог не
+     * попадает вовсе, и запас нужен только на редкий долгий цикл опроса.
+     */
+    static final long SILENCE_MS = 3 * 60_000L;
+
+    /** Кому уже сказали про молчание и когда — чтобы не повторять каждый цикл. */
+    private final java.util.Map<String, Long> silenceTold = new java.util.HashMap<>();
+
     public InfoBot(String token, long chatId, List<Watched> watched) {
         this(token, chatId, watched,
                 System.getProperty("revx.info.alloc", "../revx-shared/alloc.db"));
@@ -161,6 +179,7 @@ public final class InfoBot implements Runnable {
                     Thread.sleep(2000);
                     continue;
                 }
+                watchSilence();
                 for (JsonNode update : JSON.readTree(body).path("result")) {
                     offset = update.path("update_id").asLong() + 1;
                     String text = update.path("message").path("text").asText("").trim();
@@ -201,6 +220,10 @@ public final class InfoBot implements Runnable {
                     /all — котирование, форма сетки, инвентарь, сделки и доход
                     /pnl — доход за 24 часа и за 7 суток, плюс нереализованное
                     /alloc — кто что держит за собой и сколько ничейного
+
+                    💀 МОЛЧИТ — котирование числится включённым, а тиков нет:
+                    поток котирования мёртв, systemd этого НЕ видит. Про это
+                    сводка сообщает сама, не дожидаясь вопроса.
 
                     Ничейное — монета, не записанная ни за одним ботом: ею никто
                     не торгует, пока кто-нибудь не сделает /claim в своём чате.
@@ -395,6 +418,78 @@ public final class InfoBot implements Runnable {
         }
     }
 
+    /**
+     * 🔑 СТОРОЖ МОЛЧАНИЯ: единственное, чего не видит ни systemd, ни сводка по запросу.
+     *
+     * <h2>Зачем</h2>
+     *
+     * 16.09.2026 пять ботов из шести умерли в течение часа после выкатки:
+     * {@code app.jar} перезаписали ПОД работающими процессами, Spring грузит
+     * классы лениво, и на первом же исключении, которое надо было залогировать,
+     * поток котирования падал с
+     * {@code ClassNotFoundException: ch.qos.logback.classic.spi.ThrowableProxy}.
+     * Процесс при этом жив — в нём остаётся опрос Telegram, — поэтому
+     * {@code systemctl} двадцать три часа показывал {@code active (running)}, а
+     * {@code /all} показывал 🟢 «торгует»: флаг котирования берётся из журнала, а
+     * там записан {@code start}. Единственным признаком была строка «тик 23 ч» в
+     * конце блока, и её никто не прочитал.
+     *
+     * <h2>Почему именно тик, а не сердцебиение реестра</h2>
+     *
+     * Сердцебиение живёт в {@code alloc.db} и есть только у бота, за которым
+     * что-то записано. Бот с нулевой претензией (а после массового
+     * {@code /release} такими были все пятеро) в реестре невидим, а тик пишет
+     * каждый работающий котировщик независимо ни от чего.
+     *
+     * <h2>Тревога, а не строка в сводке</h2>
+     *
+     * По правилу владельца будить можно тем, что внутри не сходится. Бот,
+     * который числится включённым и при этом не тикает, — ровно этот случай:
+     * он не работает и сам об этом сказать не может. Повтор не чаще раза в час,
+     * и отдельным сообщением — когда ожил.
+     */
+    void watchSilence() {                                // пакетный доступ: тест
+        long now = System.currentTimeMillis();
+        for (Watched w : watched) {
+            // ⚠️ НЕ read(w): тот строит книгу партий по ВСЕМ исполнениям журнала,
+            // а сторожу нужны два числа. На машине одно ядро на шесть ботов и
+            // сборщик, и отчёт раз в двадцать пять секунд обошёлся бы дороже
+            // того, что он сторожит.
+            long lastTick;
+            boolean quoting;
+            try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
+                quoting = j.quotingOn();
+                lastTick = j.lastQuoteMs();
+            } catch (Exception e) {
+                continue;             // журнала нет — про это скажет /all строкой
+            }
+            String id = w.botId().toLowerCase(Locale.ROOT);
+            boolean silent = quoting && lastTick > 0 && now - lastTick > SILENCE_MS;
+            Long told = silenceTold.get(id);
+            if (!silent) {
+                if (told != null) {
+                    silenceTold.remove(id);
+                    send("🟢 " + w.botId().toUpperCase(Locale.ROOT) + " " + w.symbol()
+                            + " снова тикает.");
+                }
+                continue;
+            }
+            if (told != null && now - told < 3_600_000L) {
+                continue;                                // уже сказали, ждём час
+            }
+            silenceTold.put(id, now);
+            send(("💀 %s %s МОЛЧИТ %s: котирование числится ВКЛЮЧЁННЫМ, а тиков нет.%n"
+                    + "Поток котирования мёртв — systemd этого не видит, он показывает "
+                    + "active (running).%n"
+                    + "Проверить: есть ли в процессе поток revx-quote-loop; если нет — "
+                    + "перезапустить службу.%n"
+                    + "⚠️ Самая частая причина — app.jar перезаписан под работающим "
+                    + "процессом (классы грузятся лениво).")
+                    .formatted(w.botId().toUpperCase(Locale.ROOT), w.symbol(),
+                            ago(now - lastTick)));
+        }
+    }
+
     private String all() {
         long now = System.currentTimeMillis();
         StringBuilder sb = new StringBuilder("СВОДКА ПО ИСПОЛНИТЕЛЯМ\n\n");
@@ -417,8 +512,19 @@ public final class InfoBot implements Runnable {
             // 🟡 включён, но НЕ торгует: гейт закрыт, заявки в отводе. Именно это
             // состояние прежде выглядело рабочим и стоило боту E трёх четвертей
             // суточного бюджета постановок за час.
-            String mark = !s.quoting() ? "⚪" : s.trading() ? "🟢" : "🟡";
-            String what = !s.quoting() ? "выключен"
+            // ⚠️ ЧЕТВЁРТОЕ СОСТОЯНИЕ — 💀 МОЛЧИТ, и оно старше остальных трёх.
+            //
+            // Флаг котирования берётся из журнала, а журнал помнит команду
+            // человека, а не то, жив ли поток. 16.09.2026 пять мёртвых ботов
+            // двадцать три часа показывались зелёными «торгует» (задача A64):
+            // поток котирования упал, а запись `start` в журнале осталась.
+            // Поэтому молчание проверяется ПЕРЕД тем, как верить флагу.
+            boolean silent = s.quoting() && s.lastEventMs() > 0
+                    && now - s.lastEventMs() > SILENCE_MS;
+            String mark = silent ? "💀" : !s.quoting() ? "⚪" : s.trading() ? "🟢" : "🟡";
+            String what = silent
+                    ? "МОЛЧИТ " + age + " — поток котирования мёртв (systemd этого не видит)"
+                    : !s.quoting() ? "выключен"
                     : s.trading() ? "торгует"
                     : "НЕ ТОРГУЕТ: " + (s.pausedReason() == null ? "гейт закрыт" : s.pausedReason());
             // Доля бюджета важнее самого числа: у ботов разные потолки, и «60»
@@ -641,13 +747,17 @@ public final class InfoBot implements Runnable {
                 double qty = bot.getValue()[0];
                 long beat = (long) bot.getValue()[1];
                 claimed += qty;
-                if (qty <= 0) {
-                    continue;                      // нулевые не показываем: их много и они пусты
-                }
                 // ⚠️ Мёртвый бот продолжает держать резервацию, пока её не
                 // распустят. Отметка времени показывает, жив ли он.
                 String stale = now - beat > 10 * 60_000L
                         ? "  ⚠️ молчит " + ago(now - beat) : "";
+                // ⚠️ НУЛЕВЫЕ ПРЯЧЕМ, НО НЕ МОЛЧАЩИЕ (задача A64). После массового
+                // `/release` 16.09.2026 у всех пяти мёртвых ботов претензия по
+                // монете была нулём — и они пропали из этой таблицы целиком,
+                // ровно тогда, когда о них надо было сказать.
+                if (qty <= 0 && stale.isEmpty()) {
+                    continue;                      // нулевые не показываем: их много и они пусты
+                }
                 rows.append(String.format(Locale.ROOT, "  %s  %s%s%n",
                         bot.getKey().toUpperCase(Locale.ROOT), trim(qty), stale));
             }
