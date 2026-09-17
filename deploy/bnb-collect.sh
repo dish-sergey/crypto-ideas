@@ -18,18 +18,74 @@
 # `/stream?streams=a/b` подключается и молчит — ни ошибки, ни данных. Та же
 # грабля описана в CLAUDE.md для фьючерсов и повторилась на споте 16.09.2026:
 # двадцать секунд тишины вместо потока. Работает `/ws` + SUBSCRIBE.
+#
+# 🔑 ⚠️ ПОЧЕМУ ЗДЕСЬ FIFO, А НЕ `{ echo …; sleep 86400; } | websocat`
+#
+# Первая версия держала подписку открытой суточным `sleep` в первом звене
+# конвейера. 16.09.2026 в 18:01 websocat умер («WebSocketError: I/O failure»),
+# читатель получил EOF и закончился — а оболочка ждала ВСЕГО конвейера, то есть
+# того самого `sleep 86400`. Цикл не перезапустился, и захват молчал **23 часа**,
+# ровно до момента, когда сутки истекли (16:53:58 + 86400). Служба при этом всё
+# время была `active`, рестартов ноль.
+#
+# Потеряно 16.09 18:01 → 17.09 16:54, и восстановить это нельзя: bookTicker
+# спота в архив Бинанса не попадает.
+#
+# Теперь подписку держит ФОНОВЫЙ процесс через FIFO. Когда websocat умирает,
+# конвейер заканчивается сразу, держатель убивается, и через две секунды
+# начинается новая сессия. Плюс `--ping-timeout`: молчащее соединение (pong не
+# пришёл) рвётся само, а не висит до конца суток.
+#
+# 🔑 ⚠️ ФАЙЛ ВЫБИРАЕТСЯ ПО КАЖДОМУ СООБЩЕНИЮ, А НЕ ОДИН РАЗ НА СЕССИЮ.
+#
+# Прежний `DAY=$(date …)` вычислялся при старте сессии, и сессия, начавшаяся в
+# 16:53, писала данные СЛЕДУЮЩИХ суток в файл предыдущего дня. А ночная чистка
+# (`bnb-prune.sh`) жмёт «вчерашний» файл — то есть gzip забрал бы файл, в который
+# служба ещё пишет:оригинал удаляется, запись уходит в отвязанный inode и пропадает.
+# Одна отметка времени даёт и миллисекунды, и дату — то же число вызовов `date`.
 set -u
 OUT="${OUT:-$HOME/binance-book}"
 SYMS='"btcusdc@bookTicker","ethusdc@bookTicker","solusdc@bookTicker"'
+PING_INTERVAL="${PING_INTERVAL:-20}"
+PING_TIMEOUT="${PING_TIMEOUT:-30}"
 mkdir -p "$OUT"
+
+FIFO="$(mktemp -u "${TMPDIR:-/tmp}/bnb-sub.XXXXXX")"
+cleanup() {
+    [ -n "${HOLDER:-}" ] && kill "$HOLDER" 2>/dev/null
+    rm -f "$FIFO"
+}
+trap cleanup EXIT
+
 while true; do
-  DAY=$(date -u +%Y-%m-%d)
-  { echo "{\"method\":\"SUBSCRIBE\",\"params\":[$SYMS],\"id\":1}"; sleep 86400; } \
-    | timeout 86400 "$HOME/bin/websocat" -t --ping-interval 20 "wss://stream.binance.com:9443/ws" \
-    | while IFS= read -r line; do
-        # Время ПРИЁМА: у bookTicker спота своей отметки нет, а нам важен момент,
-        # когда мы БЫ узнали.
-        printf '%s %s\n' "$(date -u +%s%3N)" "$line"
-      done >> "$OUT/book-$DAY.jsonl"
-  sleep 2
+    rm -f "$FIFO"
+    mkfifo "$FIFO" || { sleep 5; continue; }
+    # Держатель: отдаёт подписку и НЕ закрывает канал, пока его не убьют.
+    # Короткие `sleep` вместо одного длинного — чтобы kill срабатывал сразу.
+    (
+        echo "{\"method\":\"SUBSCRIBE\",\"params\":[$SYMS],\"id\":1}"
+        while :; do sleep 10; done
+    ) > "$FIFO" &
+    HOLDER=$!
+
+    # ⚠️ ФЛАГ -E ОБЯЗАТЕЛЕН РЯДОМ С ПИНГАМИ. Сам websocat предупреждает:
+    # «--ping-interval is currently not very effective without -E or -U» — то
+    # есть без него сторож молчащего соединения бесполезен, а он тут главный.
+    # -E закрывает передачу, когда другая сторона дала EOF; наш FIFO не
+    # закрывается никогда, поэтому преждевременного выхода он не вызовет —
+    # только нужный при обрыве со стороны Бинанса.
+    "$HOME/bin/websocat" -t -E --ping-interval "$PING_INTERVAL" \
+        --ping-timeout "$PING_TIMEOUT" "wss://stream.binance.com:9443/ws" < "$FIFO" \
+        | while IFS= read -r line; do
+            # Время ПРИЁМА: у bookTicker спота своей отметки нет, а нам важен
+            # момент, когда мы БЫ узнали. Дата берётся из того же вызова `date`.
+            stamp=$(date -u +"%s%3N %Y-%m-%d")
+            printf '%s %s\n' "${stamp% *}" "$line" >> "$OUT/book-${stamp#* }.jsonl"
+        done
+
+    kill "$HOLDER" 2>/dev/null
+    wait "$HOLDER" 2>/dev/null
+    HOLDER=
+    echo "$(date -u +%FT%TZ) сессия закончилась, переподключаюсь" >&2
+    sleep 2
 done
