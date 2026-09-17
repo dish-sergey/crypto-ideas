@@ -117,6 +117,35 @@ public final class InfoBot implements Runnable {
     /** Кому уже сказали про молчание и когда — чтобы не повторять каждый цикл. */
     private final java.util.Map<String, Long> silenceTold = new java.util.HashMap<>();
 
+    /**
+     * ⚠️ ПОРОГИ ПО ДИСКУ. Отказ записи книги невосполним (принцип 4), поэтому
+     * будить надо ЗАРАНЕЕ, а не по факту.
+     *
+     * Величины — из измеренного прироста: книга даёт 600–800 МБ в сутки при
+     * глубине 50 уровней на торгуемых парах. Значит 5 ГБ — это неделя запаса
+     * (успеть спокойно), 2 ГБ — двое-трое суток (бросать другое и чистить).
+     */
+    static final long DISK_WARN_BYTES = 5L * 1024 * 1024 * 1024;
+    static final long DISK_CRIT_BYTES = 2L * 1024 * 1024 * 1024;
+
+    /**
+     * ⚠️ СКОЛЬКО СУТОК КНИГИ ЗНАЧИТ «ЧИСТКА НЕ РАБОТАЕТ».
+     *
+     * Ночная чистка держит 14 суток (`RETAIN_DAYS` в `revx-prune.sh`). Если
+     * книга на ARM лежит заметно дольше — значит чистка не доехала, и это видно
+     * за дни до того, как кончится место. 13–17.09.2026 она падала через день на
+     * замке SQLite и никто не знал (задача A65); сводка смотрит на ту же машину,
+     * где лежит база, и может сказать это сама.
+     *
+     * Порог 17, а не 15: сутки на неудачный прогон — нормально (чистка идёт
+     * партиями и может не добрать за один раз), двое — уже повод посмотреть.
+     */
+    static final double BOOK_DAYS_ALARM = 17.0;
+
+    /** Когда последний раз говорили про диск и про залежавшуюся книгу. */
+    private long diskTold;
+    private long bookTold;
+
     public InfoBot(String token, long chatId, List<Watched> watched) {
         this(token, chatId, watched,
                 System.getProperty("revx.info.alloc", "../revx-shared/alloc.db"));
@@ -180,6 +209,7 @@ public final class InfoBot implements Runnable {
                     continue;
                 }
                 watchSilence();
+                watchDisk();
                 for (JsonNode update : JSON.readTree(body).path("result")) {
                     offset = update.path("update_id").asLong() + 1;
                     String text = update.path("message").path("text").asText("").trim();
@@ -220,6 +250,10 @@ public final class InfoBot implements Runnable {
                     /all — котирование, форма сетки, инвентарь, сделки и доход
                     /pnl — доход за 24 часа и за 7 суток, плюс нереализованное
                     /alloc — кто что держит за собой и сколько ничейного
+
+                    Снизу в /all — состояние диска: свободно, прирост книги и
+                    на сколько суток запаса, если ночная чистка сломается.
+                    Про диск и про залежавшуюся книгу сводка говорит сама.
 
                     💀 МОЛЧИТ — котирование числится включённым, а тиков нет:
                     поток котирования мёртв, systemd этого НЕ видит. Про это
@@ -566,6 +600,17 @@ public final class InfoBot implements Runnable {
         // строками выше, а это худший вид неправды в отчёте.
         sb.append(hiddenNote());
         sb.append(unownedNote());
+        // Диск — не про ботов, но это единственный прибор, который на него
+        // смотрит: сводка живёт на той же машине, где пишется книга.
+        Disk d = disk();
+        if (d != null) {
+            sb.append('\n').append(d.freeBytes() < DISK_WARN_BYTES ? "⚠️ " : "")
+                    .append(d.line()).append('\n');
+            if (d.bookDays() > BOOK_DAYS_ALARM) {
+                sb.append("⚠️ книга лежит дольше плановых 14 суток — ночная чистка "
+                        + "не доехала (~/revx-prune.log на micro)\n");
+            }
+        }
         return sb.toString();
     }
 
@@ -661,6 +706,131 @@ public final class InfoBot implements Runnable {
      * USDC сам себе цена: без этого он выпал бы из суммы, а его в ничейном
      * обычно больше всего.
      */
+    /**
+     * СОСТОЯНИЕ ДИСКА И КНИГИ — то, чего не видно ни в одном журнале.
+     *
+     * <h2>Зачем в сводке</h2>
+     *
+     * Сводный бот живёт на той же машине, где лежит база сборщика, и это
+     * единственный наш прибор, который может посмотреть на диск НЕ по просьбе
+     * человека. 17.09.2026 диск дошёл до 92% (4 ГБ), и узналось это случайно —
+     * при разборе другой поломки. Отказ записи книги невосполним (принцип 4).
+     *
+     * <h2>Почему «суток запаса», а не только гигабайты</h2>
+     *
+     * Гигабайты сами по себе ничего не говорят: при 600–800 МБ в сутки пять
+     * свободных — это неделя, а при остановленном сборщике — вечность. Прирост
+     * считается из самой базы: её размер, поделённый на длину окна книги. ⚠️ Это
+     * ОЦЕНКА СВЕРХУ и по построению отвечает на вопрос «сколько осталось, если
+     * чистка снова сломается»: при работающей чистке файл не растёт вовсе.
+     */
+    record Disk(long totalBytes, long freeBytes, long dbBytes, double bookDays) {
+        int usedPct() {
+            return totalBytes <= 0 ? 0
+                    : (int) Math.round(100.0 * (totalBytes - freeBytes) / totalBytes);
+        }
+
+        /** ГБ в сутки: размер базы на длину окна книги. */
+        double gbPerDay() {
+            return bookDays > 0.5 ? dbBytes / 1073741824.0 / bookDays : 0;
+        }
+
+        /** Сколько суток до отказа записи, если чистка не работает. */
+        double daysLeft() {
+            double rate = gbPerDay();
+            return rate > 0.01 ? freeBytes / 1073741824.0 / rate : Double.POSITIVE_INFINITY;
+        }
+
+        String line() {
+            StringBuilder sb = new StringBuilder(String.format(Locale.ROOT,
+                    "диск %d%%, свободно %.1f ГБ из %.0f",
+                    usedPct(), freeBytes / 1073741824.0, totalBytes / 1073741824.0));
+            if (dbBytes > 0 && bookDays > 0.5) {
+                sb.append(String.format(Locale.ROOT,
+                        "; книга %.1f ГБ за %.1f сут (%.2f ГБ/сут)",
+                        dbBytes / 1073741824.0, bookDays, gbPerDay()));
+                double left = daysLeft();
+                if (Double.isFinite(left)) {
+                    sb.append(String.format(Locale.ROOT,
+                            " → при сломанной чистке хватит на %.0f сут", left));
+                }
+            }
+            return sb.toString();
+        }
+    }
+
+    /** Диск и окно книги. Возвращает null, если базы сборщика не видно. */
+    Disk disk() {                                        // пакетный доступ: тест
+        try {
+            java.nio.file.Path db = java.nio.file.Path.of(bookPath);
+            java.nio.file.Path where = java.nio.file.Files.exists(db) ? db
+                    : db.toAbsolutePath().getParent();
+            if (where == null) {
+                return null;
+            }
+            java.nio.file.FileStore fs = java.nio.file.Files.getFileStore(where);
+            long size = java.nio.file.Files.exists(db) ? java.nio.file.Files.size(db) : 0;
+            double days = 0;
+            if (size > 0) {
+                try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                        "jdbc:sqlite:file:" + bookPath + "?mode=ro");
+                     java.sql.Statement st = c.createStatement();
+                     java.sql.ResultSet rs = st.executeQuery(
+                             "SELECT min(t_recv_ms), max(t_recv_ms) FROM revx_book")) {
+                    if (rs.next() && rs.getLong(1) > 0) {
+                        days = (rs.getLong(2) - rs.getLong(1)) / 86_400_000.0;
+                    }
+                }
+            }
+            return new Disk(fs.getTotalSpace(), fs.getUsableSpace(), size, days);
+        } catch (Exception e) {
+            log.debug("состояние диска недоступно: {}", e.toString());
+            return null;
+        }
+    }
+
+    /**
+     * 🔑 ТРЕВОГА ПО ДИСКУ И ПО ЗАЛЕЖАВШЕЙСЯ КНИГЕ.
+     *
+     * Два независимых признака одной беды, и второй срабатывает раньше:
+     * <ul>
+     *   <li><b>место</b> — меньше 5 ГБ (неделя) и меньше 2 ГБ (двое суток);</li>
+     *   <li><b>окно книги</b> — если книга лежит дольше {@link #BOOK_DAYS_ALARM}
+     *       суток, значит ночная чистка не доехала. Это видно ЗА ДНИ до того,
+     *       как кончится место, и именно это проспали 13–17.09.2026.</li>
+     * </ul>
+     *
+     * Повтор не чаще раза в час, как у сторожа заморозки: будить каждую минуту
+     * значит приучить не смотреть.
+     */
+    void watchDisk() {                                   // пакетный доступ: тест
+        Disk d = disk();
+        if (d == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (d.freeBytes() < DISK_WARN_BYTES && now - diskTold > 3_600_000L) {
+            diskTold = now;
+            send((d.freeBytes() < DISK_CRIT_BYTES ? "🔴 " : "⚠️ ")
+                    + "МЕСТО НА ДИСКЕ: " + d.line() + ".\n"
+                    + "Отказ записи книги невосполним. Убирать: копии app.jar.bak-* "
+                    + "в каталогах ботов и логи прогонов; чистку книги гоняет micro "
+                    + "(revx-prune.sh, 04:45 UTC) — проверить, что она не падает.");
+        } else if (d.freeBytes() >= DISK_WARN_BYTES && diskTold > 0) {
+            diskTold = 0;
+            send("🟢 С диском снова порядок: " + d.line() + ".");
+        }
+        if (d.bookDays() > BOOK_DAYS_ALARM && now - bookTold > 3_600_000L) {
+            bookTold = now;
+            send(String.format(Locale.ROOT,
+                    "⚠️ КНИГА ЛЕЖИТ %.1f СУТОК при плане 14: ночная чистка не доехала.%n"
+                            + "Смотреть ~/revx-prune.log на micro. Место: %s",
+                    d.bookDays(), d.line()));
+        } else if (d.bookDays() <= BOOK_DAYS_ALARM && bookTold > 0) {
+            bookTold = 0;
+        }
+    }
+
     private java.util.Map<String, Double> prices(java.util.Collection<String> currencies) {
         java.util.Map<String, Double> out = new java.util.HashMap<>();
         out.put("USDC", 1.0);
