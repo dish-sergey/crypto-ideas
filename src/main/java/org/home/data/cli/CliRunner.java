@@ -91,6 +91,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.Executor> executor;
     private final ObjectProvider<org.home.data.revx.exec.ExecReport> execReport;
     private final ObjectProvider<org.home.data.revx.exec.HoldCheck> holdCheck;
+    private final ObjectProvider<org.home.data.revx.exec.CarryReport> carryReport;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
     /** Кого наблюдает сводный бот: метка:пара:путь. */
@@ -122,6 +123,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.Executor> executor,
                      ObjectProvider<org.home.data.revx.exec.ExecReport> execReport,
                      ObjectProvider<org.home.data.revx.exec.HoldCheck> holdCheck,
+                     ObjectProvider<org.home.data.revx.exec.CarryReport> carryReport,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols,
                      @Value("${revx.info.bots}") List<String> infoBots) {
@@ -160,6 +162,7 @@ public class CliRunner implements ApplicationRunner {
         this.executor = executor;
         this.execReport = execReport;
         this.holdCheck = holdCheck;
+        this.carryReport = carryReport;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
         this.infoBots = infoBots;
@@ -401,6 +404,19 @@ public class CliRunner implements ApplicationRunner {
                         // не сверены — на этом числе висит весь вывод про выход.
                         Double.parseDouble(firstOr(args, "taker-cost-bp", "16.4")),
                         firstOr(args, "out", "reports/revx_hold.md"));
+            }
+            if (args.containsOption("revx-carry")) {
+                long to = args.containsOption("to")
+                        ? java.time.Instant.parse(firstOr(args, "to", "")).toEpochMilli()
+                        : System.currentTimeMillis();
+                long hours = Long.parseLong(firstOr(args, "hours", "0"));
+                carryReport.getObject().run(
+                        firstOr(args, "journals", firstOr(args, "journal", "state/exec.db")),
+                        args.containsOption("from")
+                                ? java.time.Instant.parse(firstOr(args, "from", "")).toEpochMilli()
+                                : (hours > 0 ? to - hours * 3_600_000L : 0L),
+                        to,
+                        firstOr(args, "out", ""));
             }
             if (args.containsOption("revx-offset-axis")) {
                 org.home.data.revx.exec.OffsetAxis.run(

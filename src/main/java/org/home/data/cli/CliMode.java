@@ -37,7 +37,7 @@ public class CliMode {
             "revx-pair-sweep", "revx-info", "revx-assemble", "revx-fill-check",
             "revx-order", "revx-book", "revx-depth-probe", "revx-flow-markout",
             "revx-hold-check", "revx-fate-probe", "revx-rate-check", "revx-offset-axis", "revx-order-status", "revx-audit",
-            "revx-paired", "revx-release-stale", "revx-unbook");
+            "revx-paired", "revx-release-stale", "revx-unbook", "revx-carry");
 
     /**
      * Параметры команд. Их нельзя считать неизвестными опциями: они не запускают
