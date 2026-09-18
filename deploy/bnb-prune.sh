@@ -2,7 +2,9 @@
 # Сжать вчерашний захват Бинанса и убрать старое.
 # ⚠️ Сегодняшний файл НЕ ТРОГАЕМ: в него пишет живая служба.
 set -u
-DIR="$HOME/binance-book"
+# ⚠️ Каталог берётся из окружения: тем же скриптом жмётся захват Kraken
+# (`DIR=$HOME/kraken-book`), чтобы не держать две копии одной логики.
+DIR="${DIR:-$HOME/binance-book}"
 TODAY=$(date -u +%Y-%m-%d)
 for f in "$DIR"/book-*.jsonl; do
   [ -e "$f" ] || continue

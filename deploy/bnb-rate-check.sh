@@ -24,6 +24,9 @@ DIR="${DIR:-$HOME/binance-book}"
 # восстановление заняло 3.3 секунды.
 MAX_AGE_SECONDS="${MAX_AGE_SECONDS:-300}"
 STATE="${STATE:-$HOME/.bnb-rate-state}"
+# Ярлык в тревоге: тот же скрипт сторожит и захват Kraken (LABEL, DIR, STATE).
+LABEL="${LABEL:-ЗАХВАТ БИНАНСА}"
+SERVICE="${SERVICE:-bnb-book}"
 BOT_FILE="${BOT_FILE:-$HOME/s5/telegram/s5_bot.txt}"
 
 alert() {
@@ -43,7 +46,7 @@ alert() {
         fi
         curl -sS -o /dev/null --max-time 20 \
             --data-urlencode "chat_id=$chat" \
-            --data-urlencode "text=🔧 ЗАХВАТ БИНАНСА (это НЕ S5): $text" \
+            --data-urlencode "text=🔧 $LABEL (это НЕ S5): $text" \
             "https://api.telegram.org/bot$token/sendMessage" || true
     fi
 }
@@ -54,7 +57,7 @@ previous=$(cat "$STATE" 2>/dev/null || echo ok)
 # может быть и вчерашний, если поток в этот момент затих.
 newest=$(ls -t "$DIR"/book-*.jsonl 2>/dev/null | head -1 || true)
 if [ -z "$newest" ]; then
-    [ "$previous" = "nofile" ] || alert "в $DIR нет ни одного открытого файла захвата — служба bnb-book не пишет вовсе"
+    [ "$previous" = "nofile" ] || alert "в $DIR нет ни одного открытого файла захвата — служба $SERVICE не пишет вовсе"
     echo nofile > "$STATE"
     exit 0
 fi
@@ -73,7 +76,7 @@ esac
 age=$(( ( $(date -u +%s%3N) - last_ms ) / 1000 ))
 
 if [ "$age" -gt "$MAX_AGE_SECONDS" ]; then
-    [ "$previous" = "stale" ] || alert "тишина $((age / 60)) мин (порог $((MAX_AGE_SECONDS / 60))): последняя строка $(date -u -d "@$((last_ms / 1000))" +%FT%TZ) в $(basename "$newest"). Проверить: systemctl status bnb-book, ps -C websocat"
+    [ "$previous" = "stale" ] || alert "тишина $((age / 60)) мин (порог $((MAX_AGE_SECONDS / 60))): последняя строка $(date -u -d "@$((last_ms / 1000))" +%FT%TZ) в $(basename "$newest"). Проверить: systemctl status $SERVICE, ps -C websocat"
     echo stale > "$STATE"
     exit 0
 fi

@@ -1,0 +1,14 @@
+[Unit]
+Description=Kraken Futures ticker capture (PF_XBTUSD/ETH/SOL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/home/ubuntu/bin/kr-collect.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
