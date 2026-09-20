@@ -92,6 +92,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.ExecReport> execReport;
     private final ObjectProvider<org.home.data.revx.exec.HoldCheck> holdCheck;
     private final ObjectProvider<org.home.data.revx.exec.CarryReport> carryReport;
+    private final ObjectProvider<org.home.data.revx.exec.LeadCheck> leadCheck;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
     /** Кого наблюдает сводный бот: метка:пара:путь. */
@@ -124,6 +125,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.ExecReport> execReport,
                      ObjectProvider<org.home.data.revx.exec.HoldCheck> holdCheck,
                      ObjectProvider<org.home.data.revx.exec.CarryReport> carryReport,
+                     ObjectProvider<org.home.data.revx.exec.LeadCheck> leadCheck,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols,
                      @Value("${revx.info.bots}") List<String> infoBots) {
@@ -163,6 +165,7 @@ public class CliRunner implements ApplicationRunner {
         this.execReport = execReport;
         this.holdCheck = holdCheck;
         this.carryReport = carryReport;
+        this.leadCheck = leadCheck;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
         this.infoBots = infoBots;
@@ -404,6 +407,14 @@ public class CliRunner implements ApplicationRunner {
                         // не сверены — на этом числе висит весь вывод про выход.
                         Double.parseDouble(firstOr(args, "taker-cost-bp", "16.4")),
                         firstOr(args, "out", "reports/revx_hold.md"));
+            }
+            if (args.containsOption("revx-lead")) {
+                leadCheck.getObject().run(
+                        firstOr(args, "captures", ""),
+                        firstOr(args, "journals", ""),
+                        firstOr(args, "from", ""),
+                        firstOr(args, "to", ""),
+                        firstOr(args, "out", ""));
             }
             if (args.containsOption("revx-carry")) {
                 long to = args.containsOption("to")
