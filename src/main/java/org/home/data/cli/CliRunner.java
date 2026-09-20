@@ -416,6 +416,7 @@ public class CliRunner implements ApplicationRunner {
                         firstOr(args, "journals", ""),
                         Double.parseDouble(firstOr(args, "band", "3")),
                         Double.parseDouble(firstOr(args, "fee-bp", "2")),
+                        Double.parseDouble(firstOr(args, "step-usd", "0")),
                         firstOr(args, "from", ""),
                         firstOr(args, "to", ""),
                         firstOr(args, "out", ""));

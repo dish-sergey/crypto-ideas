@@ -109,7 +109,20 @@ public class HedgeOverlay {
         this.marks = marks;
     }
 
-    public void run(String journals, double bandLots, double feeBp,
+    /**
+     *  stepUsd подмена шага контракта, в долларах. Ноль — настоящий шаг
+     *        площадки из { #STEP}.
+     *
+     *        ⚠️ Зачем подмена. На BTC шаг 0.0001 BTC = 2.7 наших лота, и хедж
+     *        просто не включается: инвентарь до такого редко доходит. Это
+     *        МЕХАНИЧЕСКОЕ препятствие, а не свойство хеджа, и их надо различать —
+     *        иначе «на BTC не работает» читается как приговор механизму, хотя
+     *        означает «лот втрое мельче, чем нужно площадке». Подменив шаг на
+     *        доллар, получаем ответ на вопрос «заработал бы механизм, будь
+     *        гранулярность как у SOL» — и, значит, стоит ли переходить на лот
+     *        около $9, где шаг BTC сам станет меньше лота.
+     */
+    public void run(String journals, double bandLots, double feeBp, double stepUsd,
                     String fromIso, String toIso, String out) {
         long from = fromIso == null || fromIso.isBlank() ? 0 : Instant.parse(fromIso).toEpochMilli();
         long to = toIso == null || toIso.isBlank() ? Long.MAX_VALUE : Instant.parse(toIso).toEpochMilli();
@@ -159,7 +172,8 @@ public class HedgeOverlay {
                 continue;
             }
             double lot = s.lot;
-            double step = STEP.getOrDefault(base, 1e-4);
+            double price = s.fair[0];
+            double step = stepUsd > 0 ? stepUsd / price : STEP.getOrDefault(base, 1e-4);
             Result plain = evaluate(s, null, 0, 0, 0);
             Result hedged = evaluate(s, mark, bandLots * lot, step, feeBp / 1e4);
             sb.append("| ").append(b.id()).append(" | ").append(base)
