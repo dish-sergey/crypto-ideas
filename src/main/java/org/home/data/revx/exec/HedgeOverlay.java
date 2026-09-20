@@ -156,6 +156,8 @@ public class HedgeOverlay {
         double gapPlainSum = 0;
         double gapHedgedSum = 0;
         int counted = 0;
+        TreeMap<Long, Double> hourPlain = new TreeMap<>();
+        TreeMap<Long, Double> hourHedged = new TreeMap<>();
 
         for (Bot b : bots) {
             Series s = readSeries(b, from, to);
@@ -191,6 +193,10 @@ public class HedgeOverlay {
             exBetaHedged += hedged.split.exBeta();
             gapPlainSum += plain.split.slopeGap();
             gapHedgedSum += hedged.split.slopeGap();
+            // Отрезок — ЧАС, и складываются в нём все боты: внутри часа они
+            // несут один и тот же рынок, и считать их независимыми нельзя.
+            plain.exBetaHour().forEach((h, v) -> hourPlain.merge(h, v, Double::sum));
+            hedged.exBetaHour().forEach((h, v) -> hourHedged.merge(h, v, Double::sum));
             counted++;
         }
 
@@ -205,6 +211,7 @@ public class HedgeOverlay {
                     .append("** | падение минимум ВДВОЕ |\n");
             double ratio = gapHedgedSum == 0 ? 0 : gapPlainSum / gapHedgedSum;
             sb.append("\nРазность наклонов упала в ").append(round(ratio, 2)).append(" раза.\n");
+            sb.append(pairedSection(hourPlain, hourHedged));
         }
 
         String text = sb.toString();
@@ -236,7 +243,19 @@ public class HedgeOverlay {
         double lot;
     }
 
-    private record Result(Split split, int trades) {
+    /**
+     * Итог по одной траектории плюс ЧАСОВОЙ ряд «итога без беты».
+     *
+     * 🔑 Ряд нужен для парного счёта отрезками — того самого, который протокол
+     * 160 (часть V) требует заранее: «итог без беты больше нуля на двух окнах
+     * противоположного направления, с {@code t} ≥ 2 по парному счёту отрезками».
+     * Одна сумма за окно этого вопроса не решает: у неё нет ошибки.
+     *
+     * Ключ — номер часа (эпоха / 3 600 000), значение — приращение итога без
+     * беты за этот час. Сумма ряда равна {@link Split#exBeta()} с точностью до
+     * разрывов в тиках (часы без предшественника в ряд не входят).
+     */
+    private record Result(Split split, int trades, TreeMap<Long, Double> exBetaHour) {
     }
 
     /**
@@ -326,7 +345,111 @@ public class HedgeOverlay {
         double carry = spotCarry + (mark != null ? hedgeCarry : 0);
         double[] slopes = hourlySlopes(hourly);
         return new Result(new Split(capture, beta, carry - beta, fees,
-                slopes[0], slopes[1], (int) slopes[2]), trades);
+                slopes[0], slopes[1], (int) slopes[2]), trades,
+                exBetaByHour(hourly, meanPos));
+    }
+
+    /**
+     * ПАРНЫЙ СЧЁТ ОТРЕЗКАМИ — критерий части V протокола 160.
+     *
+     * Считаются три величины, и путать их нельзя:
+     * <ul>
+     *   <li><b>разность</b> (с хеджем − без хеджа) на ОДНИХ И ТЕХ ЖЕ отрезках —
+     *       работает ли механизм. Рынок в паре сокращается, поэтому ошибка здесь
+     *       мала;</li>
+     *   <li><b>уровень с хеджем</b> против нуля — то самое «итог без беты > 0»,
+     *       которым протокол решает. Тут рынок не сокращается, и ошибка большая;</li>
+     *   <li><b>уровень без хеджа</b> против нуля — контроль.</li>
+     * </ul>
+     *
+     * ⚠️ Отрезки укрупняются до 6 и 24 часов намеренно: соседние часы одного
+     * бота не независимы (позиция переходит через границу часа), и на часовом
+     * отрезке {@code t} завышен. Если знак держится и на суточных блоках — он не
+     * артефакт нарезки.
+     */
+    private String pairedSection(TreeMap<Long, Double> plain, TreeMap<Long, Double> hedged) {
+        List<Long> hours = new ArrayList<>(hedged.keySet());
+        hours.retainAll(plain.keySet());
+        if (hours.size() < 10) {
+            return "\n⚠️ отрезков меньше десяти — парный счёт не считается.\n";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n## Парный счёт отрезками (критерий части V протокола)\n\n");
+        sb.append("| отрезок | отрезков | разность с хеджем − без, $/отрезок | `t` разности")
+                .append(" | уровень С хеджем, $/отрезок | `t` уровня | уровень БЕЗ хеджа | `t` |\n");
+        sb.append("|---|---:|---:|---:|---:|---:|---:|---:|\n");
+        for (int block : new int[]{1, 6, 24}) {
+            TreeMap<Long, double[]> agg = new TreeMap<>();
+            for (long h : hours) {
+                double[] v = agg.computeIfAbsent(Math.floorDiv(h, block), k -> new double[2]);
+                v[0] += plain.get(h);
+                v[1] += hedged.get(h);
+            }
+            if (agg.size() < 5) {
+                continue;
+            }
+            double[] diff = new double[agg.size()];
+            double[] lvlH = new double[agg.size()];
+            double[] lvlP = new double[agg.size()];
+            int i = 0;
+            for (double[] v : agg.values()) {
+                diff[i] = v[1] - v[0];
+                lvlH[i] = v[1];
+                lvlP[i] = v[0];
+                i++;
+            }
+            double[] d = stat(diff);
+            double[] h = stat(lvlH);
+            double[] p = stat(lvlP);
+            sb.append("| ").append(block == 1 ? "час" : block + " ч")
+                    .append(" | ").append(agg.size())
+                    .append(" | ").append(money(d[0])).append(" | **").append(round(d[1], 2))
+                    .append("** | ").append(money(h[0])).append(" | **").append(round(h[1], 2))
+                    .append("** | ").append(money(p[0])).append(" | ").append(round(p[1], 2))
+                    .append(" |\n");
+        }
+        sb.append("\nПорог протокола: `t` ≥ 2 при положительном уровне с хеджем.\n");
+        return sb.toString();
+    }
+
+    /** Среднее и {@code t = среднее / ошибка среднего} по ряду отрезков. */
+    private static double[] stat(double[] x) {
+        int n = x.length;
+        double mean = 0;
+        for (double v : x) {
+            mean += v;
+        }
+        mean /= n;
+        double ss = 0;
+        for (double v : x) {
+            ss += (v - mean) * (v - mean);
+        }
+        double se = n < 2 ? 0 : Math.sqrt(ss / (n - 1.0) / n);
+        return new double[]{mean, se == 0 ? 0 : mean / se};
+    }
+
+    /**
+     * Часовой ряд «итога без беты»: {@code Δкапитал − средний запас × Δопоры}.
+     *
+     * Бета запаса за окно равна {@code средний запас × (конец − начало)}, а это
+     * телескопическая сумма часовых кусков — значит вычитать её можно по часам,
+     * и сумма ряда совпадёт с итогом за окно. Считаются только СОСЕДНИЕ часы,
+     * как и в {@link #hourlySlopes}: через разрыв приращения нет.
+     */
+    private TreeMap<Long, Double> exBetaByHour(TreeMap<Long, double[]> hourly, double meanPos) {
+        TreeMap<Long, Double> out = new TreeMap<>();
+        Long prevHour = null;
+        double[] prev = null;
+        for (Map.Entry<Long, double[]> e : hourly.entrySet()) {
+            if (prev != null && e.getKey() - prevHour == 1) {
+                double dEquity = e.getValue()[0] - prev[0];
+                double dFair = e.getValue()[1] - prev[1];
+                out.put(e.getKey(), dEquity - meanPos * dFair);
+            }
+            prevHour = e.getKey();
+            prev = e.getValue();
+        }
+        return out;
     }
 
     /**
