@@ -95,6 +95,8 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.LeadCheck> leadCheck;
     private final ObjectProvider<org.home.data.revx.exec.HedgeOverlay> hedgeOverlay;
     private final ObjectProvider<org.home.data.revx.exec.CoreRegression> coreRegression;
+    private final ObjectProvider<org.home.data.revx.exec.OffsetSurface> offsetSurface;
+    private final ObjectProvider<org.home.data.revx.exec.SeedGain> seedGain;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
     /** Кого наблюдает сводный бот: метка:пара:путь. */
@@ -130,6 +132,8 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.LeadCheck> leadCheck,
                      ObjectProvider<org.home.data.revx.exec.HedgeOverlay> hedgeOverlay,
                      ObjectProvider<org.home.data.revx.exec.CoreRegression> coreRegression,
+                     ObjectProvider<org.home.data.revx.exec.OffsetSurface> offsetSurface,
+                     ObjectProvider<org.home.data.revx.exec.SeedGain> seedGain,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols,
                      @Value("${revx.info.bots}") List<String> infoBots) {
@@ -172,6 +176,8 @@ public class CliRunner implements ApplicationRunner {
         this.leadCheck = leadCheck;
         this.hedgeOverlay = hedgeOverlay;
         this.coreRegression = coreRegression;
+        this.offsetSurface = offsetSurface;
+        this.seedGain = seedGain;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
         this.infoBots = infoBots;
@@ -428,6 +434,26 @@ public class CliRunner implements ApplicationRunner {
             if (args.containsOption("revx-core")) {
                 coreRegression.getObject().run(
                         firstOr(args, "hours", ""),
+                        firstOr(args, "out", ""));
+            }
+            if (args.containsOption("revx-surface")) {
+                offsetSurface.getObject().run(
+                        firstOr(args, "stand", "D:/revx-data/w10.db"),
+                        firstOr(args, "journals", ""),
+                        firstOr(args, "from", ""),
+                        firstOr(args, "to", ""),
+                        Long.parseLong(firstOr(args, "horizon-ms", "60000")),
+                        Double.parseDouble(firstOr(args, "lot", "2.90")),
+                        Integer.parseInt(firstOr(args, "classes", "4")),
+                        firstOr(args, "out", ""));
+            }
+            if (args.containsOption("revx-seed-gain")) {
+                seedGain.getObject().run(
+                        firstOr(args, "stand", "D:/revx-data/w10.db"),
+                        firstOr(args, "journals", ""),
+                        firstOr(args, "from", ""),
+                        firstOr(args, "to", ""),
+                        Double.parseDouble(firstOr(args, "delta-bp", "12")),
                         firstOr(args, "out", ""));
             }
             if (args.containsOption("revx-lead")) {
