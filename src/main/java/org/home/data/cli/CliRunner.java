@@ -94,6 +94,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.CarryReport> carryReport;
     private final ObjectProvider<org.home.data.revx.exec.LeadCheck> leadCheck;
     private final ObjectProvider<org.home.data.revx.exec.HedgeOverlay> hedgeOverlay;
+    private final ObjectProvider<org.home.data.revx.exec.CoreRegression> coreRegression;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
     /** Кого наблюдает сводный бот: метка:пара:путь. */
@@ -128,6 +129,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.CarryReport> carryReport,
                      ObjectProvider<org.home.data.revx.exec.LeadCheck> leadCheck,
                      ObjectProvider<org.home.data.revx.exec.HedgeOverlay> hedgeOverlay,
+                     ObjectProvider<org.home.data.revx.exec.CoreRegression> coreRegression,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols,
                      @Value("${revx.info.bots}") List<String> infoBots) {
@@ -169,6 +171,7 @@ public class CliRunner implements ApplicationRunner {
         this.carryReport = carryReport;
         this.leadCheck = leadCheck;
         this.hedgeOverlay = hedgeOverlay;
+        this.coreRegression = coreRegression;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
         this.infoBots = infoBots;
@@ -419,6 +422,12 @@ public class CliRunner implements ApplicationRunner {
                         Double.parseDouble(firstOr(args, "step-usd", "0")),
                         firstOr(args, "from", ""),
                         firstOr(args, "to", ""),
+                        firstOr(args, "out", ""),
+                        firstOr(args, "hours-out", ""));
+            }
+            if (args.containsOption("revx-core")) {
+                coreRegression.getObject().run(
+                        firstOr(args, "hours", ""),
                         firstOr(args, "out", ""));
             }
             if (args.containsOption("revx-lead")) {

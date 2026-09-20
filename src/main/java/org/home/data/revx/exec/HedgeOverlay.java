@@ -124,6 +124,17 @@ public class HedgeOverlay {
      */
     public void run(String journals, double bandLots, double feeBp, double stepUsd,
                     String fromIso, String toIso, String out) {
+        run(journals, bandLots, feeBp, stepUsd, fromIso, toIso, out, null);
+    }
+
+    /**
+     *  hoursOut куда выгрузить ЧАСОВЫЕ строки (бот; пара; час; итог без беты без
+     *        хеджа; он же с хеджем; опора в начале часа; опора в конце). Нужен
+     *        пункту П2.4 из 165: регрессия ядра гоняется на ОБЪЕДИНЁННЫХ окнах, а
+     *        один запуск прибора считает одно окно.
+     */
+    public void run(String journals, double bandLots, double feeBp, double stepUsd,
+                    String fromIso, String toIso, String out, String hoursOut) {
         long from = fromIso == null || fromIso.isBlank() ? 0 : Instant.parse(fromIso).toEpochMilli();
         long to = toIso == null || toIso.isBlank() ? Long.MAX_VALUE : Instant.parse(toIso).toEpochMilli();
 
@@ -158,6 +169,8 @@ public class HedgeOverlay {
         int counted = 0;
         TreeMap<Long, Double> hourPlain = new TreeMap<>();
         TreeMap<Long, Double> hourHedged = new TreeMap<>();
+        StringBuilder rows = new StringBuilder(
+                "бот;пара;час;без_хеджа;с_хеджем;опора0;опора1;захват;сделок\n");
 
         for (Bot b : bots) {
             Series s = readSeries(b, from, to);
@@ -197,6 +210,23 @@ public class HedgeOverlay {
             // несут один и тот же рынок, и считать их независимыми нельзя.
             plain.exBetaHour().forEach((h, v) -> hourPlain.merge(h, v, Double::sum));
             hedged.exBetaHour().forEach((h, v) -> hourHedged.merge(h, v, Double::sum));
+            for (Map.Entry<Long, Double> e : plain.exBetaHour().entrySet()) {
+                long h = e.getKey();
+                double[] cur = plain.hourly().get(h);
+                double[] prev = plain.hourly().get(h - 1);
+                Double hv = hedged.exBetaHour().get(h);
+                if (cur == null || prev == null || hv == null) {
+                    continue;
+                }
+                double[] cap = plain.capHour().getOrDefault(h, new double[2]);
+                rows.append(b.id()).append(';').append(base).append(';').append(h)
+                        .append(';').append(round(e.getValue(), 6))
+                        .append(';').append(round(hv, 6))
+                        .append(';').append(round(prev[1], 6))
+                        .append(';').append(round(cur[1], 6))
+                        .append(';').append(round(cap[0], 6))
+                        .append(';').append((int) cap[1]).append('\n');
+            }
             counted++;
         }
 
@@ -212,6 +242,19 @@ public class HedgeOverlay {
             double ratio = gapHedgedSum == 0 ? 0 : gapPlainSum / gapHedgedSum;
             sb.append("\nРазность наклонов упала в ").append(round(ratio, 2)).append(" раза.\n");
             sb.append(pairedSection(hourPlain, hourHedged));
+        }
+
+        if (hoursOut != null && !hoursOut.isBlank()) {
+            try {
+                Path p = Path.of(hoursOut);
+                if (p.getParent() != null) {
+                    Files.createDirectories(p.getParent());
+                }
+                Files.writeString(p, rows.toString(), StandardCharsets.UTF_8);
+                log.info("часовые строки: {}", p.toAbsolutePath());
+            } catch (IOException e) {
+                log.warn("не записать {}: {}", hoursOut, e.toString());
+            }
         }
 
         String text = sb.toString();
@@ -255,7 +298,8 @@ public class HedgeOverlay {
      * беты за этот час. Сумма ряда равна {@link Split#exBeta()} с точностью до
      * разрывов в тиках (часы без предшественника в ряд не входят).
      */
-    private record Result(Split split, int trades, TreeMap<Long, Double> exBetaHour) {
+    private record Result(Split split, int trades, TreeMap<Long, Double> exBetaHour,
+                          TreeMap<Long, double[]> hourly, TreeMap<Long, double[]> capHour) {
     }
 
     /**
@@ -286,6 +330,11 @@ public class HedgeOverlay {
         boolean first = true;
         // Часовой ряд: капитал на границе каждого часа и ход опоры за час.
         TreeMap<Long, double[]> hourly = new TreeMap<>();   // час -> {капитал, опора}
+        // 🔑 Отдельно — ЗАХВАТ по часам и число исполнений: без них нельзя
+        // проверить, законна ли экстраполяция регрессии П2.4 к нулевому ходу.
+        // Захват идёт со сделками, а сделок в тихий час мало — если он падает
+        // вместе с |Δp|, свободный член регрессии меряет несуществующий режим.
+        TreeMap<Long, double[]> capHour = new TreeMap<>();  // час -> {захват, сделок}
 
         for (int i = 0; i < s.ts.length; i++) {
             long t = s.ts[i];
@@ -294,7 +343,11 @@ public class HedgeOverlay {
             // Сделки, случившиеся до этого тика: марка — ТЕКУЩИЙ тик.
             while (fi < s.fillTs.length && s.fillTs[fi] <= t) {
                 cash -= s.fillDq[fi] * s.fillPx[fi];
-                capture += (f - s.fillPx[fi]) * s.fillDq[fi];
+                double got = (f - s.fillPx[fi]) * s.fillDq[fi];
+                capture += got;
+                double[] ch = capHour.computeIfAbsent(t / 3_600_000L, k -> new double[2]);
+                ch[0] += got;
+                ch[1]++;
                 turnover += Math.abs(s.fillDq[fi]) * s.fillPx[fi];
                 fi++;
             }
@@ -346,7 +399,7 @@ public class HedgeOverlay {
         double[] slopes = hourlySlopes(hourly);
         return new Result(new Split(capture, beta, carry - beta, fees,
                 slopes[0], slopes[1], (int) slopes[2]), trades,
-                exBetaByHour(hourly, meanPos));
+                exBetaByHour(hourly, meanPos), hourly, capHour);
     }
 
     /**
