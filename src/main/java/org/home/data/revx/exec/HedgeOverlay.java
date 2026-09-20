@@ -171,6 +171,8 @@ public class HedgeOverlay {
         TreeMap<Long, Double> hourHedged = new TreeMap<>();
         StringBuilder rows = new StringBuilder(
                 "бот;пара;час;без_хеджа;с_хеджем;опора0;опора1;захват;сделок\n");
+        List<Object[]> legs = new ArrayList<>();   // {метка, пара, Legs} — для П2.6
+        StringBuilder rateNoise = new StringBuilder();
 
         for (Bot b : bots) {
             Series s = readSeries(b, from, to);
@@ -189,8 +191,14 @@ public class HedgeOverlay {
             double lot = s.lot;
             double price = s.fair[0];
             double step = stepUsd > 0 ? stepUsd / price : STEP.getOrDefault(base, 1e-4);
+            // Сырые USD-марки — для П2.6: нога Kraken живёт в USD, и разница с
+            // USDC-пересчётом и есть базис, которым возражал док. 150.
+            NavigableMap<Long, Double> markUsd = marks.marks(PerpMarkSource.perpFor(base),
+                    s.ts[0] - 120_000, s.ts[s.ts.length - 1] + 120_000);
             Result plain = evaluate(s, null, 0, 0, 0);
-            Result hedged = evaluate(s, mark, bandLots * lot, step, feeBp / 1e4);
+            Result hedged = evaluate(s, mark, markUsd, bandLots * lot, step, feeBp / 1e4);
+            legs.add(new Object[]{b.id(), base, hedged.legs()});
+            rateNoise.append(rateStats(b.id(), mark, markUsd));
             sb.append("| ").append(b.id()).append(" | ").append(base)
                     .append(" | ").append(plain.split.hours())
                     .append(" | ").append(money(plain.split.total()))
@@ -241,7 +249,27 @@ public class HedgeOverlay {
                     .append("** | падение минимум ВДВОЕ |\n");
             double ratio = gapHedgedSum == 0 ? 0 : gapPlainSum / gapHedgedSum;
             sb.append("\nРазность наклонов упала в ").append(round(ratio, 2)).append(" раза.\n");
+            // ⚠️ Та же величина, но с ногой перпа в ЕГО валюте: перп рассчитывается
+            // в USD, а поминутный пересчёт в USDC подмешивает дрожание нашей оценки
+            // курса (см. раздел про курс ниже).
+            double usdShift = 0;
+            for (Object[] row : legs) {
+                Legs l = (Legs) row[2];
+                usdShift += l.krakenUsd() - l.krakenUsdc();
+            }
+            sb.append("\n⚠️ Тот же итог без беты, но с ногой перпа в USD (без поминутного")
+                    .append(" пересчёта в USDC): **").append(money(exBetaHedged + usdShift))
+                    .append("** против ").append(money(exBetaHedged))
+                    .append(" — разница ").append(money(usdShift)).append(".\n");
             sb.append(pairedSection(hourPlain, hourHedged));
+            sb.append(legsSection(legs));
+            sb.append("\n### Курс USDC/USD, которым пересчитана нога\n\n")
+                    .append("| бот | средний курс | СКО поминутного изменения, б.п. | минут |\n")
+                    .append("|---|---:|---:|---:|\n").append(rateNoise)
+                    .append("\n⚠️ Колонка «курс USDC/USD» в таблице выше — это НЕ базис,")
+                    .append(" а в основном ШУМ нашей оценки курса: он входит в переоценку")
+                    .append(" ноги каждую минуту (CLAUDE.md: медиана implied гуляет 7 б.п.")
+                    .append(" за 43 секунды, пока прямая книга стоит).\n");
         }
 
         if (hoursOut != null && !hoursOut.isBlank()) {
@@ -299,7 +327,35 @@ public class HedgeOverlay {
      * разрывов в тиках (часы без предшественника в ряд не входят).
      */
     private record Result(Split split, int trades, TreeMap<Long, Double> exBetaHour,
-                          TreeMap<Long, double[]> hourly, TreeMap<Long, double[]> capHour) {
+                          TreeMap<Long, double[]> hourly, TreeMap<Long, double[]> capHour,
+                          Legs legs) {
+    }
+
+    /**
+     * СЫРОЙ РЕЗУЛЬТАТ ПО НОГАМ (П2.6 из 165 v2) — то, что видят два счёта, а не
+     * мерка «без беты».
+     *
+     * 🔑 Зачем отдельно от всего остального: «итог без беты» — конструкция для
+     * сравнения вариантов, в ней вычтена бета среднего запаса. Налоговая её не
+     * знает. На растущем окне мерка показывала по хеджу плюс, хотя сырой шорт был
+     * в убытке: бету просто вычли.
+     *
+     * @param revolut   результат спотового счёта в USDC (капитал по опоре).
+     *                  ⚠️ От хеджа не зависит ВООБЩЕ: бот о перпе не знает;
+     * @param krakenUsdc нога перпа, пересчитанная в USDC (пошлина уже вычтена);
+     * @param krakenUsd  она же по СЫРЫМ USD-маркам: разница с предыдущей — это
+     *                   курс USDC/USD, то есть базис, которым 150 и возражал;
+     * @param mirror     зеркальная часть ноги перпа: минус изменение стоимости
+     *                   спотового запаса за те же интервалы. Если хедж полный,
+     *                   вся нога состоит из неё;
+     * @param fees       пошлина перевешиваний.
+     */
+    private record Legs(double revolut, double krakenUsdc, double krakenUsd,
+                        double mirror, double fees) {
+        /** Остаток ноги перпа сверх зеркала: полоса, базис и округление. */
+        double residual() {
+            return krakenUsdc + fees - mirror;
+        }
     }
 
     /**
@@ -311,6 +367,12 @@ public class HedgeOverlay {
      * добавляется переоценка перпа и вычитается пошлина перевешиваний.
      */
     private Result evaluate(Series s, NavigableMap<Long, Double> mark,
+                            double band, double step, double fee) {
+        return evaluate(s, mark, null, band, step, fee);
+    }
+
+    private Result evaluate(Series s, NavigableMap<Long, Double> mark,
+                            NavigableMap<Long, Double> markUsd,
                             double band, double step, double fee) {
         double cash = 0;
         double capture = 0;
@@ -327,6 +389,9 @@ public class HedgeOverlay {
         double prevInv = 0;
         double prevPerp = 0;
         double prevMark = 0;
+        double prevMarkUsd = 0;
+        double hedgeCarryUsd = 0;
+        double mirror = 0;
         boolean first = true;
         // Часовой ряд: капитал на границе каждого часа и ход опоры за час.
         TreeMap<Long, double[]> hourly = new TreeMap<>();   // час -> {капитал, опора}
@@ -356,10 +421,21 @@ public class HedgeOverlay {
                 Map.Entry<Long, Double> e = mark.floorEntry(t);
                 m = e == null ? 0 : e.getValue();
             }
+            double mu = 0;
+            if (markUsd != null) {
+                Map.Entry<Long, Double> e = markUsd.floorEntry(t);
+                mu = e == null ? 0 : e.getValue();
+            }
             if (!first) {
                 spotCarry += prevInv * (f - prevFair);
                 if (mark != null && prevMark > 0 && m > 0) {
                     hedgeCarry += prevPerp * (m - prevMark);
+                    // Зеркало: то же движение, но по спотовой опоре и на спотовом
+                    // запасе. Разница с ногой перпа — полоса, базис, округление.
+                    mirror -= prevInv * (f - prevFair);
+                }
+                if (markUsd != null && prevMarkUsd > 0 && mu > 0) {
+                    hedgeCarryUsd += prevPerp * (mu - prevMarkUsd);
                 }
             }
             // Перевешивание ПОСЛЕ переоценки: решение принимается по состоянию,
@@ -384,6 +460,7 @@ public class HedgeOverlay {
             prevInv = inv;
             prevPerp = perp;
             prevMark = m;
+            prevMarkUsd = mu;
             area += inv;
             areaNet += inv + perp;
             double equity = cash + inv * f + (mark != null ? hedgeCarry - fees : 0);
@@ -399,7 +476,104 @@ public class HedgeOverlay {
         double[] slopes = hourlySlopes(hourly);
         return new Result(new Split(capture, beta, carry - beta, fees,
                 slopes[0], slopes[1], (int) slopes[2]), trades,
-                exBetaByHour(hourly, meanPos), hourly, capHour);
+                exBetaByHour(hourly, meanPos), hourly, capHour,
+                new Legs(capture + spotCarry, hedgeCarry - fees,
+                        hedgeCarryUsd - fees, mirror, fees));
+    }
+
+    /**
+     * Курс, которым пересчитана нога перпа: он восстанавливается делением
+     * USDC-марки на USD-марку.
+     *
+     * 🔑 Зачем печатать. Переоценка ноги идёт КАЖДУЮ минуту, поэтому в неё
+     * попадает не отклонение курса от единицы, а его поминутное ДРОЖАНИЕ,
+     * умноженное на номинал и накопленное за окно. Если СКО изменения курса
+     * велико, разница «нога в USD против ноги в USDC» — это шум оценки, а не
+     * базис, и вычитать его как базис нельзя.
+     */
+    private String rateStats(String bot, NavigableMap<Long, Double> quote,
+                             NavigableMap<Long, Double> usd) {
+        List<Double> rate = new ArrayList<>();
+        for (Map.Entry<Long, Double> e : usd.entrySet()) {
+            Double q = quote.get(e.getKey());
+            if (q != null && e.getValue() > 0) {
+                rate.add(q / e.getValue());
+            }
+        }
+        if (rate.size() < 10) {
+            return "";
+        }
+        double mean = 0;
+        for (double v : rate) {
+            mean += v;
+        }
+        mean /= rate.size();
+        double ss = 0;
+        for (int i = 1; i < rate.size(); i++) {
+            double d = (rate.get(i) - rate.get(i - 1)) * 1e4;
+            ss += d * d;
+        }
+        double sd = Math.sqrt(ss / (rate.size() - 1));
+        return "| " + bot + " | " + round(mean, 6) + " | " + round(sd, 2)
+                + " | " + rate.size() + " |\n";
+    }
+
+    /**
+     * П2.6 — СЫРОЙ РЕЗУЛЬТАТ ПО НОГАМ, без единого вычитания.
+     *
+     * 🔑 Печатается ровно потому, что все остальные числа прибора — это мерка
+     * «без беты», а налоговая её не знает. Здесь два счёта как они есть: USDC на
+     * Revolut и USD на Kraken.
+     *
+     * Проверка, которую надо смотреть первой: сумма ног обязана совпасть с
+     * колонкой «итог с хеджем» из верхней таблицы — это тождество, а не
+     * совпадение. Если не совпало, сломан прибор.
+     */
+    private String legsSection(List<Object[]> legs) {
+        if (legs.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder("\n## П2.6. Сырой результат по ногам"
+                + " (то, что видят счета, а не мерка)\n\n");
+        sb.append("| бот | пара | Revolut, USDC | Kraken в USDC | Kraken в USD | курс USDC/USD")
+                .append(" | из ноги: зеркало | остаток | пошлина | **сумма ног** |\n");
+        sb.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        double rev = 0;
+        double kr = 0;
+        double krUsd = 0;
+        double mir = 0;
+        double fee = 0;
+        for (Object[] row : legs) {
+            Legs l = (Legs) row[2];
+            sb.append("| ").append(row[0]).append(" | ").append(row[1])
+                    .append(" | ").append(money(l.revolut()))
+                    .append(" | ").append(money(l.krakenUsdc()))
+                    .append(" | ").append(money(l.krakenUsd()))
+                    .append(" | ").append(money(l.krakenUsd() - l.krakenUsdc()))
+                    .append(" | ").append(money(l.mirror()))
+                    .append(" | ").append(money(l.residual()))
+                    .append(" | ").append(money(l.fees()))
+                    .append(" | **").append(money(l.revolut() + l.krakenUsdc())).append("** |\n");
+            rev += l.revolut();
+            kr += l.krakenUsdc();
+            krUsd += l.krakenUsd();
+            mir += l.mirror();
+            fee += l.fees();
+        }
+        sb.append("| **всего** | | **").append(money(rev)).append("** | **").append(money(kr))
+                .append("** | ").append(money(krUsd))
+                .append(" | ").append(money(krUsd - kr))
+                .append(" | ").append(money(mir))
+                .append(" | ").append(money(kr + fee - mir))
+                .append(" | ").append(money(fee))
+                .append(" | **").append(money(rev + kr)).append("** |\n");
+        sb.append("\nНалог 19% с положительной ноги Kraken: ")
+                .append(money(kr > 0 ? -0.19 * kr : 0))
+                .append(", на руки ").append(money(rev + kr - (kr > 0 ? 0.19 * kr : 0)))
+                .append(".\n");
+        sb.append("⚠️ Нога Revolut от хеджа НЕ зависит — бот о перпе не знает;")
+                .append(" весь эффект хеджа сидит в ноге Kraken.\n");
+        return sb.toString();
     }
 
     /**
