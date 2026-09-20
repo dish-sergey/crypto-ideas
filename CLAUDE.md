@@ -42,6 +42,8 @@ Drive «Trading Bot — Спецификация», ключевые докум�
 ./gradlew bootRun --args='--revx-ladder --journal=<путь> --offsets=6,7,8,9,10,11,12'      # лестница отступов, каждая ступень ОТДЕЛЬНЫМ ботом, плюс κ
 ./gradlew bootRun --args='--revx-hold-check --journal=<путь> --from=<ISO> --to=<ISO> --sigma=3.61 --offset-bp=12'  # ВРЕМЯ ПОД ПОЗИЦИЕЙ: FIFO, LIFO и закон Литтла рядом
 ./gradlew bootRun --args='--revx-carry --journals=a=<путь>,b=<путь>'                  # ТРОЙКА ВЕЛИЧИН: захват, бета среднего запаса, время под позицией
+./gradlew bootRun --args='--revx-lead --captures=binance=<путь>,kraken=<путь> --journals=BTC=<db>'  # ОТБОР ПО ОТСТАВШЕЙ ЦЕНЕ: ход чужой середины до нашей сделки
+./gradlew bootRun --args='--revx-hedge --journals=a:BTC=<db>,b:SOL=<db> --band=1 --fee-bp=2'  # ХЕДЖ НАЛОЖЕНИЕМ на фактическую траекторию: итог без беты и вогнутость до/после
 ./gradlew bootRun --args='--revx-offset-axis --journals=a=<путь>,e=<путь> --placed=a=<путь> --out=<файл>'  # ОСЬ ЛЕСТНИЦЫ: настройка против эффективного отступа, κ по живым заявкам
 ./gradlew bootRun --args='--revx-paired --a=<журнал> --b=<журнал> --segment=180 --out=<файл>'  # ПАРНЫЙ ОПЫТ: разность по совпадающим отрезкам времени с ошибкой
 ./gradlew bootRun --args='--revx-audit'  # СВЕРКА УЧЁТА: площадка ↔ реестр ↔ журналы, только GET
