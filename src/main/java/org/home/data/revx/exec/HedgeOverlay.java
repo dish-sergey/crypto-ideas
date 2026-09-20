@@ -71,6 +71,9 @@ public class HedgeOverlay {
 
     private static final Logger log = LoggerFactory.getLogger(HedgeOverlay.class);
 
+    /** Сдвиг плацебо-контроля для П2.10: связь со сделкой рвём, снос оставляем. */
+    private static final long PLACEBO_LAG_MS = 3 * 3_600_000L;
+
     /**
      * Шаг контракта Kraken в единицах базовой валюты.
      *
@@ -187,6 +190,7 @@ public class HedgeOverlay {
                 "бот;пара;час;без_хеджа;с_хеджем;опора0;опора1;захват;сделок\n");
         List<Object[]> legs = new ArrayList<>();   // {метка, пара, Legs} — для П2.6
         StringBuilder rateNoise = new StringBuilder();
+        List<Object[]> hedgeFills = new ArrayList<>();   // {метка, марки, сделки} — П2.10
 
         for (Bot b : bots) {
             Series s = readSeries(b, from, to);
@@ -213,6 +217,8 @@ public class HedgeOverlay {
             Result hedged = evaluate(s, mark, markUsd, bandLots * lot, step, feeBp / 1e4,
                     (long) (periodMin * 60_000), perpUsd);
             legs.add(new Object[]{b.id(), base, hedged.legs()});
+            hedgeFills.add(new Object[]{b.id(), perpUsd && !markUsd.isEmpty() ? markUsd : mark,
+                    hedged.hedgeFills()});
             rateNoise.append(rateStats(b.id(), mark, markUsd));
             sb.append("| ").append(b.id()).append(" | ").append(base)
                     .append(" | ").append(plain.split.hours())
@@ -289,6 +295,7 @@ public class HedgeOverlay {
             sb.append(pairedSection(hourPlain, hourHedged, hourMove));
             sb.append(legsSection(legs));
             sb.append(coverageSection(cover));
+            sb.append(hedgeMarkoutSection(hedgeFills));
             sb.append("\n### Курс USDC/USD, которым пересчитана нога\n\n")
                     .append("| бот | средний курс | СКО поминутного изменения, б.п. | минут |\n")
                     .append("|---|---:|---:|---:|\n").append(rateNoise)
@@ -354,7 +361,8 @@ public class HedgeOverlay {
      */
     private record Result(Split split, int trades, TreeMap<Long, Double> exBetaHour,
                           TreeMap<Long, double[]> hourly, TreeMap<Long, double[]> capHour,
-                          Legs legs, TreeMap<Long, double[]> carryHour) {
+                          Legs legs, TreeMap<Long, double[]> carryHour,
+                          List<double[]> hedgeFills) {
     }
 
     /**
@@ -438,6 +446,8 @@ public class HedgeOverlay {
         TreeMap<Long, double[]> capHour = new TreeMap<>();  // час -> {захват, сделок}
         // Накопленные переноски на конец каждого часа: {спот, перп}.
         TreeMap<Long, double[]> carryHour = new TreeMap<>();
+        // П2.10: собственные исполнения хеджа {время, сторона, марка}.
+        List<double[]> hedgeFills = new ArrayList<>();
 
         for (int i = 0; i < s.ts.length; i++) {
             long t = s.ts[i];
@@ -505,6 +515,10 @@ public class HedgeOverlay {
                         perp += rounded;
                         fees += Math.abs(rounded) * m * fee;
                         trades++;
+                        // П2.10: перевешивание — это тоже ИСПОЛНЕНИЕ, и оно тоже
+                        // отбирается. Запоминаем время, сторону и марку, чтобы
+                        // потом посмотреть, куда ушла цена перпа после нас.
+                        hedgeFills.add(new double[]{t, Math.signum(rounded), m});
                     }
                 }
             }
@@ -536,7 +550,7 @@ public class HedgeOverlay {
                 slopes[0], slopes[1], (int) slopes[2]), trades,
                 exBetaByHour(hourly, meanPos), hourly, capHour,
                 new Legs(capture + spotCarry, hedgeCarry - fees,
-                        hedgeCarryUsd - fees, mirror, fees), carryHour);
+                        hedgeCarryUsd - fees, mirror, fees), carryHour, hedgeFills);
     }
 
     /**
@@ -759,6 +773,79 @@ public class HedgeOverlay {
                     .append(" | ").append(money(mean)).append(" | ").append(money(se))
                     .append(" | **").append(round(se > 0 ? mean / se : 0, 2))
                     .append("** | ").append(round(eq[1], 2)).append(" |\n");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * П2.10: ОТБОР НА СОБСТВЕННОЙ НОГЕ ХЕДЖА (док. 171 часть III).
+     *
+     * 🔑 Перевешивание — это тоже исполнение, и мейкер у касания по определению
+     * исполняется тогда, когда цена собирается пройти сквозь его уровень. Значит
+     * у ноги перпа есть свой отбор, и до сих пор его никто не мерил: цена
+     * перевешивания считалась равной одной пошлине в 2 б.п.
+     *
+     * ⚠️ Плацебо обязателен: на трендовом окне ход марки за час после сделки
+     * меряет снос рынка, а не отбор. Берётся тот же знак стороны, но ход за три
+     * часа ДО сделки.
+     *
+     * ⚠️ Марки МИНУТНЫЕ, поэтому горизонт в минуту стоит на грани разрешения:
+     * читать надо 5–60 минут.
+     */
+    private String hedgeMarkoutSection(List<Object[]> fills) {
+        long[] hs = {60_000, 300_000, 900_000, 3_600_000};
+        String[] names = {"1 мин", "5 мин", "15 мин", "60 мин"};
+        int total = 0;
+        for (Object[] f : fills) {
+            total += ((List<?>) f[2]).size();
+        }
+        if (total < 30) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder("\n### П2.10. Отбор на собственных"
+                + " перевешиваниях (маркаут ноги перпа)\n\n");
+        sb.append("Плюс — против нас. Клетка: `отбор − плацебо`, ошибка по сделкам.\n\n");
+        sb.append("| горизонт | сделок | отбор, б.п. | плацебо | **чистый** | `SE` | **`t`** |\n");
+        sb.append("|---|---:|---:|---:|---:|---:|---:|\n");
+        for (int h = 0; h < hs.length; h++) {
+            List<Double> net = new ArrayList<>();
+            double rawSum = 0;
+            double placSum = 0;
+            for (Object[] f : fills) {
+                @SuppressWarnings("unchecked")
+                NavigableMap<Long, Double> mark = (NavigableMap<Long, Double>) f[1];
+                for (Object o : (List<?>) f[2]) {
+                    double[] t = (double[]) o;
+                    long ts = (long) t[0];
+                    double side = t[1];
+                    double m0 = t[2];
+                    Map.Entry<Long, Double> e = mark.ceilingEntry(ts + hs[h]);
+                    Map.Entry<Long, Double> p0 = mark.floorEntry(ts - PLACEBO_LAG_MS);
+                    Map.Entry<Long, Double> p1 = mark.ceilingEntry(ts - PLACEBO_LAG_MS + hs[h]);
+                    if (e == null || m0 <= 0 || p0 == null || p1 == null || p0.getValue() <= 0) {
+                        continue;
+                    }
+                    // Купили перп — против нас падение; продали — рост.
+                    double raw = -side * (e.getValue() - m0) / m0 * 1e4;
+                    double plac = -side * (p1.getValue() - p0.getValue()) / p0.getValue() * 1e4;
+                    rawSum += raw;
+                    placSum += plac;
+                    net.add(raw - plac);
+                }
+            }
+            if (net.size() < 20) {
+                continue;
+            }
+            double[] arr = net.stream().mapToDouble(Double::doubleValue).toArray();
+            // stat отдаёт {среднее, t}; ошибка восстанавливается делением.
+            double[] st = stat(arr);
+            double se = st[1] == 0 ? 0 : st[0] / st[1];
+            sb.append("| ").append(names[h]).append(" | ").append(net.size())
+                    .append(" | ").append(round(rawSum / net.size(), 2))
+                    .append(" | ").append(round(placSum / net.size(), 2))
+                    .append(" | **").append(round(st[0], 2))
+                    .append("** | ").append(round(se, 2))
+                    .append(" | **").append(round(st[1], 2)).append("** |\n");
         }
         return sb.toString();
     }

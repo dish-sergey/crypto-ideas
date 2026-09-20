@@ -199,7 +199,8 @@ public class OffsetSurface {
             }
             // П2.8: тот же отбор на лестнице горизонтов. Ноль в клетке значит
             // «опоры на таком удалении нет» — такие клетки в среднее не идут.
-            double[] row = new double[2 + 2 * HORIZONS.length];
+            double[] row = new double[3 + 2 * HORIZONS.length];
+            row[2 + 2 * HORIZONS.length] = p.aggressor() < 0 ? 1 : 0;   // 1 — наш бид
             row[0] = dist;
             row[1] = markout;
             // ⚠️ Контроль сноса обязателен, иначе дальние горизонты меряют рынок,
@@ -387,20 +388,31 @@ public class OffsetSurface {
      */
     private void structure(StringBuilder sb, List<double[]> ev, int nHours, double lot) {
         sb.append("\n### Структура кривой: `λ(δ)` и `c(δ)` порознь\n\n");
-        sb.append("| δ | λ(δ), событий/ч | `c(δ)`, б.п. | `δ − c` | `c'(δ)` | прибыль, $/ч |\n");
-        sb.append("|---:|---:|---:|---:|---:|---:|\n");
+        sb.append("| δ | λ(δ), событий/ч | из них бид / аск | `c(δ)`, б.п. | `δ − c` | `c'(δ)` | прибыль, $/ч |\n");
+        sb.append("|---:|---:|---|---:|---:|---:|---:|\n");
         double[] lambda = new double[GRID.length];
+        double[] lambdaBid = new double[GRID.length];
+        double[] lambdaAsk = new double[GRID.length];
         double[] c = new double[GRID.length];
         for (int i = 0; i < GRID.length; i++) {
             int n = 0;
+            int nb = 0;
             double sum = 0;
             for (double[] x : ev) {
                 if (x[0] >= GRID[i]) {
                     n++;
+                    // 🔑 Сторона нужна для сверки конвенций (док. 171 часть IV):
+                    // λ считает ОБЕ стороны, и сравнивать её надо с обеими же
+                    // живыми сделками, а не с одной.
+                    if (x[2 + 2 * HORIZONS.length] > 0) {
+                        nb++;
+                    }
                     sum += x[1];
                 }
             }
             lambda[i] = n / (double) nHours;
+            lambdaBid[i] = nb / (double) nHours;
+            lambdaAsk[i] = (n - nb) / (double) nHours;
             c[i] = n < 5 ? Double.NaN : sum / n;
         }
         for (int i = 0; i < GRID.length; i++) {
@@ -410,6 +422,8 @@ public class OffsetSurface {
             }
             sb.append("| ").append((int) GRID[i])
                     .append(" | ").append(round(lambda[i], 2))
+                    .append(" | ").append(round(lambdaBid[i], 2)).append(" / ")
+                    .append(round(lambdaAsk[i], 2))
                     .append(" | ").append(Double.isNaN(c[i]) ? "—" : round(c[i], 2))
                     .append(" | ").append(Double.isNaN(c[i]) ? "—" : round(GRID[i] - c[i], 2))
                     .append(" | ").append(Double.isNaN(deriv) ? "—" : round(deriv, 2))
