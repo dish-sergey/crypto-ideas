@@ -429,7 +429,9 @@ public class CliRunner implements ApplicationRunner {
                         firstOr(args, "from", ""),
                         firstOr(args, "to", ""),
                         firstOr(args, "out", ""),
-                        firstOr(args, "hours-out", ""));
+                        firstOr(args, "hours-out", ""),
+                        Double.parseDouble(firstOr(args, "period-min", "0")),
+                        Boolean.parseBoolean(firstOr(args, "perp-usd", "false")));
             }
             if (args.containsOption("revx-core")) {
                 coreRegression.getObject().run(

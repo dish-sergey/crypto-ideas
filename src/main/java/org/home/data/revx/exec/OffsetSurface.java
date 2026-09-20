@@ -65,6 +65,24 @@ public class OffsetSurface {
     /** Ширина плато из док. 151: пики классов обязаны разойтись сильнее. */
     private static final double PLATEAU_BP = 4.5;
 
+    /**
+     * Горизонты отбора для П2.8 (док. 169 часть III).
+     *
+     * 🔑 Зачем лестница: «ядро» измерено маркой на СЛЕДУЮЩЕМ тике, а хедж с
+     * полосой выравнивает раз в десятки минут. Между этими двумя горизонтами
+     * отбор успевает вырасти, и разница — это то, что потолок конструкции
+     * теряет по дороге. Если {@code c(δ, h)} выходит на плато раньше типичного
+     * времени до перевешивания, потолок близок к захвату; если растёт на всём
+     * диапазоне — потолок существенно ниже, и полосу надо сужать до предела шага.
+     */
+    private static final long[] HORIZONS = {1_000, 60_000, 300_000, 900_000, 1_800_000, 7_200_000};
+
+    /** Подписи горизонтов для таблицы. */
+    private static final String[] HORIZON_NAMES = {"1 с", "60 с", "5 мин", "15 мин", "30 мин", "2 ч"};
+
+    /** Сдвиг плацебо-контроля: связь с принтом рвём, снос рынка оставляем. */
+    private static final long PLACEBO_LAG_MS = 3 * 3_600_000L;
+
     /** Один час: класс по волатильности предыдущего часа и его события. */
     private record Hour(long hour, double prevVolBp, List<double[]> events) {
     }
@@ -179,8 +197,24 @@ public class OffsetSurface {
             if (dist <= 0) {
                 continue;
             }
-            byHour.computeIfAbsent(p.tsMs() / 3_600_000L, k -> new ArrayList<>())
-                    .add(new double[]{dist, markout});
+            // П2.8: тот же отбор на лестнице горизонтов. Ноль в клетке значит
+            // «опоры на таком удалении нет» — такие клетки в среднее не идут.
+            double[] row = new double[2 + 2 * HORIZONS.length];
+            row[0] = dist;
+            row[1] = markout;
+            // ⚠️ Контроль сноса обязателен, иначе дальние горизонты меряют рынок,
+            // а не отбор: за два часа снос доходил до −27.65 б.п. при отборе в 8
+            // (задача A29). Плацебо — тот же знак агрессора, но ход, взятый за
+            // ТРИ ЧАСА ДО принта: связь с принтом разорвана, снос остался.
+            double fPlacebo = fair.at(p.tsMs() - PLACEBO_LAG_MS);
+            for (int h = 0; h < HORIZONS.length; h++) {
+                double fh = fair.after(p.tsMs() + HORIZONS[h]);
+                row[2 + h] = fh <= 0 ? Double.NaN : p.aggressor() * (fh - f0) / f0 * 1e4;
+                double fph = fair.after(p.tsMs() - PLACEBO_LAG_MS + HORIZONS[h]);
+                row[2 + HORIZONS.length + h] = fPlacebo <= 0 || fph <= 0 ? Double.NaN
+                        : p.aggressor() * (fph - fPlacebo) / fPlacebo * 1e4;
+            }
+            byHour.computeIfAbsent(p.tsMs() / 3_600_000L, k -> new ArrayList<>()).add(row);
         }
 
         // 2. Волатильность часа по ленте и класс по ПРЕДЫДУЩЕМУ часу.
@@ -311,6 +345,13 @@ public class OffsetSurface {
             }
         }
 
+        List<double[]> all = new ArrayList<>();
+        for (Hour h : hours) {
+            all.addAll(h.events());
+        }
+        structure(sb, all, hours.size(), lot);
+        horizons(sb, all, hours.size());
+
         double spread = peaks.isEmpty() ? 0
                 : peaks.stream().mapToDouble(Double::doubleValue).max().orElse(0)
                 - peaks.stream().mapToDouble(Double::doubleValue).min().orElse(0);
@@ -328,6 +369,135 @@ public class OffsetSurface {
                 + round(spread, 1) + " б.п., плато внутри класса " + round(meanWidth, 1)
                 + " б.п. — " + (spread > PLATEAU_BP && meanWidth < PLATEAU_BP
                 ? "**подтверждает**" : "**опровергает**");
+    }
+
+    /**
+     * СТРУКТУРА КРИВОЙ: множители порознь (док. 169 часть IV).
+     *
+     * 🔑 Зачем. Кривая прибыли — это произведение {@code λ(δ) × (δ − c(δ))}, и по
+     * произведению нельзя понять, ПОЧЕМУ поверхность плоская. Условие оптимума
+     * при {@code λ = A·e^(−κδ)}:
+     *
+     * <pre>δ* − c(δ*) = (1 − c'(δ*)) / κ</pre>
+     *
+     * Если {@code c'(δ) → 1} — каждый лишний базисный пункт отступа съедается
+     * лишним пунктом отбора, числитель обращается в ноль, и плоская поверхность
+     * оказывается свойством РЫНКА, а не усреднения по нашим часам. Это и есть
+     * разница между «плато измерено» и «плато объяснено».
+     */
+    private void structure(StringBuilder sb, List<double[]> ev, int nHours, double lot) {
+        sb.append("\n### Структура кривой: `λ(δ)` и `c(δ)` порознь\n\n");
+        sb.append("| δ | λ(δ), событий/ч | `c(δ)`, б.п. | `δ − c` | `c'(δ)` | прибыль, $/ч |\n");
+        sb.append("|---:|---:|---:|---:|---:|---:|\n");
+        double[] lambda = new double[GRID.length];
+        double[] c = new double[GRID.length];
+        for (int i = 0; i < GRID.length; i++) {
+            int n = 0;
+            double sum = 0;
+            for (double[] x : ev) {
+                if (x[0] >= GRID[i]) {
+                    n++;
+                    sum += x[1];
+                }
+            }
+            lambda[i] = n / (double) nHours;
+            c[i] = n < 5 ? Double.NaN : sum / n;
+        }
+        for (int i = 0; i < GRID.length; i++) {
+            double deriv = Double.NaN;
+            if (i > 0 && i < GRID.length - 1 && !Double.isNaN(c[i - 1]) && !Double.isNaN(c[i + 1])) {
+                deriv = (c[i + 1] - c[i - 1]) / (GRID[i + 1] - GRID[i - 1]);
+            }
+            sb.append("| ").append((int) GRID[i])
+                    .append(" | ").append(round(lambda[i], 2))
+                    .append(" | ").append(Double.isNaN(c[i]) ? "—" : round(c[i], 2))
+                    .append(" | ").append(Double.isNaN(c[i]) ? "—" : round(GRID[i] - c[i], 2))
+                    .append(" | ").append(Double.isNaN(deriv) ? "—" : round(deriv, 2))
+                    .append(" | ").append(Double.isNaN(c[i]) ? "—"
+                            : money(lambda[i] * (GRID[i] - c[i]) * lot / 1e4))
+                    .append(" |\n");
+        }
+        // κ по наклону ln λ на рабочем участке 6–16 б.п.
+        double sx = 0;
+        double sy = 0;
+        double sxy = 0;
+        double sxx = 0;
+        int n = 0;
+        for (int i = 0; i < GRID.length; i++) {
+            if (GRID[i] >= 6 && GRID[i] <= 16 && lambda[i] > 0) {
+                double x = GRID[i];
+                double y = Math.log(lambda[i]);
+                sx += x;
+                sy += y;
+                sxy += x * y;
+                sxx += x * x;
+                n++;
+            }
+        }
+        double kappa = n > 1 ? -(n * sxy - sx * sy) / (n * sxx - sx * sx) : 0;
+        sb.append("\n`κ` по наклону `ln λ` на участке 6–16 б.п.: **").append(round(kappa, 3))
+                .append("** на базисный пункт.\n");
+    }
+
+    /**
+     * П2.8: КАК ОТБОР РАСТЁТ С ГОРИЗОНТОМ. Потолок конструкции равен захвату
+     * минус отбор на ТОМ горизонте, на котором позиция реально выравнивается.
+     */
+    private void horizons(StringBuilder sb, List<double[]> ev, int nHours) {
+        sb.append("\n### П2.8: `c(δ, горизонт)` — на чём стоит потолок\n\n");
+        sb.append("Клетка — `отбор минус плацебо` (плацебо: тот же знак, ход за три часа")
+                .append(" до принта; без него дальние горизонты меряют снос рынка).\n\n");
+        sb.append("| δ | событий/ч |");
+        for (String h : HORIZON_NAMES) {
+            sb.append(' ').append(h).append(" |");
+        }
+        sb.append(" рост 1 с → 30 мин | плацебо на 2 ч |\n|---:|---:|");
+        for (int i = 0; i < HORIZON_NAMES.length; i++) {
+            sb.append("---:|");
+        }
+        sb.append("---:|---:|\n");
+        for (double delta : new double[]{6, 8, 10, 12, 16}) {
+            int cnt = 0;
+            double[] sum = new double[HORIZONS.length];
+            double[] plac = new double[HORIZONS.length];
+            int[] n = new int[HORIZONS.length];
+            int[] np = new int[HORIZONS.length];
+            for (double[] x : ev) {
+                if (x[0] < delta) {
+                    continue;
+                }
+                cnt++;
+                for (int h = 0; h < HORIZONS.length; h++) {
+                    if (!Double.isNaN(x[2 + h])) {
+                        sum[h] += x[2 + h];
+                        n[h]++;
+                    }
+                    if (!Double.isNaN(x[2 + HORIZONS.length + h])) {
+                        plac[h] += x[2 + HORIZONS.length + h];
+                        np[h]++;
+                    }
+                }
+            }
+            if (cnt < 20) {
+                continue;
+            }
+            double[] net = new double[HORIZONS.length];
+            for (int h = 0; h < HORIZONS.length; h++) {
+                net[h] = n[h] < 5 ? Double.NaN
+                        : sum[h] / n[h] - (np[h] < 5 ? 0 : plac[h] / np[h]);
+            }
+            sb.append("| ").append((int) delta).append(" | ")
+                    .append(round(cnt / (double) nHours, 2)).append(" |");
+            for (int h = 0; h < HORIZONS.length; h++) {
+                sb.append(' ').append(Double.isNaN(net[h]) ? "—" : round(net[h], 2)).append(" |");
+            }
+            sb.append(' ').append(Double.isNaN(net[0]) || Double.isNaN(net[4])
+                            ? "—" : round(net[4] - net[0], 2))
+                    .append(" | ").append(np[5] < 5 ? "—"
+                            : round(plac[5] / np[5], 2)).append(" |\n");
+        }
+        sb.append("\n⚠️ Уровень `c` по ленте и по своим исполнениям различается (лента не знает")
+                .append(" очереди и инвентаря) — читать надо ФОРМУ роста, а не уровень.\n");
     }
 
     /** Ширина полосы вокруг пика, где прибыль не ниже 90% пиковой, б.п. */

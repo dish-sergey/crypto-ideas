@@ -135,6 +135,16 @@ public class HedgeOverlay {
      */
     public void run(String journals, double bandLots, double feeBp, double stepUsd,
                     String fromIso, String toIso, String out, String hoursOut) {
+        run(journals, bandLots, feeBp, stepUsd, fromIso, toIso, out, hoursOut, 0, false);
+    }
+
+    /**
+     *  periodMin перевешивать по ЧАСАМ, а не по полосе (П2.8): ноль — по полосе.
+     *  perpUsd   считать ногу перпа в сырых USD-марках (П2.7).
+     */
+    public void run(String journals, double bandLots, double feeBp, double stepUsd,
+                    String fromIso, String toIso, String out, String hoursOut,
+                    double periodMin, boolean perpUsd) {
         long from = fromIso == null || fromIso.isBlank() ? 0 : Instant.parse(fromIso).toEpochMilli();
         long to = toIso == null || toIso.isBlank() ? Long.MAX_VALUE : Instant.parse(toIso).toEpochMilli();
 
@@ -169,6 +179,10 @@ public class HedgeOverlay {
         int counted = 0;
         TreeMap<Long, Double> hourPlain = new TreeMap<>();
         TreeMap<Long, Double> hourHedged = new TreeMap<>();
+        // Ход опоры за час, сложенный по ботам: {Σ|Δp|, число ботов} — веса П2.7.
+        TreeMap<Long, double[]> hourMove = new TreeMap<>();
+        // П2.9: по каждому боту-часу {|Δp| %, переноска спота, нога перпа}.
+        List<double[]> cover = new ArrayList<>();
         StringBuilder rows = new StringBuilder(
                 "бот;пара;час;без_хеджа;с_хеджем;опора0;опора1;захват;сделок\n");
         List<Object[]> legs = new ArrayList<>();   // {метка, пара, Legs} — для П2.6
@@ -196,7 +210,8 @@ public class HedgeOverlay {
             NavigableMap<Long, Double> markUsd = marks.marks(PerpMarkSource.perpFor(base),
                     s.ts[0] - 120_000, s.ts[s.ts.length - 1] + 120_000);
             Result plain = evaluate(s, null, 0, 0, 0);
-            Result hedged = evaluate(s, mark, markUsd, bandLots * lot, step, feeBp / 1e4);
+            Result hedged = evaluate(s, mark, markUsd, bandLots * lot, step, feeBp / 1e4,
+                    (long) (periodMin * 60_000), perpUsd);
             legs.add(new Object[]{b.id(), base, hedged.legs()});
             rateNoise.append(rateStats(b.id(), mark, markUsd));
             sb.append("| ").append(b.id()).append(" | ").append(base)
@@ -225,6 +240,16 @@ public class HedgeOverlay {
                 Double hv = hedged.exBetaHour().get(h);
                 if (cur == null || prev == null || hv == null) {
                     continue;
+                }
+                double[] mv = hourMove.computeIfAbsent(h, k -> new double[2]);
+                mv[0] += Math.abs(100.0 * (cur[1] - prev[1]) / prev[1]);
+                mv[1]++;
+                // П2.9: приращения переносок за час — из накопленных на границах.
+                double[] c0 = hedged.carryHour().get(h - 1);
+                double[] c1 = hedged.carryHour().get(h);
+                if (c0 != null && c1 != null) {
+                    cover.add(new double[]{Math.abs(100.0 * (cur[1] - prev[1]) / prev[1]),
+                            c1[0] - c0[0], c1[1] - c0[1]});
                 }
                 double[] cap = plain.capHour().getOrDefault(h, new double[2]);
                 rows.append(b.id()).append(';').append(base).append(';').append(h)
@@ -261,8 +286,9 @@ public class HedgeOverlay {
                     .append(" пересчёта в USDC): **").append(money(exBetaHedged + usdShift))
                     .append("** против ").append(money(exBetaHedged))
                     .append(" — разница ").append(money(usdShift)).append(".\n");
-            sb.append(pairedSection(hourPlain, hourHedged));
+            sb.append(pairedSection(hourPlain, hourHedged, hourMove));
             sb.append(legsSection(legs));
+            sb.append(coverageSection(cover));
             sb.append("\n### Курс USDC/USD, которым пересчитана нога\n\n")
                     .append("| бот | средний курс | СКО поминутного изменения, б.п. | минут |\n")
                     .append("|---|---:|---:|---:|\n").append(rateNoise)
@@ -328,7 +354,7 @@ public class HedgeOverlay {
      */
     private record Result(Split split, int trades, TreeMap<Long, Double> exBetaHour,
                           TreeMap<Long, double[]> hourly, TreeMap<Long, double[]> capHour,
-                          Legs legs) {
+                          Legs legs, TreeMap<Long, double[]> carryHour) {
     }
 
     /**
@@ -374,6 +400,16 @@ public class HedgeOverlay {
     private Result evaluate(Series s, NavigableMap<Long, Double> mark,
                             NavigableMap<Long, Double> markUsd,
                             double band, double step, double fee) {
+        return evaluate(s, mark, markUsd, band, step, fee, 0, false);
+    }
+
+    private Result evaluate(Series s, NavigableMap<Long, Double> mark,
+                            NavigableMap<Long, Double> markUsd,
+                            double band, double step, double fee,
+                            long periodMs, boolean perpUsd) {
+        // ⚠️ НЕ Long.MIN_VALUE: разность t − lastHedge переполняется, и первое
+        // перевешивание не наступает никогда. Ноль означает «пора сразу».
+        long lastHedge = 0;
         double cash = 0;
         double capture = 0;
         double turnover = 0;
@@ -400,6 +436,8 @@ public class HedgeOverlay {
         // Захват идёт со сделками, а сделок в тихий час мало — если он падает
         // вместе с |Δp|, свободный член регрессии меряет несуществующий режим.
         TreeMap<Long, double[]> capHour = new TreeMap<>();  // час -> {захват, сделок}
+        // Накопленные переноски на конец каждого часа: {спот, перп}.
+        TreeMap<Long, double[]> carryHour = new TreeMap<>();
 
         for (int i = 0; i < s.ts.length; i++) {
             long t = s.ts[i];
@@ -429,7 +467,14 @@ public class HedgeOverlay {
             if (!first) {
                 spotCarry += prevInv * (f - prevFair);
                 if (mark != null && prevMark > 0 && m > 0) {
-                    hedgeCarry += prevPerp * (m - prevMark);
+                    // 🔑 П2.7: нога перпа может считаться в СЫРЫХ USD-марках.
+                    // Поминутный пересчёт в USDC подмешивает дрожание нашей
+                    // оценки курса (3.3–5.8 б.п. в минуту, задача A73), и этот
+                    // шум сидит в парной разности целиком: плечо «без хеджа»
+                    // курса не требует вовсе.
+                    hedgeCarry += perpUsd && markUsd != null && prevMarkUsd > 0 && mu > 0
+                            ? prevPerp * (mu - prevMarkUsd)
+                            : prevPerp * (m - prevMark);
                     // Зеркало: то же движение, но по спотовой опоре и на спотовом
                     // запасе. Разница с ногой перпа — полоса, базис, округление.
                     mirror -= prevInv * (f - prevFair);
@@ -440,9 +485,17 @@ public class HedgeOverlay {
             }
             // Перевешивание ПОСЛЕ переоценки: решение принимается по состоянию,
             // которое уже отмечено в капитале.
-            if (mark != null && m > 0 && band > 0) {
+            if (mark != null && m > 0 && (band > 0 || periodMs > 0)) {
                 double net = inv + perp;
-                if (Math.abs(net) > band) {
+                // 🔑 Два правила перевешивания, и второе нужно для П2.8: полоса
+                // отвечает на вопрос «насколько далеко пускаем», период — «как
+                // часто выравниваем». Потолок конструкции задаёт ВТОРОЕ: отбор
+                // растёт с горизонтом удержания, а не с величиной отклонения.
+                boolean due = periodMs > 0 && t - lastHedge >= periodMs && Math.abs(net) > 0;
+                if (due) {
+                    lastHedge = t;
+                }
+                if (due || (band > 0 && Math.abs(net) > band)) {
                     double want = -inv;
                     double delta = want - perp;
                     // ⚠️ ВНИЗ по модулю: округление к ближайшему на грубом шаге
@@ -465,6 +518,11 @@ public class HedgeOverlay {
             areaNet += inv + perp;
             double equity = cash + inv * f + (mark != null ? hedgeCarry - fees : 0);
             hourly.put(t / 3_600_000L, new double[]{equity, f});
+            // П2.9: переноска спота и ноги перпа ПО ЧАСАМ — чтобы увидеть, где
+            // именно хедж покрывает, а где молчит.
+            double[] cr = carryHour.computeIfAbsent(t / 3_600_000L, k -> new double[2]);
+            cr[0] = spotCarry;
+            cr[1] = hedgeCarry;
         }
 
         int n = s.ts.length;
@@ -478,7 +536,7 @@ public class HedgeOverlay {
                 slopes[0], slopes[1], (int) slopes[2]), trades,
                 exBetaByHour(hourly, meanPos), hourly, capHour,
                 new Legs(capture + spotCarry, hedgeCarry - fees,
-                        hedgeCarryUsd - fees, mirror, fees));
+                        hedgeCarryUsd - fees, mirror, fees), carryHour);
     }
 
     /**
@@ -594,7 +652,8 @@ public class HedgeOverlay {
      * отрезке {@code t} завышен. Если знак держится и на суточных блоках — он не
      * артефакт нарезки.
      */
-    private String pairedSection(TreeMap<Long, Double> plain, TreeMap<Long, Double> hedged) {
+    private String pairedSection(TreeMap<Long, Double> plain, TreeMap<Long, Double> hedged,
+                                 TreeMap<Long, double[]> move) {
         List<Long> hours = new ArrayList<>(hedged.keySet());
         hours.retainAll(plain.keySet());
         if (hours.size() < 10) {
@@ -636,6 +695,115 @@ public class HedgeOverlay {
                     .append(" |\n");
         }
         sb.append("\nПорог протокола: `t` ≥ 2 при положительном уровне с хеджем.\n");
+        sb.append(weighted(hours, plain, hedged, move));
+        return sb.toString();
+    }
+
+    /**
+     * ТО ЖЕ, НО С ВЕСАМИ ПО ОБРАТНОЙ ДИСПЕРСИИ (П2.7 из док. 169).
+     *
+     * 🔑 Разброс часовой разности растёт вместе с ходом часа, а ход по квинтилям
+     * различается в 26 раз (166). При равных весах бурные часы дают почти всю
+     * дисперсию, и оценка теряет мощность ни за что. Вес {@code 1/|Δp|²} это
+     * лечит.
+     *
+     * ⚠️ И почему это НЕ подгонка: вес считается из хода часа, который ОДИНАКОВ в
+     * обоих плечах пары. Он не знает, включён хедж или нет, поэтому не может
+     * сдвинуть саму оценку — только её ошибку.
+     *
+     * ⚠️ Но это приём ИЗМЕРЕНИЯ, а не правило торговли: ход часа известен только
+     * после часа.
+     */
+    private String weighted(List<Long> hours, TreeMap<Long, Double> plain,
+                            TreeMap<Long, Double> hedged, TreeMap<Long, double[]> move) {
+        List<double[]> rows = new ArrayList<>();   // {разность, уровень, |Δp|}
+        List<Double> moves = new ArrayList<>();
+        for (long h : hours) {
+            double[] mv = move.get(h);
+            if (mv == null || mv[1] <= 0) {
+                continue;
+            }
+            double abs = Math.abs(mv[0] / mv[1]);
+            rows.add(new double[]{hedged.get(h) - plain.get(h), hedged.get(h), abs});
+            moves.add(abs);
+        }
+        if (rows.size() < 10) {
+            return "";
+        }
+        // ⚠️ Пол на веса: без него один сверхтихий час получает вес в тысячи и
+        // становится единственным наблюдением.
+        List<Double> sorted = new ArrayList<>(moves);
+        sorted.sort(Double::compareTo);
+        double floor = sorted.get(Math.max(0, (int) (0.1 * sorted.size())));
+        StringBuilder sb = new StringBuilder("\n### Те же часы, но с весами `1/|Δp|²` (П2.7)\n\n");
+        sb.append("| величина | оценка, $/ч | `SE` | **`t`** | было при равных весах |\n");
+        sb.append("|---|---:|---:|---:|---:|\n");
+        for (int col = 0; col < 2; col++) {
+            double sw = 0;
+            double swx = 0;
+            for (double[] r : rows) {
+                double w = 1.0 / Math.pow(Math.max(r[2], floor), 2);
+                sw += w;
+                swx += w * r[col];
+            }
+            double mean = swx / sw;
+            double ss = 0;
+            for (double[] r : rows) {
+                double w = 1.0 / Math.pow(Math.max(r[2], floor), 2);
+                ss += w * (r[col] - mean) * (r[col] - mean);
+            }
+            double se = Math.sqrt(ss / (rows.size() - 1.0) / sw);
+            final int c = col;
+            double[] eq = stat(rows.stream().mapToDouble(r -> r[c]).toArray());
+            sb.append("| ").append(col == 0 ? "разность с хеджем − без" : "уровень с хеджем")
+                    .append(" | ").append(money(mean)).append(" | ").append(money(se))
+                    .append(" | **").append(round(se > 0 ? mean / se : 0, 2))
+                    .append("** | ").append(round(eq[1], 2)).append(" |\n");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * П2.9: ГДЕ ИМЕННО ХЕДЖ ПОКРЫВАЕТ (док. 169 часть VI).
+     *
+     * 🔑 Среднее покрытие в 34% ничего не решает, пока не известно, ГДЕ эти 34%.
+     * Если хедж покрывает половину переноски в тихих часах и десятую часть в
+     * бурных, он работает наоборот: платит пошлину там, где терять нечего, и
+     * молчит там, где теряется всё. Лечится это тогда не полосой, а темпом.
+     *
+     * Покрытие считается отношением СУММ по квинтилю (нога перпа к зеркалу
+     * спотовой переноски), а не средним отношений: у частного с малым
+     * знаменателем нет матожидания.
+     */
+    private String coverageSection(List<double[]> cover) {
+        if (cover.size() < 20) {
+            return "";
+        }
+        List<double[]> rows = new ArrayList<>(cover);
+        rows.sort((x, y) -> Double.compare(x[0], y[0]));
+        StringBuilder sb = new StringBuilder("\n### П2.9. Покрытие по квинтилям хода часа\n\n");
+        sb.append("| квинтиль | \\|Δp\\| часа | бот-часов | зеркало (−переноска спота)")
+                .append(" | нога перпа | **покрытие** |\n");
+        sb.append("|---|---:|---:|---:|---:|---:|\n");
+        int q = rows.size() / 5;
+        for (int b = 0; b < 5; b++) {
+            double mv = 0;
+            double mirror = 0;
+            double perp = 0;
+            int n = 0;
+            for (int i = b * q; i < Math.min((b + 1) * q, rows.size()); i++) {
+                mv += rows.get(i)[0];
+                mirror -= rows.get(i)[1];
+                perp += rows.get(i)[2];
+                n++;
+            }
+            sb.append("| ").append(b + 1).append(" | ").append(round(mv / n, 3)).append("%")
+                    .append(" | ").append(n)
+                    .append(" | ").append(money(mirror))
+                    .append(" | ").append(money(perp))
+                    .append(" | **").append(Math.abs(mirror) < 1e-9 ? "—"
+                            : round(100 * perp / mirror, 0) + "%").append("** |\n");
+        }
         return sb.toString();
     }
 
