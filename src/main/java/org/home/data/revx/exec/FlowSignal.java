@@ -344,7 +344,11 @@ public class FlowSignal {
     private void sweeps(StringBuilder sb, String base, List<TapeData.Print> prints,
                         TapeData.Fair fair, TreeMap<Long, Double> bnb) {
         // Свип — цепочка принтов одной стороны в пределах 100 мс.
-        List<double[]> bursts = new ArrayList<>();   // {время, знак, номинал}
+        // 🔑 У свипа запоминается и НАЧАЛО, и КОНЕЦ. Путь считается от опоры
+        // ПОСЛЕ последнего принта: иначе в «ход после свипа» попадает его
+        // собственный удар — те уровни книги, которые он съел, — а его бот
+        // избежать не может по определению (док. 181 часть II).
+        List<double[]> bursts = new ArrayList<>();   // {начало, знак, номинал, конец}
         long start = 0;
         int side = 0;
         double notional = 0;
@@ -353,7 +357,7 @@ public class FlowSignal {
             boolean same = p.aggressor() == side && p.tsMs() - prevTs <= 100;
             if (!same) {
                 if (notional > 0) {
-                    bursts.add(new double[]{start, side, notional});
+                    bursts.add(new double[]{start, side, notional, prevTs});
                 }
                 start = p.tsMs();
                 side = p.aggressor();
@@ -363,7 +367,7 @@ public class FlowSignal {
             prevTs = p.tsMs();
         }
         if (notional > 0) {
-            bursts.add(new double[]{start, side, notional});
+            bursts.add(new double[]{start, side, notional, prevTs});
         }
         if (bursts.size() < 200) {
             return;
@@ -377,11 +381,12 @@ public class FlowSignal {
                 .append(round(big, 0)).append(") — ")
                 .append(bursts.stream().filter(b -> b[2] >= big).count()).append("\n\n");
 
-        // Вопрос 2: разбор по событиям, с плацебо.
-        sb.append("| горизонт | событий | путь по свипу, б.п. | плацебо | **чистый** | **`t`** |\n");
+        // Вопрос 2 и П5.3: разбор по событиям, с плацебо, от КОНЦА свипа.
+        sb.append("| горизонт от конца свипа | событий | путь по свипу, б.п. | плацебо")
+                .append(" | **чистый** | **`t`** |\n");
         sb.append("|---|---:|---:|---:|---:|---:|\n");
-        long[] hs = {60_000, 300_000, 900_000};
-        String[] names = {"1 мин", "5 мин", "15 мин"};
+        long[] hs = {1_000, 5_000, 15_000, 30_000, 60_000, 300_000, 900_000};
+        String[] names = {"1 с", "5 с", "15 с", "30 с", "60 с", "5 мин", "15 мин"};
         for (int h = 0; h < hs.length; h++) {
             List<Double> net = new ArrayList<>();
             double raw = 0;
@@ -390,8 +395,8 @@ public class FlowSignal {
                 if (b[2] < big) {
                     continue;
                 }
-                long t = (long) b[0];
-                double f0 = fair.at(t);
+                long t = (long) b[3];
+                double f0 = fair.after(t);
                 double f1 = fair.after(t + hs[h]);
                 double p0 = fair.at(t - PLACEBO_LAG_MS);
                 double p1 = fair.after(t - PLACEBO_LAG_MS + hs[h]);
