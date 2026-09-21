@@ -335,7 +335,22 @@ public class RevxCollectorDaemon {
                         symbol, cfg.rateBookPeriodSeconds(),
                         Math.round(100.0 / cfg.rateBookPeriodSeconds()) / 100.0);
             }
-            addTradeTasks(queue, universe, tradesPeriodMs, now + 2_000, 2);
+            // 🔑 Лента по торгуемым парам — отдельным, быстрым заданием (A83).
+            // Сделки мы узнавали в среднем через 32 секунды, книгу — за одну, и
+            // на реакции по свипам это стоило трети информации (A82). Бюджет не
+            // увеличен, а переложен: хвост уехал с 60 с на 600.
+            if (cfg.fastTradesPeriodMs() > 0 && !fast.isEmpty()) {
+                addTradeTasks(queue, fast, Math.max(1_000L, cfg.fastTradesPeriodMs()),
+                        now + 2_000, 1);
+                addTradeTasks(queue, normal, tradesPeriodMs, now + 5_000, 3);
+                plannedRps += fast.size() * 1000.0 / cfg.fastTradesPeriodMs()
+                        - (double) fast.size() / endpoints.tradesPeriodSeconds();
+                log.info("быстрая лента: {} пар раз в {} мс, хвост {} пар раз в {} с",
+                        fast.size(), cfg.fastTradesPeriodMs(), normal.size(),
+                        endpoints.tradesPeriodSeconds());
+            } else {
+                addTradeTasks(queue, universe, tradesPeriodMs, now + 2_000, 2);
+            }
             long refresh = cfg.pairsRefreshHours() * 3600_000L;
             queue.add(new Task("pairs", refresh, 5, now + refresh, catalog::refresh));
             log.info("единый ярус: {} пар раз в {} c" + (fast.isEmpty() ? "" : ", быстрых {} раз в {} мс")

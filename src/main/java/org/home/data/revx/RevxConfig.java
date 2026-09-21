@@ -50,6 +50,14 @@ public class RevxConfig {
     private final List<String> collectOnly;
     private final List<String> fastPairs;
     private final long fastBookPeriodMs;
+    /**
+     * Период опроса ЛЕНТЫ по торгуемым парам, мс. Ноль — общий период на всех.
+     *
+     * 🔑 Заведён потому, что сделки мы узнавали в среднем через 32 секунды при
+     * секундном опросе книги (задача A82): лента шла раз в минуту на всю
+     * вселенную. Для реакции на свипы это решающая величина.
+     */
+    private final long fastTradesPeriodMs;
     private final List<String> tier1;
     private final List<String> tier2;
     private final int bookPeriodTier1Seconds;
@@ -181,6 +189,7 @@ public class RevxConfig {
             @Value("${revx.collect-only}") List<String> collectOnly,
             @Value("${revx.fast-pairs}") List<String> fastPairs,
             @Value("${revx.fast-book-period-ms}") long fastBookPeriodMs,
+            @Value("${revx.fast-trades-period-ms:0}") long fastTradesPeriodMs,
             @Value("${revx.tier1}") List<String> tier1,
             @Value("${revx.tier2}") List<String> tier2,
             @Value("${revx.book-period-tier1-seconds}") int bookPeriodTier1Seconds,
@@ -307,6 +316,7 @@ public class RevxConfig {
         this.collectOnly = collectOnly;
         this.fastPairs = fastPairs;
         this.fastBookPeriodMs = fastBookPeriodMs;
+        this.fastTradesPeriodMs = fastTradesPeriodMs;
         this.tier1 = tier1;
         this.tier2 = tier2;
         this.bookPeriodTier1Seconds = bookPeriodTier1Seconds;
@@ -558,6 +568,10 @@ public class RevxConfig {
 
     public long fastBookPeriodMs() {
         return fastBookPeriodMs;
+    }
+
+    public long fastTradesPeriodMs() {
+        return fastTradesPeriodMs;
     }
 
     public List<String> tier1() {
