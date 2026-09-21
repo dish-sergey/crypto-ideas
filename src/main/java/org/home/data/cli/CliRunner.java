@@ -97,6 +97,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.CoreRegression> coreRegression;
     private final ObjectProvider<org.home.data.revx.exec.OffsetSurface> offsetSurface;
     private final ObjectProvider<org.home.data.revx.exec.SeedGain> seedGain;
+    private final ObjectProvider<org.home.data.revx.exec.FlowSignal> flowSignal;
     private final List<String> okxInstruments;
     private final List<String> defaultSymbols;
     /** Кого наблюдает сводный бот: метка:пара:путь. */
@@ -134,6 +135,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.CoreRegression> coreRegression,
                      ObjectProvider<org.home.data.revx.exec.OffsetSurface> offsetSurface,
                      ObjectProvider<org.home.data.revx.exec.SeedGain> seedGain,
+                     ObjectProvider<org.home.data.revx.exec.FlowSignal> flowSignal,
                      @Value("${collectors.okx-instruments}") List<String> okxInstruments,
                      @Value("${collectors.symbols}") List<String> defaultSymbols,
                      @Value("${revx.info.bots}") List<String> infoBots) {
@@ -178,6 +180,7 @@ public class CliRunner implements ApplicationRunner {
         this.coreRegression = coreRegression;
         this.offsetSurface = offsetSurface;
         this.seedGain = seedGain;
+        this.flowSignal = flowSignal;
         this.okxInstruments = okxInstruments;
         this.defaultSymbols = defaultSymbols;
         this.infoBots = infoBots;
@@ -456,6 +459,15 @@ public class CliRunner implements ApplicationRunner {
                         firstOr(args, "from", ""),
                         firstOr(args, "to", ""),
                         Double.parseDouble(firstOr(args, "delta-bp", "12")),
+                        firstOr(args, "out", ""));
+            }
+            if (args.containsOption("revx-flow-signal")) {
+                flowSignal.getObject().run(
+                        firstOr(args, "stand", "D:/revx-data/w10.db"),
+                        firstOr(args, "journals", ""),
+                        firstOr(args, "from", ""),
+                        firstOr(args, "to", ""),
+                        Integer.parseInt(firstOr(args, "min-trades", "5")),
                         firstOr(args, "out", ""));
             }
             if (args.containsOption("revx-lead")) {
