@@ -382,15 +382,25 @@ public class FlowSignal {
                 .append(bursts.stream().filter(b -> b[2] >= big).count()).append("\n\n");
 
         // Вопрос 2 и П5.3: разбор по событиям, с плацебо, от КОНЦА свипа.
-        sb.append("| горизонт от конца свипа | событий | путь по свипу, б.п. | плацебо")
-                .append(" | **чистый** | **`t`** |\n");
-        sb.append("|---|---:|---:|---:|---:|---:|\n");
+        // 🔑 Плацебо ДВА, и второй важнее (урок 176):
+        //   • дальний — тот же знак, путь за три часа до события. Снимает снос
+        //     окна, но НЕ снимает направленность самого часа;
+        //   • внутричасовой — тот же знак, средний путь из ОСТАЛЬНЫХ минут того
+        //     же часа. Крупные свипы сосредоточены в бурных часах, где средний
+        //     пятиминутный ход того же порядка, что искомый эффект, — и только
+        //     этот контроль отвечает, свойство это свипа или часа.
+        sb.append("| горизонт от конца свипа | событий | путь по свипу, б.п. | плацебо 3 ч")
+                .append(" | **чистый** | **`t`** | плацебо ВНУТРИ часа | **чистый по часу**")
+                .append(" | **`t`** |\n");
+        sb.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
         long[] hs = {1_000, 5_000, 15_000, 30_000, 60_000, 300_000, 900_000};
         String[] names = {"1 с", "5 с", "15 с", "30 с", "60 с", "5 мин", "15 мин"};
         for (int h = 0; h < hs.length; h++) {
             List<Double> net = new ArrayList<>();
+            List<Double> netHour = new ArrayList<>();
             double raw = 0;
             double plac = 0;
+            double placHour = 0;
             for (double[] b : bursts) {
                 if (b[2] < big) {
                     continue;
@@ -408,17 +418,29 @@ public class FlowSignal {
                 raw += r;
                 plac += pl;
                 net.add(r - pl);
+                double inHour = withinHour(fair, t, hs[h], b[1]);
+                if (!Double.isNaN(inHour)) {
+                    placHour += inHour;
+                    netHour.add(r - inHour);
+                }
             }
             if (net.size() < 30) {
                 continue;
             }
-            double[] arr = net.stream().mapToDouble(Double::doubleValue).toArray();
-            double[] st = stat(arr);
+            double[] st = stat(net.stream().mapToDouble(Double::doubleValue).toArray());
             sb.append("| ").append(names[h]).append(" | ").append(net.size())
                     .append(" | ").append(round(raw / net.size(), 2))
                     .append(" | ").append(round(plac / net.size(), 2))
                     .append(" | **").append(round(st[0], 2))
-                    .append("** | **").append(round(st[1], 2)).append("** |\n");
+                    .append("** | **").append(round(st[1], 2)).append("**");
+            if (netHour.size() >= 30) {
+                double[] sh = stat(netHour.stream().mapToDouble(Double::doubleValue).toArray());
+                sb.append(" | ").append(round(placHour / netHour.size(), 2))
+                        .append(" | **").append(round(sh[0], 2))
+                        .append("** | **").append(round(sh[1], 2)).append("** |\n");
+            } else {
+                sb.append(" | — | — | — |\n");
+            }
         }
 
         // Вопросы 1 и 3: пятиминутные окна, свип рядом с перевесом.
@@ -461,6 +483,40 @@ public class FlowSignal {
                 .append(" | **").append(round(joint[0][1], 2)).append("** |\n");
         sb.append("| размер свипов, на $1000 | ").append(round(joint[1][0], 4))
                 .append(" | **").append(round(joint[1][1], 2)).append("** |\n");
+    }
+
+    /**
+     * ВНУТРИЧАСОВОЕ ПЛАЦЕБО: средний путь той же длины и того же знака, взятый с
+     * ОСТАЛЬНЫХ минут того же часа (урок 176).
+     *
+     * 🔑 Зачем оно нужно отдельно от дальнего. Крупные свипы сосредоточены в
+     * бурных часах, а там средний пятиминутный ход — того же порядка, что
+     * искомый эффект (166, верхний квинтиль). Дальнее плацебо со сдвигом в три
+     * часа снимает снос ОКНА, но час с его собственной направленностью остаётся
+     * внутри. Этот контроль спрашивает ровно то, что нужно: отличается ли путь
+     * ПОСЛЕ СВИПА от обычного пути в этот же час.
+     *
+     * ⚠️ Минуты в пределах ±5 от события исключаются: иначе контроль будет
+     * содержать сам эффект.
+     */
+    private static double withinHour(TapeData.Fair fair, long t, long horizonMs, double side) {
+        long hour = t / 3_600_000L;
+        double sum = 0;
+        int n = 0;
+        for (long m = hour * 60; m < (hour + 1) * 60; m++) {
+            long ts = m * 60_000L;
+            if (Math.abs(ts - t) <= 5 * 60_000L) {
+                continue;
+            }
+            double a = fair.at(ts);
+            double b = fair.after(ts + horizonMs);
+            if (a <= 0 || b <= 0) {
+                continue;
+            }
+            sum += side * (b - a) / a * 1e4;
+            n++;
+        }
+        return n < 10 ? Double.NaN : sum / n;
     }
 
     /** Корреляция первых двух колонок. */
