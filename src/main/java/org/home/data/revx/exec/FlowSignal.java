@@ -69,8 +69,52 @@ public class FlowSignal {
     /** Порог `t` с поправкой на шесть проверок (Бонферрони, общая ошибка 5%). */
     private static final double T_THRESHOLD = 2.64;
 
+    /**
+     * ПЕРЕВЕС ТЕЙКЕРОВ БИНАНСА из минутных свечей: {@code 2 × покупки / объём − 1}.
+     *
+     * 🔑 Зачем второй источник. На ленте Revolut минута с пятью сделками —
+     * редкость (2.6% минут), и сигнал там держится на горстке принтов. У Бинанса
+     * та же величина считается по ОБЪЁМУ десятков тысяч сделок и лежит в архиве
+     * готовой колонкой {@code taker_buy_volume}. Плюс Бинанс идёт впереди нашей
+     * площадки на 1–2 секунды (A54), то есть у его потока есть фора по
+     * построению.
+     *
+     * ⚠️ Величина не та же самая: там доля ОБЪЁМА, здесь доля ЧИСЛА сделок.
+     * Сравнивать наклоны между источниками нельзя, сравнивать значимость — можно.
+     */
+    private static TreeMap<Long, Double> binanceImbalance(String cryptoDb, String symbol,
+                                                          long from, long to) {
+        TreeMap<Long, Double> out = new TreeMap<>();
+        String url = "jdbc:sqlite:file:" + Path.of(cryptoDb).toAbsolutePath() + "?mode=ro";
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(url);
+             java.sql.PreparedStatement ps = c.prepareStatement(
+                     "SELECT open_time, volume, taker_buy_volume FROM candles"
+                             + " WHERE symbol = ? AND interval = '1m' AND open_time >= ?"
+                             + " AND open_time < ? AND volume > 0 AND taker_buy_volume IS NOT NULL")) {
+            ps.setString(1, symbol);
+            ps.setLong(2, from);
+            ps.setLong(3, to);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.put(rs.getLong(1) / 60_000L, 2 * rs.getDouble(3) / rs.getDouble(2) - 1);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("свечи {} из {}: {}", symbol, cryptoDb, e.toString());
+        }
+        return out;
+    }
+
     public void run(String standDb, String journals, String fromIso, String toIso,
                     int minTrades, String out) {
+        run(standDb, journals, fromIso, toIso, minTrades, out, "");
+    }
+
+    /**
+     *  cryptoDb база со свечами Бинанса; пусто — считать только по ленте Revolut.
+     */
+    public void run(String standDb, String journals, String fromIso, String toIso,
+                    int minTrades, String out, String cryptoDb) {
         long from = fromIso == null || fromIso.isBlank() ? 0
                 : java.time.Instant.parse(fromIso).toEpochMilli();
         long to = toIso == null || toIso.isBlank() ? Long.MAX_VALUE
@@ -104,6 +148,15 @@ public class FlowSignal {
             }
             any = true;
             section(sb, base, prints, fair, minTrades);
+            if (cryptoDb != null && !cryptoDb.isBlank()) {
+                TreeMap<Long, Double> bnb = binanceImbalance(cryptoDb, base + "USDT",
+                        fair.ts()[0], fair.ts()[fair.ts().length - 1]);
+                if (bnb.size() > 500) {
+                    binance(sb, base, bnb, fair);
+                } else {
+                    log.warn("{}: свечей Бинанса мало ({})", base, bnb.size());
+                }
+            }
         }
         if (!any) {
             log.warn("считать нечего");
@@ -203,6 +256,79 @@ public class FlowSignal {
                         .append(" |\n");
             }
         }
+    }
+
+    /**
+     * Тот же счёт, но сигнал — перевес тейкеров БИНАНСА, а цель по-прежнему ход
+     * НАШЕЙ опоры. Тихие окна отбрасывать не нужно: на Бинансе их не бывает.
+     */
+    private void binance(StringBuilder sb, String base, TreeMap<Long, Double> imb,
+                         TapeData.Fair fair) {
+        long first = imb.firstKey();
+        long last = imb.lastKey();
+        for (int n : WINDOWS) {
+            List<double[]> rows = new ArrayList<>();
+            for (long m = first + 2L * n; m + n <= last; m++) {
+                double s1 = mean(imb, m - n, m);
+                double s0 = mean(imb, m - 2L * n, m - n);
+                if (Double.isNaN(s1)) {
+                    continue;
+                }
+                double f0 = fair.at(m * 60_000L);
+                double f1 = fair.at((m + n) * 60_000L);
+                if (f0 <= 0 || f1 <= 0) {
+                    continue;
+                }
+                rows.add(new double[]{s1, Double.isNaN(s0) ? Double.NaN : s1 - s0,
+                        (f1 - f0) / f0 * 1e4, m});
+            }
+            if (rows.size() < 50) {
+                continue;
+            }
+            for (int sig = 0; sig < 2; sig++) {
+                List<double[]> use = new ArrayList<>();
+                for (double[] r : rows) {
+                    if (!Double.isNaN(r[sig])) {
+                        use.add(new double[]{r[sig], r[2], r[3]});
+                    }
+                }
+                if (use.size() < 50) {
+                    continue;
+                }
+                double[] all = fit(use);
+                List<double[]> sparse = new ArrayList<>();
+                long lastTaken = Long.MIN_VALUE;
+                for (double[] r : use) {
+                    if (lastTaken == Long.MIN_VALUE || (long) r[2] - lastTaken >= n) {
+                        sparse.add(r);
+                        lastTaken = (long) r[2];
+                    }
+                }
+                double[] sp = sparse.size() >= 30 ? fit(sparse) : new double[]{0, 0};
+                double tNw = neweyWest(use, all[0], n);
+                sb.append("| ").append(base).append(" **Бинанс**")
+                        .append(" | ").append(sig == 0 ? "S1 уровень" : "S2 изменение")
+                        .append(" | ").append(n)
+                        .append(" | ").append(use.size()).append(" / ").append(sparse.size())
+                        .append(" | ").append(round(all[0], 2))
+                        .append(" | **").append(round(sp[1], 2))
+                        .append("** | ").append(round(tNw, 2))
+                        .append(" | ").append(Math.abs(sp[1]) >= T_THRESHOLD
+                                ? "**берёт порог**" : "нет")
+                        .append(" |\n");
+            }
+        }
+    }
+
+    /** Среднее поминутного перевеса на полуинтервале {@code [a, b)}. */
+    private static double mean(TreeMap<Long, Double> imb, long a, long b) {
+        double s = 0;
+        int n = 0;
+        for (Double v : imb.subMap(a, b).values()) {
+            s += v;
+            n++;
+        }
+        return n == 0 ? Double.NaN : s / n;
     }
 
     /** Перевес тейкеров на полуинтервале минут {@code [a, b)}; NaN — окно бедное. */

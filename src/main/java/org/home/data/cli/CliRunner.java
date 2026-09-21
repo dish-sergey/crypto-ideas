@@ -468,7 +468,8 @@ public class CliRunner implements ApplicationRunner {
                         firstOr(args, "from", ""),
                         firstOr(args, "to", ""),
                         Integer.parseInt(firstOr(args, "min-trades", "5")),
-                        firstOr(args, "out", ""));
+                        firstOr(args, "out", ""),
+                        firstOr(args, "crypto-db", ""));
             }
             if (args.containsOption("revx-lead")) {
                 leadCheck.getObject().run(
