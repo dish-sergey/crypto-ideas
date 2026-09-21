@@ -58,6 +58,11 @@ public class Executor {
 
     private final RevxConfig cfg;
     private final String standDbPath;
+    /** Доля ожидаемого остатка пути после свипа; 0 — реакция выключена. */
+    private final double sweepCoef;
+    private final double sweepMinNotional;
+    private final long sweepChainMs;
+    private final double sweepMaxBp;
     private final String symbol;
     private final double size;
     private final double inventoryCap;
@@ -86,6 +91,10 @@ public class Executor {
 
     public Executor(RevxConfig cfg,
                     @Value("${revx.exec.stand-db}") String standDbPath,
+                    @Value("${revx.exec.sweep-coef:0}") double sweepCoef,
+                    @Value("${revx.exec.sweep-min-notional:1633}") double sweepMinNotional,
+                    @Value("${revx.exec.sweep-chain-ms:100}") long sweepChainMs,
+                    @Value("${revx.exec.sweep-max-bp:6}") double sweepMaxBp,
                     @Value("${revx.exec.symbol}") String symbol,
                     @Value("${revx.exec.size}") double size,
                     @Value("${revx.exec.inventory-cap}") double inventoryCap,
@@ -112,6 +121,10 @@ public class Executor {
                     Panic panic) {
         this.cfg = cfg;
         this.standDbPath = standDbPath;
+        this.sweepCoef = sweepCoef;
+        this.sweepMinNotional = sweepMinNotional;
+        this.sweepChainMs = sweepChainMs;
+        this.sweepMaxBp = sweepMaxBp;
         this.symbol = symbol;
         this.size = size;
         this.inventoryCap = inventoryCap;
@@ -179,6 +192,13 @@ public class Executor {
         // же причине: суточный лимит у площадки один на аккаунт, а процессов
         // шесть. Общий файл — единственное место, где они могут договориться.
         loop.placementBudget(new PlacementBudget(allocPath, ExecLimits.BOTS_SHARING_ACCOUNT));
+        // 🔑 Реакция на свип: включается ТОЛЬКО явной настройкой (по умолчанию
+        // доля 0). Эффект измерен на записи (A81–A84), живьём не проверялся ни
+        // разу — поэтому умолчание «выключено», а не «включено».
+        if (sweepCoef > 0) {
+            loop.sweepWatch(new SweepWatch(standDbPath, symbol, sweepMinNotional,
+                    sweepChainMs, sweepCoef, sweepMaxBp));
+        }
         loop.maxTradingLoss(maxLossUsdc);
 
         // ГЕЙТ ПО ШИРИНЕ ОПОРЫ РАЗДВИГАЕТ ОТСТУП, А НЕ ВЫКЛЮЧАЕТ КОТИРОВАНИЕ.

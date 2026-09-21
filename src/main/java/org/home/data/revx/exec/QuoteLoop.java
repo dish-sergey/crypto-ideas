@@ -1028,6 +1028,13 @@ public final class QuoteLoop implements Runnable {
     private final double parkDistance;
     /** Реестр владения инвентарём: счёт у площадки один на всех ботов. */
     private final AllocRegistry alloc;
+    /**
+     * Сторож свипов; { null} — реакция выключена.
+     *
+     * ⚠️ Выключен по умолчанию и включается только явной настройкой: это
+     * изменение поведения на живых деньгах, а измерен эффект на записи.
+     */
+    private SweepWatch sweeps;
     private final java.util.ArrayDeque<long[]> fairHistory = new java.util.ArrayDeque<>();
     private final org.home.data.revx.sim.EfficiencyRatio efficiency;
     private volatile String pausedReason = "не запущен";
@@ -1163,6 +1170,11 @@ public final class QuoteLoop implements Runnable {
     private double startQuote;
     private boolean startCaptured;
     private java.util.function.Consumer<String> alert = message -> { };
+
+    /** Включить реакцию на свипы; {@code null} выключает. */
+    public void sweepWatch(SweepWatch watch) {
+        this.sweeps = watch;
+    }
 
     public QuoteLoop(Venue client, Clock clock, FairSource stand, ExecJournal journal,
                      Quoter.Params params, String symbol, long periodMs, double minNotional,
@@ -1695,9 +1707,28 @@ public final class QuoteLoop implements Runnable {
         // В распродаже цена считается котировщиком с ЦЕЛЬЮ СКОСА В НОЛЬ: иначе
         // скос тянул бы к половине потолка, то есть подтягивал бид и отодвигал
         // аск — ровно наоборот тому, что нужно, когда надо сводить позицию.
+        // 🔑 РЕАКЦИЯ НА СВИП: котируем вокруг ОЖИДАЕМОЙ середины, а не текущей.
+        //
+        // После крупного свипа опора идёт в его сторону, и остаток пути измерен
+        // (A81–A84): 3.97 б.п. всего, из них к минуте проходит 3.40. Сдвигаем
+        // опору на ожидаемый ОСТАТОК — тогда бид не стоит под падение, а аск не
+        // отдаёт монету перед ростом.
+        //
+        // ⚠️ Форма именно сдвиг, а не гейт: гейт убирает вместе с плохими
+        // сделками и хорошие, и на этом провалились гейты A46.
+        double sweepBp = sweeps == null ? 0 : sweeps.shiftBp(clock.now());
+        double quoteFair = fair.price() * (1 + sweepBp / 1e4);
+        if (sweepBp != 0) {
+            SweepWatch.Sweep sw = sweeps.lastSweep(clock.now());
+            if (sweeps.isNew(sw)) {
+                journal.event("sweep_shift", String.format(java.util.Locale.ROOT,
+                        "%s: свип %s на $%.0f, опора %+.2f б.п.", symbol,
+                        sw.side() > 0 ? "вверх" : "вниз", sw.notional(), sweepBp));
+            }
+        }
         Quoter.Quotes target = frozenUnwind
-                ? unwindQuoter().quotes(fair.price(), inventory, drift)
-                : policy.quotes(fair.price(), inventory, drift);
+                ? unwindQuoter().quotes(quoteFair, inventory, drift)
+                : policy.quotes(quoteFair, inventory, drift);
         if (widened) {
             target = widenForSpread(target, fair.price(), fair.referenceSpreadPct(),
                     spreadToOffset);
