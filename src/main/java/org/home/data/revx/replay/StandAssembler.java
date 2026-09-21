@@ -69,8 +69,13 @@ public final class StandAssembler {
             Files.deleteIfExists(out);
             Path tmp = dir.resolve("part.tmp.db");
 
-            // Первый файл становится основой: схема, индексы и первичные ключи
-            // приезжают из него готовыми, и создавать их руками не нужно.
+            // Первый файл становится основой: схема и первичные ключи приезжают
+            // из него готовыми.
+            //
+            // ⚠️ А вот ИНДЕКСЫ — нет, и прежняя запись «индексы приезжают
+            // готовыми» была неверна. Инкременты снимаются через
+            // `CREATE TABLE ... AS SELECT`, а эта форма копирует строки без
+            // индексов. Поэтому в конце сборки они строятся явно, см. index().
             unpack(parts.get(0), out);
             log.warn("основа: {} ({} книг)", parts.get(0).getFileName(), count(out, "revx_book"));
 
@@ -102,9 +107,54 @@ public final class StandAssembler {
                 log.warn("{} → книг всего {}", parts.get(i).getFileName(), count(out, "revx_book"));
             }
             Files.deleteIfExists(tmp);
+            index(out);
             report(out);
         } catch (Exception e) {
             log.error("сборка базы не прошла: {}", e.toString(), e);
+        }
+    }
+
+    /**
+     * Индексы собранной базы.
+     *
+     * 🔑 ⚠️ АРХИВНЫЕ ИНКРЕМЕНТЫ ИНДЕКСОВ НЕ НЕСУТ, И ЭТО НЕ ОЧЕВИДНО.
+     * {@code deploy/revx-backup.sh} снимает хвост через
+     * {@code CREATE TABLE ... AS SELECT}, а эта форма копирует СТРОКИ, но не
+     * индексы. Комментарий выше — «схема, индексы и первичные ключи приезжают из
+     * основы готовыми» — верен для выгрузки целой базы и НЕВЕРЕН для
+     * инкрементов: у них нет ни одного индекса ни на ленте, ни на книге.
+     *
+     * Чем это стоило: сторож свипов спрашивал ленту на каждом тике, план
+     * запроса — полный {@code SCAN} плюс сортировка во временном B-дереве, и
+     * прогон на 70 727 тиках превращался в 2.4 млрд чтений. Он переставал
+     * укладываться в предохранитель {@link Forecast} и до 21.09.2026 молча
+     * печатал ОБРЕЗАННЫЙ результат: 36 сделок на свободной машине против 17 на
+     * занятой при одном и том же вводе.
+     *
+     * ⚠️ Строить индексы в самом архиве нельзя: инкремент делается на
+     * одноядерном ARM рядом с живым сбором, и лишняя работа там — отказ записи
+     * книги, который невосполним (принцип 4). Значит место им здесь.
+     */
+    private static void index(Path out) {
+        String[] ddl = {
+            "CREATE INDEX IF NOT EXISTS idx_revx_trade_symbol_ts ON revx_trade(symbol, ts_ms)",
+            "CREATE INDEX IF NOT EXISTS idx_revx_book_recv ON revx_book(symbol, t_recv_ms)",
+            "CREATE INDEX IF NOT EXISTS idx_revx_book_snap ON revx_book(snap_id)",
+        };
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + out);
+             Statement st = c.createStatement()) {
+            for (String sql : ddl) {
+                long t0 = System.currentTimeMillis();
+                st.execute(sql);
+                log.warn("индекс: {} ({} мс)",
+                        sql.substring(sql.indexOf("EXISTS") + 7, sql.indexOf(" ON ")),
+                        System.currentTimeMillis() - t0);
+            }
+        } catch (Exception e) {
+            // Не повод терять собранную базу: без индексов она работает, просто
+            // медленно. Но молчать нельзя — именно молчание и стоило прогонов.
+            log.error("⚠️ ИНДЕКСЫ НЕ ПОСТРОЕНЫ: {}. База пригодна, но запросы по "
+                    + "ленте и книге пойдут полным сканом", e.toString());
         }
     }
 

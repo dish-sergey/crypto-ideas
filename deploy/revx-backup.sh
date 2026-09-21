@@ -59,6 +59,13 @@ book_max=$(sqlite3 -readonly "$DB" 'select coalesce(max(rowid),0) from revx_book
 trade_max=$(sqlite3 -readonly "$DB" 'select coalesce(max(rowid),0) from revx_trade;')
 
 rm -f "$OUT" "$OUT.gz"
+# ⚠️ `CREATE TABLE ... AS SELECT` копирует СТРОКИ, но НЕ ИНДЕКСЫ: в инкременте их
+# нет ни одного — ни на ленте, ни на книге. Это намеренно: строить их здесь значит
+# грузить одноядерный ARM рядом с живым сбором, а отказ записи книги невосполним
+# (принцип 4). Индексы ставит StandAssembler в конце сборки (--revx-assemble).
+#
+# ⚠️ Молчать об этом нельзя: до 21.09.2026 собранные базы шли полным сканом по
+# всем запросам к ленте и книге, и на этом молча обрезался прогон стенда.
 nice -n 19 ionice -c3 sqlite3 "$DB" <<SQL
 attach '$OUT' as d;
 create table d.revx_book    as select * from main.revx_book    where rowid > $book_cur  and rowid <= $book_max;
