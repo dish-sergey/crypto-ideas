@@ -1035,6 +1035,17 @@ public final class QuoteLoop implements Runnable {
      * изменение поведения на живых деньгах, а измерен эффект на записи.
      */
     private SweepWatch sweeps;
+
+    /**
+     * Какую сторону двигает реакция на свип.
+     *
+     * {@code BOTH} — сдвигается ОПОРА, то есть обе стороны разом (как было).
+     * {@code BID} и {@code ASK} двигают одну, оставляя вторую там, где её
+     * поставила бы логика без правки, — это ось сравнения, а не настройка среды.
+     */
+    public enum SweepSide { BOTH, BID, ASK }
+
+    private SweepSide sweepSide = SweepSide.BOTH;
     private final java.util.ArrayDeque<long[]> fairHistory = new java.util.ArrayDeque<>();
     private final org.home.data.revx.sim.EfficiencyRatio efficiency;
     private volatile String pausedReason = "не запущен";
@@ -1174,6 +1185,31 @@ public final class QuoteLoop implements Runnable {
     /** Включить реакцию на свипы; {@code null} выключает. */
     public void sweepWatch(SweepWatch watch) {
         this.sweeps = watch;
+    }
+
+    public void sweepWatch(SweepWatch watch, SweepSide side) {
+        this.sweeps = watch;
+        this.sweepSide = side == null ? SweepSide.BOTH : side;
+    }
+
+    /**
+     * Склейка односторонней реакции: одна сторона от СДВИНУТОЙ опоры, вторая от
+     * нетронутой.
+     *
+     * ⚠️ Складывать надо именно готовые котировки, а не «сдвигать полцены»:
+     * между опорой и ценой стоят скос по инвентарю, снос и форма сетки, и
+     * повторять их в обход {@code policy} значило бы завести вторую реализацию
+     * котировщика — ровно то, от чего стенд и уберегает.
+     *
+     * @param shifted котировка по сдвинутой опоре
+     * @param plain   котировка по опоре БЕЗ сдвига (тот же инвентарь и снос)
+     */
+    static Quoter.Quotes spliceSide(Quoter.Quotes shifted, Quoter.Quotes plain, SweepSide side) {
+        return switch (side) {
+            case BOTH -> shifted;
+            case BID -> new Quoter.Quotes(shifted.bid(), plain.ask());
+            case ASK -> new Quoter.Quotes(plain.bid(), shifted.ask());
+        };
     }
 
     public QuoteLoop(Venue client, Clock clock, FairSource stand, ExecJournal journal,
@@ -1729,6 +1765,24 @@ public final class QuoteLoop implements Runnable {
         Quoter.Quotes target = frozenUnwind
                 ? unwindQuoter().quotes(quoteFair, inventory, drift)
                 : policy.quotes(quoteFair, inventory, drift);
+        // ОДНОСТОРОННИЙ СДВИГ: считаем котировку ДВАЖДЫ и берём одну сторону от
+        // сдвинутой опоры, другую от нетронутой.
+        //
+        // 🔑 Зачем разделять. Сдвиг опоры двигает обе стороны сразу, а
+        // действуют они по-разному: на свипе ВНИЗ бид уходит от рынка (не лови
+        // падающий нож), а аск приближается (успей продать). Это две разные
+        // ставки, и на замере они смешаны. Прогон 21.09 показал, что весь плюс
+        // пришёл оттуда, где бот РАСКЛИНИЛСЯ у потолка, — то есть от аска, а не
+        // от бида, но раздельно это не мерилось.
+        //
+        // ⚠️ Второй вызов обязан идти по ТОМУ ЖЕ инвентарю и сносу: иначе
+        // сравнивались бы не стороны, а два разных состояния.
+        if (sweepBp != 0 && sweepSide != SweepSide.BOTH) {
+            Quoter.Quotes plain = frozenUnwind
+                    ? unwindQuoter().quotes(fair.price(), inventory, drift)
+                    : policy.quotes(fair.price(), inventory, drift);
+            target = spliceSide(target, plain, sweepSide);
+        }
         if (widened) {
             target = widenForSpread(target, fair.price(), fair.referenceSpreadPct(),
                     spreadToOffset);

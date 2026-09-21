@@ -357,7 +357,8 @@ public class CliRunner implements ApplicationRunner {
                 executor.getObject().sweepRun(firstOr(args, "journal", "state/exec.db"),
                         firstOr(args, "coefs", "0,1"),
                         Long.parseLong(firstOr(args, "sweep-delay-ms", "2000")),
-                        firstOr(args, "from", ""), firstOr(args, "to", ""));
+                        firstOr(args, "from", ""), firstOr(args, "to", ""),
+                        firstOr(args, "offsets", ""), firstOr(args, "sides", "both"));
             }
             if (args.containsOption("revx-order-probe")) {
                 orderProbe.getObject().run();

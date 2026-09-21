@@ -556,6 +556,34 @@ public class Executor {
      */
     public void sweepRun(String journalPath, String coefs, long delayMs,
                          String from, String to) {
+        sweepRun(journalPath, coefs, delayMs, from, to, "", "both");
+    }
+
+    /**
+     * То же с двумя осями: {@code --offsets=6,8,10,12} и {@code --sides=both,bid,ask}.
+     *
+     * <h2>Ось СТОРОН</h2>
+     *
+     * Сдвиг опоры двигает обе стороны разом, а действуют они по-разному. На
+     * свипе ВНИЗ бид уходит от рынка (не лови падающий нож), а аск приближается
+     * (успей продать). Это две разные ставки, и в сводном замере они смешаны:
+     * прогон 21.09 показал, что весь плюс пришёл оттуда, где бот РАСКЛИНИЛСЯ у
+     * потолка, то есть похоже на аск, — но порознь это не мерилось.
+     *
+     * <h2>Ось ОТСТУПОВ</h2>
+     *
+     * При {@code λ(δ) = A·e^{−κδ}} относительный отклик на сдвиг от δ НЕ
+     * зависит: {@code λ(δ−Δ)/λ(δ) = e^{κΔ}} при любом δ. А вот абсолютный
+     * растёт — ближе к цене сделок больше, значит и денег на том же сдвиге
+     * больше. Ось проверяет ровно это.
+     *
+     * ⚠️ В стенде потолок постановок снят (одиночный бот), а живьём тесные
+     * отступы упираются в бюджет: переход BTC на 8 б.п. просит ~+200 постановок
+     * в сутки при свободных ~100 (A75). Выигрыш узкой ступени на стенде живьём
+     * достижим не будет без освобождения бюджета.
+     */
+    public void sweepRun(String journalPath, String coefs, long delayMs,
+                         String from, String to, String offsets, String sides) {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
@@ -582,24 +610,57 @@ public class Executor {
                     java.time.Instant.ofEpochMilli(ticks.get(ticks.size() - 1).tsMs()),
                     bp.offset() * 10_000, delayMs);
 
+            // Отступы: пусто — тот, с которым бот работал (из журнала).
+            double[] deltas = offsets == null || offsets.isBlank()
+                    ? new double[]{bp.offset()}
+                    : java.util.Arrays.stream(offsets.split(","))
+                            .mapToDouble(s -> Double.parseDouble(s.trim()) / 10_000).toArray();
+            String[] sideNames = sides == null || sides.isBlank()
+                    ? new String[]{"both"} : sides.split(",");
+
             var all = new java.util.ArrayList<org.home.data.revx.replay.Forecast.BotResult>();
-            for (String part : coefs.split(",")) {
-                double coef = Double.parseDouble(part.trim());
-                var bots = java.util.List.of(new org.home.data.revx.replay.Forecast.BotSpec(
-                        part.trim(), bp.offset(), bp.skewTarget(), bp.inventoryCap(),
-                        bp.levels(), bp.levelStep(), bp.size(), bp.innerFirst(), 0,
-                        coef, delayMs));
-                // Модель и книга перечитываются на каждую ступень: у модели
-                // исполнения есть состояние (очередь, видимость), и делить её
-                // между прогонами значило бы мерить не долю, а порядок запуска.
-                var market = org.home.data.revx.replay.MarketData.load(standDbPath, bp.symbol(),
-                        ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
-                var results = org.home.data.revx.replay.Forecast.run(ticks,
-                        new org.home.data.revx.replay.MarketFillModel(market),
-                        bp, bots, cfg, standDbPath);
-                all.addAll(results);
+            for (double delta : deltas) {
+                for (String part : coefs.split(",")) {
+                    double coef = Double.parseDouble(part.trim());
+                    for (String sideName : sideNames) {
+                        QuoteLoop.SweepSide side = QuoteLoop.SweepSide.valueOf(
+                                sideName.trim().toUpperCase(java.util.Locale.ROOT));
+                        // Без реакции сторона ничего не значит — считаем контроль
+                        // ОДИН раз, на первой стороне списка.
+                        //
+                        // ⚠️ Здесь стояло `side != BOTH`, и при `--sides=bid`
+                        // (без `both` в списке) контроль пропадал ЦЕЛИКОМ: в
+                        // таблице оставались только ветки с реакцией, сравнивать
+                        // было не с чем. Поймано 21.09.2026 на прогоне бида по
+                        // десяти суткам.
+                        if (coef == 0) {
+                            if (!sideName.trim().equals(sideNames[0].trim())) {
+                                continue;
+                            }
+                            side = QuoteLoop.SweepSide.BOTH;   // контроль стороны не имеет
+                        }
+                        String id = String.format(java.util.Locale.ROOT, "%.0f/%s%s",
+                                delta * 10_000, part.trim(),
+                                coef == 0 ? "" : "/" + sideName.trim());
+                        var bots = java.util.List.of(
+                                new org.home.data.revx.replay.Forecast.BotSpec(
+                                        id, delta, bp.skewTarget(), bp.inventoryCap(),
+                                        bp.levels(), bp.levelStep(), bp.size(),
+                                        bp.innerFirst(), 0, coef, delayMs, side));
+                        // Модель и книга перечитываются на каждую ступень: у модели
+                        // исполнения есть состояние (очередь, видимость), и делить её
+                        // между прогонами значило бы мерить не настройку, а порядок
+                        // запуска.
+                        var market = org.home.data.revx.replay.MarketData.load(standDbPath,
+                                bp.symbol(), ticks.get(0).tsMs(),
+                                ticks.get(ticks.size() - 1).tsMs());
+                        all.addAll(org.home.data.revx.replay.Forecast.run(ticks,
+                                new org.home.data.revx.replay.MarketFillModel(market),
+                                bp, bots, cfg, standDbPath));
+                    }
+                }
             }
-            log.info("\n=== Реакция на свип: доли на одном окне ===\n{}",
+            log.info("\n=== Реакция на свип: отступ/доля/сторона на одном окне ===\n{}",
                     org.home.data.revx.replay.Forecast.render("рабочая (очередь по книге)", all));
         } catch (Exception e) {
             log.error("свип-прогон не прошёл: {}", e.toString(), e);

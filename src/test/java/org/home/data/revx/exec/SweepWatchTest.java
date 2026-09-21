@@ -138,6 +138,41 @@ class SweepWatchTest {
         }
     }
 
+    /**
+     * 🔑 ЛЕНТА В ПАМЯТИ И ЗАПРОСОМ — ОДИН ПРИБОР, А НЕ ДВА.
+     *
+     * Предзагрузка заведена 21.09.2026 потому, что у {@code revx_trade} нет ни
+     * одного индекса: запрос на каждом тике давал полный скан таблицы, прогон
+     * переставал укладываться в предохранитель и печатал ОБРЕЗАННЫЙ результат
+     * (36 сделок на свободной машине против 17 на занятой). Ускорение не имеет
+     * права менять ответ, поэтому оба пути сверяются на одной ленте в каждой
+     * точке.
+     */
+    @Test
+    void лентаВПамятиДаётТоЖе(@TempDir Path dir) throws Exception {
+        String path = db(dir, "equiv.db");
+        long t0 = 1_000_000_000_000L;
+        // Три разные цепочки: крупная продажа, мелочь врозь, крупная покупка.
+        for (int i = 0; i < 4; i++) {
+            print(path, t0 + i * 20L, 100_000, 0.005, "sell");
+        }
+        for (int i = 0; i < 3; i++) {
+            print(path, t0 + 30_000 + i * 700L, 100_000, 0.004, "buy");
+        }
+        for (int i = 0; i < 5; i++) {
+            print(path, t0 + 90_000 + i * 15L, 100_000, 0.006, "buy");
+        }
+        try (SweepWatch query = new SweepWatch(path, "BTC/USDC", 1633, 100, 1.0, 6, 0);
+             SweepWatch memory = SweepWatch.preloaded(path, "BTC/USDC", 1633, 100, 1.0, 6, 0,
+                     t0, t0 + 400_000)) {
+            for (long dt = 0; dt <= 350_000; dt += 250) {
+                long now = t0 + dt;
+                assertEquals(query.shiftBp(now), memory.shiftBp(now), 1e-12,
+                        "сдвиг разошёлся на " + dt + " мс от начала");
+            }
+        }
+    }
+
     @Test
     void криваяПутиМонотоннаИНасыщается() {
         assertTrue(SweepWatch.path(0.5) < SweepWatch.path(5), "путь растёт");

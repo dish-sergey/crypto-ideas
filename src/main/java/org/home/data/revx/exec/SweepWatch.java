@@ -136,8 +136,91 @@ public final class SweepWatch implements AutoCloseable {
         return bp;
     }
 
+    /**
+     * Лента, загруженная В ПАМЯТЬ один раз на всё окно; {@code null} — режим
+     * запроса на каждый вызов.
+     *
+     * 🔑 ⚠️ У {@code revx_trade} НЕТ НИ ОДНОГО ИНДЕКСА, и план запроса — полный
+     * {@code SCAN} плюс сортировка во временном B-дереве. На тике это незаметно,
+     * а на прогоне убийственно: 70 727 тиков × 33 249 строк ≈ 2.4 млрд чтений.
+     * Прогон переставал укладываться в предохранитель {@link Forecast}, и до
+     * 21.09.2026 молча печатал обрезанный результат.
+     *
+     * Живой бот ленту читает раз в тик (секунда) и на растущей базе упрётся в тот
+     * же скан — ⚠️ перед включением реакции живьём нужен индекс
+     * {@code (symbol, ts_ms)}.
+     */
+    private long[] tapeTs;
+    private double[] tapeNotional;
+    private int[] tapeSide;
+
+    /**
+     * Сторож с ЛЕНТОЙ В ПАМЯТИ на известное окно: для стенда.
+     *
+     * Поведение обязано совпадать с запросным режимом до последнего свипа —
+     * различается только то, откуда берутся принты (закреплено
+     * {@code SweepWatchTest}).
+     */
+    public static SweepWatch preloaded(String dbPath, String symbol, double minNotional,
+                                       long chainMs, double coefficient, double maxBp,
+                                       long delayMs, long fromMs, long toMs) {
+        SweepWatch w = new SweepWatch(dbPath, symbol, minNotional, chainMs,
+                coefficient, maxBp, delayMs);
+        w.preload(fromMs - LOOKBACK_MS, toMs);
+        return w;
+    }
+
+    private void preload(long fromMs, long toMs) {
+        java.util.List<long[]> ts = new java.util.ArrayList<>();
+        java.util.List<double[]> nt = new java.util.ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT ts_ms, price, qty, side FROM revx_trade"
+                        + " WHERE symbol = ? AND ts_ms >= ? AND ts_ms <= ? ORDER BY ts_ms")) {
+            ps.setString(1, symbol);
+            ps.setLong(2, fromMs);
+            ps.setLong(3, toMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String s = rs.getString(4);
+                    ts.add(new long[]{rs.getLong(1),
+                            s != null && s.toLowerCase().startsWith("b") ? 1 : -1});
+                    nt.add(new double[]{rs.getDouble(2) * rs.getDouble(3)});
+                }
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("не прочиталась лента " + symbol, e);
+        }
+        tapeTs = new long[ts.size()];
+        tapeSide = new int[ts.size()];
+        tapeNotional = new double[ts.size()];
+        for (int i = 0; i < ts.size(); i++) {
+            tapeTs[i] = ts.get(i)[0];
+            tapeSide[i] = (int) ts.get(i)[1];
+            tapeNotional[i] = nt.get(i)[0];
+        }
+        log.info("лента {} в памяти: принтов {}", symbol, tapeTs.length);
+    }
+
+    /** Первый индекс с {@code ts >= key}; размер массива, если такого нет. */
+    private int lowerBound(long key) {
+        int lo = 0;
+        int hi = tapeTs.length;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (tapeTs[mid] < key) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
     /** Конец последнего крупного свипа и его знак; {@code null} — такого нет. */
     public Sweep lastSweep(long nowMs) {
+        if (tapeTs != null) {
+            return lastSweepInMemory(nowMs);
+        }
         Sweep best = null;
         // 🔑 ⚠️ ВЕРХНЯЯ ГРАНИЦА ОБЯЗАТЕЛЬНА, И БЕЗ НЕЁ ПРИБОР ЛЖЁТ НА СТЕНДЕ.
         //
@@ -187,6 +270,37 @@ public final class SweepWatch implements AutoCloseable {
             // свипа» и работаем как раньше.
             log.warn("лента {}: {}", symbol, e.toString());
             return null;
+        }
+        return best;
+    }
+
+    /**
+     * То же по ленте в памяти. Логика склейки — ОДНА И ТА ЖЕ, различается только
+     * источник принтов; расхождение здесь означало бы два разных прибора.
+     */
+    private Sweep lastSweepInMemory(long nowMs) {
+        int from = lowerBound(nowMs - LOOKBACK_MS);
+        int to = lowerBound(nowMs - delayMs + 1);
+        Sweep best = null;
+        long chainStart = 0;
+        long chainEnd = 0;
+        int chainSide = 0;
+        double chainNotional = 0;
+        for (int i = from; i < to; i++) {
+            boolean same = tapeSide[i] == chainSide && tapeTs[i] - chainEnd <= chainMs;
+            if (!same) {
+                if (chainNotional >= minNotional && chainSide != 0) {
+                    best = new Sweep(chainStart, chainEnd, chainSide, chainNotional);
+                }
+                chainStart = tapeTs[i];
+                chainSide = tapeSide[i];
+                chainNotional = 0;
+            }
+            chainNotional += tapeNotional[i];
+            chainEnd = tapeTs[i];
+        }
+        if (chainNotional >= minNotional && chainSide != 0) {
+            best = new Sweep(chainStart, chainEnd, chainSide, chainNotional);
         }
         return best;
     }

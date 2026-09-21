@@ -46,6 +46,14 @@ public final class Forecast {
 
     private static final Logger log = LoggerFactory.getLogger(Forecast.class);
 
+    /**
+     * Предохранитель от зависания на барьере, а не ожидаемое время прогона.
+     *
+     * ⚠️ Если он сработал — прогон НЕ ДОСЧИТАН, и результат печатать нельзя
+     * (см. проверку живых потоков ниже).
+     */
+    private static final long JOIN_TIMEOUT_MS = 30 * 60_000L;
+
     /** Один котировщик в прогоне: чем отличается от базового. */
     /**
      * @param inventoryCap потолок инвентаря ЭТОГО уровня. Отдельным полем не для
@@ -68,11 +76,16 @@ public final class Forecast {
      * @param sweepDelayMs задержка узнавания ленты, мс. ⚠️ Ноль моделирует бота
      *                     с МГНОВЕННОЙ лентой, которого не бывает: после
      *                     ускорения опроса (A83) живая задержка 2.0 с.
+     * @param sweepSide    какую сторону двигать. Сдвиг ОПОРЫ двигает обе разом,
+     *                     а действуют они по-разному: на свипе вниз бид уходит
+     *                     от рынка (не лови нож), а аск приближается (успей
+     *                     продать). Ось нужна, чтобы мерить их порознь.
      */
     public record BotSpec(String botId, double offset, double skewTarget,
                           double inventoryCap, int levels, double levelStep,
                           double size, boolean innerFirst, double dynOffsetK,
-                          double sweepCoef, long sweepDelayMs) {
+                          double sweepCoef, long sweepDelayMs,
+                          org.home.data.revx.exec.QuoteLoop.SweepSide sweepSide) {
 
         public BotSpec(String botId, double offset, double skewTarget,
                        double inventoryCap, int levels, double levelStep,
@@ -86,6 +99,15 @@ public final class Forecast {
                        double size, boolean innerFirst, double dynOffsetK) {
             this(botId, offset, skewTarget, inventoryCap, levels, levelStep,
                     size, innerFirst, dynOffsetK, 0, 2_000);
+        }
+
+        public BotSpec(String botId, double offset, double skewTarget,
+                       double inventoryCap, int levels, double levelStep,
+                       double size, boolean innerFirst, double dynOffsetK,
+                       double sweepCoef, long sweepDelayMs) {
+            this(botId, offset, skewTarget, inventoryCap, levels, levelStep,
+                    size, innerFirst, dynOffsetK, sweepCoef, sweepDelayMs,
+                    org.home.data.revx.exec.QuoteLoop.SweepSide.BOTH);
         }
     }
 
@@ -387,11 +409,16 @@ public final class Forecast {
                         throw new IllegalStateException("реакция на свип просит базу стенда: "
                                 + "ленту брать неоткуда");
                     }
-                    var watch = new org.home.data.revx.exec.SweepWatch(standDbPath, base.symbol(),
-                            cfg.execSweepMinNotional(), cfg.execSweepChainMs(),
-                            spec.sweepCoef(), cfg.execSweepMaxBp(), spec.sweepDelayMs());
+                    // Лента грузится в память на всё окно: у revx_trade нет ни
+                    // одного индекса, и запрос на каждом тике превращался в
+                    // 2.4 млрд чтений — прогон переставал укладываться в
+                    // предохранитель и печатал обрезанный результат.
+                    var watch = org.home.data.revx.exec.SweepWatch.preloaded(standDbPath,
+                            base.symbol(), cfg.execSweepMinNotional(), cfg.execSweepChainMs(),
+                            spec.sweepCoef(), cfg.execSweepMaxBp(), spec.sweepDelayMs(),
+                            start, end);
                     watches.add(watch);
-                    loop.sweepWatch(watch);
+                    loop.sweepWatch(watch, spec.sweepSide());
                 }
                 loop.statsInventoryCap(spec.inventoryCap());
                 loops.add(loop);
@@ -429,7 +456,29 @@ public final class Forecast {
                 t.start();
             }
             for (Thread t : threads) {
-                t.join(600_000);
+                t.join(JOIN_TIMEOUT_MS);
+            }
+            // 🔑 ⚠️ НЕДОСЧИТАННЫЙ ПРОГОН ВЫГЛЯДЕЛ КАК ЧЕСТНЫЙ РЕЗУЛЬТАТ.
+            //
+            // `join` с таймаутом возвращает управление и тогда, когда поток ЖИВ.
+            // Главный поток шёл печатать отчёт, пока котировщик ещё торговал, и
+            // числа получались обрезанные ровно настолько, насколько загружена
+            // машина. Поймано 21.09.2026: один и тот же прогон (BTC, окно
+            // 14–16.09, доля свипа 1) дал 36 сделок и −0.0905 на свободной
+            // машине и 17 сделок и −0.0504 на занятой, при том что контрольная
+            // ветка совпала до знака — она быстрая и успевала обе.
+            //
+            // Это та же болезнь, что и «упавший котировщик выглядел как ноль
+            // сделок»: ошибка, неотличимая от результата. Таймаут оставлен как
+            // предохранитель от зависания на барьере, но молчать он больше не
+            // имеет права.
+            List<String> stuck = threads.stream().filter(Thread::isAlive)
+                    .map(Thread::getName).toList();
+            if (!stuck.isEmpty()) {
+                throw new IllegalStateException("прогон НЕ ДОСЧИТАН за "
+                        + JOIN_TIMEOUT_MS / 60_000 + " мин: ещё торгуют " + stuck
+                        + ". Числа такого прогона зависят от скорости машины, "
+                        + "а не от настройки — печатать их нельзя");
             }
             if (!crashes.isEmpty()) {
                 throw new IllegalStateException("прогон не состоялся: упало котировщиков "
