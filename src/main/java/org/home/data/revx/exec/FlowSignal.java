@@ -153,6 +153,7 @@ public class FlowSignal {
                         fair.ts()[0], fair.ts()[fair.ts().length - 1]);
                 if (bnb.size() > 500) {
                     binance(sb, base, bnb, fair);
+                    sweeps(sb, base, prints, fair, bnb);
                 } else {
                     log.warn("{}: свечей Бинанса мало ({})", base, bnb.size());
                 }
@@ -319,6 +320,274 @@ public class FlowSignal {
             }
         }
     }
+
+    /**
+     * СВИПЫ: несут ли они что-то СВЕРХ перевеса (док. 179 часть IV).
+     *
+     * Три вопроса по порядку:
+     * <ol>
+     *   <li>связаны ли размер перевеса и размер свипов — вопрос владельца
+     *       буквально;</li>
+     *   <li>предсказывает ли свип ход сам по себе — разбором ПО СОБЫТИЯМ, а не
+     *       регрессией по минутам: свип редок, и в регрессии по всем минутам он
+     *       утонет в пустых;</li>
+     *   <li>🔑 решающий: остаётся ли свип значимым, когда перевес уже учтён.</li>
+     * </ol>
+     *
+     * ⚠️ Знак допускается ЛЮБОЙ: продолжение (свип осведомлён) и возврат (свип
+     * переплатил за немедленность) — разные гипотезы, и выбирать между ними
+     * должен замер, а не ожидание.
+     *
+     * ⚠️ Плацебо обязателен — после урока 176: на трендовом окне «продолжение»
+     * получается у любого события, направленного по тренду.
+     */
+    private void sweeps(StringBuilder sb, String base, List<TapeData.Print> prints,
+                        TapeData.Fair fair, TreeMap<Long, Double> bnb) {
+        // Свип — цепочка принтов одной стороны в пределах 100 мс.
+        List<double[]> bursts = new ArrayList<>();   // {время, знак, номинал}
+        long start = 0;
+        int side = 0;
+        double notional = 0;
+        long prevTs = Long.MIN_VALUE;
+        for (TapeData.Print p : prints) {
+            boolean same = p.aggressor() == side && p.tsMs() - prevTs <= 100;
+            if (!same) {
+                if (notional > 0) {
+                    bursts.add(new double[]{start, side, notional});
+                }
+                start = p.tsMs();
+                side = p.aggressor();
+                notional = 0;
+            }
+            notional += p.price() * p.qty();
+            prevTs = p.tsMs();
+        }
+        if (notional > 0) {
+            bursts.add(new double[]{start, side, notional});
+        }
+        if (bursts.size() < 200) {
+            return;
+        }
+        double[] sizes = bursts.stream().mapToDouble(b -> b[2]).sorted().toArray();
+        double big = sizes[(int) (sizes.length * 0.9)];
+
+        sb.append("\n### Свипы ").append(base)
+                .append(": всего ").append(bursts.size())
+                .append(", крупных (верхние 10% по номиналу, от $")
+                .append(round(big, 0)).append(") — ")
+                .append(bursts.stream().filter(b -> b[2] >= big).count()).append("\n\n");
+
+        // Вопрос 2: разбор по событиям, с плацебо.
+        sb.append("| горизонт | событий | путь по свипу, б.п. | плацебо | **чистый** | **`t`** |\n");
+        sb.append("|---|---:|---:|---:|---:|---:|\n");
+        long[] hs = {60_000, 300_000, 900_000};
+        String[] names = {"1 мин", "5 мин", "15 мин"};
+        for (int h = 0; h < hs.length; h++) {
+            List<Double> net = new ArrayList<>();
+            double raw = 0;
+            double plac = 0;
+            for (double[] b : bursts) {
+                if (b[2] < big) {
+                    continue;
+                }
+                long t = (long) b[0];
+                double f0 = fair.at(t);
+                double f1 = fair.after(t + hs[h]);
+                double p0 = fair.at(t - PLACEBO_LAG_MS);
+                double p1 = fair.after(t - PLACEBO_LAG_MS + hs[h]);
+                if (f0 <= 0 || f1 <= 0 || p0 <= 0 || p1 <= 0) {
+                    continue;
+                }
+                double r = b[1] * (f1 - f0) / f0 * 1e4;
+                double pl = b[1] * (p1 - p0) / p0 * 1e4;
+                raw += r;
+                plac += pl;
+                net.add(r - pl);
+            }
+            if (net.size() < 30) {
+                continue;
+            }
+            double[] arr = net.stream().mapToDouble(Double::doubleValue).toArray();
+            double[] st = stat(arr);
+            sb.append("| ").append(names[h]).append(" | ").append(net.size())
+                    .append(" | ").append(round(raw / net.size(), 2))
+                    .append(" | ").append(round(plac / net.size(), 2))
+                    .append(" | **").append(round(st[0], 2))
+                    .append("** | **").append(round(st[1], 2)).append("** |\n");
+        }
+
+        // Вопросы 1 и 3: пятиминутные окна, свип рядом с перевесом.
+        TreeMap<Long, Double> sweepByMinute = new TreeMap<>();
+        for (double[] b : bursts) {
+            if (b[2] >= big) {
+                sweepByMinute.merge((long) b[0] / 60_000L, b[1] * b[2], Double::sum);
+            }
+        }
+        List<double[]> rows = new ArrayList<>();   // {перевес, свип, ход, минута}
+        for (long m : bnb.keySet()) {
+            double imb = mean(bnb, m - 5, m);
+            if (Double.isNaN(imb)) {
+                continue;
+            }
+            double sw = 0;
+            for (long k = m - 5; k < m; k++) {
+                sw += sweepByMinute.getOrDefault(k, 0.0);
+            }
+            double f0 = fair.at(m * 60_000L);
+            double f1 = fair.at((m + 5) * 60_000L);
+            if (f0 <= 0 || f1 <= 0) {
+                continue;
+            }
+            // Номинал приводится к тысячам долларов, чтобы наклон читался.
+            rows.add(new double[]{imb, sw / 1000.0, (f1 - f0) / f0 * 1e4, m});
+        }
+        if (rows.size() < 200) {
+            return;
+        }
+        sb.append("\nСвязь перевеса Бинанса и размера свипов (вопрос 1): **r = ")
+                .append(round(correlation(rows), 3)).append("**");
+        sb.append(", то есть ").append(Math.abs(correlation(rows)) > 0.5
+                        ? "это во многом одно и то же" : "это РАЗНАЯ информация")
+                .append(".\n\n");
+
+        double[][] joint = jointFit(rows, 5);
+        sb.append("| в одной регрессии (вопрос 3) | наклон | **`t` непересек.** |\n|---|---:|---:|\n");
+        sb.append("| перевес Бинанса | ").append(round(joint[0][0], 2))
+                .append(" | **").append(round(joint[0][1], 2)).append("** |\n");
+        sb.append("| размер свипов, на $1000 | ").append(round(joint[1][0], 4))
+                .append(" | **").append(round(joint[1][1], 2)).append("** |\n");
+    }
+
+    /** Корреляция первых двух колонок. */
+    private static double correlation(List<double[]> rows) {
+        int n = rows.size();
+        double sx = 0;
+        double sy = 0;
+        for (double[] r : rows) {
+            sx += r[0];
+            sy += r[1];
+        }
+        double mx = sx / n;
+        double my = sy / n;
+        double sxy = 0;
+        double sxx = 0;
+        double syy = 0;
+        for (double[] r : rows) {
+            sxy += (r[0] - mx) * (r[1] - my);
+            sxx += (r[0] - mx) * (r[0] - mx);
+            syy += (r[1] - my) * (r[1] - my);
+        }
+        return sxx <= 0 || syy <= 0 ? 0 : sxy / Math.sqrt(sxx * syy);
+    }
+
+    /**
+     * Регрессия хода на ДВА предиктора сразу, на непересекающихся точках.
+     *
+     * 🔑 Это и есть решающий вопрос про свипы: значим ли свип, когда перевес уже
+     * в модели. Если нет — он был частью перевеса, а не отдельной информацией.
+     */
+    private static double[][] jointFit(List<double[]> rows, int step) {
+        List<double[]> use = new ArrayList<>();
+        long lastTaken = Long.MIN_VALUE;
+        for (double[] r : rows) {
+            if (lastTaken == Long.MIN_VALUE || (long) r[3] - lastTaken >= step) {
+                use.add(r);
+                lastTaken = (long) r[3];
+            }
+        }
+        int n = use.size();
+        double[][] xtx = new double[3][3];
+        double[] xty = new double[3];
+        for (double[] r : use) {
+            double[] x = {1, r[0], r[1]};
+            for (int i = 0; i < 3; i++) {
+                xty[i] += x[i] * r[2];
+                for (int j = 0; j < 3; j++) {
+                    xtx[i][j] += x[i] * x[j];
+                }
+            }
+        }
+        double[][] inv = invert3(xtx);
+        if (inv == null) {
+            return new double[][]{{0, 0}, {0, 0}};
+        }
+        double[] b = new double[3];
+        for (int i = 0; i < 3; i++) {
+            for (int k = 0; k < 3; k++) {
+                b[i] += inv[i][k] * xty[k];
+            }
+        }
+        double ss = 0;
+        for (double[] r : use) {
+            double u = r[2] - b[0] - b[1] * r[0] - b[2] * r[1];
+            ss += u * u;
+        }
+        double s2 = ss / (n - 3.0);
+        double se1 = Math.sqrt(Math.max(s2 * inv[1][1], 0));
+        double se2 = Math.sqrt(Math.max(s2 * inv[2][2], 0));
+        return new double[][]{
+                {b[1], se1 == 0 ? 0 : b[1] / se1},
+                {b[2], se2 == 0 ? 0 : b[2] / se2}};
+    }
+
+    /** Обращение 3×3; при вырождении {@code null}. */
+    private static double[][] invert3(double[][] a) {
+        double[][] m = new double[3][6];
+        for (int i = 0; i < 3; i++) {
+            System.arraycopy(a[i], 0, m[i], 0, 3);
+            m[i][3 + i] = 1;
+        }
+        for (int c = 0; c < 3; c++) {
+            int piv = c;
+            for (int i = c; i < 3; i++) {
+                if (Math.abs(m[i][c]) > Math.abs(m[piv][c])) {
+                    piv = i;
+                }
+            }
+            if (Math.abs(m[piv][c]) < 1e-15) {
+                return null;
+            }
+            double[] t = m[c];
+            m[c] = m[piv];
+            m[piv] = t;
+            double d = m[c][c];
+            for (int j = 0; j < 6; j++) {
+                m[c][j] /= d;
+            }
+            for (int i = 0; i < 3; i++) {
+                if (i != c) {
+                    double f = m[i][c];
+                    for (int j = 0; j < 6; j++) {
+                        m[i][j] -= f * m[c][j];
+                    }
+                }
+            }
+        }
+        double[][] inv = new double[3][3];
+        for (int i = 0; i < 3; i++) {
+            System.arraycopy(m[i], 3, inv[i], 0, 3);
+        }
+        return inv;
+    }
+
+    /** Среднее и {@code t} по ряду. */
+    private static double[] stat(double[] x) {
+        int n = x.length;
+        double mean = 0;
+        for (double v : x) {
+            mean += v;
+        }
+        mean /= n;
+        double ss = 0;
+        for (double v : x) {
+            ss += (v - mean) * (v - mean);
+        }
+        double se = n < 2 ? 0 : Math.sqrt(ss / (n - 1.0) / n);
+        return new double[]{mean, se == 0 ? 0 : mean / se};
+    }
+
+    /** Сдвиг плацебо: связь с событием рвём, снос рынка оставляем. */
+    private static final long PLACEBO_LAG_MS = 3 * 3_600_000L;
 
     /** Среднее поминутного перевеса на полуинтервале {@code [a, b)}. */
     private static double mean(TreeMap<Long, Double> imb, long a, long b) {
