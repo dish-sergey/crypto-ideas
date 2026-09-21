@@ -70,6 +70,14 @@ public final class SweepWatch implements AutoCloseable {
     private final long chainMs;
     private final double coefficient;
     private final double maxBp;
+    /**
+     * Задержка узнавания ленты, мс: принты моложе неё бот ещё не видит.
+     *
+     * 🔑 Измерено: после A83 торгуемые пары опрашиваются раз в 3 с, средняя
+     * задержка 2.0 с. На стенде без этой поправки получился бы бот с мгновенной
+     * лентой — то есть результат, которого живьём не бывает.
+     */
+    private final long delayMs;
 
     /** Последний ПРИМЕНЁННЫЙ свип: конец, знак. Нужен, чтобы не логировать каждый тик. */
     private long lastSeenEndMs;
@@ -84,6 +92,12 @@ public final class SweepWatch implements AutoCloseable {
      */
     public SweepWatch(String dbPath, String symbol, double minNotional, long chainMs,
                       double coefficient, double maxBp) {
+        this(dbPath, symbol, minNotional, chainMs, coefficient, maxBp, 2_000);
+    }
+
+    public SweepWatch(String dbPath, String symbol, double minNotional, long chainMs,
+                      double coefficient, double maxBp, long delayMs) {
+        this.delayMs = delayMs;
         this.symbol = symbol;
         this.minNotional = minNotional;
         this.chainMs = chainMs;
@@ -94,8 +108,8 @@ public final class SweepWatch implements AutoCloseable {
         } catch (Exception e) {
             throw new IllegalStateException("не открыть базу стенда для ленты: " + dbPath, e);
         }
-        log.info("сторож свипов: {} от ${}, склейка {} мс, доля {}, потолок {} б.п.",
-                symbol, Math.round(minNotional), chainMs, coefficient, maxBp);
+        log.info("сторож свипов: {} от ${}, склейка {} мс, доля {}, потолок {} б.п., задержка {} мс",
+                symbol, Math.round(minNotional), chainMs, coefficient, maxBp, delayMs);
     }
 
     /**
@@ -114,7 +128,10 @@ public final class SweepWatch implements AutoCloseable {
         if (remaining <= 0) {
             return 0;
         }
-        double bp = Math.min(maxBp, coefficient * remaining) * last.side;
+        // Потолок режет ВЕЛИЧИНУ, а не значение со знаком: при отрицательной доле
+        // (плацебо с перевёрнутым знаком) `Math.min` пропустил бы что угодно.
+        double raw = coefficient * remaining;
+        double bp = Math.copySign(Math.min(maxBp, Math.abs(raw)), raw) * last.side;
         lastSeenEndMs = last.endMs;
         return bp;
     }
@@ -122,11 +139,23 @@ public final class SweepWatch implements AutoCloseable {
     /** Конец последнего крупного свипа и его знак; {@code null} — такого нет. */
     public Sweep lastSweep(long nowMs) {
         Sweep best = null;
+        // 🔑 ⚠️ ВЕРХНЯЯ ГРАНИЦА ОБЯЗАТЕЛЬНА, И БЕЗ НЕЁ ПРИБОР ЛЖЁТ НА СТЕНДЕ.
+        //
+        // Живьём будущих принтов в базе нет, и запрос без верхней границы
+        // безобиден. В ПОВТОРЕ база содержит всю запись целиком, а часы
+        // симулированные, — и тот же запрос вернул бы сделки из будущего. Бот
+        // «реагировал» бы на свип до того, как тот случился, и стенд показал бы
+        // блестящий результат, которого живьём не бывает.
+        //
+        // ⚠️ И вторая граница, {@code delayMs}: живой бот видит принт не в
+        // момент сделки, а когда лента доедет (2.0 с после A83). Без этой
+        // поправки стенд моделирует бота с мгновенной лентой.
         try (PreparedStatement ps = connection.prepareStatement(
                 "SELECT ts_ms, price, qty, side FROM revx_trade"
-                        + " WHERE symbol = ? AND ts_ms >= ? ORDER BY ts_ms")) {
+                        + " WHERE symbol = ? AND ts_ms >= ? AND ts_ms <= ? ORDER BY ts_ms")) {
             ps.setString(1, symbol);
             ps.setLong(2, nowMs - LOOKBACK_MS);
+            ps.setLong(3, nowMs - delayMs);
             try (ResultSet rs = ps.executeQuery()) {
                 long chainStart = 0;
                 long chainEnd = 0;

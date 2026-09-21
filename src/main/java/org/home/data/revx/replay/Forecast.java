@@ -60,15 +60,32 @@ public final class Forecast {
      *                   ботах). Поле здесь, а не в конфиге, потому что это ось
      *                   сравнения: в одном прогоне нужны оба режима рядом.
      */
+    /**
+     * @param sweepCoef    доля ожидаемого остатка пути после свипа, на которую
+     *                     сдвигается опора (0 — реакции нет). Поле здесь по той
+     *                     же причине, что и {@code dynOffsetK}: это ось
+     *                     сравнения, а не настройка среды.
+     * @param sweepDelayMs задержка узнавания ленты, мс. ⚠️ Ноль моделирует бота
+     *                     с МГНОВЕННОЙ лентой, которого не бывает: после
+     *                     ускорения опроса (A83) живая задержка 2.0 с.
+     */
     public record BotSpec(String botId, double offset, double skewTarget,
                           double inventoryCap, int levels, double levelStep,
-                          double size, boolean innerFirst, double dynOffsetK) {
+                          double size, boolean innerFirst, double dynOffsetK,
+                          double sweepCoef, long sweepDelayMs) {
 
         public BotSpec(String botId, double offset, double skewTarget,
                        double inventoryCap, int levels, double levelStep,
                        double size, boolean innerFirst) {
             this(botId, offset, skewTarget, inventoryCap, levels, levelStep,
                     size, innerFirst, 0);
+        }
+
+        public BotSpec(String botId, double offset, double skewTarget,
+                       double inventoryCap, int levels, double levelStep,
+                       double size, boolean innerFirst, double dynOffsetK) {
+            this(botId, offset, skewTarget, inventoryCap, levels, levelStep,
+                    size, innerFirst, dynOffsetK, 0, 2_000);
         }
     }
 
@@ -197,6 +214,36 @@ public final class Forecast {
     public static List<BotResult> run(List<ReplayFair.Tick> ticks, FillModel model,
                                       BootParams base, List<BotSpec> bots,
                                       org.home.data.revx.RevxConfig cfg) throws Exception {
+        return run(ticks, model, base, bots, cfg, null);
+    }
+
+    /**
+     * То же, но с лентой для РЕАКЦИИ НА СВИП: {@code standDbPath} — база стенда.
+     *
+     * ⚠️ Сторож заводится только тем ботам, у кого {@link BotSpec#sweepCoef()}
+     * положителен. Остальные работают ровно как раньше — это и делает прогон
+     * парным.
+     */
+    public static List<BotResult> run(List<ReplayFair.Tick> ticks, FillModel model,
+                                      BootParams base, List<BotSpec> bots,
+                                      org.home.data.revx.RevxConfig cfg,
+                                      String standDbPath) throws Exception {
+        List<org.home.data.revx.exec.SweepWatch> watches = new ArrayList<>();
+        try {
+            return runInner(ticks, model, base, bots, cfg, standDbPath, watches);
+        } finally {
+            for (var w : watches) {
+                w.close();
+            }
+        }
+    }
+
+    private static List<BotResult> runInner(List<ReplayFair.Tick> ticks, FillModel model,
+                                            BootParams base, List<BotSpec> bots,
+                                            org.home.data.revx.RevxConfig cfg,
+                                            String standDbPath,
+                                            List<org.home.data.revx.exec.SweepWatch> watches)
+            throws Exception {
         long start = ticks.get(0).tsMs();
         long end = ticks.get(ticks.size() - 1).tsMs();
 
@@ -321,6 +368,30 @@ public final class Forecast {
                         spec.dynOffsetK(), 1.0, 1.0);
                 if (!mods.builtIn()) {
                     loop.modules(mods.layout(), mods.placer());
+                }
+                // РЕАКЦИЯ НА СВИП — тот же сторож, что в бою. Заводится только
+                // тем ботам, у кого доля положительна: так в одном прогоне стоят
+                // рядом «с реакцией» и «без», и различаются они ровно этим.
+                //
+                // ⚠️ Задержка ленты обязана быть НЕНУЛЕВОЙ. Живой бот узнаёт о
+                // принте не в момент сделки, а когда доедет опрос (2.0 с после
+                // A83); стенд с нулём смоделировал бы бота, которого не бывает,
+                // и весь выигрыш был бы в этой разнице.
+                // ⚠️ Сравнение с нулём, а не «больше нуля»: ОТРИЦАТЕЛЬНАЯ доля —
+                // это плацебо с перевёрнутым знаком, и оно обязано доходить до
+                // сторожа. Калитка `> 0` молча возвращала базовый прогон, то есть
+                // плацебо показало бы ровно ноль разницы и выглядело бы как
+                // «эффект несимметричен».
+                if (spec.sweepCoef() != 0) {
+                    if (standDbPath == null) {
+                        throw new IllegalStateException("реакция на свип просит базу стенда: "
+                                + "ленту брать неоткуда");
+                    }
+                    var watch = new org.home.data.revx.exec.SweepWatch(standDbPath, base.symbol(),
+                            cfg.execSweepMinNotional(), cfg.execSweepChainMs(),
+                            spec.sweepCoef(), cfg.execSweepMaxBp(), spec.sweepDelayMs());
+                    watches.add(watch);
+                    loop.sweepWatch(watch);
                 }
                 loop.statsInventoryCap(spec.inventoryCap());
                 loops.add(loop);

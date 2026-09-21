@@ -327,6 +327,23 @@ public class Executor {
     }
 
     public void replay(String journalPath, String fillModel) {
+        replay(journalPath, fillModel, 0, 2_000);
+    }
+
+    /**
+     * Повтор с РЕАКЦИЕЙ НА СВИП: {@code --sweep-coef=1 --sweep-delay-ms=2000}.
+     *
+     * Так сравниваются две НАСТРОЙКИ на одном окне — с реакцией и без, — а не
+     * стенд с живым ботом. Модель исполнения брать {@code market}: при
+     * {@code recorded} исполнения взяты из записи и от котировок не зависят
+     * вовсе, то есть реакция не может изменить ничего по построению.
+     *
+     * ⚠️ Задержка по умолчанию 2 с — это измеренная (A83) задержка живой ленты
+     * ПОСЛЕ ускорения опроса. Прогон с нулём моделирует бота с мгновенной
+     * лентой, которого не бывает.
+     */
+    public void replay(String journalPath, String fillModel,
+                       double sweepCoefOverride, long sweepDelayMs) {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
@@ -395,13 +412,29 @@ public class Executor {
             double[] dyn = ReplayRunner.dynOffset(journalPath);
             log.warn("гейт по опоре из журнала: k={}, потолок ширины {}%{}",
                     dyn[0], dyn[1], dyn[0] > 0 ? "" : " — в записи его нет, повтор без гейта");
-            ReplayRunner.Result result = ReplayRunner.run(ticks, fills, params, policy,
-                    bp.symbol(), bp.periodMs(), bp.minNotional(), bp.botId(),
-                    bp.baseStep(), bp.parkDistance(),
-                    bp.inventoryCap() * 1.2 * ticks.get(0).fair(),
-                    model, bp.levels(), bp.levelStep(), bp.innerFirst(), 0,
-                    dyn[0], dyn[1]);
-            log.info("\n{}", ReplayRunner.render(result));
+            double coef = sweepCoefOverride > 0 ? sweepCoefOverride : sweepCoef;
+            if (coef > 0 && "recorded".equals(fillModel)) {
+                throw new IllegalStateException("реакция на свип с моделью recorded "
+                        + "бессмысленна: исполнения взяты из записи и от котировок не "
+                        + "зависят. Нужна --model=market");
+            }
+            try (SweepWatch sweeps = coef > 0
+                    ? new SweepWatch(standDbPath, bp.symbol(), sweepMinNotional,
+                            sweepChainMs, coef, sweepMaxBp, sweepDelayMs)
+                    : null) {
+                if (coef > 0) {
+                    log.warn("РЕАКЦИЯ НА СВИП включена: доля {}, задержка ленты {} мс. "
+                            + "⚠️ Сверка котировок теперь мерит вмешательство, а не "
+                            + "исправность прибора", coef, sweepDelayMs);
+                }
+                ReplayRunner.Result result = ReplayRunner.run(ticks, fills, params, policy,
+                        bp.symbol(), bp.periodMs(), bp.minNotional(), bp.botId(),
+                        bp.baseStep(), bp.parkDistance(),
+                        bp.inventoryCap() * 1.2 * ticks.get(0).fair(),
+                        model, bp.levels(), bp.levelStep(), bp.innerFirst(), 0,
+                        dyn[0], dyn[1], sweeps);
+                log.info("\n{}", ReplayRunner.render(result));
+            }
         } catch (Exception e) {
             log.error("повтор не прошёл: {}", e.toString(), e);
         }
@@ -498,6 +531,81 @@ public class Executor {
      * {@code −κ}. Живьём эта величина не мерилась ни разу (док. 132 §5), а она
      * задаёт {@code δ* = c + 1/κ} и весь выбор пар.
      */
+    /**
+     * {@code --revx-sweep-run --journal=<путь> --coefs=0,0.5,1}: РЕАКЦИЯ НА СВИП
+     * на стенде — каждая доля отдельным прогоном, отступ и всё прочее общее.
+     *
+     * <h2>Почему по одному боту, а не всех разом</h2>
+     *
+     * По той же причине, что и лестница отступов: поток на площадке конечен
+     * (BTC — около тысячи принтов в сутки), и два бота на ОДНОМ отступе, стоящие
+     * в книге одновременно, отнимали бы сделки друг у друга. Тот, кто сдвинул
+     * опору к рынку, забирал бы принт первым — и выигрыш вышел бы из соседства,
+     * а не из реакции. Каждая доля идёт своим прогоном по той же книге.
+     *
+     * <h2>Что это измеряет и чего НЕ измеряет</h2>
+     *
+     * Измеряет разницу ДВУХ НАСТРОЕК на одном окне — ровно то, для чего стенд и
+     * годится. ⚠️ Не измеряет, сколько сделок сделает живой бот: расхождение
+     * стенда с живым — свойство траектории, а не дефект (CLAUDE.md).
+     *
+     * ⚠️ И главная оговорка этого прибора: лента в базе стенда лежит с ИСТИННЫМИ
+     * отметками сделок, а живой бот видит принт с задержкой опроса. Поэтому
+     * {@code --sweep-delay-ms} обязателен и по умолчанию равен измеренным 2 с;
+     * прогон с нулём — это бот с мгновенной лентой, которого не бывает.
+     */
+    public void sweepRun(String journalPath, String coefs, long delayMs,
+                         String from, String to) {
+        try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
+                new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
+                        cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
+                cfg.fairMaxSkewMs())) {
+            this.spec = stand.spec(symbol);
+            long boot = ReplayRunner.lastBoot(journalPath);
+            var bp = org.home.data.revx.replay.BootParams.parse(
+                    ReplayRunner.lastBootDetail(journalPath));
+            if (bp == null) {
+                throw new IllegalStateException("в событии boot нет машинной части");
+            }
+            long fromMs = from == null || from.isBlank() ? boot
+                    : java.time.Instant.parse(from).toEpochMilli();
+            long toMs = to == null || to.isBlank() ? Long.MAX_VALUE
+                    : java.time.Instant.parse(to).toEpochMilli();
+            var ticks = ReplayRunner.readTicks(journalPath, fromMs, toMs);
+            if (ticks.isEmpty()) {
+                throw new IllegalStateException("в журнале нет тиков в этом окне");
+            }
+            log.warn("свип-прогон {}: тиков {}, окно {} → {}, отступ {} б.п., "
+                            + "задержка ленты {} мс",
+                    bp.symbol(), ticks.size(),
+                    java.time.Instant.ofEpochMilli(ticks.get(0).tsMs()),
+                    java.time.Instant.ofEpochMilli(ticks.get(ticks.size() - 1).tsMs()),
+                    bp.offset() * 10_000, delayMs);
+
+            var all = new java.util.ArrayList<org.home.data.revx.replay.Forecast.BotResult>();
+            for (String part : coefs.split(",")) {
+                double coef = Double.parseDouble(part.trim());
+                var bots = java.util.List.of(new org.home.data.revx.replay.Forecast.BotSpec(
+                        part.trim(), bp.offset(), bp.skewTarget(), bp.inventoryCap(),
+                        bp.levels(), bp.levelStep(), bp.size(), bp.innerFirst(), 0,
+                        coef, delayMs));
+                // Модель и книга перечитываются на каждую ступень: у модели
+                // исполнения есть состояние (очередь, видимость), и делить её
+                // между прогонами значило бы мерить не долю, а порядок запуска.
+                var market = org.home.data.revx.replay.MarketData.load(standDbPath, bp.symbol(),
+                        ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
+                var results = org.home.data.revx.replay.Forecast.run(ticks,
+                        new org.home.data.revx.replay.MarketFillModel(market),
+                        bp, bots, cfg, standDbPath);
+                all.addAll(results);
+            }
+            log.info("\n=== Реакция на свип: доли на одном окне ===\n{}",
+                    org.home.data.revx.replay.Forecast.render("рабочая (очередь по книге)", all));
+        } catch (Exception e) {
+            log.error("свип-прогон не прошёл: {}", e.toString(), e);
+        }
+    }
+
     public void ladder(String journalPath, String offsets) {
         try {
             long boot = ReplayRunner.lastBoot(journalPath);

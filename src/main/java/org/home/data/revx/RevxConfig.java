@@ -58,6 +58,14 @@ public class RevxConfig {
      * вселенную. Для реакции на свипы это решающая величина.
      */
     private final long fastTradesPeriodMs;
+
+    /** Порог «крупного» свипа в долларах, склейка цепочки и потолок сдвига. */
+
+    private final double execSweepMinNotional;
+
+    private final long execSweepChainMs;
+
+    private final double execSweepMaxBp;
     private final List<String> tier1;
     private final List<String> tier2;
     private final int bookPeriodTier1Seconds;
@@ -190,6 +198,12 @@ public class RevxConfig {
             @Value("${revx.fast-pairs}") List<String> fastPairs,
             @Value("${revx.fast-book-period-ms}") long fastBookPeriodMs,
             @Value("${revx.fast-trades-period-ms:0}") long fastTradesPeriodMs,
+
+            @Value("${revx.exec.sweep-min-notional:1633}") double execSweepMinNotional,
+
+            @Value("${revx.exec.sweep-chain-ms:100}") long execSweepChainMs,
+
+            @Value("${revx.exec.sweep-max-bp:6}") double execSweepMaxBp,
             @Value("${revx.tier1}") List<String> tier1,
             @Value("${revx.tier2}") List<String> tier2,
             @Value("${revx.book-period-tier1-seconds}") int bookPeriodTier1Seconds,
@@ -317,6 +331,12 @@ public class RevxConfig {
         this.fastPairs = fastPairs;
         this.fastBookPeriodMs = fastBookPeriodMs;
         this.fastTradesPeriodMs = fastTradesPeriodMs;
+
+        this.execSweepMinNotional = execSweepMinNotional;
+
+        this.execSweepChainMs = execSweepChainMs;
+
+        this.execSweepMaxBp = execSweepMaxBp;
         this.tier1 = tier1;
         this.tier2 = tier2;
         this.bookPeriodTier1Seconds = bookPeriodTier1Seconds;
@@ -572,6 +592,24 @@ public class RevxConfig {
 
     public long fastTradesPeriodMs() {
         return fastTradesPeriodMs;
+    }
+
+
+
+    public double execSweepMinNotional() {
+        return execSweepMinNotional;
+    }
+
+
+
+    public long execSweepChainMs() {
+        return execSweepChainMs;
+    }
+
+
+
+    public double execSweepMaxBp() {
+        return execSweepMaxBp;
     }
 
     public List<String> tier1() {

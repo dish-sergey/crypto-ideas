@@ -60,7 +60,7 @@ class SweepWatchTest {
         for (int i = 0; i < 4; i++) {
             print(path, t0 + i * 20L, 100_000, 0.005, "sell");
         }
-        try (SweepWatch watch = new SweepWatch(path, "BTC/USDC", 1633, 100, 1.0, 6)) {
+        try (SweepWatch watch = new SweepWatch(path, "BTC/USDC", 1633, 100, 1.0, 6, 0)) {
             long end = t0 + 60L;
             double at1s = watch.shiftBp(end + 1_000);
             double at30s = watch.shiftBp(end + 30_000);
@@ -84,7 +84,7 @@ class SweepWatchTest {
         for (int i = 0; i < 4; i++) {
             print(path, t0 + i * 500L, 100_000, 0.005, "sell");
         }
-        try (SweepWatch watch = new SweepWatch(path, "BTC/USDC", 1633, 100, 1.0, 6)) {
+        try (SweepWatch watch = new SweepWatch(path, "BTC/USDC", 1633, 100, 1.0, 6, 0)) {
             assertEquals(0.0, watch.shiftBp(t0 + 2_000), 1e-9,
                     "принты врозь — это не свип, сдвига быть не должно");
         }
@@ -95,9 +95,46 @@ class SweepWatchTest {
         String path = db(dir, "tape3.db");
         long t0 = 1_000_000_000_000L;
         print(path, t0, 100_000, 1.0, "buy");   // $100 000 — заведомо крупный
-        try (SweepWatch watch = new SweepWatch(path, "BTC/USDC", 1633, 100, 10.0, 6)) {
+        try (SweepWatch watch = new SweepWatch(path, "BTC/USDC", 1633, 100, 10.0, 6, 0)) {
             double bp = watch.shiftBp(t0 + 1_000);
             assertEquals(6.0, bp, 1e-9, "потолок обязан срезать даже при большой доле");
+        }
+    }
+
+    /**
+     * 🔑 ГЛАВНЫЙ ТЕСТ ДЛЯ СТЕНДА: будущие принты не видны.
+     *
+     * Живьём этой беды нет — будущего в базе просто не лежит. В ПОВТОРЕ лежит
+     * вся запись целиком, а часы симулированные, и запрос без верхней границы
+     * вернул бы свип, которого в этот момент ещё не было. Стенд показал бы
+     * блестящий результат, невозможный живьём, и мы бы поверили.
+     */
+    @Test
+    void будущиеПринтыНеВидны(@TempDir Path dir) throws Exception {
+        String path = db(dir, "future.db");
+        long t0 = 1_000_000_000_000L;
+        for (int i = 0; i < 4; i++) {
+            print(path, t0 + i * 20L, 100_000, 0.005, "sell");
+        }
+        try (SweepWatch watch = new SweepWatch(path, "BTC/USDC", 1633, 100, 1.0, 6, 0)) {
+            assertEquals(0.0, watch.shiftBp(t0 - 1_000), 1e-9,
+                    "за секунду ДО свипа сдвига быть не может");
+            assertTrue(watch.shiftBp(t0 + 1_000) < 0, "а после свипа — должен");
+        }
+    }
+
+    /** Задержка ленты: принт моложе неё бот ещё не видит. */
+    @Test
+    void задержкаЛентыОтодвигаетРеакцию(@TempDir Path dir) throws Exception {
+        String path = db(dir, "delay.db");
+        long t0 = 1_000_000_000_000L;
+        for (int i = 0; i < 4; i++) {
+            print(path, t0 + i * 20L, 100_000, 0.005, "sell");
+        }
+        try (SweepWatch watch = new SweepWatch(path, "BTC/USDC", 1633, 100, 1.0, 6, 2_000)) {
+            assertEquals(0.0, watch.shiftBp(t0 + 1_000), 1e-9,
+                    "через секунду принт ещё не доехал при задержке в две");
+            assertTrue(watch.shiftBp(t0 + 3_000) < 0, "через три секунды — уже виден");
         }
     }
 

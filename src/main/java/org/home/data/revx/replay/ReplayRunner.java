@@ -221,6 +221,32 @@ public final class ReplayRunner {
                              boolean innerFirst,
 
                              double tolerance, double dynK, double dynMaxPct) throws Exception {
+        return run(ticks, fills, params, policy, symbol, periodMs, minNotional, botId,
+                baseStep, parkDistance, quoteStart, model, levels, levelStep, innerFirst,
+                tolerance, dynK, dynMaxPct, null);
+    }
+
+    /**
+     * То же, но с РЕАКЦИЕЙ НА СВИП: сторож ленты сдвигает опору перед котировкой.
+     *
+     * ⚠️ Со сторожем это больше НЕ СВЕРКА. Повтор перестаёт быть замкнутым — бот
+     * котирует иначе, чем котировал живой, — и доля совпавших котировок обязана
+     * упасть. Она становится мерой ВМЕШАТЕЛЬСТВА: «на скольких тиках сторож
+     * сдвинул опору», а не мерой исправности прибора.
+     *
+     * ⚠️ И второе: сравнивать можно только два прогона на ОДНОМ окне между
+     * собой. Предсказать число сделок живого бота повтор не может и не обязан
+     * (CLAUDE.md, «расхождение обхода с живым — свойство траектории»).
+     */
+    public static Result run(List<ReplayFair.Tick> ticks, List<RecordedFillModel.RecordedFill> fills,
+                             Quoter.Params params, QuotePolicy policy, String symbol,
+                             long periodMs, double minNotional, String botId,
+                             double baseStep, double parkDistance, double quoteStart,
+                             FillModel model, int levels, double levelStep,
+                             boolean innerFirst,
+
+                             double tolerance, double dynK, double dynMaxPct,
+                             org.home.data.revx.exec.SweepWatch sweeps) throws Exception {
         if (ticks.isEmpty()) {
             return new Result(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
@@ -276,6 +302,13 @@ public final class ReplayRunner {
             //
             // Записи без этой колонки дают ноль, то есть прежнее поведение.
             loop.replayPressure(pressureAt(ticks));
+            // Реакция на свип — ТОТ ЖЕ сторож, что в бою. Вся разница в часах:
+            // он спрашивает ленту «что было к моменту clock.now() минус
+            // задержка», и верхняя граница запроса обязательна именно здесь
+            // (см. SweepWatch#lastSweep) — без неё повтор увидел бы будущее.
+            if (sweeps != null) {
+                loop.sweepWatch(sweeps);
+            }
             clock.stopAt(end, loop::shutdown);
             loop.startQuoting();
             loop.run();

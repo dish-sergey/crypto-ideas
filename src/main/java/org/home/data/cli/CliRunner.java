@@ -292,8 +292,12 @@ public class CliRunner implements ApplicationRunner {
                         firstOr(args, "alloc", ""));
             }
             if (args.containsOption("revx-replay")) {
+                // --sweep-coef>0 включает реакцию на свип: тогда это не сверка,
+                // а сравнение двух настроек на одном окне (нужна --model=market).
                 executor.getObject().replay(firstOr(args, "journal", "state/exec.db"),
-                        firstOr(args, "model", "recorded"));
+                        firstOr(args, "model", "recorded"),
+                        Double.parseDouble(firstOr(args, "sweep-coef", "0")),
+                        Long.parseLong(firstOr(args, "sweep-delay-ms", "2000")));
             }
             if (args.containsOption("revx-fill-check")) {
                 executor.getObject().fillCheck(
@@ -347,6 +351,13 @@ public class CliRunner implements ApplicationRunner {
             if (args.containsOption("revx-ladder")) {
                 executor.getObject().ladder(firstOr(args, "journal", "state/exec.db"),
                         firstOr(args, "offsets", "8,9,10,11,12,13,14,15,16"));
+            }
+            if (args.containsOption("revx-sweep-run")) {
+                // Реакция на свип: каждая доля ОТДЕЛЬНЫМ ботом по той же книге.
+                executor.getObject().sweepRun(firstOr(args, "journal", "state/exec.db"),
+                        firstOr(args, "coefs", "0,1"),
+                        Long.parseLong(firstOr(args, "sweep-delay-ms", "2000")),
+                        firstOr(args, "from", ""), firstOr(args, "to", ""));
             }
             if (args.containsOption("revx-order-probe")) {
                 orderProbe.getObject().run();
