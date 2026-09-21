@@ -451,6 +451,71 @@ public class OffsetSurface {
         double kappa = n > 1 ? -(n * sxy - sx * sy) / (n * sxx - sx * sx) : 0;
         sb.append("\n`κ` по наклону `ln λ` на участке 6–16 б.п.: **").append(round(kappa, 3))
                 .append("** на базисный пункт.\n");
+        sides(sb, ev, nHours, lot);
+    }
+
+    /**
+     * ТА ЖЕ КРИВАЯ, НО ОТДЕЛЬНО ПО СТОРОНАМ (док. 173 часть V).
+     *
+     * 🔑 Зачем. Живой бот стоит НЕ симметрично: скос держит бид на эффективных
+     * 8.9 б.п., а аск на 13.0 (замер A46). Значит «перейти на δ = 10» — это не
+     * одно действие, а два разных: бид уже почти на оптимуме, а аск широк. Но
+     * прочитать это можно только из кривой, посчитанной по сторонам порознь:
+     * поток тейкеров-покупателей толще, и у сторон разные и {@code λ}, и
+     * {@code c}.
+     *
+     * ⚠️ «Бид» здесь — события, в которых агрессор ПРОДАЁТ (значит исполнился бы
+     * наш бид), «аск» — наоборот.
+     */
+    private void sides(StringBuilder sb, List<double[]> ev, int nHours, double lot) {
+        sb.append("\n### Кривая по сторонам\n\n");
+        sb.append("| δ | бид: λ / `c` / прибыль | аск: λ / `c` / прибыль |\n");
+        sb.append("|---:|---|---|\n");
+        int bidBest = -1;
+        int askBest = -1;
+        double bidTop = 0;
+        double askTop = 0;
+        for (int i = 0; i < GRID.length; i++) {
+            double[] out = new double[6];   // {λ, c, прибыль} × 2 стороны
+            for (int side = 0; side < 2; side++) {
+                int n = 0;
+                double sum = 0;
+                for (double[] x : ev) {
+                    boolean isBid = x[2 + 2 * HORIZONS.length] > 0;
+                    if (x[0] >= GRID[i] && (isBid == (side == 0))) {
+                        n++;
+                        sum += x[1];
+                    }
+                }
+                double lambda = n / (double) nHours;
+                double c = n < 5 ? Double.NaN : sum / n;
+                out[side * 3] = lambda;
+                out[side * 3 + 1] = c;
+                out[side * 3 + 2] = Double.isNaN(c) ? Double.NaN
+                        : lambda * (GRID[i] - c) * lot / 1e4;
+            }
+            if (!Double.isNaN(out[2]) && (bidBest < 0 || out[2] > bidTop)) {
+                bidTop = out[2];
+                bidBest = i;
+            }
+            if (!Double.isNaN(out[5]) && (askBest < 0 || out[5] > askTop)) {
+                askTop = out[5];
+                askBest = i;
+            }
+            sb.append("| ").append((int) GRID[i]).append(" | ")
+                    .append(round(out[0], 2)).append(" / ")
+                    .append(Double.isNaN(out[1]) ? "—" : round(out[1], 2)).append(" / ")
+                    .append(Double.isNaN(out[2]) ? "—" : money(out[2])).append(" | ")
+                    .append(round(out[3], 2)).append(" / ")
+                    .append(Double.isNaN(out[4]) ? "—" : round(out[4], 2)).append(" / ")
+                    .append(Double.isNaN(out[5]) ? "—" : money(out[5])).append(" |\n");
+        }
+        if (bidBest >= 0 && askBest >= 0) {
+            sb.append("\nОптимум по ленте: **бид ").append((int) GRID[bidBest])
+                    .append(" б.п.** (").append(money(bidTop)).append(" $/ч), **аск ")
+                    .append((int) GRID[askBest]).append(" б.п.** (").append(money(askTop))
+                    .append(" $/ч). Живые ЭФФЕКТИВНЫЕ отступы — 8.9 и 13.0 (A46).\n");
+        }
     }
 
     /**
