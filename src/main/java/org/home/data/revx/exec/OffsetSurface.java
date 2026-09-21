@@ -352,6 +352,7 @@ public class OffsetSurface {
         }
         structure(sb, all, hours.size(), lot);
         horizons(sb, all, hours.size());
+        sidesBySign(sb, hours, fair);
 
         double spread = peaks.isEmpty() ? 0
                 : peaks.stream().mapToDouble(Double::doubleValue).max().orElse(0)
@@ -452,6 +453,95 @@ public class OffsetSurface {
         sb.append("\n`κ` по наклону `ln λ` на участке 6–16 б.п.: **").append(round(kappa, 3))
                 .append("** на базисный пункт.\n");
         sides(sb, ev, nHours, lot);
+    }
+
+    /**
+     * АСИММЕТРИЯ СТОРОН ОТДЕЛЬНО В РАСТУЩИХ И ПАДАЮЩИХ ЧАСАХ (док. 175 часть II).
+     *
+     * 🔑 Зачем. «Бид платит хуже аска» снято на ПАДАЮЩЕМ окне, а на падающем
+     * рынке всякий, кто продаёт нам, прав задним числом. Асимметрия тогда
+     * возникает из направления окна, даже если никакой осведомлённости нет.
+     * Решающая клетка одна: РАСТУЩИЕ часы внутри того же окна. Если и там бид
+     * хуже — асимметрия структурная, свойство площадки. Если картина
+     * переворачивается — это тренд, и пользоваться нечем.
+     *
+     * ⚠️ Отбор берётся ЗА ВЫЧЕТОМ ПЛАЦЕБО (тот же знак, ход за три часа до
+     * принта): без этого в растущих часах у аска окажется «выигрыш», который на
+     * деле просто рост.
+     *
+     * ⚠️ Ошибка кластерная по часу: события внутри часа несут один рынок.
+     */
+    private void sidesBySign(StringBuilder sb, List<Hour> hours, TapeData.Fair fair) {
+        sb.append("\n### Асимметрия сторон по знаку часа (с плацебо)\n\n");
+        sb.append("| часы | δ | `c` бид | `c` аск | **разность** | `SE` | **`t`** | событий бид / аск |\n");
+        sb.append("|---|---:|---:|---:|---:|---:|---:|---|\n");
+        for (int up = 1; up >= 0; up--) {
+            for (double delta : new double[]{8, 10, 12}) {
+                List<Double> perHour = new ArrayList<>();
+                double sBid = 0;
+                double sAsk = 0;
+                int nBid = 0;
+                int nAsk = 0;
+                for (Hour h : hours) {
+                    double f0 = fair.at(h.hour() * 3_600_000L);
+                    double f1 = fair.at((h.hour() + 1) * 3_600_000L);
+                    if (f0 <= 0 || f1 <= 0 || (f1 > f0) != (up == 1)) {
+                        continue;
+                    }
+                    double hb = 0;
+                    double ha = 0;
+                    int cb = 0;
+                    int ca = 0;
+                    for (double[] x : h.events()) {
+                        if (x[0] < delta) {
+                            continue;
+                        }
+                        // Чистый отбор на 60 с: маркаут минус плацебо того же знака.
+                        double net = x[2 + 1] - x[2 + HORIZONS.length + 1];
+                        if (Double.isNaN(net)) {
+                            continue;
+                        }
+                        if (x[2 + 2 * HORIZONS.length] > 0) {
+                            hb += net;
+                            cb++;
+                        } else {
+                            ha += net;
+                            ca++;
+                        }
+                    }
+                    sBid += hb;
+                    nBid += cb;
+                    sAsk += ha;
+                    nAsk += ca;
+                    if (cb > 0 && ca > 0) {
+                        perHour.add(hb / cb - ha / ca);
+                    }
+                }
+                if (perHour.size() < 10) {
+                    continue;
+                }
+                double mean = 0;
+                for (double v : perHour) {
+                    mean += v;
+                }
+                mean /= perHour.size();
+                double ss = 0;
+                for (double v : perHour) {
+                    ss += (v - mean) * (v - mean);
+                }
+                double se = Math.sqrt(ss / (perHour.size() - 1.0) / perHour.size());
+                sb.append("| ").append(up == 1 ? "растущие" : "падающие")
+                        .append(" | ").append((int) delta)
+                        .append(" | ").append(nBid > 0 ? round(sBid / nBid, 2) : "—")
+                        .append(" | ").append(nAsk > 0 ? round(sAsk / nAsk, 2) : "—")
+                        .append(" | **").append(round(mean, 2))
+                        .append("** | ").append(round(se, 2))
+                        .append(" | **").append(round(se > 0 ? mean / se : 0, 2))
+                        .append("** | ").append(nBid).append(" / ").append(nAsk).append(" |\n");
+            }
+        }
+        sb.append("\nКритерий 175: асимметрия структурна, если в РАСТУЩИХ часах")
+                .append(" `c` бида выше `c` аска при `t` ≥ 2.\n");
     }
 
     /**
