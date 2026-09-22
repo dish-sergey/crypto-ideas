@@ -850,6 +850,24 @@ public class Executor {
     public void pairForecast(String pairSymbol, String offsets, int levels,
                              double levelStepBp, boolean innerFirst,
                              String from, String to) {
+        pairForecast(pairSymbol, offsets, levels, levelStepBp, innerFirst, from, to, "");
+    }
+
+    /**
+     * То же с ВЫГРУЗКОЙ ЖУРНАЛОВ прогона ({@code --journal-out=<каталог>}).
+     *
+     * Нужна, чтобы считать по стенду то же, что по живым, ТЕМ ЖЕ прибором:
+     * {@code --revx-carry --hours-out} по выгруженному журналу.
+     *
+     * 🔑 Смысл именно в этом: у живого бота часовой разрез цены запаса смещён —
+     * бот выключается по суточному пределу постановок, а выбирает его быстрее в
+     * бурные часы, и стоимость запаса во время простоя в замер не попадает.
+     * У стендового бота потолок постановок снят, простоя по этой причине нет
+     * вовсе, и сравнение классов волатильности выходит чистым.
+     */
+    public void pairForecast(String pairSymbol, String offsets, int levels,
+                             double levelStepBp, boolean innerFirst,
+                             String from, String to, String journalOut) {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
@@ -910,7 +928,11 @@ public class Executor {
                 org.home.data.revx.replay.FillModel model = "touch".equals(name)
                         ? new org.home.data.revx.replay.TouchFillModel(market)
                         : new org.home.data.revx.replay.MarketFillModel(market);
-                var results = org.home.data.revx.replay.Forecast.run(ticks, model, bp, bots, cfg);
+                // ⚠️ Журнал выгружается только у РАБОЧЕЙ модели: верхняя граница
+                // заведомо завышена (ТЗ §4.3), и считать по ней цену запаса
+                // значило бы мерить свойство модели, а не рынка.
+                var results = org.home.data.revx.replay.Forecast.run(ticks, model, bp, bots, cfg,
+                        standDbPath, "market".equals(name) ? journalOut : null);
                 out.append('\n').append(org.home.data.revx.replay.Forecast.render(
                         model.describe(), results));
                 out.append(org.home.data.revx.replay.Forecast.renderDays(

@@ -326,7 +326,8 @@ public class CliRunner implements ApplicationRunner {
                         Integer.parseInt(firstOr(args, "levels", "1")),
                         Double.parseDouble(firstOr(args, "level-step", "0")),
                         !args.containsOption("outer-first"),
-                        firstOr(args, "from", ""), firstOr(args, "to", ""));
+                        firstOr(args, "from", ""), firstOr(args, "to", ""),
+                        firstOr(args, "journal-out", ""));
             }
             if (args.containsOption("revx-assemble")) {
                 org.home.data.revx.replay.StandAssembler.assemble(
@@ -502,7 +503,10 @@ public class CliRunner implements ApplicationRunner {
                                 ? java.time.Instant.parse(firstOr(args, "from", "")).toEpochMilli()
                                 : (hours > 0 ? to - hours * 3_600_000L : 0L),
                         to,
-                        firstOr(args, "out", ""));
+                        firstOr(args, "out", ""),
+                        // --hours-out включает часовой разрез и раздел «цена
+                        // запаса по классам волатильности» (шаг 1 док. 187).
+                        firstOr(args, "hours-out", ""));
             }
             if (args.containsOption("revx-offset-axis")) {
                 org.home.data.revx.exec.OffsetAxis.run(

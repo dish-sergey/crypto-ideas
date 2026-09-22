@@ -250,9 +250,33 @@ public final class Forecast {
                                       BootParams base, List<BotSpec> bots,
                                       org.home.data.revx.RevxConfig cfg,
                                       String standDbPath) throws Exception {
+        return run(ticks, model, base, bots, cfg, standDbPath, null);
+    }
+
+    /**
+     * То же с ВЫГРУЗКОЙ ЖУРНАЛОВ: {@code journalOut} — каталог, куда лечь
+     * {@code bot-<id>.db} каждого котировщика вместе с котировками.
+     *
+     * <h2>Зачем</h2>
+     *
+     * Чтобы считать по стенду то же, что по живым, ТЕМ ЖЕ прибором. Живой
+     * часовой разрез ({@code --revx-carry --hours-out}) смещён: бот выключается
+     * по суточному пределу постановок, а выбирает его быстрее в бурные часы, и
+     * стоимость запаса во время простоя в замер не попадает. У стендового бота
+     * потолок постановок снят, значит простоя по этой причине нет вовсе — и
+     * сравнение классов волатильности выходит чистым.
+     *
+     * ⚠️ Котировки обычно НЕ пишутся ({@code journal.quotesOff()}): в обходе их
+     * десятки миллионов, а считается всё в памяти. Здесь они нужны, поэтому
+     * выгрузка включается только по явной просьбе.
+     */
+    public static List<BotResult> run(List<ReplayFair.Tick> ticks, FillModel model,
+                                      BootParams base, List<BotSpec> bots,
+                                      org.home.data.revx.RevxConfig cfg,
+                                      String standDbPath, String journalOut) throws Exception {
         List<org.home.data.revx.exec.SweepWatch> watches = new ArrayList<>();
         try {
-            return runInner(ticks, model, base, bots, cfg, standDbPath, watches);
+            return runInner(ticks, model, base, bots, cfg, standDbPath, watches, journalOut);
         } finally {
             for (var w : watches) {
                 w.close();
@@ -264,7 +288,8 @@ public final class Forecast {
                                             BootParams base, List<BotSpec> bots,
                                             org.home.data.revx.RevxConfig cfg,
                                             String standDbPath,
-                                            List<org.home.data.revx.exec.SweepWatch> watches)
+                                            List<org.home.data.revx.exec.SweepWatch> watches,
+                                            String journalOut)
             throws Exception {
         long start = ticks.get(0).tsMs();
         long end = ticks.get(ticks.size() - 1).tsMs();
@@ -319,7 +344,15 @@ public final class Forecast {
                 // Котировки в базу не пишем: единственное, ради чего они писались,
                 // теперь считается в памяти. Живому боту так делать НЕЛЬЗЯ —
                 // у него по ним восстанавливаются захват и markout.
-                journal.quotesOff();
+                // Котировки нужны только выгрузке: по ним считается часовой разрез
+
+                // цены запаса тем же прибором, что и на живых ботах.
+
+                if (journalOut == null || journalOut.isBlank()) {
+
+                    journal.quotesOff();
+
+                }
                 journals.add(journal);
 
                 // ⚠️ СТАРТОВЫЙ ЗАПАС НАДО И ЗАХВАТИТЬ, И ЗАСЕЯТЬ.
@@ -536,6 +569,25 @@ public final class Forecast {
             // примерно на 19 ГБ. Уборка была написана, но её нечем было
             // выполнить — открытое соединение держало файл.
             alloc.close();
+            // ⚠️ Соединения закрываются ДО копирования: SQLite держит файл, и
+            // копия открытой базы приезжает без последних записей.
+            if (journalOut != null && !journalOut.isBlank()) {
+                Path outDir = Path.of(journalOut);
+                Files.createDirectories(outDir);
+                for (ExecJournal j : journals) {
+                    j.close();
+                }
+                String base0 = base.symbol().substring(0, base.symbol().indexOf('/'));
+                for (BotSpec spec : bots) {
+                    Path src = dir.resolve("bot-" + spec.botId() + ".db");
+                    if (Files.exists(src)) {
+                        Files.copy(src, outDir.resolve(base0 + "-"
+                                        + spec.botId().replace("/", "_") + ".db"),
+                                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    }
+                }
+                log.warn("журналы прогона выгружены в {}", outDir.toAbsolutePath());
+            }
             delete(dir);
         }
     }

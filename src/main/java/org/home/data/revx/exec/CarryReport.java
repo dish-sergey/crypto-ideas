@@ -80,6 +80,49 @@ public class CarryReport {
 
     private static final Logger log = LoggerFactory.getLogger(CarryReport.class);
 
+    /**
+     * Один БОТ-ЧАС: цена запаса, исполнения и волатильность.
+     *
+     * @param carry   {@code Σ q·Δp} за час — во что обошёлся запас целиком
+     * @param timing  тот же час за вычетом беты: ковариационная часть
+     * @param volBp   реализованная волатильность часа, б.п. за минуту
+     * @param prevVol волатильность ПРЕДЫДУЩЕГО часа — по ней и класс: текущую
+     *                бот знать не может
+     */
+    private record Hour(String bot, long hourMs, double carry, double beta, double timing,
+                        int fills, double turnover, double meanQ, double volBp,
+                        double prevVol, double movePct, int ticks, int quotingTicks,
+                        double meanQUsd) {
+
+        /** Цена запаса на одно исполнение, б.п. от оборота часа. */
+        double priceBp(boolean useTiming) {
+            double v = useTiming ? timing : carry;
+            return !(turnover > 0) ? 0 : 1e4 * v / turnover;
+        }
+
+        /**
+         * Доля часа, которую бот ПРОСТОЯЛ, не котируя.
+         *
+         * 🔑 ⚠️ Это не мелочь учёта, а смещение в ту самую сторону, которую мы
+         * меряем. Бот выключается, упершись в суточный предел постановок
+         * ({@code limit_blocked: 100 из 100}), а предел он выбирает быстрее в
+         * БУРНЫЕ часы — там больше перестановок. После выключения тики в журнал
+         * не пишутся вовсе, значит:
+         * <ul>
+         *   <li>бурный час обрезается, и его цена запаса считается по началу;</li>
+         *   <li>стоимость запаса, который бот держит ВО ВРЕМЯ простоя, в замер
+         *       не попадает — а это ровно то, что мы ищем.</li>
+         * </ul>
+         * Поэтому час с неполным покрытием в сравнение классов не идёт.
+         */
+        double idleShare() {
+            return 1 - quotingTicks / 3600.0;
+        }
+    }
+
+    /** Часовые строки; {@code null} — разрез не просили. */
+    private List<Hour> hourly;
+
     /** Разложение одного бота. */
     private record Split(String name, double capture, double beta, double timing,
                          double actual, double meanUsd, int fills, double hours,
@@ -116,6 +159,25 @@ public class CarryReport {
      *                 окна, а не по началу журнала
      */
     public void run(String journals, long fromMs, long toMs, String out) {
+        run(journals, fromMs, toMs, out, "");
+    }
+
+    /**
+     * То же плюс ЧАСОВОЙ разрез в CSV ({@code --hours-out}).
+     *
+     * <h2>Зачем часы</h2>
+     *
+     * Блок 3 закрывали по ЛЕНТОЧНОЙ кривой края сделки на минутном горизонте, а
+     * в ней нет цены запаса вовсе: она считает каждое событие само по себе и не
+     * знает, что сделка потом лежит в запасе около сорока минут (док. 187).
+     * Чтобы спросить «дороже ли запас в бурный час», нужен часовой
+     * ковариационный член и число исполнений того же часа.
+     *
+     * ⚠️ Класс часа берётся по волатильности ПРЕДЫДУЩЕГО часа: текущую бот знать
+     * не может, а предыдущая её предсказывает ({@code r} = 0.29, док. 166).
+     */
+    public void run(String journals, long fromMs, long toMs, String out, String hoursOut) {
+        this.hourly = hoursOut == null || hoursOut.isBlank() ? null : new ArrayList<>();
         List<Split> splits = new ArrayList<>();
         for (String part : journals.split(",")) {
             String[] kv = part.split("=", 2);
@@ -219,6 +281,11 @@ public class CarryReport {
                 .append("на число сделок завысило бы ранние втрое. Разность двух колонок и\n")
                 .append("есть то, что бот зарабатывает или теряет на обороте.\n");
 
+        if (hourly != null && !hourly.isEmpty()) {
+            sb.append('\n').append(classSection());
+            dumpHours(hoursOut);
+        }
+
         String text = sb.toString();
         if (out == null || out.isBlank()) {
             log.info("\n{}", text);
@@ -247,8 +314,11 @@ public class CarryReport {
     private Split split(String name, String[] paths, long fromMs, long toMs) {
         TreeMap<Long, Double> marks = new TreeMap<>();
         TreeMap<Long, Double> inv = new TreeMap<>();
+        // Тики, на которых бот ДЕЙСТВИТЕЛЬНО котировал: час, где он полчаса
+        // стоял по лимиту, мерит длину простоя, а не цену запаса.
+        java.util.Set<Long> quoting = new java.util.HashSet<>();
         for (String path : paths) {
-            if (!readQuotes(path.trim(), fromMs, toMs, marks, inv)) {
+            if (!readQuotes(path.trim(), fromMs, toMs, marks, inv, quoting)) {
                 return null;
             }
         }
@@ -287,6 +357,12 @@ public class CarryReport {
         double p1 = marks.lastEntry().getValue();
         double beta = meanQ * (p1 - p0);
         double actual = trades.cash + prevQ * p1 - inv.firstEntry().getValue() * p0;
+        if (hourly != null) {
+
+            collectHours(name, marks, inv, trades, quoting);
+
+        }
+
         double hours = (marks.lastKey() - marks.firstKey()) / 3_600_000.0;
         return new Split(name, trades.capture, beta, carry - beta, actual,
                 areaUsd / marks.size(), trades.fills, hours,
@@ -299,14 +375,84 @@ public class CarryReport {
         double capture;
         double turnover;
         int fills;
+        /** Исполнения и оборот по часам — для часового разреза. */
+        final TreeMap<Long, int[]> fillsByHour = new TreeMap<>();
+        final TreeMap<Long, double[]> turnoverByHour = new TreeMap<>();
+    }
+
+    private static long hourOf(long ms) {
+        return ms - Math.floorMod(ms, 3_600_000L);
+    }
+
+    /**
+     * Часовой разрез одного бота: цена запаса, исполнения, волатильность.
+     *
+     * ⚠️ Час берётся ЦЕЛИКОМ или не берётся: неполный час на краю окна даёт
+     * заниженную и цену запаса, и число исполнений сразу, а отношение одного к
+     * другому при этом смещается непредсказуемо. Отбрасываются первый и
+     * последний.
+     */
+    private void collectHours(String bot, TreeMap<Long, Double> marks,
+                              TreeMap<Long, Double> inv, Trades trades,
+                              java.util.Set<Long> quoting) {
+        // Ход и волатильность часа считаются по тем же тикам, что и запас.
+        TreeMap<Long, double[]> agg = new TreeMap<>();          // час → {carry, Σq, n, p0, p1, Σ(Δp/p)²}
+        Long prevKey = null;
+        for (Map.Entry<Long, Double> e : marks.entrySet()) {
+            long h = hourOf(e.getKey());
+            double px = e.getValue();
+            double[] a = agg.computeIfAbsent(h, k -> new double[]{0, 0, 0, px, px, 0, 0});
+            if (prevKey != null && hourOf(prevKey) == h) {
+                double prevP = marks.get(prevKey);
+                a[0] += inv.get(prevKey) * (px - prevP);
+                double r = (px - prevP) / prevP;
+                a[5] += r * r;
+            }
+            a[1] += inv.get(e.getKey());
+
+            a[6] += inv.get(e.getKey()) * px;   // запас в ДОЛЛАРАХ: вес второй мерки
+            a[2] += 1;
+            a[4] = px;
+            prevKey = e.getKey();
+        }
+        if (agg.size() < 3) {
+            return;
+        }
+        long first = agg.firstKey();
+        long last = agg.lastKey();
+        Double prevVol = null;
+        for (Map.Entry<Long, double[]> e : agg.entrySet()) {
+            double[] a = e.getValue();
+            // б.п. за минуту: СКО тикового хода, приведённое к минуте
+            double secs = Math.max(1, a[2]);
+            double vol = Math.sqrt(a[5] / secs) * 1e4 * Math.sqrt(60);
+            long h = e.getKey();
+            if (h != first && h != last && prevVol != null) {
+                double meanQ = a[1] / a[2];
+                double beta = meanQ * (a[4] - a[3]);
+                int[] f = trades.fillsByHour.get(h);
+                double[] t = trades.turnoverByHour.get(h);
+                int qt = 0;
+                        for (long ts : quoting) {
+                            if (hourOf(ts) == h) {
+                                qt++;
+                            }
+                        }
+                        hourly.add(new Hour(bot, h, a[0], beta, a[0] - beta,
+                                f == null ? 0 : f[0], t == null ? 0 : t[0], meanQ, vol, prevVol,
+                                100.0 * (a[4] - a[3]) / a[3], (int) a[2], qt, a[6] / a[2]));
+            }
+            prevVol = vol;
+        }
     }
 
     private boolean readQuotes(String path, long fromMs, long toMs,
-                               TreeMap<Long, Double> marks, TreeMap<Long, Double> inv) {
+                               TreeMap<Long, Double> marks, TreeMap<Long, Double> inv,
+                               java.util.Set<Long> quoting) {
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:file:"
                 + Path.of(path).toAbsolutePath() + "?mode=ro");
              PreparedStatement ps = c.prepareStatement(
-                     "SELECT ts_ms, fair, inventory FROM exec_quote"
+                     "SELECT ts_ms, fair, inventory, quotable FROM exec_quote"
                              + " WHERE ts_ms >= ? AND ts_ms < ? AND fair > 0 ORDER BY ts_ms")) {
             ps.setLong(1, fromMs);
             ps.setLong(2, toMs);
@@ -314,6 +460,12 @@ public class CarryReport {
                 while (rs.next()) {
                     marks.put(rs.getLong(1), rs.getDouble(2));
                     inv.put(rs.getLong(1), rs.getDouble(3));
+                    // 🔑 Котировал ли бот на этом тике. Нужно не для тождества, а
+                    // для часового разреза: час, в котором бот полчаса стоял,
+                    // мерит не цену запаса, а длину простоя.
+                    if (rs.getInt(4) != 0) {
+                        quoting.add(rs.getLong(1));
+                    }
                 }
             }
             return true;
@@ -344,12 +496,410 @@ public class CarryReport {
                     trades.capture += (fair - price) * dq;
                     trades.turnover += qty * price;
                     trades.fills++;
+                    long h = hourOf(rs.getLong(1));
+                    trades.fillsByHour.computeIfAbsent(h, k -> new int[1])[0]++;
+                    trades.turnoverByHour.computeIfAbsent(h, k -> new double[1])[0] += qty * price;
                 }
             }
             return true;
         } catch (Exception e) {
             log.warn("журнал {}: исполнения не прочитаны: {}", path, e.toString());
             return false;
+        }
+    }
+
+    /**
+     * ЦЕНА ЗАПАСА ПО КЛАССАМ ВОЛАТИЛЬНОСТИ — шаг 1 блока П3.0-бис (док. 187).
+     *
+     * <h2>Что решается</h2>
+     *
+     * Подтверждает: в бурном классе цена запаса НА ОДНО ИСПОЛНЕНИЕ заметно выше,
+     * чем в тихом, — тогда оптимум отступа обязан ехать вправо в бурные часы, и
+     * шаг 2 имеет смысл. Опровергает: примерно одинакова во всех классах — тогда
+     * запас оптимум не двигает, и блок 3 закрыт окончательно, уже на полной
+     * задаче.
+     *
+     * <h2>Две вещи, без которых число врёт</h2>
+     *
+     * ⚠️ Класс берётся по волатильности ПРЕДЫДУЩЕГО часа. По текущей вышел бы
+     * идеальный, но недоступный боту прогноз: он бы «узнавал» бурный час в его
+     * начале.
+     *
+     * ⚠️ Часы БЕЗ ИСПОЛНЕНИЙ в среднее не идут: цена запаса на исполнение там
+     * деление на ноль, а молча считать их нулём значило бы разбавлять бурный
+     * класс тишиной.
+     */
+    private String classSection() {
+        List<Hour> all = hourly.stream().filter(h -> h.fills() > 0
+                && h.turnover() > 0 && h.prevVol() > 0).toList();
+        // ⚠️ Часы с простоем выбрасываются: бот выключается по суточному пределу
+        // постановок, а выбирает его быстрее в БУРНЫЕ часы — то есть отбор
+        // срезает ровно тот класс, который мы меряем.
+        List<Hour> withFills = all.stream().filter(h -> h.idleShare() < 0.10).toList();
+        StringBuilder sb = new StringBuilder();
+        sb.append("## Цена запаса по классам волатильности (шаг 1, док. 187)\n\n");
+        if (withFills.size() < 20) {
+            return sb.append("бот-часов с исполнениями всего ").append(withFills.size())
+                    .append(" — на классы делить нечего\n").toString();
+        }
+        double[] vols = withFills.stream().mapToDouble(Hour::prevVol).sorted().toArray();
+        double[] edge = {vols[vols.length / 4], vols[vols.length / 2],
+                vols[vols.length * 3 / 4]};
+
+        sb.append("класс — по волатильности ПРЕДЫДУЩЕГО часа, границы ")
+                .append(String.format(Locale.ROOT, "%.2f / %.2f / %.2f б.п./мин",
+                        edge[0], edge[1], edge[2]))
+                .append("\n\n| класс | бот-часов | исполнений | ")
+                .append("цена запаса, $/час | **на исполнение, б.п.** | ")
+                .append("только ковариация, б.п. | захват−? |\n")
+                .append("|---|---:|---:|---:|---:|---:|\n");
+
+        String[] names = {"тихий", "ниже среднего", "выше среднего", "бурный"};
+        double[][] acc = new double[4][5];   // часы, исполнения, Σcarry, Σturnover, Σtiming
+        for (Hour h : withFills) {
+            int k = h.prevVol() <= edge[0] ? 0 : h.prevVol() <= edge[1] ? 1
+                    : h.prevVol() <= edge[2] ? 2 : 3;
+            acc[k][0]++;
+            acc[k][1] += h.fills();
+            acc[k][2] += h.carry();
+            acc[k][3] += h.turnover();
+            acc[k][4] += h.timing();
+        }
+        for (int k = 0; k < 4; k++) {
+            double[] a = acc[k];
+            sb.append("| ").append(names[k])
+                    .append(" | ").append((long) a[0])
+                    .append(" | ").append((long) a[1])
+                    .append(" | ").append(String.format(Locale.ROOT, "%+.4f", a[2] / a[0]))
+                    .append(" | ").append(String.format(Locale.ROOT, "**%+.2f**",
+                            a[3] > 0 ? 1e4 * a[2] / a[3] : 0))
+                    .append(" | ").append(String.format(Locale.ROOT, "%+.2f",
+                            a[3] > 0 ? 1e4 * a[4] / a[3] : 0))
+                    .append(" |\n");
+        }
+
+        // Тихий против бурного — с ошибкой бутстрапом по часам, иначе это два
+        // числа без права на сравнение.
+        sb.append('\n').append(diff(withFills, edge));
+        sb.append('\n').append(slope(withFills));
+        // Вторая мерка — по НОСИМОМУ ЗАПАСУ. Ей не нужны исполнения в часе,
+        // поэтому данных у неё втрое больше: у стендового бота при δ = 12 и
+        // лоте $1 из 650 бот-часов с исполнениями годны 173, а с запасом — почти
+        // все.
+        List<Hour> withStock = hourly.stream().filter(h -> h.idleShare() < 0.10).toList();
+        sb.append('\n').append(inventorySlope(withStock, false));
+        sb.append('\n').append(inventorySlope(withStock, true));
+        return sb.toString();
+    }
+
+    /**
+     * ЦЕНА ЗАПАСА КАК ФУНКЦИЯ ВОЛАТИЛЬНОСТИ — по ВСЕМ часам, а не по крайним.
+     *
+     * <h2>Почему не хватило квартилей</h2>
+     *
+     * ⚠️ Сравнение «бурный минус тихий» выбрасывает половину наблюдений: средние
+     * два класса в него не входят вовсе. На живых данных это дало точечную
+     * оценку −6.2 б.п. при ошибке 7.2, то есть прибор не различал эффект и ноль.
+     *
+     * <h2>Что считается</h2>
+     *
+     * Взвешенная по обороту прямая {@code carry = a·T + b·T·V}, где {@code T} —
+     * оборот часа, {@code V} — волатильность ПРЕДЫДУЩЕГО часа. Тогда цена
+     * доллара запаса при волатильности {@code V} равна {@code a + b·V}, и весь
+     * вопрос в знаке {@code b}: отрицательный означает «в бурный час запас
+     * дороже».
+     *
+     * ⚠️ Ошибка — бутстрапом по ЧАСАМ целиком: шесть ботов внутри часа торгуют
+     * один рынок.
+     */
+    private static String slope(List<Hour> hours) {
+        return slope(hours, false) + "\n" + slope(hours, true);
+    }
+
+    /**
+     * ЦЕНА ДОЛЛАРА ЗАПАСА В ЧАС — тот же вопрос, но на порядок больше данных.
+     *
+     * <h2>Почему понадобилась вторая мерка</h2>
+     *
+     * Счёт «на доллар ОБОРОТА» требует, чтобы в часе были исполнения, а их
+     * часто нет: у стендового бота при δ = 12 и лоте $1 выходит полсотни сделок
+     * в сутки, и из 650 бот-часов годными остаются 173. Здесь вес — НОСИМЫЙ
+     * ЗАПАС, и годится каждый час, где бот что-то держал.
+     *
+     * <h2>Что считается</h2>
+     *
+     * {@code carry = a·Q + b·Q·V}, где {@code Q} — средний запас часа в долларах,
+     * {@code V} — волатильность предыдущего часа. Тогда {@code a + b·V} — во что
+     * обходится доллар запаса за час при такой волатильности.
+     *
+     * 🔑 Это прямая проверка того, что говорит теория (Авелланеда–Стойков): член
+     * за риск запаса растёт с волатильностью, значит {@code b} обязан быть
+     * отрицательным и заметным. Если он ноль — запас в бурный час не дороже, и
+     * подстраивать отступ под волатильность не на чем.
+     */
+    private static String inventorySlope(List<Hour> hours, boolean useTiming) {
+        TreeMap<Long, List<Hour>> byClock = new TreeMap<>();
+        for (Hour h : hours) {
+            if (Math.abs(h.meanQUsd()) > 0 && h.prevVol() > 0) {
+                byClock.computeIfAbsent(h.hourMs(), k -> new ArrayList<>()).add(h);
+            }
+        }
+        List<List<Hour>> units = new ArrayList<>(byClock.values());
+        int n = units.stream().mapToInt(List::size).sum();
+        if (n < 50) {
+            return "часов с запасом мало (" + n + ")\n";
+        }
+        double[] point = fitInv(units, useTiming);
+        if (point == null) {
+            return "прямую по запасу не построить\n";
+        }
+        java.util.Random rnd = new java.util.Random(20260922L);
+        List<Double> bs = new ArrayList<>();
+        for (int r = 0; r < 2000; r++) {
+            List<List<Hour>> sample = new ArrayList<>(units.size());
+            for (int i = 0; i < units.size(); i++) {
+                sample.add(units.get(rnd.nextInt(units.size())));
+            }
+            double[] f = fitInv(sample, useTiming);
+            if (f != null) {
+                bs.add(f[1]);
+            }
+        }
+        double mean = bs.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+        double sd = Math.sqrt(bs.stream().mapToDouble(x -> (x - mean) * (x - mean)).sum()
+                / Math.max(1, bs.size() - 1));
+        java.util.Collections.sort(bs);
+        double[] v = hours.stream().mapToDouble(Hour::prevVol).sorted().toArray();
+        double lo = v[v.length / 10];
+        double hi = v[v.length * 9 / 10];
+        return String.format(Locale.ROOT,
+                "### Цена ДОЛЛАРА ЗАПАСА в час — %s (%d бот-часов с запасом)%n%n"
+                        + "`б.п. за час на доллар запаса = %+.3f %+.3f × волатильность`%n%n"
+                        + "наклон: ошибка %.3f, **t = %+.2f**, 95%%%% [%+.3f, %+.3f]%n%n"
+                        + "| волатильность | цена доллара запаса за час, б.п. |%n|---|---:|%n"
+                        + "| 10%%%% (%.2f б.п./мин, тихо) | %+.3f |%n"
+                        + "| 90%%%% (%.2f б.п./мин, бурно) | %+.3f |%n",
+                useTiming ? "ТОЛЬКО КОВАРИАЦИЯ" : "весь перенос", n,
+                point[0], point[1], sd, sd > 0 ? point[1] / sd : 0,
+                bs.get((int) (0.025 * bs.size())), bs.get((int) (0.975 * bs.size())),
+                lo, point[0] + point[1] * lo, hi, point[0] + point[1] * hi);
+    }
+
+    /** Взвешенная прямая {@code carry = a·Q + b·Q·V}, вес — носимый запас в долларах. */
+    private static double[] fitInv(List<List<Hour>> units, boolean useTiming) {
+        double s11 = 0;
+        double s12 = 0;
+        double s22 = 0;
+        double y1 = 0;
+        double y2 = 0;
+        for (List<Hour> unit : units) {
+            for (Hour h : unit) {
+                double q = Math.abs(h.meanQUsd());
+                double x1 = q;
+                double x2 = q * h.prevVol();
+                double y = useTiming ? h.timing() : h.carry();
+                s11 += x1 * x1;
+                s12 += x1 * x2;
+                s22 += x2 * x2;
+                y1 += x1 * y;
+                y2 += x2 * y;
+            }
+        }
+        double det = s11 * s22 - s12 * s12;
+        return Math.abs(det) > 0
+                ? new double[]{1e4 * (s22 * y1 - s12 * y2) / det,
+                        1e4 * (s11 * y2 - s12 * y1) / det}
+                : null;
+    }
+
+    /**
+     * @param useTiming брать ТОЛЬКО ковариационную часть переноски.
+     *
+     * 🔑 Этот выбор решает не вкус, а мощность, и я сначала выбрал неверно.
+     * Час раскладывается как
+     * {@code Σq·Δp = средний_запас·(p1−p0) + Σ(q−средний)·Δp}. Первое слагаемое
+     * — средний запас, умноженный на ход часа: ход случаен, знак его случаен, и
+     * всё это чистый шум с нулевым средним. Второе — то, ради чего считается:
+     * «запас оказывался выше своего среднего ровно тогда, когда цена падала».
+     *
+     * Ex ante боту доступно только второе: дрейф он предсказать не может, и в
+     * ожидании тот ноль. Значит и цена запаса для решения — это ковариационный
+     * член, и он же имеет меньший разброс. Полный перенос печатается рядом как
+     * контроль.
+     */
+    private static String slope(List<Hour> hours, boolean useTiming) {
+        TreeMap<Long, List<Hour>> byClock = new TreeMap<>();
+        for (Hour h : hours) {
+            byClock.computeIfAbsent(h.hourMs(), k -> new ArrayList<>()).add(h);
+        }
+        List<List<Hour>> units = new ArrayList<>(byClock.values());
+        double[] point = fit(units, useTiming);
+        if (point == null) {
+            return "прямую не построить\n";
+        }
+        java.util.Random rnd = new java.util.Random(20260922L);
+        List<Double> bs = new ArrayList<>();
+        for (int r = 0; r < 2000; r++) {
+            List<List<Hour>> sample = new ArrayList<>(units.size());
+            for (int i = 0; i < units.size(); i++) {
+                sample.add(units.get(rnd.nextInt(units.size())));
+            }
+            double[] f = fit(sample, useTiming);
+            if (f != null) {
+                bs.add(f[1]);
+            }
+        }
+        if (bs.size() < 1000) {
+            return "бутстрап прямой не собрался\n";
+        }
+        double mean = bs.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+        double sd = Math.sqrt(bs.stream().mapToDouble(x -> (x - mean) * (x - mean)).sum()
+                / (bs.size() - 1));
+        java.util.Collections.sort(bs);
+        double[] v = hours.stream().mapToDouble(Hour::prevVol).sorted().toArray();
+        double lo = v[v.length / 10];
+        double hi = v[v.length * 9 / 10];
+        return String.format(Locale.ROOT,
+                "### Цена запаса как прямая по волатильности — %s (все %d бот-часов)%n%n"
+                        + "`цена доллара запаса, б.п. = %+.2f %+.2f × волатильность`%n%n"
+                        + "наклон: ошибка %.2f, **t = %+.2f**, 95%%%% [%+.2f, %+.2f]%n%n"
+                        + "| волатильность | цена доллара запаса, б.п. |%n|---|---:|%n"
+                        + "| 10%%%% (%.2f б.п./мин, тихо) | %+.2f |%n"
+                        + "| 90%%%% (%.2f б.п./мин, бурно) | %+.2f |%n",
+                useTiming ? "ТОЛЬКО КОВАРИАЦИЯ (решающая)" : "весь перенос (контроль)", hours.size(), point[0], point[1], sd, sd > 0 ? point[1] / sd : 0,
+                bs.get((int) (0.025 * bs.size())), bs.get((int) (0.975 * bs.size())),
+                lo, point[0] + point[1] * lo, hi, point[0] + point[1] * hi);
+    }
+
+    /** Взвешенная прямая {@code carry = a·T + b·T·V}; {@code null} — вырождено. */
+    private static double[] fit(List<List<Hour>> units, boolean useTiming) {
+        double s11 = 0;
+        double s12 = 0;
+        double s22 = 0;
+        double y1 = 0;
+        double y2 = 0;
+        for (List<Hour> unit : units) {
+            for (Hour h : unit) {
+                double t = h.turnover();
+                double x1 = t;
+                double x2 = t * h.prevVol();
+                s11 += x1 * x1;
+                s12 += x1 * x2;
+                s22 += x2 * x2;
+                double y = useTiming ? h.timing() : h.carry();
+                y1 += x1 * y;
+                y2 += x2 * y;
+            }
+        }
+        double det = s11 * s22 - s12 * s12;
+        if (!(Math.abs(det) > 0)) {
+            return null;
+        }
+        return new double[]{1e4 * (s22 * y1 - s12 * y2) / det,
+                1e4 * (s11 * y2 - s12 * y1) / det};
+    }
+
+    /**
+     * Разность «бурный минус тихий» — БУТСТРАПОМ ПО ЧАСАМ.
+     *
+     * <h2>Почему не среднее по бот-часам</h2>
+     *
+     * ⚠️ Нужная величина — {@code Σcarry / Σoborot} внутри класса, то есть
+     * ВЗВЕШЕННАЯ по обороту. Простое среднее отношений даёт другое число и
+     * чудовищный разброс: в часе с тремя сделками отношение скачет как угодно,
+     * и на живых данных ошибка такого среднего вышла 5.72 б.п. при эффекте
+     * 6 б.п. — то есть прибор не мерил ничего.
+     *
+     * <h2>Почему бутстрап, а не формула</h2>
+     *
+     * Оценка — ОТНОШЕНИЕ двух сумм, и её ошибку пришлось бы линеаризовать. Плюс
+     * ⚠️ шесть ботов внутри одного часа торгуют один рынок и независимыми не
+     * являются. Бутстрап по ЧАСАМ (час целиком, со всеми ботами) закрывает и то
+     * и другое: пересобираем часы с возвращением и смотрим разброс разности.
+     */
+    private static String diff(List<Hour> hours, double[] edge) {
+        // Час целиком — одна единица пересборки, вместе со всеми ботами в нём.
+        TreeMap<Long, List<Hour>> byClock = new TreeMap<>();
+        for (Hour h : hours) {
+            byClock.computeIfAbsent(h.hourMs(), k -> new ArrayList<>()).add(h);
+        }
+        List<List<Hour>> units = new ArrayList<>(byClock.values());
+        double point = ratioDiff(units, edge);
+        if (Double.isNaN(point)) {
+            return "клеток в крайних классах мало — сравнивать нельзя\n";
+        }
+        int reps = 2000;
+        java.util.Random rnd = new java.util.Random(20260922L);
+        double[] draws = new double[reps];
+        int ok = 0;
+        for (int r = 0; r < reps; r++) {
+            List<List<Hour>> sample = new ArrayList<>(units.size());
+            for (int i = 0; i < units.size(); i++) {
+                sample.add(units.get(rnd.nextInt(units.size())));
+            }
+            double d = ratioDiff(sample, edge);
+            if (!Double.isNaN(d)) {
+                draws[ok++] = d;
+            }
+        }
+        if (ok < reps / 2) {
+            return "бутстрап не собрался\n";
+        }
+        double[] v = java.util.Arrays.copyOf(draws, ok);
+        java.util.Arrays.sort(v);
+        double mean = java.util.Arrays.stream(v).average().orElse(0);
+        double sd = Math.sqrt(java.util.Arrays.stream(v)
+                .map(x -> (x - mean) * (x - mean)).sum() / (ok - 1));
+        return String.format(Locale.ROOT,
+                "**БУРНЫЙ МИНУС ТИХИЙ: %+.2f б.п. на доллар оборота**%n"
+                        + "бутстрап по часам (%d часов, %d пересборок): ошибка %.2f, "
+                        + "t = %+.2f, 95%%%% промежуток [%+.2f, %+.2f]%n"
+                        + "(часов в крайних классах считается по каждой пересборке)%n",
+                point, units.size(), ok, sd, sd > 0 ? point / sd : 0,
+                v[(int) (0.025 * ok)], v[(int) (0.975 * ok)]);
+    }
+
+    /** {@code Σcarry/Σoborot} бурного класса минус то же тихого; NaN — класс пуст. */
+    private static double ratioDiff(List<List<Hour>> units, double[] edge) {
+        double cc = 0;
+        double ct = 0;
+        double wc = 0;
+        double wt = 0;
+        for (List<Hour> unit : units) {
+            for (Hour h : unit) {
+                if (h.prevVol() <= edge[0]) {
+                    cc += h.carry();
+                    ct += h.turnover();
+                } else if (h.prevVol() > edge[2]) {
+                    wc += h.carry();
+                    wt += h.turnover();
+                }
+            }
+        }
+        return ct > 0 && wt > 0 ? 1e4 * wc / wt - 1e4 * cc / ct : Double.NaN;
+    }
+
+    private void dumpHours(String path) {
+        StringBuilder csv = new StringBuilder(
+                "bot,hour_utc,carry,beta,timing,fills,turnover,mean_q,vol_bp_min,"
+                        + "prev_vol_bp_min,move_pct,carry_bp_per_fill\n");
+        for (Hour h : hourly) {
+            csv.append(h.bot()).append(',').append(Instant.ofEpochMilli(h.hourMs()))
+                    .append(String.format(Locale.ROOT,
+                            ",%.8f,%.8f,%.8f,%d,%.6f,%.8f,%.4f,%.4f,%.4f,%.4f,%.4f%n",
+                            h.carry(), h.beta(), h.timing(), h.fills(), h.turnover(),
+                            h.meanQ(), h.volBp(), h.prevVol(), h.movePct(),
+                            h.priceBp(false), h.idleShare()));
+        }
+        try {
+            Path p = Path.of(path);
+            if (p.getParent() != null) {
+                Files.createDirectories(p.getParent());
+            }
+            Files.writeString(p, csv.toString(), StandardCharsets.UTF_8);
+            log.warn("часовой разрез: {} строк → {}", hourly.size(), p.toAbsolutePath());
+        } catch (IOException e) {
+            log.warn("не записать {}: {}", path, e.toString());
         }
     }
 
