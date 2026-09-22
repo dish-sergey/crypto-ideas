@@ -1046,6 +1046,13 @@ public final class QuoteLoop implements Runnable {
     public enum SweepSide { BOTH, BID, ASK }
 
     private SweepSide sweepSide = SweepSide.BOTH;
+
+
+
+    /** Сдвиг опоры по перевесу тейкеров Бинанса (док. 179). */
+
+
+    private FlowWatch flow;
     private final java.util.ArrayDeque<long[]> fairHistory = new java.util.ArrayDeque<>();
     private final org.home.data.revx.sim.EfficiencyRatio efficiency;
     private volatile String pausedReason = "не запущен";
@@ -1186,6 +1193,19 @@ public final class QuoteLoop implements Runnable {
     public void sweepWatch(SweepWatch watch) {
         this.sweeps = watch;
     }
+
+    /** Сторож перевеса тейкеров Бинанса; null — сдвига по потоку нет. */
+
+
+    public void flowWatch(FlowWatch watch) {
+
+
+        this.flow = watch;
+
+
+    }
+
+
 
     public void sweepWatch(SweepWatch watch, SweepSide side) {
         this.sweeps = watch;
@@ -1752,8 +1772,12 @@ public final class QuoteLoop implements Runnable {
         //
         // ⚠️ Форма именно сдвиг, а не гейт: гейт убирает вместе с плохими
         // сделками и хорошие, и на этом провалились гейты A46.
+        // Два источника сдвига опоры, и они СКЛАДЫВАЮТСЯ: свип — событие на нашей
+        // ленте, перевес тейкеров Бинанса — состояние чужого рынка. Корреляция
+        // между ними 0.012–0.053 (задача A81), то есть это разные события.
         double sweepBp = sweeps == null ? 0 : sweeps.shiftBp(clock.now());
-        double quoteFair = fair.price() * (1 + sweepBp / 1e4);
+        double flowBp = flow == null ? 0 : flow.shiftBp(clock.now());
+        double quoteFair = fair.price() * (1 + (sweepBp + flowBp) / 1e4);
         if (sweepBp != 0) {
             SweepWatch.Sweep sw = sweeps.lastSweep(clock.now());
             if (sweeps.isNew(sw)) {
@@ -1777,7 +1801,7 @@ public final class QuoteLoop implements Runnable {
         //
         // ⚠️ Второй вызов обязан идти по ТОМУ ЖЕ инвентарю и сносу: иначе
         // сравнивались бы не стороны, а два разных состояния.
-        if (sweepBp != 0 && sweepSide != SweepSide.BOTH) {
+        if (sweepBp + flowBp != 0 && sweepSide != SweepSide.BOTH) {
             Quoter.Quotes plain = frozenUnwind
                     ? unwindQuoter().quotes(fair.price(), inventory, drift)
                     : policy.quotes(fair.price(), inventory, drift);

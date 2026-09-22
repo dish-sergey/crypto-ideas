@@ -584,6 +584,24 @@ public class Executor {
      */
     public void sweepRun(String journalPath, String coefs, long delayMs,
                          String from, String to, String offsets, String sides) {
+        sweepRun(journalPath, coefs, delayMs, from, to, offsets, sides, "0", 30_000);
+    }
+
+    /**
+     * То же плюс ось СДВИГА ПО ПЕРЕВЕСУ ТЕЙКЕРОВ БИНАНСА ({@code --flow-coefs}).
+     *
+     * Пункт 2 части IV док. 186. Форма та же, что у свипа — сдвиг опоры, а не
+     * гейт; величина из док. 178: наклон 2.92 б.п. на единицу перевеса, то есть
+     * типичный предсказанный ход 0.46–0.64 б.п.
+     *
+     * ⚠️ {@code --flow-delay-ms} — сколько ПОСЛЕ закрытия минуты свеча
+     * становится доступна. Ноль означал бы бота, знающего перевес минуты в её
+     * середине; такого не бывает, а информация живёт 1–5 минут, поэтому
+     * задержка съедает заметную часть сигнала и обязана быть в прогоне.
+     */
+    public void sweepRun(String journalPath, String coefs, long delayMs,
+                         String from, String to, String offsets, String sides,
+                         String flowCoefs, long flowDelayMs) {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
@@ -623,6 +641,8 @@ public class Executor {
                 for (String part : coefs.split(",")) {
                     double coef = Double.parseDouble(part.trim());
                     for (String sideName : sideNames) {
+                      for (String fc : flowCoefs.split(",")) {
+                        double flowCoef = Double.parseDouble(fc.trim());
                         QuoteLoop.SweepSide side = QuoteLoop.SweepSide.valueOf(
                                 sideName.trim().toUpperCase(java.util.Locale.ROOT));
                         // Без реакции сторона ничего не значит — считаем контроль
@@ -639,14 +659,16 @@ public class Executor {
                             }
                             side = QuoteLoop.SweepSide.BOTH;   // контроль стороны не имеет
                         }
-                        String id = String.format(java.util.Locale.ROOT, "%.0f/%s%s",
+                        String id = String.format(java.util.Locale.ROOT, "%.0f/%s%s%s",
                                 delta * 10_000, part.trim(),
-                                coef == 0 ? "" : "/" + sideName.trim());
+                                coef == 0 ? "" : "/" + sideName.trim(),
+                                flowCoef == 0 ? "" : "/поток" + flowCoef);
                         var bots = java.util.List.of(
                                 new org.home.data.revx.replay.Forecast.BotSpec(
                                         id, delta, bp.skewTarget(), bp.inventoryCap(),
                                         bp.levels(), bp.levelStep(), bp.size(),
-                                        bp.innerFirst(), 0, coef, delayMs, side));
+                                        bp.innerFirst(), 0, coef, delayMs, side,
+                                        flowCoef, flowDelayMs));
                         // Модель и книга перечитываются на каждую ступень: у модели
                         // исполнения есть состояние (очередь, видимость), и делить её
                         // между прогонами значило бы мерить не настройку, а порядок
@@ -657,6 +679,7 @@ public class Executor {
                         all.addAll(org.home.data.revx.replay.Forecast.run(ticks,
                                 new org.home.data.revx.replay.MarketFillModel(market),
                                 bp, bots, cfg, standDbPath));
+                      }
                     }
                 }
             }

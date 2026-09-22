@@ -85,13 +85,24 @@ public final class Forecast {
                           double inventoryCap, int levels, double levelStep,
                           double size, boolean innerFirst, double dynOffsetK,
                           double sweepCoef, long sweepDelayMs,
-                          org.home.data.revx.exec.QuoteLoop.SweepSide sweepSide) {
+                          org.home.data.revx.exec.QuoteLoop.SweepSide sweepSide,
+                          double flowCoef, long flowDelayMs) {
 
         public BotSpec(String botId, double offset, double skewTarget,
                        double inventoryCap, int levels, double levelStep,
                        double size, boolean innerFirst) {
             this(botId, offset, skewTarget, inventoryCap, levels, levelStep,
                     size, innerFirst, 0);
+        }
+
+        public BotSpec(String botId, double offset, double skewTarget,
+                       double inventoryCap, int levels, double levelStep,
+                       double size, boolean innerFirst, double dynOffsetK,
+                       double sweepCoef, long sweepDelayMs,
+                       org.home.data.revx.exec.QuoteLoop.SweepSide sweepSide) {
+            this(botId, offset, skewTarget, inventoryCap, levels, levelStep,
+                    size, innerFirst, dynOffsetK, sweepCoef, sweepDelayMs,
+                    sweepSide, 0, 30_000);
         }
 
         public BotSpec(String botId, double offset, double skewTarget,
@@ -275,10 +286,15 @@ public final class Forecast {
                                       org.home.data.revx.RevxConfig cfg,
                                       String standDbPath, String journalOut) throws Exception {
         List<org.home.data.revx.exec.SweepWatch> watches = new ArrayList<>();
+        List<org.home.data.revx.exec.FlowWatch> flows = new ArrayList<>();
         try {
-            return runInner(ticks, model, base, bots, cfg, standDbPath, watches, journalOut);
+            return runInner(ticks, model, base, bots, cfg, standDbPath, watches,
+                    journalOut, flows);
         } finally {
             for (var w : watches) {
+                w.close();
+            }
+            for (var w : flows) {
                 w.close();
             }
         }
@@ -289,7 +305,8 @@ public final class Forecast {
                                             org.home.data.revx.RevxConfig cfg,
                                             String standDbPath,
                                             List<org.home.data.revx.exec.SweepWatch> watches,
-                                            String journalOut)
+                                            String journalOut,
+                                            List<org.home.data.revx.exec.FlowWatch> flows)
             throws Exception {
         long start = ticks.get(0).tsMs();
         long end = ticks.get(ticks.size() - 1).tsMs();
@@ -437,6 +454,18 @@ public final class Forecast {
                 // сторожа. Калитка `> 0` молча возвращала базовый прогон, то есть
                 // плацебо показало бы ровно ноль разницы и выглядело бы как
                 // «эффект несимметричен».
+                // Сдвиг по перевесу тейкеров Бинанса — второй источник, складывается
+
+                // со свипом (корреляция между ними 0.012-0.053, задача A81).
+
+                if (spec.flowCoef() != 0) {
+                    var fw = new org.home.data.revx.exec.FlowWatch(cfg.cryptoDb(),
+                            base.symbol(), spec.flowCoef(), cfg.execSweepMaxBp(),
+                            spec.flowDelayMs(), start, end);
+                    flows.add(fw);
+                    loop.flowWatch(fw);
+                }
+
                 if (spec.sweepCoef() != 0) {
                     if (standDbPath == null) {
                         throw new IllegalStateException("реакция на свип просит базу стенда: "

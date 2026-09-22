@@ -351,6 +351,7 @@ public class OffsetSurface {
             all.addAll(h.events());
         }
         structure(sb, all, hours.size(), lot);
+        watch(sb, hours, lot);
         horizons(sb, all, hours.size());
         sidesBySign(sb, hours, fair);
 
@@ -387,6 +388,132 @@ public class OffsetSurface {
      * оказывается свойством РЫНКА, а не усреднения по нашим часам. Это и есть
      * разница между «плато измерено» и «плато объяснено».
      */
+    /**
+     * МОНИТОР ПЛАТО: `κ`, `c` и положение оптимума ПО СУТКАМ (док. 186, пункт 1).
+     *
+     * <h2>Зачем следить за причинами, а не за следствием</h2>
+     *
+     * Перебор отступов — дорогой способ узнать, где оптимум: деньги меряются
+     * плохо, каждая ступень стоит дней, и ответ приходит задним числом. А обе
+     * величины, которые оптимум ЗАДАЮТ, ленточные и считаются на тысячах событий
+     * за сутки:
+     * <ul>
+     *   <li>{@code κ} — как быстро поток уходит с расстоянием;</li>
+     *   <li>{@code c(δ)} — как быстро растёт отбор.</li>
+     * </ul>
+     *
+     * Условие оптимума: {@code δ* − c(δ*) = (1 − c′)/κ}, ширина плато примерно
+     * {@code 0.9/κ}. Если {@code κ} или {@code c} поползли — это видно на ленте
+     * за сутки, задолго до того, как проявится в деньгах.
+     *
+     * <h2>Что уже сбылось</h2>
+     *
+     * Док. 151 записал заранее: «полка 8.6–13.1 держится на {@code κ} = 0.203 со
+     * стенда; если пересчитанная {@code κ} уйдёт за 0.3, полка сдвинется к 8–9».
+     * В 170 {@code κ} перемерили трижды (0.385, 0.406, 0.315), и лента поставила
+     * оптимум на 8–10. Предсказание по двум числам сбылось.
+     *
+     * ⚠️ Но честно: тот сдвиг — ИСПРАВЛЕНИЕ плохого замера {@code κ}, а не
+     * изменение рынка. Теория говорит, за чем следить; сдвигаться за эти недели
+     * было особенно нечему.
+     *
+     * ⚠️ И второе ограничение: формула считает стороны независимыми, а у бота,
+     * который только держит лонг, они связаны через запас (док. 185). Это первое
+     * приближение, а не последнее слово.
+     */
+    private void watch(StringBuilder sb, List<Hour> hours, double lot) {
+        // ⚠️ Hour.hour() — НОМЕР часа от эпохи (ts_ms / 3 600 000), а не
+
+        // миллисекунды. Первая версия делила на сутки по нему как по
+
+        // миллисекундам и сложила всё окно в 1970-01-01.
+
+        Map<String, List<Hour>> byDay = new java.util.TreeMap<>();
+        for (Hour h : hours) {
+            byDay.computeIfAbsent(java.time.Instant.ofEpochMilli(h.hour() * 3_600_000L)
+                    .toString().substring(0, 10), k -> new ArrayList<>()).add(h);
+        }
+        sb.append("\n### Монитор плато по суткам: `κ`, `c` и оптимум\n\n");
+        sb.append("| сутки | часов | событий | `κ` | `c(12)`, б.п. | `δ*` | ширина плато |\n");
+        sb.append("|---|---:|---:|---:|---:|---:|---:|\n");
+        for (Map.Entry<String, List<Hour>> e : byDay.entrySet()) {
+            List<double[]> ev = new ArrayList<>();
+            for (Hour h : e.getValue()) {
+                ev.addAll(h.events());
+            }
+            int nh = e.getValue().size();
+            if (nh < 6 || ev.size() < 50) {
+                continue;                       // неполные сутки на краю окна
+            }
+            double[] lam = new double[GRID.length];
+            double[] c = new double[GRID.length];
+            for (int i = 0; i < GRID.length; i++) {
+                int n = 0;
+                double sum = 0;
+                for (double[] x : ev) {
+                    if (x[0] >= GRID[i]) {
+                        n++;
+                        sum += x[1];
+                    }
+                }
+                lam[i] = n / (double) nh;
+                c[i] = n < 5 ? Double.NaN : sum / n;
+            }
+            double kappa = kappaOf(lam);
+            // Оптимум — вершина ленточной прибыли λ(δ)·(δ − c(δ)).
+            double best = Double.NaN;
+            double bestProfit = Double.NEGATIVE_INFINITY;
+            double c12 = Double.NaN;
+            for (int i = 0; i < GRID.length; i++) {
+                if (GRID[i] == 12) {
+                    c12 = c[i];
+                }
+                if (Double.isNaN(c[i])) {
+                    continue;
+                }
+                double p = lam[i] * (GRID[i] - c[i]) * lot / 1e4;
+                if (p > bestProfit) {
+                    bestProfit = p;
+                    best = GRID[i];
+                }
+            }
+            sb.append("| ").append(e.getKey())
+                    .append(" | ").append(nh)
+                    .append(" | ").append(ev.size())
+                    .append(" | ").append(kappa > 0 ? round(kappa, 3) : "—")
+                    .append(" | ").append(Double.isNaN(c12) ? "—" : round(c12, 2))
+                    .append(" | ").append(Double.isNaN(best) ? "—" : (int) best)
+                    .append(" | ").append(kappa > 0 ? round(0.9 / kappa, 1) : "—")
+                    .append(" |\n");
+        }
+        sb.append("\n⚠️ Столбец `δ*` — вершина ЛЕНТОЧНОЙ прибыли, а не денег бота:")
+                .append(" в ней нет ни цены запаса, ни связи сторон через него.")
+                .append(" Следить надо за ДВИЖЕНИЕМ `κ` и `c`, а не за самим `δ*`:")
+                .append(" при ширине плато в 2–4 б.п. соседние ступени неразличимы,")
+                .append(" и вершина будет прыгать от шума.\n");
+    }
+
+    /** `κ` по наклону `ln λ` на рабочем участке 6–16 б.п.; 0 — не построилась. */
+    private static double kappaOf(double[] lambda) {
+        double sx = 0;
+        double sy = 0;
+        double sxy = 0;
+        double sxx = 0;
+        int n = 0;
+        for (int i = 0; i < GRID.length; i++) {
+            if (GRID[i] >= 6 && GRID[i] <= 16 && lambda[i] > 0) {
+                double x = GRID[i];
+                double y = Math.log(lambda[i]);
+                sx += x;
+                sy += y;
+                sxy += x * y;
+                sxx += x * x;
+                n++;
+            }
+        }
+        return n > 1 ? -(n * sxy - sx * sy) / (n * sxx - sx * sx) : 0;
+    }
+
     private void structure(StringBuilder sb, List<double[]> ev, int nHours, double lot) {
         sb.append("\n### Структура кривой: `λ(δ)` и `c(δ)` порознь\n\n");
         sb.append("| δ | λ(δ), событий/ч | из них бид / аск | `c(δ)`, б.п. | `δ − c` | `c'(δ)` | прибыль, $/ч |\n");

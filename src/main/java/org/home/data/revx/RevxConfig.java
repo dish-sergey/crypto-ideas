@@ -66,6 +66,12 @@ public class RevxConfig {
     private final long execSweepChainMs;
 
     private final double execSweepMaxBp;
+
+
+    /** База со свечами Бинанса: источник перевеса тейкеров (док. 178). */
+
+
+    private final String cryptoDb;
     private final List<String> tier1;
     private final List<String> tier2;
     private final int bookPeriodTier1Seconds;
@@ -204,6 +210,9 @@ public class RevxConfig {
             @Value("${revx.exec.sweep-chain-ms:100}") long execSweepChainMs,
 
             @Value("${revx.exec.sweep-max-bp:6}") double execSweepMaxBp,
+
+
+            @Value("${revx.crypto-db:data/crypto.db}") String cryptoDb,
             @Value("${revx.tier1}") List<String> tier1,
             @Value("${revx.tier2}") List<String> tier2,
             @Value("${revx.book-period-tier1-seconds}") int bookPeriodTier1Seconds,
@@ -337,6 +346,9 @@ public class RevxConfig {
         this.execSweepChainMs = execSweepChainMs;
 
         this.execSweepMaxBp = execSweepMaxBp;
+
+
+        this.cryptoDb = cryptoDb;
         this.tier1 = tier1;
         this.tier2 = tier2;
         this.bookPeriodTier1Seconds = bookPeriodTier1Seconds;
@@ -610,6 +622,14 @@ public class RevxConfig {
 
     public double execSweepMaxBp() {
         return execSweepMaxBp;
+    }
+
+
+
+
+
+    public String cryptoDb() {
+        return cryptoDb;
     }
 
     public List<String> tier1() {
