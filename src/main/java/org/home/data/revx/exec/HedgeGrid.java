@@ -94,7 +94,15 @@ public class HedgeGrid {
     /** Настройка хеджа. {@code forcedMaker} — только для {@link Exec#FORCED}. */
     record Config(Rule rule, double bandLots, int periodMin, int waitSec, boolean flatten,
                   Exec exec, double forcedMaker, double underwaterBp,
-                  int flowMin, double flowPct, double minLots) {
+                  int flowMin, double flowPct, double minLots, boolean entryOnly) {
+
+        /** Условие и на вход, и на выход (прежний смысл). */
+        Config(Rule rule, double bandLots, int periodMin, int waitSec, boolean flatten,
+               Exec exec, double forcedMaker, double underwaterBp,
+               int flowMin, double flowPct, double minLots) {
+            this(rule, bandLots, periodMin, waitSec, flatten, exec, forcedMaker, underwaterBp,
+                    flowMin, flowPct, minLots, false);
+        }
 
         /** С условием «под водой», без перевеса тейкеров. */
         Config(Rule rule, double bandLots, int periodMin, int waitSec, boolean flatten,
@@ -111,7 +119,7 @@ public class HedgeGrid {
         /** Та же настройка с другим исполнением (для порога мейкерской доли). */
         Config withExec(Exec e, double maker) {
             return new Config(rule, bandLots, periodMin, waitSec, flatten, e, maker, underwaterBp,
-                    flowMin, flowPct, minLots);
+                    flowMin, flowPct, minLots, entryOnly);
         }
 
         String name() {
@@ -123,12 +131,14 @@ public class HedgeGrid {
             return r + ", ждать " + waitSec + " с" + (flatten ? ", до нуля перед темнотой" : "")
                     + (underwaterBp > 0 ? ", только под водой ≥ " + fmt(underwaterBp) + " б.п." : "")
                     + (flowMin > 0 ? ", перевес продаж Бинанса ≥ " + fmt(flowPct) + "% за " + flowMin + " мин" : "")
-                    + (minLots > 0 ? ", запас ≥ " + fmt(minLots) + " лот." : "");
+                    + (minLots > 0 ? ", запас ≥ " + fmt(minLots) + " лот." : "")
+                    + (entryOnly ? " — ТОЛЬКО НА ВХОД" : "");
         }
 
         String key() {
             return rule + "|" + bandLots + "|" + periodMin + "|" + waitSec + "|" + flatten
-                    + "|" + underwaterBp + "|" + flowMin + "|" + flowPct + "|" + minLots;
+                    + "|" + underwaterBp + "|" + flowMin + "|" + flowPct + "|" + minLots
+                    + "|" + entryOnly;
         }
     }
 
@@ -398,6 +408,19 @@ public class HedgeGrid {
             for (double m : new double[]{10, 20}) {
                 for (double k : new double[]{0, 2}) {
                     out.add(new Config(Rule.BAND, 1, 0, 30, false, Exec.SIM, 0, 0, n, m, k));
+                }
+            }
+        }
+        // «Только на вход» (владелец, 27.09.2026): условие лишь разрешает НАРАЩИВАТЬ
+        // шорт; откуп при убыли запаса и уже открытый хедж — как в обычном хедже.
+        for (double x : new double[]{10, 20}) {
+            out.add(new Config(Rule.BAND, 1, 0, 30, false, Exec.SIM, 0, x, 0, 0, 0, true));
+            out.add(new Config(Rule.PERIOD, 0, 60, 120, false, Exec.SIM, 0, x, 0, 0, 0, true));
+        }
+        for (int n : new int[]{5, 15}) {
+            for (double m : new double[]{10, 20}) {
+                for (double k : new double[]{0, 2}) {
+                    out.add(new Config(Rule.BAND, 1, 0, 30, false, Exec.SIM, 0, 0, n, m, k, true));
                 }
             }
         }
@@ -773,7 +796,9 @@ public class HedgeGrid {
             if (pendQty == 0 && m > 0) {
                 // Цель перпа: −запас, а при условии «под водой» — только пока оно
                 // выполнено, иначе ноль. «net» — отклонение от цели.
-                double want = active ? -inv : 0;
+                // «Только на вход»: цель всегда −запас, но НАРАЩИВАТЬ шорт можно лишь
+                // при выполненном условии; откуп при убыли запаса — как обычно.
+                double want = active || cfg.entryOnly() ? -inv : 0;
                 double net = perp - want;
                 boolean due = false;
                 switch (cfg.rule()) {
@@ -795,7 +820,7 @@ public class HedgeGrid {
                     due = Math.abs(net) >= step;
                 }
                 // Условие переключилось — действуем сразу, не дожидаясь полосы или часа.
-                if (active != activeWas) {
+                if (active != activeWas && (!cfg.entryOnly() || active)) {
                     due = Math.abs(net) >= step;
                 }
                 // Переключение отмечается только тогда, когда было кому на него
@@ -803,6 +828,9 @@ public class HedgeGrid {
                 activeWas = active;
                 if (due) {
                     double delta = want - perp;
+                    if (cfg.entryOnly() && !active && delta < 0) {
+                        delta = 0;             // условие не выполнено — шорт не наращиваем
+                    }
                     double q = Math.signum(delta) * Math.floor(Math.abs(delta) / step + 1e-9) * step;
                     if (Math.abs(q) >= step) {
                         // Перед темнотой — сразу тейкером: бот гаснет сейчас.

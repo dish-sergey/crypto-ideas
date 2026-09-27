@@ -136,6 +136,37 @@ class HedgeGridTest {
         return agg;
     }
 
+    /**
+     * «Только на вход»: на росте (условие «под водой» не выполняется) шорт не
+     * открывается вовсе; на падении — открывается и живёт, пока есть запас.
+     */
+    @Test
+    void толькоНаВходНаРостеНеОткрывает() {
+        HedgeGrid.Bot b = bot();
+        for (int i = 0; i < b.fair.length; i++) {
+            b.fair[i] = 120 + i * 0.001;
+        }
+        var cfg = new HedgeGrid.Config(HedgeGrid.Rule.BAND, 1, 0, 30, false,
+                HedgeGrid.Exec.MAKER, 0, 10, 0, 0, 0, true);
+        Map<LocalDate, double[]> days = new TreeMap<>();
+        double[] agg = new double[6];
+        double[] taker = new double[2];
+        long[] window = {b.ts[0], b.ts[b.ts.length - 1] + 1};
+        new HedgeGrid(null).sim(b, cfg, HedgeGrid.Exec.MAKER, window, marks(b), new TreeMap<>(),
+                7, days, agg, taker);
+        assertEquals(0.0, agg[2], 0.0);
+    }
+
+    @Test
+    void толькоНаВходНеДёргается() {
+        var gated = new HedgeGrid.Config(HedgeGrid.Rule.BAND, 1, 0, 30, false,
+                HedgeGrid.Exec.MAKER, 0, 10);
+        var entry = new HedgeGrid.Config(HedgeGrid.Rule.BAND, 1, 0, 30, false,
+                HedgeGrid.Exec.MAKER, 0, 10, 0, 0, 0, true);
+        assertTrue(trades(entry)[2] > 0);
+        assertTrue(trades(entry)[2] <= trades(gated)[2]);
+    }
+
     /** Перевес продаж по закрытым минутам; минута становится известной через 30 с. */
     @Test
     void перевесПродажТолькоПоИзвестнымМинутам() {
