@@ -3351,6 +3351,18 @@ public final class QuoteLoop implements Runnable {
         }
         heir = null;
         heirEvidence = 0;
+        // ⚠️ ПРИ ЖИВОЙ ЛЕНТЕ СДЕЛОК ДОГАДКА ЗАПРЕЩЕНА (27.09.2026, этап 2 читателя).
+        // Запись по догадке идёт БЕЗ id заявки; если наследник действительно
+        // исполнился, лента сделок принесёт ту же сделку с настоящим id — и лот
+        // записался бы дважды. Лента видит наследника по нашей метке сама.
+        if (ledgerActive()) {
+            String note = ("наследник %s (%s %s по %s): улики совпали, но записывать по "
+                    + "догадке не буду — исполнение, если оно было, придёт по ленте сделок")
+                    .formatted(h.clientId(), h.side(), fmt(h.size()), fmt(h.price()));
+            log.warn(note);
+            journal.event("heir_left_to_ledger", note);
+            return;
+        }
         journal.fill(null, h.side().name(), h.size(), h.price(), lastFair, 0, null, "inferred");
         applyFill(h.side(), h.size(), h.price());
         String message = ("ЗАПИСАНО ПО ДОГАДКЕ: %s %s по %s. Площадка не вернула "
@@ -4939,6 +4951,98 @@ public final class QuoteLoop implements Runnable {
         journal.event("unowned", message);
     }
 
+    /**
+     * 🔑 ЭТАП 2 ЧИТАТЕЛЯ ПЛОЩАДКИ: ИСПОЛНЕНИЯ ПО ЛЕНТЕ СДЕЛОК (27.09.2026).
+     *
+     * Схема и доказательства — {@code docs/pairs/ЧИТАТЕЛЬ-ПЛОЩАДКИ.md}. Бот узнаёт об
+     * исполнении по исчезновению заявки и её статусу, и в затык площадки этот путь
+     * терял сделки (шесть за сутки прогона 22–23.09: 204 на отмену уже исполненной,
+     * 404 на живую). Правдой в разобранных случаях была только лента своих сделок
+     * {@code /trades/private}, которую читатель складывает в {@code venue.db}.
+     *
+     * Раз в минуту бот берёт из ленты свои сделки (метка бота, своя пара) старше
+     * {@link #LEDGER_GRACE_MS} и моложе {@link #LEDGER_LOOKBACK_MS} и дописывает
+     * разницу «исполнено площадкой − записано в журнале» обычным {@link #book}: он
+     * пишет разницу по заявке, поэтому повторная встреча той же сделки ничего не
+     * сдвигает. Льгота пять минут — обычный путь бывает выясняет судьбу заявки за
+     * 1–4 минуты (fate_resolved), и с ним нельзя бежать наперегонки:
+     * ленте остаётся только то, что он пропустил, и об этом — тревога.
+     *
+     * Всё в потоке котирования, как и остальной учёт: гонок с {@code book} нет.
+     * Работает только у живого бота и только если база читателя на месте; у
+     * стенда и без читателя — ничего не делает.
+     */
+    private void bookFromLedger(long now) {
+        if (!ledgerActive()) {
+            return;
+        }
+        String sql = "SELECT t.oid, MAX(t.side), SUM(t.qty), SUM(t.qty * t.price), MAX(t.tdt), "
+                + "MAX(o.status) FROM trade t JOIN order_info o ON o.oid = t.oid "
+                + "WHERE o.bot = ? AND o.symbol = ? AND t.tdt BETWEEN ? AND ? GROUP BY t.oid";
+        java.util.List<Object[]> rows = new java.util.ArrayList<>();
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                "jdbc:sqlite:file:" + VENUE_DB + "?mode=ro");
+             java.sql.PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, tag.id());
+            ps.setString(2, symbol);
+            ps.setLong(3, now - LEDGER_LOOKBACK_MS);
+            ps.setLong(4, now - LEDGER_GRACE_MS);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    rows.add(new Object[]{rs.getString(1), rs.getString(2), rs.getDouble(3),
+                            rs.getDouble(4), rs.getLong(5), rs.getString(6)});
+                }
+            }
+        } catch (Exception e) {
+            log.warn("лента сделок не прочитана: {}", e.toString());
+            return;
+        }
+        for (Object[] r : rows) {
+            String oid = (String) r[0];
+            double total = (double) r[2];
+            double already = bookedByOrder.containsKey(oid)
+                    ? bookedByOrder.get(oid) : journal.bookedFor(oid);
+            if (total - already <= 1e-12 || total <= 0) {
+                continue;
+            }
+            Side side = "sell".equalsIgnoreCase((String) r[1]) ? Side.SELL : Side.BUY;
+            double price = (double) r[3] / total;
+            String status = r[5] == null ? "partially_filled" : (String) r[5];
+            String body = String.format(java.util.Locale.ROOT,
+                    "{\"status\":\"%s\",\"filled_quantity\":\"%s\",\"price\":\"%s\",\"total_fee\":\"0\"}",
+                    status, java.math.BigDecimal.valueOf(total).toPlainString(),
+                    java.math.BigDecimal.valueOf(price).toPlainString());
+            double before = inventory;
+            book(side, oid, body);
+            String message = String.format(java.util.Locale.ROOT,
+                    "ИСПОЛНЕНИЕ ПО ЛЕНТЕ: %s %s по %s (заявка %s, сделка %s) — обычный путь его "
+                            + "пропустил. Позиция %s → %s.",
+                    side, fmt(total - already), fmt(price), oid,
+                    java.time.Instant.ofEpochMilli((long) r[4]), fmt(before), fmt(inventory));
+            log.error(message);
+            journal.event("ledger_fill", message);
+            alert.accept(message);
+        }
+    }
+
+    /** Живой бот и база читателя на месте. */
+    private boolean ledgerActive() {
+        return client instanceof TradeClient
+                && java.nio.file.Files.exists(java.nio.file.Path.of(VENUE_DB));
+    }
+
+    /** База читателя площадки. */
+    private static final String VENUE_DB =
+            System.getProperty("revx.exec.venue-db", "/home/ubuntu/revx-shared/venue.db");
+    /** Сделку моложе этого ведёт обычный путь — лента подбирает только пропущенное. */
+    static final long LEDGER_GRACE_MS = 5 * 60_000L;
+    /**
+     * Глубже не смотрим: старые пропуски записаны по догадке или вручную без id
+     * заявки, и лента записала бы их второй раз. Шесть часов покрывают любой затык
+     * и перезапуск.
+     */
+    static final long LEDGER_LOOKBACK_MS = 6 * 3_600_000L;
+
     private void rollCounters() {
         long now = clock.now();
         if (now - minuteStartMs >= 60_000) {
@@ -4950,6 +5054,7 @@ public final class QuoteLoop implements Runnable {
             // чаще всего именно этим и объясняется, и кричать о нём, не задав
             // вопрос ещё раз, значит будить человека зря.
             retryUnknownFates(now);
+            bookFromLedger(now);
             if (alloc != null) {
                 alloc.heartbeat(tag.id(), now);
                 checkRegistryAgainstJournal(now);
