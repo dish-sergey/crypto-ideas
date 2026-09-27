@@ -1,0 +1,25 @@
+[Unit]
+Description=Revolut X — БУМАЖНЫЙ ХЕДЖ (без заявок на Kraken, только журнал «что бы сделал»)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx-hedge-paper
+
+# Бумажный режим пилота (192, 195; владелец 27.09.2026): позиции ботов — из их
+# журналов, цены — публичный тикер Kraken, решения и имитация исполнения пишутся
+# в ~/revx-shared/hedge_paper.db. НИ ОДНОЙ заявки на Kraken, ключа здесь нет.
+# Итог: --revx-hedge-paper-report.
+#
+# ⚠️ Свой каталог и свой jar (A64): выкатка — scp app.jar.new → mv → restart.
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx128m -jar /home/ubuntu/revx-hedge-paper/app.jar --revx-hedge-paper
+
+Restart=on-failure
+RestartSec=30
+SuccessExitStatus=143
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -36,7 +36,7 @@ public class CliMode {
             "revx-replay", "revx-forecast", "revx-ladder", "revx-sweep-run", "revx-pair-forecast",
             "revx-pair-sweep", "revx-info", "revx-assemble", "revx-fill-check",
             "revx-order", "revx-book", "revx-depth-probe", "revx-flow-markout",
-            "revx-hold-check", "revx-fate-probe", "revx-rate-check", "revx-offset-axis", "revx-order-status", "revx-audit", "revx-history-probe", "revx-venue", "revx-budget-facts", "revx-hedge-grid",
+            "revx-hold-check", "revx-fate-probe", "revx-rate-check", "revx-offset-axis", "revx-order-status", "revx-audit", "revx-history-probe", "revx-venue", "revx-budget-facts", "revx-hedge-grid", "revx-hedge-paper", "revx-hedge-paper-report",
             "revx-paired", "revx-release-stale", "revx-unbook", "revx-carry", "revx-lead", "revx-hedge", "revx-core", "revx-surface", "revx-seed-gain", "revx-flow-signal");
 
     /**
