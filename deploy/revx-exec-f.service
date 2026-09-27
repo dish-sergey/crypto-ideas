@@ -35,22 +35,23 @@ EnvironmentFile=/etc/revx-exec-f.env
 #
 # Ценность запуска не в деньгах, а в проверке модели очереди на тонком рынке:
 # это единственная гипотеза обхода, которую нельзя закрыть счётом.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-exec-f/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -jar /home/ubuntu/revx-exec-f/app.jar --revx-exec \
   --revx.exec.bot-id=f \
-  --revx.exec.symbol=PEPE/USDC \
-  --revx.exec.journal=state/exec-f-pepe.db \
-  --revx.exec.size=279330 \
-  --revx.exec.inventory-cap=5586590 \
-  --revx.exec.offset=0.0020 \
+  --revx.exec.symbol=SOL/USDC \
+  --revx.exec.journal=state/exec-f-sol.db \
+  --revx.exec.size=0.01888000 \
+  --revx.exec.inventory-cap=0.13216000 \
+  --revx.exec.offset=0.0012 \
   --revx.exec.skew-target=0.3 \
+  --revx.exec.max-loss=6.0 \
   --revx.exec.cost-floor-margin=-1 \
   --revx.exec.anchor-leash=-1 \
   --revx.exec.own-position=true \
   --revx.exec.position-seed=0 \
   --revx.exec.park-distance=0.10 \
   --revx.exec.levels=3 \
-  --revx.exec.level-step=0.0002 \
-  --revx.exec.inner-first=false
+  --revx.exec.level-step=0.0003 \
+  --revx.exec.inner-first=true
 
 # Размеры под цену PEPE 3.58e-06 на 06.09.2026: лот $1 = 279 330 PEPE,
 # потолок $20 = 5 586 590 PEPE. Шаг количества здесь 10 монет (= $0.0000358),
@@ -58,7 +59,7 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-ex
 # семь тиков, вырождения как у ENA нет.
 
 # ПЛАНОВАЯ остановка ПАРКУЕТ заявки, а не снимает их: восстановление после# отмены стоит 3-6 постановок (замер 07.09.2026), а оставленную заявку# вернувшийся бот усыновляет по метке и двигает через PUT — бесплатно.# ⚠️ Аварийная остановка по-прежнему снимает всё: --revx-panic на кнопке в боте# и на ручном запуске (ТЗ §6). Трогает ТОЛЬКО свои заявки.
-ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-f/app.jar --revx-park --revx.exec.bot-id=f --revx.exec.symbol=PEPE/USDC --revx.exec.journal=state/exec-f-pepe.db || true'
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-f/app.jar --revx-park --revx.exec.bot-id=f --revx.exec.symbol=SOL/USDC --revx.exec.journal=state/exec-f-sol.db || true'
 
 SuccessExitStatus=143
 Restart=no

@@ -51,6 +51,17 @@ public record BootParams(String symbol, String botId, double size, double invent
             if (!n.has("symbol") || !n.has("skewTarget")) {
                 return null;
             }
+            // ⚠️ Множитель шага уровней живёт в системном свойстве, а не в
+            // параметрах: повтор с другим множителем положит уровни иначе, чем
+            // живой бот (12/15/20 у d/e/f с 27.09.2026). Говорим об этом громко.
+            double growthRec = n.path("levelGrowth").asDouble(1.0);
+            double growthNow = Double.parseDouble(System.getProperty("revx.sim.level-growth", "1.0"));
+            if (n.path("levels").asInt(1) > 1 && Math.abs(growthRec - growthNow) > 1e-6) {
+                org.slf4j.LoggerFactory.getLogger(BootParams.class).warn(
+                        "⚠️ множитель шага уровней в записи {} , в этом прогоне {} — уровни лягут "
+                                + "иначе, чем у живого бота; задайте -Drevx.sim.level-growth={}",
+                        growthRec, growthNow, growthRec);
+            }
             return new BootParams(
                     n.path("symbol").asText(),
                     n.path("botId").asText("a"),

@@ -40,22 +40,23 @@ EnvironmentFile=/etc/revx-exec-e.env
 # Настройка при этом оставлена как есть: обход считал с тем же шагом цены, и
 # +3.8788 измерено ИМЕННО с этим вырождением. Поменять шаг сетки на кратный тику
 # (например 20/26/32) значит запустить неизмеренную конфигурацию.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-exec-e/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -jar /home/ubuntu/revx-exec-e/app.jar --revx-exec \
   --revx.exec.bot-id=e \
-  --revx.exec.symbol=ENA/USDC \
-  --revx.exec.journal=state/exec-e-ena.db \
-  --revx.exec.size=5.7937 \
-  --revx.exec.inventory-cap=115.8749 \
-  --revx.exec.offset=0.0026 \
+  --revx.exec.symbol=BTC/USDC \
+  --revx.exec.journal=state/exec-e-btc.db \
+  --revx.exec.size=0.00002510 \
+  --revx.exec.inventory-cap=0.00017570 \
+  --revx.exec.offset=0.0012 \
   --revx.exec.skew-target=0.3 \
+  --revx.exec.max-loss=6.0 \
   --revx.exec.cost-floor-margin=-1 \
   --revx.exec.anchor-leash=-1 \
   --revx.exec.own-position=true \
   --revx.exec.position-seed=0 \
   --revx.exec.park-distance=0.10 \
   --revx.exec.levels=3 \
-  --revx.exec.level-step=0.0008 \
-  --revx.exec.inner-first=false
+  --revx.exec.level-step=0.0003 \
+  --revx.exec.inner-first=true
 
 # ⚠️ ОТСТУП 26 И ШАГ СЕТКИ 8 Б.П. — с 07.09.2026, и шаг важнее отступа.
 #
@@ -83,7 +84,7 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-ex
 # $20 = 115.8749 ENA. Шаг количества 0.0001 — оба значения на нём лежат.
 
 # ПЛАНОВАЯ остановка ПАРКУЕТ заявки, а не снимает их: восстановление после# отмены стоит 3-6 постановок (замер 07.09.2026), а оставленную заявку# вернувшийся бот усыновляет по метке и двигает через PUT — бесплатно.# ⚠️ Аварийная остановка по-прежнему снимает всё: --revx-panic на кнопке в боте# и на ручном запуске (ТЗ §6). Трогает ТОЛЬКО свои заявки.
-ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-e/app.jar --revx-park --revx.exec.bot-id=e --revx.exec.symbol=ENA/USDC --revx.exec.journal=state/exec-e-ena.db || true'
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-e/app.jar --revx-park --revx.exec.bot-id=e --revx.exec.symbol=BTC/USDC --revx.exec.journal=state/exec-e-btc.db || true'
 
 SuccessExitStatus=143
 Restart=no

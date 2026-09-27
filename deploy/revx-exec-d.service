@@ -26,22 +26,23 @@ EnvironmentFile=/etc/revx-exec-d.env
 # Волатильность окна для ADA была близка к норме (среднее движение 3.97% против
 # базовых 3.31% за два года, отношение 1.20), так что хрупкость — свойство пары,
 # а не окна.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-exec-d/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -jar /home/ubuntu/revx-exec-d/app.jar --revx-exec \
   --revx.exec.bot-id=d \
-  --revx.exec.symbol=ADA/USDC \
-  --revx.exec.journal=state/exec-d-ada.db \
-  --revx.exec.size=4.5981 \
-  --revx.exec.inventory-cap=91.9625 \
-  --revx.exec.offset=0.0014 \
+  --revx.exec.symbol=ETH/USDC \
+  --revx.exec.journal=state/exec-d-eth.db \
+  --revx.exec.size=0.00080530 \
+  --revx.exec.inventory-cap=0.00563710 \
+  --revx.exec.offset=0.0012 \
   --revx.exec.skew-target=0.3 \
+  --revx.exec.max-loss=6.0 \
   --revx.exec.cost-floor-margin=-1 \
   --revx.exec.anchor-leash=-1 \
   --revx.exec.own-position=true \
   --revx.exec.position-seed=0 \
   --revx.exec.park-distance=0.10 \
   --revx.exec.levels=3 \
-  --revx.exec.level-step=0.0002 \
-  --revx.exec.inner-first=false
+  --revx.exec.level-step=0.0003 \
+  --revx.exec.inner-first=true
 
 # Размеры под цену ADA 0.21748 на 06.09.2026: лот $1 = 4.5981 ADA, потолок
 # $20 = 91.9625 ADA. Шаг количества 0.0001 — оба значения на нём лежат.
@@ -66,7 +67,7 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-ex
 # планового рестарта, где процесс возвращается через секунды.
 #
 # Трогает ТОЛЬКО свои заявки: чужие отличаются по метке в client_order_id.
-ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-d/app.jar --revx-park --revx.exec.bot-id=d --revx.exec.symbol=ADA/USDC --revx.exec.journal=state/exec-d-ada.db || true'
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-d/app.jar --revx-park --revx.exec.bot-id=d --revx.exec.symbol=ETH/USDC --revx.exec.journal=state/exec-d-eth.db || true'
 
 # Намеренно НЕТ автоперезапуска: перезапуск после падения не должен сам
 # возобновлять торговлю. Котирование в любом случае стартует выключенным.
