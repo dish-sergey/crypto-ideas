@@ -3518,6 +3518,31 @@ public final class QuoteLoop implements Runnable {
             }
             Side side = "SELL".equalsIgnoreCase(o.side()) ? Side.SELL : Side.BUY;
             String status = field(order.body(), "status");
+            // ⚠️ СТАРОЕ ИСПОЛНЕНИЕ АВТОМАТИЧЕСКИ НЕ ЗАПИСЫВАЕМ (27.09.2026). Запись о
+            // заявке живёт неделю, а позицию за это время могли свести вручную
+            // (/release, /claim). Так и вышло: после перезапуска бот a записал
+            // продажу от 23.09, которую владелец уже поглотил, и ушёл в −1 лот.
+            // Граница — та же, что у ленты сделок: старше неё решает человек.
+            // ⚠️ updated_date площадка отдаёт ЧИСЛОМ без кавычек — field() его не видит.
+            Matcher um = Pattern.compile("\"updated_date\"\\s*:\\s*\"?(\\d+)").matcher(order.body());
+            long updated = um.find() ? Long.parseLong(um.group(1)) : 0;
+            if (updated > 0 && clock.now() - updated > LEDGER_LOOKBACK_MS
+                    && number(order.body(), "filled_quantity") > 0) {
+                String message = String.format(java.util.Locale.ROOT,
+                        "СТАРОЕ ИСПОЛНЕНИЕ НЕ ЗАПИСАНО: %s %s (%s %s по %s) исполнена %s — старше "
+                                + "%d ч. Если позиция с тех пор не сводилась вручную, её надо "
+                                + "поправить: /claim или разбор. Запись о заявке закрыта.",
+                        side, o.venueId(), status, fmt(number(order.body(), "filled_quantity")),
+                        fmt(o.price()), java.time.Instant.ofEpochMilli(updated),
+                        LEDGER_LOOKBACK_MS / 3_600_000L);
+                log.error(message);
+                journal.event("stale_fill_skipped", message);
+                alert.accept(message);
+                if (terminal(status)) {
+                    journal.closeOrder(o.venueId(), status, clock.now());
+                }
+                continue;
+            }
             double before = inventory;
             book(side, o.venueId(), order.body());
             if (Math.abs(inventory - before) > 1e-15) {
