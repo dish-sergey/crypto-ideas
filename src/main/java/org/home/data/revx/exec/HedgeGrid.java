@@ -93,18 +93,32 @@ public class HedgeGrid {
 
     /** Настройка хеджа. {@code forcedMaker} — только для {@link Exec#FORCED}. */
     record Config(Rule rule, double bandLots, int periodMin, int waitSec, boolean flatten,
-                  Exec exec, double forcedMaker) {
+                  Exec exec, double forcedMaker, double underwaterBp) {
+
+        /** Без условия «под водой». */
+        Config(Rule rule, double bandLots, int periodMin, int waitSec, boolean flatten,
+               Exec exec, double forcedMaker) {
+            this(rule, bandLots, periodMin, waitSec, flatten, exec, forcedMaker, 0);
+        }
+
+        /** Та же настройка с другим исполнением (для порога мейкерской доли). */
+        Config withExec(Exec e, double maker) {
+            return new Config(rule, bandLots, periodMin, waitSec, flatten, e, maker, underwaterBp);
+        }
+
         String name() {
             String r = switch (rule) {
                 case BAND -> "полоса " + fmt(bandLots);
                 case PERIOD -> "раз в " + periodMin + " мин";
                 case PERIOD_BAND -> "раз в " + periodMin + " мин, если > " + fmt(bandLots);
             };
-            return r + ", ждать " + waitSec + " с" + (flatten ? ", до нуля перед темнотой" : "");
+            return r + ", ждать " + waitSec + " с" + (flatten ? ", до нуля перед темнотой" : "")
+                    + (underwaterBp > 0 ? ", только под водой ≥ " + fmt(underwaterBp) + " б.п." : "");
         }
 
         String key() {
-            return rule + "|" + bandLots + "|" + periodMin + "|" + waitSec + "|" + flatten;
+            return rule + "|" + bandLots + "|" + periodMin + "|" + waitSec + "|" + flatten
+                    + "|" + underwaterBp;
         }
     }
 
@@ -240,9 +254,8 @@ public class HedgeGrid {
                     rowsAll.put(w.getKey() + "|" + cfg.key(), r);
                     sb.append(r.line(cfg.name()));
                 }
-                // Вариант «до нуля перед темнотой» для каждой полосы — отдельной строкой.
-                for (double b : new double[]{0.5, 1, 2}) {
-                    Config cfg = new Config(Rule.BAND, b, 0, 30, true, Exec.SIM, 0);
+                // Добавочные варианты: «до нуля перед темнотой» и «только под водой».
+                for (Config cfg : extras()) {
                     Row r = evaluate(pair.getValue(), cfg, w.getValue(), markBy.get(base),
                             fundBy.get(base), seeds);
                     rowsAll.put(w.getKey() + "|" + cfg.key(), r);
@@ -275,8 +288,7 @@ public class HedgeGrid {
                 for (double q : new double[]{0.4, 0.5, 0.66, 0.8, 1.0}) {
                     sb.append(String.format(Locale.ROOT, "| %.0f%% | ", q * 100));
                     for (Map.Entry<String, long[]> w : windows.entrySet()) {
-                        Config forced = new Config(pick.rule(), pick.bandLots(), pick.periodMin(),
-                                pick.waitSec(), pick.flatten(), Exec.FORCED, q);
+                        Config forced = pick.withExec(Exec.FORCED, q);
                         Row r = evaluate(byBase.get("SOL"), forced, w.getValue(), markBy.get("SOL"),
                                 fundBy.get("SOL"), seeds);
                         curve.computeIfAbsent(w.getKey(), k -> new TreeMap<>()).put(q, r.mean);
@@ -296,6 +308,28 @@ public class HedgeGrid {
         }
         Files.writeString(p, sb.toString(), StandardCharsets.UTF_8);
         log.info("отчёт: {}", p.toAbsolutePath());
+    }
+
+    /**
+     * Добавочные варианты к основной сетке.
+     *
+     * «Только под водой» — вопрос владельца 27.09.2026: хедж включается, когда
+     * опора ниже средней цены покупки запаса на X б.п., и снимается, когда она
+     * вернулась выше «средняя − X/2». Смысл — не отдавать хеджу плюс, который запас
+     * приносит на росте (у SOL на растущем окне это +0.043 $ на бот-сутки, 194).
+     * ⚠️ По сути это стоп-лосс с возвратом: выигрывает на продолжающемся падении,
+     * проигрывает на пиле.
+     */
+    static List<Config> extras() {
+        List<Config> out = new ArrayList<>();
+        for (double b : new double[]{0.5, 1, 2}) {
+            out.add(new Config(Rule.BAND, b, 0, 30, true, Exec.SIM, 0));
+        }
+        for (double x : new double[]{10, 20}) {
+            out.add(new Config(Rule.BAND, 1, 0, 30, false, Exec.SIM, 0, x));
+            out.add(new Config(Rule.PERIOD, 0, 60, 120, false, Exec.SIM, 0, x));
+        }
+        return out;
     }
 
     /** Правило выбора — печатается ДО результатов (192 п. 6). */
@@ -329,9 +363,7 @@ public class HedgeGrid {
     private String choose(String base, List<Config> grid, java.util.Set<String> windowNames,
                           Map<String, Row> rows) {
         List<Config> all = new ArrayList<>(grid);
-        for (double b : new double[]{0.5, 1, 2}) {
-            all.add(new Config(Rule.BAND, b, 0, 30, true, Exec.SIM, 0));
-        }
+        all.addAll(extras());
         List<Config> cand = new ArrayList<>(all);
         StringBuilder sb = new StringBuilder("\n**Выбор по правилу (").append(base).append("):** ");
         for (String w : windowNames) {
@@ -536,6 +568,10 @@ public class HedgeGrid {
         double funding = 0;
         int trades = 0;
         long lastPeriodic = b.ts[i0];
+        // Средняя цена покупки запаса и условие «под водой».
+        double avgCost = 0;
+        double costQty = -1;              // −1 — ещё не заведено (первый тик окна)
+        boolean gate = false;
         // Висящая заявка на Kraken: размер, момент постановки, цена касания, исполнится ли и когда.
         double pendQty = 0;
         long pendT0 = 0;
@@ -566,8 +602,48 @@ public class HedgeGrid {
             double f = b.fair[i];
             double inv = b.inv[i];
             while (fi < b.fillTs.length && b.fillTs[fi] <= t) {
-                cash -= b.fillDq[fi] * b.fillPx[fi];
+                double dq = b.fillDq[fi];
+                double px = b.fillPx[fi];
+                cash -= dq * px;
+                // Средняя цена покупки запаса (средневзвешенная): покупка сдвигает её,
+                // продажа — нет; запас обнулился — сброс.
+                if (dq > 0) {
+                    avgCost = (costQty * avgCost + dq * px) / (costQty + dq);
+                    costQty += dq;
+                } else {
+                    costQty = Math.max(0, costQty + dq);
+                    if (costQty < 1e-12) {
+                        avgCost = 0;
+                    }
+                }
                 fi++;
+            }
+            if (costQty < 0) {                // первый тик окна: цена входа — опора
+                costQty = inv;
+                avgCost = inv > 0 ? f : 0;
+            }
+            // Запас по тикам — источник правды: прирост без сделки (передача, затравка)
+            // считается покупкой по опоре, убыль — продажей. Без этого средняя цена
+            // не заводилась бы, и хедж «под водой» не включался бы никогда.
+            if (inv > costQty + 1e-12) {
+                avgCost = (costQty * avgCost + (inv - costQty) * f) / inv;
+                costQty = inv;
+            } else if (inv < costQty - 1e-12) {
+                costQty = Math.max(0, inv);
+                if (costQty < 1e-12) {
+                    avgCost = 0;
+                }
+            }
+            // «Под водой»: включаемся, когда опора ниже средней покупки на X б.п.;
+            // выключаемся, когда вернулась выше «средняя − X/2» (зазор от дёрганья).
+            boolean gateWas = gate;
+            if (cfg.underwaterBp() > 0) {
+                double x = cfg.underwaterBp() / 1e4;
+                if (!gate && avgCost > 0 && inv > 0 && f < avgCost * (1 - x)) {
+                    gate = true;
+                } else if (gate && (avgCost <= 0 || inv <= 0 || f >= avgCost * (1 - x / 2))) {
+                    gate = false;
+                }
             }
             double m = markAt(mark, t);
             // Переоценка перпа и фандинг за прошедший интервал (в т.ч. через темноту).
@@ -606,7 +682,10 @@ public class HedgeGrid {
             boolean darkNext = di < b.darkStarts.size() && i + 1 < b.ts.length
                     && b.darkStarts.get(di) <= b.ts[i + 1] && b.darkStarts.get(di) >= t;
             if (pendQty == 0 && m > 0) {
-                double net = inv + perp;
+                // Цель перпа: −запас, а при условии «под водой» — только пока оно
+                // выполнено, иначе ноль. «net» — отклонение от цели.
+                double want = cfg.underwaterBp() <= 0 || gate ? -inv : 0;
+                double net = perp - want;
                 boolean due = false;
                 switch (cfg.rule()) {
                     case BAND -> due = Math.abs(net) > band;
@@ -626,8 +705,12 @@ public class HedgeGrid {
                 if (cfg.flatten() && darkNext) {
                     due = Math.abs(net) >= step;
                 }
+                // Условие переключилось — действуем сразу, не дожидаясь полосы или часа.
+                if (cfg.underwaterBp() > 0 && gate != gateWas) {
+                    due = Math.abs(net) >= step;
+                }
                 if (due) {
-                    double delta = -inv - perp;
+                    double delta = want - perp;
                     double q = Math.signum(delta) * Math.floor(Math.abs(delta) / step + 1e-9) * step;
                     if (Math.abs(q) >= step) {
                         // Перед темнотой — сразу тейкером: бот гаснет сейчас.

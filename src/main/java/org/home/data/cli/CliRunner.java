@@ -357,7 +357,9 @@ public class CliRunner implements ApplicationRunner {
                         Double.parseDouble(firstOr(args, "level-step", "0")),
                         !args.containsOption("outer-first"),
                         firstOr(args, "from", ""), firstOr(args, "to", ""),
-                        firstOr(args, "journal-out", ""));
+                        firstOr(args, "journal-out", ""),
+                        Double.parseDouble(firstOr(args, "lot-usd", "1")),
+                        Double.parseDouble(firstOr(args, "cap-lots", "20")));
             }
             if (args.containsOption("revx-assemble")) {
                 org.home.data.revx.replay.StandAssembler.assemble(

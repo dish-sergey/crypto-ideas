@@ -891,6 +891,21 @@ public class Executor {
     public void pairForecast(String pairSymbol, String offsets, int levels,
                              double levelStepBp, boolean innerFirst,
                              String from, String to, String journalOut) {
+        pairForecast(pairSymbol, offsets, levels, levelStepBp, innerFirst, from, to, journalOut,
+                1.0, 20);
+    }
+
+    /**
+     * То же с ЛОТОМ и ПОТОЛКОМ как у живых ботов ({@code --lot-usd}, {@code --cap-lots}).
+     *
+     * Нужно для хеджа по стенду (док. 194, вопрос владельца 27.09.2026): у хеджа всё
+     * решает шаг контракта В ЛОТАХ, и прогон на лоте $1 с потолком 20 лотов меряет
+     * другую конструкцию, чем живые $2.90 × 2.33 и $0.97 × 7.
+     */
+    public void pairForecast(String pairSymbol, String offsets, int levels,
+                             double levelStepBp, boolean innerFirst,
+                             String from, String to, String journalOut,
+                             double lotUsd, double capLots) {
         try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
@@ -916,13 +931,14 @@ public class Executor {
                 throw new IllegalStateException("нет снимков книги для " + pairSymbol);
             }
             double price = ticks.get(ticks.size() / 2).fair();
-            // Лот в один доллар, округлённый к шагу количества пары. Потолок —
-            // двадцать лотов: отношение потолка к лоту ниже семи ступеней ломает
-            // конструкцию (измерено 05.09.2026).
+            // Лот в долларах (по умолчанию один), округлённый к шагу количества пары.
+            // Потолок по умолчанию — двадцать лотов: отношение потолка к лоту ниже
+            // семи ступеней ломает конструкцию (измерено 05.09.2026). Для сравнения
+            // с живыми лот и потолок задаются как у них (--lot-usd, --cap-lots).
             double lot = ps.baseStep() > 0
-                    ? Math.max(ps.baseStep(), Math.round(1.0 / price / ps.baseStep()) * ps.baseStep())
-                    : 1.0 / price;
-            var bp = new org.home.data.revx.replay.BootParams(pairSymbol, "a", lot, lot * 20,
+                    ? Math.max(ps.baseStep(), Math.round(lotUsd / price / ps.baseStep()) * ps.baseStep())
+                    : lotUsd / price;
+            var bp = new org.home.data.revx.replay.BootParams(pairSymbol, "a", lot, lot * capLots,
                     0.0007, cfg.simSkewK(), 0.3, 1000, ps.minNotional(), ps.baseStep(),
                     ps.quoteStep(), 0.10, -1, -1, 0, 0.02, 0.5, true,
                     levels, levelStepBp / 10_000, innerFirst);

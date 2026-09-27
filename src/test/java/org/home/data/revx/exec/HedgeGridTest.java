@@ -93,6 +93,49 @@ class HedgeGridTest {
         assertTrue(run(cfg, HedgeGrid.Exec.MAKER, fund) > run(cfg, HedgeGrid.Exec.MAKER, new TreeMap<>()));
     }
 
+    /** «Только под водой»: на растущей цене запас всегда в плюсе — хедж молчит. */
+    @Test
+    void подВодойНаРостеНеТоргует() {
+        HedgeGrid.Bot b = bot();
+        for (int i = 0; i < b.fair.length; i++) {
+            b.fair[i] = 120 + i * 0.001;
+        }
+        var cfg = new HedgeGrid.Config(HedgeGrid.Rule.BAND, 1, 0, 30, false,
+                HedgeGrid.Exec.MAKER, 0, 10);
+        Map<LocalDate, double[]> days = new TreeMap<>();
+        double[] agg = new double[6];
+        double[] taker = new double[2];
+        long[] window = {b.ts[0], b.ts[b.ts.length - 1] + 1};
+        new HedgeGrid(null).sim(b, cfg, HedgeGrid.Exec.MAKER, window, marks(b), new TreeMap<>(),
+                7, days, agg, taker);
+        assertEquals(0.0, agg[2], 0.0);
+        assertEquals(0.0, agg[0], 1e-12);
+    }
+
+    /** На падающей — включается, и сделок меньше, чем у безусловного хеджа. */
+    @Test
+    void подВодойНаПаденииВключается() {
+        var plain = new HedgeGrid.Config(HedgeGrid.Rule.BAND, 1, 0, 30, false,
+                HedgeGrid.Exec.MAKER, 0);
+        var gated = new HedgeGrid.Config(HedgeGrid.Rule.BAND, 1, 0, 30, false,
+                HedgeGrid.Exec.MAKER, 0, 10);
+        double[] a = trades(plain);
+        double[] g = trades(gated);
+        assertTrue(g[2] > 0, "под водой должен включиться");
+        assertTrue(g[2] <= a[2], g[2] + " " + a[2]);
+    }
+
+    private static double[] trades(HedgeGrid.Config cfg) {
+        HedgeGrid.Bot b = bot();
+        Map<LocalDate, double[]> days = new TreeMap<>();
+        double[] agg = new double[6];
+        double[] taker = new double[2];
+        long[] window = {b.ts[0], b.ts[b.ts.length - 1] + 1};
+        new HedgeGrid(null).sim(b, cfg, HedgeGrid.Exec.MAKER, window, marks(b), new TreeMap<>(),
+                7, days, agg, taker);
+        return agg;
+    }
+
     @Test
     void фандингПоЧасам() {
         TreeMap<Long, Double> fund = new TreeMap<>();
