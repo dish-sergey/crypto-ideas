@@ -151,6 +151,12 @@ public final class ExecJournal implements AutoCloseable {
             try (Statement st = connection.createStatement()) {
                 st.execute("PRAGMA journal_mode=WAL");
                 st.execute("PRAGMA synchronous=NORMAL");
+                // ⚠️ ЖДАТЬ ЧУЖУЮ ЗАПИСЬ, А НЕ ПАДАТЬ (27.09.2026). В журнал пишет не
+                // только бот: ночная чистка (deploy/revx-journal-prune.sh) удаляет
+                // старые строки пачками. Без ожидания запись бота, совпавшая с
+                // пачкой, получала бы «database is locked» сразу — и терялась бы
+                // любая, включая исполнение. Пачка чистки держит замок десятки мс.
+                st.execute("PRAGMA busy_timeout=10000");
                 for (String part : SCHEMA.split(";")) {
                     if (!part.isBlank()) {
                         st.execute(part);
