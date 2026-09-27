@@ -373,8 +373,11 @@ public class VenueReader {
                             + "VALUES(?,?,?,?,?)",
                     cur, num(b, "total"), reserved, num(b, "available"), started);
             double gap = reserved - visible.getOrDefault(cur, 0.0);
-            // Пыль от округлений не считается: одна миллионная доля от резерва.
-            boolean has = gap > Math.max(1e-10, reserved * 1e-6);
+            // Пыль от округлений не считается. Порог — тысячная доля резерва: площадка
+            // округляет резерв каждой заявки, и на 12 покупках живьём 27.09.2026
+            // вышло 0.0004 USDC при 39.77 заперто (1.1e-5). Настоящий призрак —
+            // целый лот, это проценты резерва, а не тысячные.
+            boolean has = gap > Math.max(1e-8, reserved * 1e-3);
             if (has) {
                 exec("INSERT INTO reserve_gap(currency, reserved, visible, gap, since_ms, updated_ms) "
                                 + "VALUES(?,?,?,?,?,?) ON CONFLICT(currency) DO UPDATE SET "

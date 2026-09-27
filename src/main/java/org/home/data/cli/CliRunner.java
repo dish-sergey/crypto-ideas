@@ -81,6 +81,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.HistoryProbe> historyProbe;
     private final ObjectProvider<org.home.data.revx.exec.HistoryWatch> historyWatch;
     private final ObjectProvider<org.home.data.revx.exec.VenueReader> venueReader;
+    private final ObjectProvider<org.home.data.revx.exec.BudgetFacts> budgetFacts;
     private final ObjectProvider<org.home.data.revx.exec.ReleaseStale> releaseStale;
     private final ObjectProvider<org.home.data.revx.exec.Unbook> unbook;
     private final ObjectProvider<org.home.data.revx.RateCheck> rateCheck;
@@ -122,6 +123,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.HistoryProbe> historyProbe,
                      ObjectProvider<org.home.data.revx.exec.HistoryWatch> historyWatch,
                      ObjectProvider<org.home.data.revx.exec.VenueReader> venueReader,
+                     ObjectProvider<org.home.data.revx.exec.BudgetFacts> budgetFacts,
                      ObjectProvider<org.home.data.revx.exec.ReleaseStale> releaseStale,
                      ObjectProvider<org.home.data.revx.exec.Unbook> unbook,
                      ObjectProvider<org.home.data.revx.RateCheck> rateCheck,
@@ -170,6 +172,7 @@ public class CliRunner implements ApplicationRunner {
         this.historyProbe = historyProbe;
         this.historyWatch = historyWatch;
         this.venueReader = venueReader;
+        this.budgetFacts = budgetFacts;
         this.releaseStale = releaseStale;
         this.unbook = unbook;
         this.rateCheck = rateCheck;
@@ -409,6 +412,13 @@ public class CliRunner implements ApplicationRunner {
             }
             if (args.containsOption("revx-exec")) {
                 executor.getObject().run();          // блокирует: демон микро-live
+            }
+            if (args.containsOption("revx-budget-facts")) {
+                // Л2/Л4 из 192: доля темноты и расход постановок по журналам.
+                budgetFacts.getObject().run(firstOr(args, "journals", ""),
+                        firstOr(args, "from", "2026-09-08T00:00:00Z"),
+                        firstOr(args, "to", "2026-09-22T00:00:00Z"),
+                        firstOr(args, "out", "reports/revx_budget_facts.md"));
             }
             if (args.containsOption("revx-venue")) {
                 // Читатель площадки: единственный, кто спрашивает её GET-ами, пишет
