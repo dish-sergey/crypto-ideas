@@ -848,12 +848,14 @@ public final class QuoteLoop implements Runnable {
         double buyCash = alloc != null
                 ? Math.max(0, alloc.own(tag.id(), quote)) : Double.MAX_VALUE;
         double sellPool = Math.max(0, inventory);
+        double buyRoom = buyRoom();
         for (var r : current) {
             Resting slot = r.side() == Side.BUY ? bids.get(r.level()) : asks.get(r.level());
             var want = findWanted(desired, r.side(), r.level());
             var action = findAction(plan, r.side(), r.level());
             double pool = r.side() == Side.BUY
-                    ? (want != null && want.price() > 0 ? buyCash / want.price() : 0)
+                    ? (want != null && want.price() > 0
+                            ? Math.min(buyCash / want.price(), buyRoom) : 0)
                     : sellPool;
             dump(String.format(java.util.Locale.ROOT,
                     "МОД %s ур%d: слот=%s цена=%.8f размер=%.6f | хочу=%s | план=%s | пул=%.6f",
@@ -864,6 +866,7 @@ public final class QuoteLoop implements Runnable {
             double took = settle(r.side(), slot, want, action, pool);
             if (r.side() == Side.BUY) {
                 buyCash = Math.max(0, buyCash - took * (want == null ? 0 : want.price()));
+                buyRoom = Math.max(0, buyRoom - took);
             } else {
                 sellPool = Math.max(0, sellPool - took);
             }
@@ -881,6 +884,25 @@ public final class QuoteLoop implements Runnable {
      * Постановку и отмену это не задевает: их {@link #settle} решает сам, по
      * состоянию слота, а не по плану.
      */
+    /**
+     * Остаток до потолка — ОБЩИЙ на все биды, как касса и как запас у продаж.
+     *
+     * ⚠️ До 27.09.2026 каждый бид резал себя остатком сам ({@link #sizeFor}), и
+     * при 6 лотах из 7 все три уровня получали по лоту: пробой всех трёх на
+     * резком падении дал бы 9 лотов при потолке 7. Живьём e и f выходили на
+     * 7.09–7.14 лота 23.09; с уровнями 12/15/20 пробой всех трёх стал реальнее.
+     */
+    /**
+     * Порядок раздачи по бидам: {@code true} — дальние первыми, независимо от
+     * {@code innerFirst} продаж (вопрос владельца 27.09.2026). Системное свойство,
+     * как {@code revx.sim.level-growth}; пишется в машинную часть {@code boot}.
+     */
+    static final boolean BUY_FAR_FIRST = Boolean.getBoolean("revx.exec.buy-far-first");
+
+    private double buyRoom() {
+        return frozenUnwind ? 0 : Math.max(0, params.inventoryCap() - inventory);
+    }
+
     private org.home.data.revx.place.RestingOrder restingOf(Side side, int level) {
         Resting r = side == Side.BUY ? bids.get(level) : asks.get(level);
         long blocked = r.partial() ? Long.MAX_VALUE : r.blockedUntilMs;
@@ -1913,17 +1935,23 @@ public final class QuoteLoop implements Runnable {
         // систематический перекос: покупки шли на всех уровнях, включая дальние
         // и выгодные, а продажи почти всегда уходили по ближней цене.
         chooseReplaceSlot(target, fair);
+        double buyRoom = buyRoom();
         for (int k = 0; k < levels; k++) {
             int i = innerFirst ? k : levels - 1 - k;
+            // Биды могут раздаваться в своём порядке: дальние первыми — у потолка
+            // бот докупает только дёшево, а продажи по-прежнему с ближнего.
+            int ib = BUY_FAR_FIRST ? levels - 1 - k : i;
             Double bidPrice = onTick(Side.BUY, noCross(Side.BUY,
-                    levelPrice(Side.BUY, target.bid(), fair.price(), i), fair));
+                    levelPrice(Side.BUY, target.bid(), fair.price(), ib), fair));
             Double askPrice = onTick(Side.SELL, noCross(Side.SELL,
                     levelPrice(Side.SELL, target.ask(), fair.price(), i), fair));
 
             double cashCap = bidPrice != null && bidPrice > 0
                     ? buyCash / bidPrice : Double.MAX_VALUE;
-            double bought = syncSide(Side.BUY, i, bids.get(i), bidPrice, fair.price(), cashCap);
+            double bought = syncSide(Side.BUY, ib, bids.get(ib), bidPrice, fair.price(),
+                    Math.min(cashCap, buyRoom));
             buyCash = Math.max(0, buyCash - bought * (bidPrice == null ? 0 : bidPrice));
+            buyRoom = Math.max(0, buyRoom - bought);
 
             sellPool = Math.max(0,
                     sellPool - syncSide(Side.SELL, i, asks.get(i), askPrice, fair.price(), sellPool));
@@ -5010,7 +5038,10 @@ public final class QuoteLoop implements Runnable {
         }
         String sql = "SELECT t.oid, MAX(t.side), SUM(t.qty), SUM(t.qty * t.price), MAX(t.tdt), "
                 + "MAX(o.status) FROM trade t JOIN order_info o ON o.oid = t.oid "
-                + "WHERE o.bot = ? AND o.symbol = ? AND t.tdt BETWEEN ? AND ? GROUP BY t.oid";
+                + "WHERE o.bot = ? AND o.symbol = ? AND t.tdt >= ? GROUP BY t.oid "
+                // Отсрочка по ПОСЛЕДНЕЙ сделке заявки: пока добивка частичной свежая,
+                // её ведёт обычный путь, и половину заявки лента не трогает.
+                + "HAVING MAX(t.tdt) <= ?";
         java.util.List<Object[]> rows = new java.util.ArrayList<>();
         try (java.sql.Connection c = java.sql.DriverManager.getConnection(
                 "jdbc:sqlite:file:" + VENUE_DB + "?mode=ro");

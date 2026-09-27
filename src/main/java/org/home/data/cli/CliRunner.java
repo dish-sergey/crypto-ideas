@@ -427,10 +427,10 @@ public class CliRunner implements ApplicationRunner {
                 log.info("\n{}", text);
             }
             if (args.containsOption("revx-hedge-paper")) {
-                // ÐÑÐ¼Ð°Ð¶Ð½ÑÐ¹ ÑÐµÐ´Ð¶: Ð½Ð¸ Ð¾Ð´Ð½Ð¾Ð¹ Ð·Ð°ÑÐ²ÐºÐ¸ Ð½Ð° Kraken, ÑÐ¾Ð»ÑÐºÐ¾ Ð¶ÑÑÐ½Ð°Ð» Â«ÑÑÐ¾ Ð±Ñ ÑÐ´ÐµÐ»Ð°Ð»Â».
+                // Бумажный хедж: ни одной заявки на Kraken, только журнал «что бы сделал».
                 var paper = hedgePaper.getObject();
                 Runtime.getRuntime().addShutdownHook(new Thread(paper::stop));
-                paper.run();                         // Ð±Ð»Ð¾ÐºÐ¸ÑÑÐµÑ: Ð´ÐµÐ¼Ð¾Ð½
+                paper.run();                         // блокирует: демон
             }
             if (args.containsOption("revx-hedge-grid")) {
                 // 191 II / 192 п. 1–6: сетка хеджа на живых траекториях.

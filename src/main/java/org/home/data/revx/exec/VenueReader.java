@@ -406,8 +406,13 @@ public class VenueReader {
         try (PreparedStatement ps = db.prepareStatement(
                 "SELECT t.oid, t.symbol, t.side, SUM(t.qty), MIN(t.tdt), o.bot "
                         + "FROM trade t JOIN order_info o ON o.oid = t.oid "
-                        + "WHERE t.tdt BETWEEN ? AND ? AND o.bot IS NOT NULL "
-                        + "GROUP BY t.oid")) {
+                        + "WHERE t.tdt >= ? AND o.bot IS NOT NULL "
+                        + "GROUP BY t.oid HAVING MAX(t.tdt) <= ?")) {
+            // ⚠️ Отсрочка — по ПОСЛЕДНЕЙ сделке заявки, а не по каждой. Частичная
+            // заявка исполняется несколькими сделками; окно по сделкам брало
+            // старую часть без свежей и сравнивало половину с целым лотом бота —
+            // ложная тревога «не записано» 27.09.2026 (f, 0.007556 из 0.01888:
+            // добивка пришла через 21 с и в окно ещё не попала).
             ps.setLong(1, now - 86_400_000L);
             ps.setLong(2, now - SHADOW_GRACE_MS);
             try (ResultSet rs = ps.executeQuery()) {

@@ -62,6 +62,13 @@ public record BootParams(String symbol, String botId, double size, double invent
                                 + "иначе, чем у живого бота; задайте -Drevx.sim.level-growth={}",
                         growthRec, growthNow, growthRec);
             }
+            boolean farRec = n.path("buyFarFirst").asBoolean(false);
+            if (n.path("levels").asInt(1) > 1
+                    && farRec != Boolean.getBoolean("revx.exec.buy-far-first")) {
+                org.slf4j.LoggerFactory.getLogger(BootParams.class).warn(
+                        "⚠️ порядок бидов в записи buyFarFirst={}, в этом прогоне иначе — "
+                                + "задайте -Drevx.exec.buy-far-first={}", farRec, farRec);
+            }
             return new BootParams(
                     n.path("symbol").asText(),
                     n.path("botId").asText("a"),

@@ -262,16 +262,18 @@ public class Executor {
                         + "\"parkDistance\":%s,\"costFloorMargin\":%s,\"anchorLeash\":%s,"
                         + "\"widening\":%s,\"wideningMaxStep\":%s,\"anchorWidening\":%s,"
                         + "\"ownPosition\":%b,\"levels\":%d,\"levelStep\":%s,"
-                        + "\"innerFirst\":%b,\"levelGrowth\":%s}",
+                        + "\"innerFirst\":%b,\"levelGrowth\":%s,\"buyFarFirst\":%b}",
                 symbol, tag.id(), num(size), num(inventoryCap), num(offset),
                 num(cfg.simSkewK()), num(skewTarget), periodMs, num(minNotional()),
                 num(spec.baseStep()), num(quoteStep()), num(parkDistance),
                 num(costFloorMargin), num(anchorLeash), num(widening),
                 num(wideningMaxStep), num(anchorWidening), ownPosition,
                 levels, num(levelStep), innerFirst,
-                // ÐÐ½Ð¾Ð¶Ð¸ÑÐµÐ»Ñ ÑÐ°Ð³Ð° ÑÑÐ¾Ð²Ð½ÐµÐ¹ (12/15/20 = ÑÐ°Ð³ 3 Ð±.Ð¿. Ã 5/3, 27.09.2026): Ð±ÐµÐ· Ð½ÐµÐ³Ð¾
-                // Ð¿Ð¾Ð²ÑÐ¾Ñ Ð¶ÑÑÐ½Ð°Ð»Ð° Ð¿Ð¾Ð»Ð¾Ð¶Ð¸Ð» Ð±Ñ ÑÑÐ¾Ð²Ð½Ð¸ ÑÐµÑÐµÐ· ÑÐ°Ð²Ð½ÑÐ¹ ÑÐ°Ð³.
-                System.getProperty("revx.sim.level-growth", "1.0"));
+                // Множитель шага уровней (12/15/20 = шаг 3 б.п. × 5/3, 27.09.2026): без него
+                // повтор журнала положил бы уровни через равный шаг.
+                System.getProperty("revx.sim.level-growth", "1.0"),
+                // Порядок раздачи кассы по бидам (дальние первыми) — тоже вне параметров бота.
+                QuoteLoop.BUY_FAR_FIRST);
     }
 
     private static String num(double v) {
