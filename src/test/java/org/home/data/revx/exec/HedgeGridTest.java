@@ -167,6 +167,19 @@ class HedgeGridTest {
         assertTrue(trades(entry)[2] <= trades(gated)[2]);
     }
 
+    /** Хедж излишка: запас ниже K лотов не страхуется вовсе. */
+    @Test
+    void излишекНижеПорогаНеХеджируется() {
+        // синтетический бот держит до 0.2 SOL при лоте 0.03, то есть до 6.7 лота;
+        // с порогом 10 лотов излишка нет никогда
+        var cfg = new HedgeGrid.Config(HedgeGrid.Rule.BAND, 1, 0, 30, false,
+                HedgeGrid.Exec.MAKER, 0, 0, 0, 0, 0, false, 10);
+        assertEquals(0.0, trades(cfg)[2], 0.0);
+        var cfg2 = new HedgeGrid.Config(HedgeGrid.Rule.BAND, 1, 0, 30, false,
+                HedgeGrid.Exec.MAKER, 0, 0, 0, 0, 0, false, 2);
+        assertTrue(trades(cfg2)[2] > 0);
+    }
+
     /** Перевес продаж по закрытым минутам; минута становится известной через 30 с. */
     @Test
     void перевесПродажТолькоПоИзвестнымМинутам() {

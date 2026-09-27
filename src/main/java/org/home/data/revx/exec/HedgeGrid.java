@@ -94,7 +94,16 @@ public class HedgeGrid {
     /** Настройка хеджа. {@code forcedMaker} — только для {@link Exec#FORCED}. */
     record Config(Rule rule, double bandLots, int periodMin, int waitSec, boolean flatten,
                   Exec exec, double forcedMaker, double underwaterBp,
-                  int flowMin, double flowPct, double minLots, boolean entryOnly) {
+                  int flowMin, double flowPct, double minLots, boolean entryOnly,
+                  double excessLots) {
+
+        /** Без хеджа излишка. */
+        Config(Rule rule, double bandLots, int periodMin, int waitSec, boolean flatten,
+               Exec exec, double forcedMaker, double underwaterBp,
+               int flowMin, double flowPct, double minLots, boolean entryOnly) {
+            this(rule, bandLots, periodMin, waitSec, flatten, exec, forcedMaker, underwaterBp,
+                    flowMin, flowPct, minLots, entryOnly, 0);
+        }
 
         /** Условие и на вход, и на выход (прежний смысл). */
         Config(Rule rule, double bandLots, int periodMin, int waitSec, boolean flatten,
@@ -119,7 +128,7 @@ public class HedgeGrid {
         /** Та же настройка с другим исполнением (для порога мейкерской доли). */
         Config withExec(Exec e, double maker) {
             return new Config(rule, bandLots, periodMin, waitSec, flatten, e, maker, underwaterBp,
-                    flowMin, flowPct, minLots, entryOnly);
+                    flowMin, flowPct, minLots, entryOnly, excessLots);
         }
 
         String name() {
@@ -132,13 +141,14 @@ public class HedgeGrid {
                     + (underwaterBp > 0 ? ", только под водой ≥ " + fmt(underwaterBp) + " б.п." : "")
                     + (flowMin > 0 ? ", перевес продаж Бинанса ≥ " + fmt(flowPct) + "% за " + flowMin + " мин" : "")
                     + (minLots > 0 ? ", запас ≥ " + fmt(minLots) + " лот." : "")
-                    + (entryOnly ? " — ТОЛЬКО НА ВХОД" : "");
+                    + (entryOnly ? " — ТОЛЬКО НА ВХОД" : "")
+                    + (excessLots > 0 ? ", хедж излишка сверх " + fmt(excessLots) + " лот." : "");
         }
 
         String key() {
             return rule + "|" + bandLots + "|" + periodMin + "|" + waitSec + "|" + flatten
                     + "|" + underwaterBp + "|" + flowMin + "|" + flowPct + "|" + minLots
-                    + "|" + entryOnly;
+                    + "|" + entryOnly + "|" + excessLots;
         }
     }
 
@@ -423,6 +433,14 @@ public class HedgeGrid {
                     out.add(new Config(Rule.BAND, 1, 0, 30, false, Exec.SIM, 0, 0, n, m, k, true));
                 }
             }
+        }
+        // Хедж по загрузке (владелец, 27.09.2026): «излишек сверх K лотов» — шорт на
+        // запас выше K, плавно; «всё с K лотов» — шорт на весь запас, пока он ≥ K.
+        for (double k : new double[]{2, 3}) {
+            out.add(new Config(Rule.BAND, 1, 0, 30, false, Exec.SIM, 0, 0, 0, 0, 0, false, k));
+            out.add(new Config(Rule.PERIOD, 0, 60, 120, false, Exec.SIM, 0, 0, 0, 0, 0, false, k));
+            out.add(new Config(Rule.BAND, 1, 0, 30, false, Exec.SIM, 0, 0, 0, 0, k));
+            out.add(new Config(Rule.PERIOD, 0, 60, 120, false, Exec.SIM, 0, 0, 0, 0, k));
         }
         return out;
     }
@@ -798,7 +816,11 @@ public class HedgeGrid {
                 // выполнено, иначе ноль. «net» — отклонение от цели.
                 // «Только на вход»: цель всегда −запас, но НАРАЩИВАТЬ шорт можно лишь
                 // при выполненном условии; откуп при убыли запаса — как обычно.
-                double want = active || cfg.entryOnly() ? -inv : 0;
+                // Хедж излишка: страхуем только запас сверх K лотов — мелкий быстрый
+                // запас бот сбрасывает сам, «загрузку» страхуем (владелец, 27.09.2026).
+                double hedged = cfg.excessLots() > 0
+                        ? Math.max(0, inv - cfg.excessLots() * b.lot) : inv;
+                double want = active || cfg.entryOnly() ? -hedged : 0;
                 double net = perp - want;
                 boolean due = false;
                 switch (cfg.rule()) {
