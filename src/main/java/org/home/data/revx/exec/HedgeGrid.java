@@ -93,7 +93,14 @@ public class HedgeGrid {
 
     /** Настройка хеджа. {@code forcedMaker} — только для {@link Exec#FORCED}. */
     record Config(Rule rule, double bandLots, int periodMin, int waitSec, boolean flatten,
-                  Exec exec, double forcedMaker, double underwaterBp) {
+                  Exec exec, double forcedMaker, double underwaterBp,
+                  int flowMin, double flowPct, double minLots) {
+
+        /** С условием «под водой», без перевеса тейкеров. */
+        Config(Rule rule, double bandLots, int periodMin, int waitSec, boolean flatten,
+               Exec exec, double forcedMaker, double underwaterBp) {
+            this(rule, bandLots, periodMin, waitSec, flatten, exec, forcedMaker, underwaterBp, 0, 0, 0);
+        }
 
         /** Без условия «под водой». */
         Config(Rule rule, double bandLots, int periodMin, int waitSec, boolean flatten,
@@ -103,7 +110,8 @@ public class HedgeGrid {
 
         /** Та же настройка с другим исполнением (для порога мейкерской доли). */
         Config withExec(Exec e, double maker) {
-            return new Config(rule, bandLots, periodMin, waitSec, flatten, e, maker, underwaterBp);
+            return new Config(rule, bandLots, periodMin, waitSec, flatten, e, maker, underwaterBp,
+                    flowMin, flowPct, minLots);
         }
 
         String name() {
@@ -113,12 +121,14 @@ public class HedgeGrid {
                 case PERIOD_BAND -> "раз в " + periodMin + " мин, если > " + fmt(bandLots);
             };
             return r + ", ждать " + waitSec + " с" + (flatten ? ", до нуля перед темнотой" : "")
-                    + (underwaterBp > 0 ? ", только под водой ≥ " + fmt(underwaterBp) + " б.п." : "");
+                    + (underwaterBp > 0 ? ", только под водой ≥ " + fmt(underwaterBp) + " б.п." : "")
+                    + (flowMin > 0 ? ", перевес продаж Бинанса ≥ " + fmt(flowPct) + "% за " + flowMin + " мин" : "")
+                    + (minLots > 0 ? ", запас ≥ " + fmt(minLots) + " лот." : "");
         }
 
         String key() {
             return rule + "|" + bandLots + "|" + periodMin + "|" + waitSec + "|" + flatten
-                    + "|" + underwaterBp;
+                    + "|" + underwaterBp + "|" + flowMin + "|" + flowPct + "|" + minLots;
         }
     }
 
@@ -135,6 +145,56 @@ public class HedgeGrid {
         double lot;
         /** Начала темноты по бюджету (остановка сразу после limit_blocked). */
         List<Long> darkStarts = new ArrayList<>();
+        /** Тейкеры Бинанса по минутам: момент доступности свечи и накопленные объёмы. */
+        long[] flowT = new long[0];
+        double[] cumVol = new double[0];
+        double[] cumBuy = new double[0];
+
+        /** Задержка доступности минутной свечи после её закрытия (A89). */
+        static final long FLOW_DELAY_MS = 30_000L;
+
+        /** Минутные свечи Бинанса с тейкерами из {@code candles}; нет базы — пусто. */
+        void loadFlow(String dbPath, String symbol, long from, long to) {
+            List<double[]> rows = new ArrayList<>();
+            try (Connection c = DriverManager.getConnection("jdbc:sqlite:file:" + dbPath + "?mode=ro");
+                 PreparedStatement ps = c.prepareStatement(
+                         "SELECT close_time, volume, taker_buy_volume FROM candles WHERE symbol = ? "
+                                 + "AND interval = '1m' AND open_time BETWEEN ? AND ? "
+                                 + "AND volume > 0 AND taker_buy_volume IS NOT NULL ORDER BY open_time")) {
+                ps.setString(1, symbol);
+                ps.setLong(2, from - 3_600_000L);
+                ps.setLong(3, to);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        rows.add(new double[]{rs.getLong(1), rs.getDouble(2), rs.getDouble(3)});
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("тейкеры Бинанса {} не прочитаны из {}: {}", symbol, dbPath, e.toString());
+            }
+            flowT = new long[rows.size()];
+            cumVol = new double[rows.size() + 1];
+            cumBuy = new double[rows.size() + 1];
+            for (int i = 0; i < rows.size(); i++) {
+                flowT[i] = (long) rows.get(i)[0] + 1 + FLOW_DELAY_MS;
+                cumVol[i + 1] = cumVol[i] + rows.get(i)[1];
+                cumBuy[i + 1] = cumBuy[i] + rows.get(i)[2];
+            }
+        }
+
+        /**
+         * Перевес продаж тейкеров за последние {@code n} известных к моменту {@code t}
+         * минут: {@code (продажи − покупки) / объём}, от −1 до 1. Данных нет — 0.
+         */
+        double sellImbalance(long t, int n) {
+            int k = lowerBound(flowT, t + 1);        // свечей, известных к t
+            if (k < n) {
+                return 0;
+            }
+            double vol = cumVol[k] - cumVol[k - n];
+            double buy = cumBuy[k] - cumBuy[k - n];
+            return vol > 0 ? (vol - 2 * buy) / vol : 0;
+        }
     }
 
     /** Итог по бот-суткам: ключ — сутки, значение — {без хеджа, с хеджем, сделок, пошлина, фандинг, тейкером}. */
@@ -169,6 +229,8 @@ public class HedgeGrid {
             Bot b = read(kv[1], from, to);
             b.id = idBase[0];
             b.base = idBase[1];
+            b.loadFlow(System.getProperty("revx.hedge.crypto-db", "data/crypto.db"),
+                    ("BTC".equals(b.base) ? "BTC" : b.base) + "USDT", from, to);
             if (b.ts.length > 100) {
                 bots.add(b);
             }
@@ -328,6 +390,16 @@ public class HedgeGrid {
         for (double x : new double[]{10, 20}) {
             out.add(new Config(Rule.BAND, 1, 0, 30, false, Exec.SIM, 0, x));
             out.add(new Config(Rule.PERIOD, 0, 60, 120, false, Exec.SIM, 0, x));
+        }
+        // Перевес продаж тейкеров Бинанса (вопрос владельца 27.09.2026): хедж включён,
+        // пока за последние N минут продажи перевешивали покупки на M% и больше
+        // (выключение — ниже M/2), по желанию — только при запасе от K лотов.
+        for (int n : new int[]{5, 15}) {
+            for (double m : new double[]{10, 20}) {
+                for (double k : new double[]{0, 2}) {
+                    out.add(new Config(Rule.BAND, 1, 0, 30, false, Exec.SIM, 0, 0, n, m, k));
+                }
+            }
         }
         return out;
     }
@@ -572,6 +644,8 @@ public class HedgeGrid {
         double avgCost = 0;
         double costQty = -1;              // −1 — ещё не заведено (первый тик окна)
         boolean gate = false;
+        boolean flowOn = false;
+        boolean activeWas = true;
         // Висящая заявка на Kraken: размер, момент постановки, цена касания, исполнится ли и когда.
         double pendQty = 0;
         long pendT0 = 0;
@@ -645,6 +719,21 @@ public class HedgeGrid {
                     gate = false;
                 }
             }
+            // Перевес продаж тейкеров Бинанса за последние N ЗАКРЫТЫХ минут; свеча
+            // известна через 30 с после закрытия (как в A89), иначе прибор знал бы
+            // перевес минуты в её середине.
+            if (cfg.flowMin() > 0) {
+                double imb = b.sellImbalance(t, cfg.flowMin());
+                double mth = cfg.flowPct() / 100;
+                if (!flowOn && imb >= mth) {
+                    flowOn = true;
+                } else if (flowOn && imb < mth / 2) {
+                    flowOn = false;
+                }
+            }
+            boolean lotsOk = cfg.minLots() <= 0 || inv >= cfg.minLots() * b.lot - 1e-12;
+            boolean active = (cfg.underwaterBp() <= 0 || gate)
+                    && (cfg.flowMin() <= 0 || flowOn) && lotsOk;
             double m = markAt(mark, t);
             // Переоценка перпа и фандинг за прошедший интервал (в т.ч. через темноту).
             if (prevT > 0 && m > 0 && prevM > 0) {
@@ -684,7 +773,7 @@ public class HedgeGrid {
             if (pendQty == 0 && m > 0) {
                 // Цель перпа: −запас, а при условии «под водой» — только пока оно
                 // выполнено, иначе ноль. «net» — отклонение от цели.
-                double want = cfg.underwaterBp() <= 0 || gate ? -inv : 0;
+                double want = active ? -inv : 0;
                 double net = perp - want;
                 boolean due = false;
                 switch (cfg.rule()) {
@@ -706,9 +795,12 @@ public class HedgeGrid {
                     due = Math.abs(net) >= step;
                 }
                 // Условие переключилось — действуем сразу, не дожидаясь полосы или часа.
-                if (cfg.underwaterBp() > 0 && gate != gateWas) {
+                if (active != activeWas) {
                     due = Math.abs(net) >= step;
                 }
+                // Переключение отмечается только тогда, когда было кому на него
+                // ответить: при висящей заявке оно подождёт до её исполнения.
+                activeWas = active;
                 if (due) {
                     double delta = want - perp;
                     double q = Math.signum(delta) * Math.floor(Math.abs(delta) / step + 1e-9) * step;

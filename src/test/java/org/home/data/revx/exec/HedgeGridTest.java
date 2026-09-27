@@ -136,6 +136,23 @@ class HedgeGridTest {
         return agg;
     }
 
+    /** Перевес продаж по закрытым минутам; минута становится известной через 30 с. */
+    @Test
+    void перевесПродажТолькоПоИзвестнымМинутам() {
+        HedgeGrid.Bot b = new HedgeGrid.Bot();
+        // три минуты: объём 10, покупки 5 / 2 / 1 → перевес 0 / 0.6 / 0.8
+        long close0 = 60_000 - 1;
+        b.flowT = new long[]{close0 + 1 + 30_000, close0 + 60_001 + 30_000, close0 + 120_001 + 30_000};
+        b.cumVol = new double[]{0, 10, 20, 30};
+        b.cumBuy = new double[]{0, 5, 7, 8};
+        long t = b.flowT[2];
+        assertEquals(0.8, b.sellImbalance(t, 1), 1e-12);
+        assertEquals((20 - 2 * 3) / 20.0, b.sellImbalance(t, 2), 1e-12);
+        // за миллисекунду до доступности третьей свечи её ещё нет
+        assertEquals(0.6, b.sellImbalance(t - 1, 1), 1e-12);
+        assertEquals(0.0, b.sellImbalance(t, 5), 1e-12);    // данных меньше n
+    }
+
     @Test
     void фандингПоЧасам() {
         TreeMap<Long, Double> fund = new TreeMap<>();
