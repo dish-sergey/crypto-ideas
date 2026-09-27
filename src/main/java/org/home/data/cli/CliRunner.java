@@ -82,6 +82,7 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.HistoryWatch> historyWatch;
     private final ObjectProvider<org.home.data.revx.exec.VenueReader> venueReader;
     private final ObjectProvider<org.home.data.revx.exec.BudgetFacts> budgetFacts;
+    private final ObjectProvider<org.home.data.revx.exec.HedgeGrid> hedgeGrid;
     private final ObjectProvider<org.home.data.revx.exec.ReleaseStale> releaseStale;
     private final ObjectProvider<org.home.data.revx.exec.Unbook> unbook;
     private final ObjectProvider<org.home.data.revx.RateCheck> rateCheck;
@@ -124,6 +125,7 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.HistoryWatch> historyWatch,
                      ObjectProvider<org.home.data.revx.exec.VenueReader> venueReader,
                      ObjectProvider<org.home.data.revx.exec.BudgetFacts> budgetFacts,
+                     ObjectProvider<org.home.data.revx.exec.HedgeGrid> hedgeGrid,
                      ObjectProvider<org.home.data.revx.exec.ReleaseStale> releaseStale,
                      ObjectProvider<org.home.data.revx.exec.Unbook> unbook,
                      ObjectProvider<org.home.data.revx.RateCheck> rateCheck,
@@ -173,6 +175,7 @@ public class CliRunner implements ApplicationRunner {
         this.historyWatch = historyWatch;
         this.venueReader = venueReader;
         this.budgetFacts = budgetFacts;
+        this.hedgeGrid = hedgeGrid;
         this.releaseStale = releaseStale;
         this.unbook = unbook;
         this.rateCheck = rateCheck;
@@ -412,6 +415,13 @@ public class CliRunner implements ApplicationRunner {
             }
             if (args.containsOption("revx-exec")) {
                 executor.getObject().run();          // блокирует: демон микро-live
+            }
+            if (args.containsOption("revx-hedge-grid")) {
+                // 191 II / 192 п. 1–6: сетка хеджа на живых траекториях.
+                hedgeGrid.getObject().run(firstOr(args, "journals", ""),
+                        firstOr(args, "windows", "down=2026-09-08..2026-09-16,up=2026-09-16..2026-09-22"),
+                        Integer.parseInt(firstOr(args, "seeds", "10")),
+                        firstOr(args, "out", "reports/revx_hedge_grid.md"));
             }
             if (args.containsOption("revx-budget-facts")) {
                 // Л2/Л4 из 192: доля темноты и расход постановок по журналам.

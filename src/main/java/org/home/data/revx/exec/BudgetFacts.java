@@ -168,7 +168,7 @@ public class BudgetFacts {
             int ei = 0;
             for (; ei < ev.size() && ev.get(ei).ts() < start; ei++) {
                 Ev e = ev.get(ei);
-                if ("limit_blocked".equals(e.kind())) {
+                if (placementBlocked(e)) {
                     lastBlocked = e.ts();
                 }
                 if ("start".equals(e.kind())) {
@@ -204,7 +204,7 @@ public class BudgetFacts {
             for (long t = start; t < to; t += step) {
                 while (ei < ev.size() && ev.get(ei).ts() <= t) {
                     Ev e = ev.get(ei++);
-                    if ("limit_blocked".equals(e.kind())) {
+                    if (placementBlocked(e)) {
                         lastBlocked = e.ts();
                     }
                     if ("start".equals(e.kind())) {
@@ -453,6 +453,15 @@ public class BudgetFacts {
         }
         stops.setLength(0);
         stops.append(outSb.toString().replaceAll("\n+$", "\n"));
+    }
+
+    /**
+     * Отказ ПО ПОСТАНОВКАМ. ⚠️ {@code limit_blocked} пишется и по денежным пределам
+     * («нотионал», «экспозиция»); остановка рядом с ними — не темнота по бюджету.
+     */
+    private static boolean placementBlocked(Ev e) {
+        return "limit_blocked".equals(e.kind()) && e.detail() != null
+                && e.detail().contains("постановк");
     }
 
     /** Предел постановок бота — из текста limit_blocked («… 100 из 100»). */
