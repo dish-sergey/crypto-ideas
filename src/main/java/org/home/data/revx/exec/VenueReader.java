@@ -64,8 +64,18 @@ public class VenueReader {
     private static final Logger log = LoggerFactory.getLogger(VenueReader.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** Цикл: снимок активных каждый раз, одна пара ленты на цикл. */
-    static final long CYCLE_MS = 1_000L;
+    /**
+     * Цикл: снимок активных каждый раз, одна пара ленты на цикл, балансы раз в
+     * {@link #BALANCE_EVERY} циклов. Читатель тратит ~2.2 GET за цикл.
+     *
+     * ⚠️ В ТЕНИ — 2 с (≈65 GET/мин), и это расчёт бюджета, а не вкус: лимит GET
+     * общий на аккаунт, сборщик берёт ~590/мин, шесть ботов по старой логике ~200,
+     * и с секундным читателем (~125) выходило ≈910 из 1000 при уже идущих 429
+     * (замер прогона 22–23.09.2026). Секундный снимок понадобится на этапе 3,
+     * когда боты начнут по нему решать, — к тому времени они перестанут делать
+     * свои ~200 GET/мин.
+     */
+    private final long cycleMs;
     /** Балансы и резерв — раз в столько циклов. */
     static final int BALANCE_EVERY = 5;
     /** Сверка с журналами ботов. */
@@ -102,7 +112,9 @@ public class VenueReader {
     public VenueReader(RevxConfig cfg,
                        @Value("${revx.info.bots}") List<String> botSpec,
                        @Value("${revx.venue.db:/home/ubuntu/revx-shared/venue.db}") String dbPath,
-                       @Value("${revx.venue.symbols:BTC-USDC,ETH-USDC,SOL-USDC}") List<String> symbols) {
+                       @Value("${revx.venue.symbols:BTC-USDC,ETH-USDC,SOL-USDC}") List<String> symbols,
+                       @Value("${revx.venue.cycle-ms:2000}") long cycleMs) {
+        this.cycleMs = cycleMs;
         this.cfg = cfg;
         this.botSpec = botSpec;
         this.dbPath = dbPath;
@@ -138,8 +150,8 @@ public class VenueReader {
         exec("INSERT INTO heartbeat(name, started_ms, last_cycle_ms, last_ok_ms, cycles, errors, "
                 + "throttled) VALUES('reader', ?, ?, 0, 0, 0, 0) ON CONFLICT(name) DO UPDATE SET "
                 + "started_ms = excluded.started_ms", started, started);
-        log.info("читатель площадки: база {}, пары {}, ботов {}, ключ {}", dbPath, symbols,
-                byPrefix.size(), auth.keyFingerprint());
+        log.info("читатель площадки: база {}, пары {}, ботов {}, цикл {} мс, ключ {}", dbPath, symbols,
+                byPrefix.size(), cycleMs, auth.keyFingerprint());
 
         long cycle = 0;
         long lastShadow = 0;
@@ -173,7 +185,7 @@ public class VenueReader {
             } catch (Exception e) {
                 log.warn("читатель: сердцебиение не записано — {}", e.toString());
             }
-            long sleep = CYCLE_MS - (System.currentTimeMillis() - t0);
+            long sleep = cycleMs - (System.currentTimeMillis() - t0);
             if (sleep > 0) {
                 pause(sleep);
             }
