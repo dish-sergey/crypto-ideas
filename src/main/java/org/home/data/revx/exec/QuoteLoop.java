@@ -2313,6 +2313,13 @@ public final class QuoteLoop implements Runnable {
      * скрывала ночную аварию), а писать каждую секунду — бесполезно.
      */
     private void warnNoFunds(Side side, Resting resting) {
+        // Дальний уровень пуст по построению, когда запаса меньше числа уровней:
+        // пул выбран внутренними. Это не односторонняя стратегия, а норма, и у f
+        // (три уровня, один лот) давало ~70 записей в час (27.09.2026). Говорим
+        // только о БЛИЖНЕМ уровне — если нечем и ему, сторона действительно пуста.
+        if (resting != (side == Side.BUY ? bids : asks).get(0)) {
+            return;
+        }
         long now = clock.now();
         if (now - resting.fundsWarnedMs < 60_000) {
             return;
