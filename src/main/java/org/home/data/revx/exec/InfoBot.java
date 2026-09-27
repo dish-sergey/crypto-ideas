@@ -142,6 +142,146 @@ public final class InfoBot implements Runnable {
      */
     static final double BOOK_DAYS_ALARM = 17.0;
 
+    /**
+     * ⚠️ СКОЛЬКО МОЛЧАНИЯ ЧИТАТЕЛЯ ПЛОЩАДКИ ЗНАЧИТ «УПАЛ» (задача A92).
+     *
+     * Читатель пишет сердцебиение каждую секунду, но двигает {@code last_ok_ms}
+     * только по УСПЕШНОМУ снимку активных заявок: живой процесс, которому
+     * площадка отвечает одними отказами, для ботов так же бесполезен, как
+     * мёртвый. Минута — это шестьдесят подряд неудачных циклов; короткие пачки
+     * 429 (десятки секунд) под порог не попадают.
+     */
+    static final long VENUE_SILENCE_MS = 60_000L;
+
+    /** Путь к базе читателя; файла нет — читатель не развёрнут, молчим. */
+    private final String venuePath =
+            System.getProperty("revx.info.venue", "../revx-shared/venue.db");
+    private long venueTold;
+    /** Про какие незаписанные исполнения уже сказали. */
+    private final java.util.Set<String> shadowTold = new java.util.HashSet<>();
+
+    /** Состояние читателя одной строкой — для сторожа и для /all. */
+    record VenueState(boolean deployed, long lastOkMs, long lastCycleMs, long errors,
+                      long throttled, String lastError, int unbooked, int reserveGaps) {
+    }
+
+    VenueState venueState() {                              // пакетный доступ: тест
+        if (!java.nio.file.Files.exists(java.nio.file.Path.of(venuePath))) {
+            return new VenueState(false, 0, 0, 0, 0, null, 0, 0);
+        }
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                "jdbc:sqlite:file:" + venuePath + "?mode=ro");
+             java.sql.Statement st = c.createStatement()) {
+            long ok = 0;
+            long cycle = 0;
+            long errors = 0;
+            long throttled = 0;
+            String last = null;
+            try (java.sql.ResultSet rs = st.executeQuery("SELECT last_ok_ms, last_cycle_ms, errors, "
+                    + "throttled, last_error FROM heartbeat WHERE name = 'reader'")) {
+                if (rs.next()) {
+                    ok = rs.getLong(1);
+                    cycle = rs.getLong(2);
+                    errors = rs.getLong(3);
+                    throttled = rs.getLong(4);
+                    last = rs.getString(5);
+                }
+            }
+            int unbooked = 0;
+            try (java.sql.ResultSet rs = st.executeQuery(
+                    "SELECT COUNT(*) FROM shadow_diff WHERE resolved_ms IS NULL")) {
+                unbooked = rs.next() ? rs.getInt(1) : 0;
+            }
+            int gaps = 0;
+            try (java.sql.ResultSet rs = st.executeQuery(
+                    "SELECT COUNT(*) FROM reserve_gap WHERE updated_ms - since_ms > 300000")) {
+                gaps = rs.next() ? rs.getInt(1) : 0;
+            }
+            return new VenueState(true, ok, cycle, errors, throttled, last, unbooked, gaps);
+        } catch (Exception e) {
+            return new VenueState(true, 0, 0, 0, 0, e.toString(), 0, 0);
+        }
+    }
+
+    /**
+     * СТОРОЖ ЧИТАТЕЛЯ ПЛОЩАДКИ. Будит, если последний успешный цикл старше
+     * минуты, повтор не чаще раза в час, и отдельным сообщением — когда ожил.
+     *
+     * Плюс исполнения, которые площадка сделала, а бот не записал: это ровно то
+     * «внутри не сходится», ради чего тревоги и заведены, и ровно то, что
+     * прогон 22–23.09.2026 терял шесть раз за сутки.
+     */
+    void watchVenue() {                                  // пакетный доступ: тест
+        VenueState v = venueState();
+        if (!v.deployed()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        boolean down = now - v.lastOkMs() > VENUE_SILENCE_MS;
+        if (!down) {
+            if (venueTold != 0) {
+                venueTold = 0;
+                send("🟢 Читатель площадки снова работает.");
+            }
+        } else if (venueTold == 0 || now - venueTold > 3_600_000L) {
+            venueTold = now;
+            send(("💀 ЧИТАТЕЛЬ ПЛОЩАДКИ НЕ РАБОТАЕТ: последний успешный цикл %s, "
+                    + "последний цикл вообще %s.%n"
+                    + "Последняя ошибка: %s%n"
+                    + "Проверить: systemctl status revx-venue; journalctl -u revx-venue -n 50.")
+                    .formatted(v.lastOkMs() > 0 ? ago(now - v.lastOkMs()) : "не было",
+                            v.lastCycleMs() > 0 ? ago(now - v.lastCycleMs()) : "не было",
+                            v.lastError() == null ? "—" : v.lastError()));
+        }
+        if (v.unbooked() == 0) {
+            return;
+        }
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                "jdbc:sqlite:file:" + venuePath + "?mode=ro");
+             java.sql.PreparedStatement ps = c.prepareStatement(
+                     "SELECT oid, bot, symbol, side, traded, booked, tdt FROM shadow_diff "
+                             + "WHERE resolved_ms IS NULL");
+             java.sql.ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                String oid = rs.getString(1);
+                if (!shadowTold.add(oid)) {
+                    continue;
+                }
+                send(("⚠️ ИСПОЛНЕНИЕ НЕ ЗАПИСАНО: бот %s, %s %s — площадка исполнила %s, "
+                        + "в журнале бота %s. Заявка %s, сделка %s.%n"
+                        + "Сверка читателя площадки (этап «в тени»): бот пока этих данных не "
+                        + "читает, позиция и реестр у него расходятся с площадкой.")
+                        .formatted(rs.getString(2).toUpperCase(Locale.ROOT), rs.getString(3),
+                                rs.getString(4), fmtQty(rs.getDouble(5)), fmtQty(rs.getDouble(6)),
+                                oid, java.time.Instant.ofEpochMilli(rs.getLong(7))));
+            }
+        } catch (Exception e) {
+            log.warn("сводка: shadow_diff не прочитан — {}", e.toString());
+        }
+    }
+
+    private static String fmtQty(double q) {
+        return String.format(Locale.ROOT, "%.8f", q);
+    }
+
+    /** Строка о читателе в /all; пусто, если он не развёрнут. */
+    private String venueLine() {
+        VenueState v = venueState();
+        if (!v.deployed()) {
+            return "";
+        }
+        long now = System.currentTimeMillis();
+        boolean down = now - v.lastOkMs() > VENUE_SILENCE_MS;
+        return String.format(Locale.ROOT, "%n%s Читатель площадки: %s, ошибок %d, 429 %d%s%s",
+                down ? "💀" : "🟢",
+                v.lastOkMs() > 0 ? "успешный цикл " + ago(now - v.lastOkMs()) : "успешных циклов не было",
+                v.errors(), v.throttled(),
+                v.unbooked() > 0 ? String.format(Locale.ROOT, "%n  ⚠️ незаписанных исполнений: %d",
+                        v.unbooked()) : "",
+                v.reserveGaps() > 0 ? String.format(Locale.ROOT,
+                        "%n  заперто без заявки дольше 5 мин: %d монет(ы)", v.reserveGaps()) : "");
+    }
+
     /** Когда последний раз говорили про диск и про залежавшуюся книгу. */
     private long diskTold;
     private long bookTold;
@@ -209,6 +349,7 @@ public final class InfoBot implements Runnable {
                     continue;
                 }
                 watchSilence();
+                watchVenue();
                 watchDisk();
                 for (JsonNode update : JSON.readTree(body).path("result")) {
                     offset = update.path("update_id").asLong() + 1;
@@ -600,6 +741,7 @@ public final class InfoBot implements Runnable {
         // строками выше, а это худший вид неправды в отчёте.
         sb.append(hiddenNote());
         sb.append(unownedNote());
+        sb.append(venueLine());
         // Диск — не про ботов, но это единственный прибор, который на него
         // смотрит: сводка живёт на той же машине, где пишется книга.
         Disk d = disk();

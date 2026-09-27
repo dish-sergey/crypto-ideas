@@ -36,7 +36,7 @@ public class CliMode {
             "revx-replay", "revx-forecast", "revx-ladder", "revx-sweep-run", "revx-pair-forecast",
             "revx-pair-sweep", "revx-info", "revx-assemble", "revx-fill-check",
             "revx-order", "revx-book", "revx-depth-probe", "revx-flow-markout",
-            "revx-hold-check", "revx-fate-probe", "revx-rate-check", "revx-offset-axis", "revx-order-status", "revx-audit",
+            "revx-hold-check", "revx-fate-probe", "revx-rate-check", "revx-offset-axis", "revx-order-status", "revx-audit", "revx-history-probe", "revx-venue",
             "revx-paired", "revx-release-stale", "revx-unbook", "revx-carry", "revx-lead", "revx-hedge", "revx-core", "revx-surface", "revx-seed-gain", "revx-flow-signal");
 
     /**
@@ -50,7 +50,7 @@ public class CliMode {
     private static final Set<String> PARAMS = Set.of(
             "symbol", "symbols", "hours", "from", "to", "interval",
             "out", "table", "bucket-seconds", "days", "edge", "up", "down", "flat",
-            "journal", "offset", "model", "offsets", "share-cap", "levels", "level-step", "size-mult", "outer-first", "inner-first", "lots", "thin", "dyn-offset", "cap-usd", "from-dir", "stand-db", "sigma", "offset-bp", "taker-cost-bp", "order-id", "client-id", "db", "journals", "placed", "segment", "a", "b", "name-a", "name-b", "alloc", "bot", "currency", "apply", "captures", "band", "fee-bp", "step-usd", "hours-out", "stand", "horizon-ms", "lot", "classes", "delta-bp", "period-min", "perp-usd", "min-trades", "crypto-db", "coefs", "sweep-coef", "sweep-delay-ms", "sides", "journal-out", "flow-coefs", "flow-delay-ms");
+            "journal", "offset", "model", "offsets", "share-cap", "levels", "level-step", "size-mult", "outer-first", "inner-first", "lots", "thin", "dyn-offset", "cap-usd", "from-dir", "stand-db", "sigma", "offset-bp", "taker-cost-bp", "order-id", "client-id", "db", "journals", "placed", "segment", "a", "b", "name-a", "name-b", "alloc", "bot", "currency", "apply", "captures", "band", "fee-bp", "step-usd", "hours-out", "stand", "horizon-ms", "lot", "classes", "delta-bp", "period-min", "perp-usd", "min-trades", "crypto-db", "coefs", "sweep-coef", "sweep-delay-ms", "sides", "journal-out", "flow-coefs", "flow-delay-ms", "watch-min", "period-ms", "heirs");
 
     private final boolean scheduleMode;
     private final Set<String> unknownOptions;

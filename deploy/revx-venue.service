@@ -1,0 +1,35 @@
+[Unit]
+Description=Revolut X — ЧИТАТЕЛЬ ПЛОЩАДКИ (только GET, пишет revx-shared/venue.db)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx-venue
+EnvironmentFile=/etc/revx-exec.env
+
+# Задача A92, схема — docs/pairs/ЧИТАТЕЛЬ-ПЛОЩАДКИ.md.
+#
+# Единственный, кто спрашивает площадку GET-ами: снимок активных заявок раз в
+# секунду, лента своих сделок, судьбы заявок, балансы. Этап 1 — В ТЕНИ: боты
+# базу не читают, читатель сверяет ленту с их журналами (shadow_diff).
+#
+# ⚠️ СВОЙ КАТАЛОГ И СВОЙ JAR. Перезапись jar под работающим процессом роняет его
+# NoClassDefFoundError (A64); выкатка — scp app.jar.new → mv → restart.
+#
+# ⚠️ Ключ торговый (из /etc/revx-exec.env), но читатель НЕ УМЕЕТ ни ставить, ни
+# снимать заявки: в коде только GET.
+#
+# Сторож — сводка revx-info: 💀, если последний УСПЕШНЫЙ цикл старше минуты.
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx128m -jar /home/ubuntu/revx-venue/app.jar --revx-venue
+
+# Перезапуск разрешён: читатель ничем не рискует, а без него в этапах 2+ боты
+# перестанут ставить заявки.
+Restart=on-failure
+RestartSec=15
+SuccessExitStatus=143
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -78,6 +78,9 @@ public class CliRunner implements ApplicationRunner {
     private final ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck;
     private final ObjectProvider<org.home.data.revx.exec.FateProbe> fateProbe;
     private final ObjectProvider<org.home.data.revx.exec.Audit> audit;
+    private final ObjectProvider<org.home.data.revx.exec.HistoryProbe> historyProbe;
+    private final ObjectProvider<org.home.data.revx.exec.HistoryWatch> historyWatch;
+    private final ObjectProvider<org.home.data.revx.exec.VenueReader> venueReader;
     private final ObjectProvider<org.home.data.revx.exec.ReleaseStale> releaseStale;
     private final ObjectProvider<org.home.data.revx.exec.Unbook> unbook;
     private final ObjectProvider<org.home.data.revx.RateCheck> rateCheck;
@@ -116,6 +119,9 @@ public class CliRunner implements ApplicationRunner {
                      ObjectProvider<org.home.data.revx.exec.TradeCheck> tradeCheck,
                      ObjectProvider<org.home.data.revx.exec.FateProbe> fateProbe,
                      ObjectProvider<org.home.data.revx.exec.Audit> audit,
+                     ObjectProvider<org.home.data.revx.exec.HistoryProbe> historyProbe,
+                     ObjectProvider<org.home.data.revx.exec.HistoryWatch> historyWatch,
+                     ObjectProvider<org.home.data.revx.exec.VenueReader> venueReader,
                      ObjectProvider<org.home.data.revx.exec.ReleaseStale> releaseStale,
                      ObjectProvider<org.home.data.revx.exec.Unbook> unbook,
                      ObjectProvider<org.home.data.revx.RateCheck> rateCheck,
@@ -161,6 +167,9 @@ public class CliRunner implements ApplicationRunner {
         this.tradeCheck = tradeCheck;
         this.fateProbe = fateProbe;
         this.audit = audit;
+        this.historyProbe = historyProbe;
+        this.historyWatch = historyWatch;
+        this.venueReader = venueReader;
         this.releaseStale = releaseStale;
         this.unbook = unbook;
         this.rateCheck = rateCheck;
@@ -276,6 +285,21 @@ public class CliRunner implements ApplicationRunner {
                 audit.getObject().run(firstOr(args, "alloc", ""),
                         firstOr(args, "out", ""));
             }
+            if (args.containsOption("revx-history-probe")) {
+                // Только GET: история заявок и свои сделки аккаунта против журналов ботов.
+                if (args.containsOption("watch-min")) {
+                    // Режим наблюдения: разовые проверки по окну --from/--to и живой опрос.
+                    historyWatch.getObject().run(firstOr(args, "from", ""), firstOr(args, "to", ""),
+                            Integer.parseInt(firstOr(args, "watch-min", "0")),
+                            Long.parseLong(firstOr(args, "period-ms", "2000")),
+                            firstOr(args, "heirs", ""),
+                            firstOr(args, "out", "reports/revx_history_watch.md"));
+                } else {
+                    historyProbe.getObject().run(firstOr(args, "from", ""), firstOr(args, "to", ""),
+                            firstOr(args, "symbols", "BTC-USDC,ETH-USDC,SOL-USDC"),
+                            firstOr(args, "out", "reports/revx_history_probe.md"));
+                }
+            }
             if (args.containsOption("revx-unbook")) {
                 // Убирает повторно записанное исполнение; без --apply только показывает.
                 unbook.getObject().run(firstOr(args, "journal", ""),
@@ -385,6 +409,13 @@ public class CliRunner implements ApplicationRunner {
             }
             if (args.containsOption("revx-exec")) {
                 executor.getObject().run();          // блокирует: демон микро-live
+            }
+            if (args.containsOption("revx-venue")) {
+                // Читатель площадки: единственный, кто спрашивает её GET-ами, пишет
+                // revx-shared/venue.db. Этап 1 — в тени (ЧИТАТЕЛЬ-ПЛОЩАДКИ.md).
+                var reader = venueReader.getObject();
+                Runtime.getRuntime().addShutdownHook(new Thread(reader::stop));
+                reader.run();                        // блокирует: демон читателя
             }
             if (args.containsOption("revx-info")) {
                 // Сводный бот: смотрит журналы шести исполнителей и ничего не
