@@ -46,7 +46,7 @@ EnvironmentFile=/etc/revx-exec.env
 #
 # Механизмы выключены ЯВНО, а не умолчанием: умолчание меняется правкой конфига,
 # и профиль однажды перестанет быть тем, чем задуман, молча.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -jar /home/ubuntu/revx-exec/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -jar /home/ubuntu/revx-exec/app.jar --revx-exec \
   --revx.exec.bot-id=a \
   --revx.exec.symbol=BTC/USDC \
   --revx.exec.journal=state/exec.db \

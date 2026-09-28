@@ -32,7 +32,7 @@ EnvironmentFile=/etc/revx-exec-c.env
 # у A). Роль закончилась — κ на живых данных теперь меряется, а держать третьего
 # бота на биткойне при шести парах значит тратить дефицитный ресурс на худшую
 # по доходу на постановку пару набора.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -jar /home/ubuntu/revx-exec-c/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -jar /home/ubuntu/revx-exec-c/app.jar --revx-exec \
   --revx.exec.bot-id=c \
   --revx.exec.symbol=ETH/USDC \
   --revx.exec.journal=state/exec-c-eth.db \
