@@ -5108,12 +5108,13 @@ public final class QuoteLoop implements Runnable {
 
     /** Живой бот и база читателя на месте. */
     private boolean ledgerActive() {
-        return client instanceof TradeClient
+        return (client instanceof TradeClient
+                || client instanceof VenueReads vr && vr.inner() instanceof TradeClient)
                 && java.nio.file.Files.exists(java.nio.file.Path.of(VENUE_DB));
     }
 
     /** База читателя площадки. */
-    private static final String VENUE_DB =
+    static final String VENUE_DB =
             System.getProperty("revx.exec.venue-db", "/home/ubuntu/revx-shared/venue.db");
     /** Сделку моложе этого ведёт обычный путь — лента подбирает только пропущенное. */
     static final long LEDGER_GRACE_MS = 5 * 60_000L;
@@ -5141,6 +5142,14 @@ public final class QuoteLoop implements Runnable {
 
     private long lastVenueFillsMs;
     private boolean venueFresh;
+
+    /**
+     * Этап 3б: {@code /orders/active} и {@code /balances} — из снимков читателя
+     * ({@link VenueReads}); сам бот спрашивает, только если снимок несвеж.
+     */
+    static final boolean VENUE_READS =
+            Boolean.parseBoolean(System.getProperty("revx.exec.venue-reads", "false"));
+    private long lastReadsReportMs;
 
     /** Лента читателя свежа и бот в неё смотрит — свои GET по предкам не нужны. */
     private boolean venueCovers() {
@@ -5251,6 +5260,10 @@ public final class QuoteLoop implements Runnable {
             // вопрос ещё раз, значит будить человека зря.
             retryUnknownFates(now);
             bookFromLedger(now);
+            if (client instanceof VenueReads vr && now - lastReadsReportMs >= 3_600_000L) {
+                lastReadsReportMs = now;
+                journal.event("venue_reads", "списочные GET за жизнь процесса: " + vr.stats());
+            }
             if (alloc != null) {
                 alloc.heartbeat(tag.id(), now);
                 checkRegistryAgainstJournal(now);

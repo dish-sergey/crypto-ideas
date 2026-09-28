@@ -223,6 +223,9 @@ public class VenueReader {
             }
             exec("INSERT OR REPLACE INTO snapshot(name, started_ms, finished_ms, rows) "
                     + "VALUES('live_order', ?, ?, ?)", started, finished, items.size());
+            // Сырой ответ — ботам (VenueReads): тот же JSON, тот же разбор, что у их GET.
+            exec("INSERT OR REPLACE INTO raw_response(name, started_ms, body) VALUES(?,?,?)",
+                    VenueReads.ACTIVE, started, r.body);
             db.commit();
         } catch (Exception e) {
             db.rollback();
@@ -354,6 +357,8 @@ public class VenueReader {
             lastError = "balances " + r.status;
             return;
         }
+        exec("INSERT OR REPLACE INTO raw_response(name, started_ms, body) VALUES(?,?,?)",
+                VenueReads.BALANCES, started, r.body);
         Map<String, Double> visible = new HashMap<>();
         try (ResultSet rs = db.createStatement().executeQuery(
                 "SELECT symbol, side, leaves, price FROM live_order")) {
@@ -651,6 +656,11 @@ public class VenueReader {
                 started_ms  INTEGER,
                 finished_ms INTEGER,
                 rows        INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS raw_response (
+                name       TEXT PRIMARY KEY,
+                started_ms INTEGER,
+                body       TEXT
             );
             CREATE TABLE IF NOT EXISTS balance (
                 currency   TEXT PRIMARY KEY,

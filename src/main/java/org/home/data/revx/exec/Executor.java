@@ -185,7 +185,9 @@ public class Executor {
         // `revx.exec.offset`, а не с базовым прогоном симуляции.
         Quoter.Params params = buildParams();
         QuotePolicy policy = buildPolicy(params);
-        QuoteLoop loop = new QuoteLoop(client, Clock.system(), stand, journal, params, symbol,
+        // Этап 3б: списочные GET — из снимков читателя (флаг revx.exec.venue-reads).
+        Venue venue = QuoteLoop.VENUE_READS ? new VenueReads(client, QuoteLoop.VENUE_DB) : client;
+        QuoteLoop loop = new QuoteLoop(venue, Clock.system(), stand, journal, params, symbol,
                 periodMs, minNotional(), tag, policy, ownPosition, positionSeed, spec.baseStep(),
                 parkDistance, alloc, levels, levelStep, innerFirst);
         // Ведро постановок живёт в том же файле, что и реестр владения, и по той
@@ -262,7 +264,7 @@ public class Executor {
                         + "\"parkDistance\":%s,\"costFloorMargin\":%s,\"anchorLeash\":%s,"
                         + "\"widening\":%s,\"wideningMaxStep\":%s,\"anchorWidening\":%s,"
                         + "\"ownPosition\":%b,\"levels\":%d,\"levelStep\":%s,"
-                        + "\"innerFirst\":%b,\"levelGrowth\":%s,\"buyFarFirst\":%b,\"venueFills\":%b}",
+                        + "\"innerFirst\":%b,\"levelGrowth\":%s,\"buyFarFirst\":%b,\"venueFills\":%b,\"venueReads\":%b}",
                 symbol, tag.id(), num(size), num(inventoryCap), num(offset),
                 num(cfg.simSkewK()), num(skewTarget), periodMs, num(minNotional()),
                 num(spec.baseStep()), num(quoteStep()), num(parkDistance),
@@ -273,7 +275,7 @@ public class Executor {
                 // повтор журнала положил бы уровни через равный шаг.
                 System.getProperty("revx.sim.level-growth", "1.0"),
                 // Порядок раздачи кассы по бидам (дальние первыми) — тоже вне параметров бота.
-                QuoteLoop.BUY_FAR_FIRST, QuoteLoop.VENUE_FILLS);
+                QuoteLoop.BUY_FAR_FIRST, QuoteLoop.VENUE_FILLS, QuoteLoop.VENUE_READS);
     }
 
     private static String num(double v) {
