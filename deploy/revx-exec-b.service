@@ -39,7 +39,7 @@ EnvironmentFile=/etc/revx-exec-b.env
 # ⚠️ Контроль повтора на боте B даёт 72.6% совпавших котировок против 99.92% у
 # A. Причина не разобрана. Это относится к сверке симуляции с живым, а не к
 # самой торговле, но доверие к числам по SOL ниже, чем к биткойновым.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-exec-b/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.exec.venue-fills=true -jar /home/ubuntu/revx-exec-b/app.jar --revx-exec \
   --revx.exec.bot-id=b \
   --revx.exec.symbol=SOL/USDC \
   --revx.exec.journal=state/exec-b-sol.db \
@@ -65,7 +65,7 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -jar /home/ubuntu/revx-ex
 # монеты в одну позицию.
 
 # ПЛАНОВАЯ остановка ПАРКУЕТ заявки, а не снимает их: восстановление после# отмены стоит 3-6 постановок (замер 07.09.2026), а оставленную заявку# вернувшийся бот усыновляет по метке и двигает через PUT — бесплатно.# ⚠️ Аварийная остановка по-прежнему снимает всё: --revx-panic на кнопке в боте# и на ручном запуске (ТЗ §6). Трогает ТОЛЬКО свои заявки.
-ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-b/app.jar --revx-park --revx.exec.bot-id=b --revx.exec.symbol=SOL/USDC --revx.exec.journal=state/exec-b-sol.db || true'
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -Drevx.exec.venue-fills=true -jar /home/ubuntu/revx-exec-b/app.jar --revx-park --revx.exec.bot-id=b --revx.exec.symbol=SOL/USDC --revx.exec.journal=state/exec-b-sol.db || true'
 
 SuccessExitStatus=143
 Restart=no

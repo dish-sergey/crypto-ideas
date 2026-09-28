@@ -26,7 +26,7 @@ EnvironmentFile=/etc/revx-exec-d.env
 # Волатильность окна для ADA была близка к норме (среднее движение 3.97% против
 # базовых 3.31% за два года, отношение 1.20), так что хрупкость — свойство пары,
 # а не окна.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -jar /home/ubuntu/revx-exec-d/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -Drevx.exec.venue-fills=true -jar /home/ubuntu/revx-exec-d/app.jar --revx-exec \
   --revx.exec.bot-id=d \
   --revx.exec.symbol=ETH/USDC \
   --revx.exec.journal=state/exec-d-eth.db \
@@ -67,7 +67,7 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1
 # планового рестарта, где процесс возвращается через секунды.
 #
 # Трогает ТОЛЬКО свои заявки: чужие отличаются по метке в client_order_id.
-ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-d/app.jar --revx-park --revx.exec.bot-id=d --revx.exec.symbol=ETH/USDC --revx.exec.journal=state/exec-d-eth.db || true'
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -Drevx.exec.venue-fills=true -jar /home/ubuntu/revx-exec-d/app.jar --revx-park --revx.exec.bot-id=d --revx.exec.symbol=ETH/USDC --revx.exec.journal=state/exec-d-eth.db || true'
 
 # Намеренно НЕТ автоперезапуска: перезапуск после падения не должен сам
 # возобновлять торговлю. Котирование в любом случае стартует выключенным.
