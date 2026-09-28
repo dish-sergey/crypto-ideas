@@ -337,8 +337,12 @@ public final class Forecast {
         double quoteStart = bots.stream().mapToDouble(BotSpec::inventoryCap).sum()
                 * refPrice * 1.2;
         double startBase = startInventory(ticks, bots);
+        // Ничейный буфер на счёте (лотов первого бота): монета, которую никто не
+        // затравил и не купил, — ею бот покрывает своё запертое призраком (§3.6).
+        double extraBase = Double.parseDouble(System.getProperty("revx.sim.extra-base-lots", "0"))
+                * bots.getFirst().size();
         SimVenue venue = new SimVenue(clock, model, base.symbol(),
-                startBase, quoteStart, base.minNotional());
+                startBase + extraBase, quoteStart, base.minNotional());
 
         Path dir = Files.createTempDirectory("revx-forecast");
         List<ExecJournal> journals = new ArrayList<>();

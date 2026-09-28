@@ -859,8 +859,8 @@ public final class QuoteLoop implements Runnable {
         }
 
         double buyCash = alloc != null
-                ? Math.max(0, alloc.own(tag.id(), quote) - lockedQuote()) : Double.MAX_VALUE;
-        double sellPool = Math.max(0, inventory - lockedBase());
+                ? Math.max(0, alloc.own(tag.id(), quote) - lockedQuoteEff()) : Double.MAX_VALUE;
+        double sellPool = Math.max(0, inventory - lockedBaseEff());
         double buyRoom = buyRoom();
         for (var r : current) {
             Resting slot = r.side() == Side.BUY ? bids.get(r.level()) : asks.get(r.level());
@@ -1919,8 +1919,8 @@ public final class QuoteLoop implements Runnable {
         // ближнего начинать или с дальнего» на половине конструкции просто не
         // задан.
         double buyCash = alloc != null
-                ? Math.max(0, alloc.own(tag.id(), quote) - lockedQuote()) : Double.MAX_VALUE;
-        double sellPool = Math.max(0, inventory - lockedBase());
+                ? Math.max(0, alloc.own(tag.id(), quote) - lockedQuoteEff()) : Double.MAX_VALUE;
+        double sellPool = Math.max(0, inventory - lockedBaseEff());
         levelTicks++;
         for (int i = 0; i < levels; i++) {
             if (bids.get(i).venueId != null) {
@@ -2284,7 +2284,7 @@ public final class QuoteLoop implements Runnable {
         // позицию к нулю, а не в том, чтобы менять её состав.
         // Запертое призраком (§3.6) в позиции есть, а продать его нельзя.
         double ownPositionCap = side == Side.SELL
-                ? Math.max(0, inventory - lockedBase())
+                ? Math.max(0, inventory - lockedBaseEff())
                 : (frozenUnwind ? 0 : Math.max(0, params.inventoryCap() - inventory));
         // Симметрично для покупки: тратить можно только СВОЮ долю кассы, иначе
         // бот покупает на деньги соседа. У бота B это стоило 197 отказов
@@ -2296,7 +2296,7 @@ public final class QuoteLoop implements Runnable {
         // сумме потолков $49.13, и требовать полного покрытия было бы нельзя.
         double ownCashCap = Double.MAX_VALUE;
         if (side == Side.BUY && alloc != null && price > 0) {
-            ownCashCap = Math.max(0, alloc.own(tag.id(), quote) - lockedQuote()) / price;
+            ownCashCap = Math.max(0, alloc.own(tag.id(), quote) - lockedQuoteEff()) / price;
         }
         // ⚠️ ПРОДАЖУ ОГРАНИЧИВАЕТ И ЗАХВАТ, А НЕ ТОЛЬКО СВОЙ СЧЁТЧИК.
         //
@@ -2319,7 +2319,7 @@ public final class QuoteLoop implements Runnable {
         // чужого. Само расхождение по-прежнему только логируется.
         double ownClaimCap = Double.MAX_VALUE;
         if (side == Side.SELL && alloc != null) {
-            ownClaimCap = Math.max(0, alloc.own(tag.id(), base) - lockedBase());
+            ownClaimCap = Math.max(0, alloc.own(tag.id(), base) - lockedBaseEff());
         }
         return Math.min(Math.min(want, ownClaimCap),
                 Math.min(Math.min(affordable, ownPositionCap), ownCashCap));
@@ -5230,6 +5230,35 @@ public final class QuoteLoop implements Runnable {
         return sum;
     }
 
+    /**
+     * 🔑 БУФЕР: запертое своё покрывается НИЧЕЙНЫМ свободным на счёте (решение
+     * владельца 28.09.2026). Продать ничейную монету вместо своей запертой — верно
+     * по учёту: претензия бота −лот, всего на счёте −лот, ничейное то же; призрак
+     * отпустит — своя монета займёт место проданной. Не берём только ЧУЖОЕ
+     * (числящееся за другими ботами): ничейное = всего − Σ претензий всех ботов.
+     * Не продаём лишь ту часть запертого, что буфером не покрыта.
+     */
+    private double ownerlessFree(String currency, double total, double available) {
+        if (alloc == null || !Double.isFinite(total)) {
+            return 0;
+        }
+        return Math.max(0, Math.min(total - claimedAll(currency, clock.now()), available));
+    }
+
+    /** Запертая своя монета, НЕ покрытая буфером: её одну и нельзя продавать. */
+    double lockedBaseEff() {
+        double locked = lockedBase();
+        return locked <= 0 ? 0
+                : Math.max(0, locked - ownerlessFree(base, baseTotalAccount, baseAvailable));
+    }
+
+    /** Запертая своя касса, не покрытая ничейными USDC. */
+    double lockedQuoteEff() {
+        double locked = lockedQuote();
+        return locked <= 0 ? 0
+                : Math.max(0, locked - ownerlessFree(quote, quoteTotal, quoteBalance));
+    }
+
     /** Своя касса, запертая призраком покупки. */
     double lockedQuote() {
         double sum = 0;
@@ -5283,8 +5312,14 @@ public final class QuoteLoop implements Runnable {
             }
             if (gap >= g.amount * 0.9) {
                 g.confirmed = true;
+                double buffer = side == Side.SELL
+                        ? ownerlessFree(base, baseTotalAccount, baseAvailable)
+                        : ownerlessFree(quote, quoteTotal, quoteBalance);
                 journal.event("ghost_confirmed", String.format(java.util.Locale.ROOT,
-                        "%s %s %s заперто: разрыв резерва %s", side, fmt(g.amount), unit, fmt(gap)));
+                        "%s %s %s заперто: разрыв резерва %s; ничейный буфер %s — %s",
+                        side, fmt(g.amount), unit, fmt(gap), fmt(buffer),
+                        buffer >= g.amount ? "покрывает, торгую как обычно"
+                                : "покрывает не всё, непокрытое не трогаю"));
             } else if (now - g.sinceMs >= GHOST_CONFIRM_MS) {
                 ghostSuspects.remove(g);
                 journal.event("ghost_false", String.format(java.util.Locale.ROOT,
