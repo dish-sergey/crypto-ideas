@@ -2296,6 +2296,17 @@ public final class QuoteLoop implements Runnable {
             // дальнему уровню значило бы продать один лот дважды.
             return resting.venueId == null ? 0 : resting.size;
         }
+        if (resting.venueId != null && partialStale(resting, targetPrice, clock.now())) {
+            // 🔑 ЧАСТИЧНАЯ ЗАЯВКА ОТСТАЛА — СНЯТЬ И ПОСТАВИТЬ ЗАНОВО (28.09.2026).
+            // Заменить её площадка не даёт, и ожидание «пока доберётся» на росте
+            // рынка длится часами: стенд SOL 18.09 — ближний бид 2+ часа на 103.737
+            // при цели 105.8–106.2, бот покупал только дальними уровнями и стоял
+            // пустым. Прежде это лечила случайно отмена всех заявок на каждом затыке.
+            cancel(side, resting, String.format(java.util.Locale.ROOT,
+                    "частичная заявка отстала от цели на %.1f б.п.",
+                    Math.abs(resting.price - targetPrice) / targetPrice * 1e4));
+            return resting.qSize;
+        }
         if (resting.venueId == null) {
             // ⚠️ ПОСТАНОВКА потолком тика НЕ ограничена, и намеренно: заявки в
             // книге нет вовсе, а это состояние дороже устаревшей цены. Постановок
@@ -5545,6 +5556,21 @@ public final class QuoteLoop implements Runnable {
 
     private record VenueTrade(String oid, String side, double qty, double notional, long lastTdt,
                               String status, String bot) {
+    }
+
+    /**
+     * Частичная заявка, отставшая от цели больше этого, снимается и ставится заново
+     * ({@code revx.exec.partial-stale-bp}, 0 — прежнее «ждать, пока доберётся»).
+     */
+    static final double PARTIAL_STALE_BP =
+            Double.parseDouble(System.getProperty("revx.exec.partial-stale-bp", "0"));
+    /** ...и висит частичной не меньше этого. */
+    static final long PARTIAL_STALE_MS = 60_000L;
+
+    private boolean partialStale(Resting r, double targetPrice, long now) {
+        return PARTIAL_STALE_BP > 0 && r.partial() && targetPrice > 0
+                && now - r.partialSinceMs >= PARTIAL_STALE_MS
+                && Math.abs(r.price - targetPrice) / targetPrice * 1e4 > PARTIAL_STALE_BP;
     }
 
     /** На затыке замереть на столько секунд вместо минуты с отменой ({@code revx.exec.stall-freeze-sec}). */
