@@ -81,6 +81,9 @@ public final class PlacementBudget implements AutoCloseable {
      */
     public static final int FLOOR_PER_DAY = 100;
 
+    /** Давление ноль, пока свободно больше этой доли общего котла. */
+    public static final double PRESSURE_KNEE = 0.5;
+
     private static final long DAY_MS = 86_400_000L;
 
     private static final String SCHEMA = """
@@ -123,7 +126,12 @@ public final class PlacementBudget implements AutoCloseable {
             }
             double free = tokens - reserve;
             double pool = Math.max(1.0, CAPACITY - reserve);
-            return Math.max(0.0, Math.min(1.0, 1.0 - free / pool));
+            // ⚠️ КОЛЕНО НА ПОЛОВИНЕ КОТЛА (28.09.2026). Прежняя линейная кривая
+            // давила от полного ведра: при 679 из 850 бот, выбравший свою сотню,
+            // раздвигал отступы на 23% — XRP уезжал с 12 б.п. (стенд +0.176 $/сут)
+            // к ~15 (на 16 б.п. стенд давал +0.029). Пока свободно больше половины
+            // котла, нехватки нет и давить незачем; дальше — линейно до 1.
+            return Math.max(0.0, Math.min(1.0, 1.0 - free / (PRESSURE_KNEE * pool)));
         }
     }
 

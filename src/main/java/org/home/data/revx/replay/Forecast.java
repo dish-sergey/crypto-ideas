@@ -418,7 +418,9 @@ public final class Forecast {
                 if (sharedBudget != null) {
                     loop.placementBudget(sharedBudget);
                 } else {
-                    loop.placementCap(100_000);
+                    // -Drevx.sim.placement-cap — живой предел бота (100/250) вместо
+                    // снятого: для прогонов поведения у предела постановок.
+                    loop.placementCap(Integer.getInteger("revx.sim.placement-cap", 100_000));
                 }
                 // ⚠️ И денежные пределы — тоже в масштабе лота. Они записаны в
                 // абсолютных долларах под лот $1 (заявка ≤ $10, экспозиция ≤ $40),

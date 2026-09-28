@@ -1750,6 +1750,13 @@ public final class QuoteLoop implements Runnable {
 
         if (!quoting.get()) {
             pausedReason = "не запущен";
+            if (AUTO_RESUME_MS > 0 && limitStoppedMs > 0
+                    && clock.now() - limitStoppedMs >= AUTO_RESUME_MS
+                    && placementsLastDay() < placementCap() * BUDGET_UNWIND_OFF) {
+                limitStoppedMs = 0;
+                journal.event("auto_resume", "стенд: оператор включил бота после остановки по пределу");
+                startQuoting();
+            }
             return;
         }
         // Две паузы, обе про площадку, а не про рынок: пока она тормозит на
@@ -1852,7 +1859,7 @@ public final class QuoteLoop implements Runnable {
                         sw.side() > 0 ? "вверх" : "вниз", sw.notional(), sweepBp));
             }
         }
-        Quoter.Quotes target = frozenUnwind
+        Quoter.Quotes target = frozenUnwind || budgetUnwind
                 ? unwindQuoter().quotes(quoteFair, inventory, drift)
                 : policy.quotes(quoteFair, inventory, drift);
         // ОДНОСТОРОННИЙ СДВИГ: считаем котировку ДВАЖДЫ и берём одну сторону от
@@ -2505,6 +2512,7 @@ public final class QuoteLoop implements Runnable {
             journal.event("limit_blocked",
                     "постановки за сутки: " + used + " из "
                             + placementCap());
+            limitStoppedMs = clock.now();
             stopQuoting();
             return;
         }
@@ -5493,6 +5501,62 @@ public final class QuoteLoop implements Runnable {
                               String status, String bot) {
     }
 
+    // ------------------------------------------------ распродажа перед пределом постановок
+
+    /**
+     * 🔑 ПЕРЕД ОСТАНОВКОЙ ПО ПРЕДЕЛУ ПОСТАНОВОК — ЦЕЛЬ СКОСА В НОЛЬ (идея
+     * владельца 28.09.2026). Дойдя до суточного предела, бот гаснет до /start и
+     * носит запас всё это время. Израсходовав {@link #BUDGET_UNWIND_ON} предела,
+     * он охотнее продаёт и неохотнее покупает (цель 0 вместо 30%); когда расход
+     * за скользящие сутки опустится до {@link #BUDGET_UNWIND_OFF}, цель прежняя.
+     * Флаг {@code revx.exec.budget-unwind}.
+     */
+    static final boolean BUDGET_UNWIND =
+            Boolean.parseBoolean(System.getProperty("revx.exec.budget-unwind", "false"));
+    static final double BUDGET_UNWIND_ON = 0.9;
+    static final double BUDGET_UNWIND_OFF = 0.7;
+    private volatile boolean budgetUnwind;
+
+    /** Гистерезис: включение с 90% предела, выключение на 70%. */
+    static boolean budgetUnwindNext(boolean now, double usage) {
+        if (!now && usage >= BUDGET_UNWIND_ON) {
+            return true;
+        }
+        if (now && usage <= BUDGET_UNWIND_OFF) {
+            return false;
+        }
+        return now;
+    }
+
+    private void checkBudgetUnwind() {
+        if (!BUDGET_UNWIND) {
+            return;
+        }
+        long used = placementsLastDay();
+        double usage = (double) used / Math.max(1, placementCap());
+        boolean next = budgetUnwindNext(budgetUnwind, usage);
+        if (next != budgetUnwind) {
+            budgetUnwind = next;
+            String text = next
+                    ? String.format(java.util.Locale.ROOT,
+                            "постановок за сутки %d из %d — цель скоса 0: продаю охотнее, покупаю реже",
+                            used, placementCap())
+                    : String.format(java.util.Locale.ROOT,
+                            "постановок за сутки %d из %d — цель скоса снова обычная", used, placementCap());
+            log.info(text);
+            journal.event("budget_unwind", text);
+        }
+    }
+
+    /**
+     * Только стенд: «оператор» снова включает бота через столько после остановки
+     * по пределу постановок ({@code revx.sim.auto-resume-min}). Живьём /start даёт
+     * человек, и без этого прогон после первой остановки был бы мёртв до конца.
+     */
+    static final long AUTO_RESUME_MS =
+            Long.getLong("revx.sim.auto-resume-min", 0L) * 60_000L;
+    private long limitStoppedMs;
+
     // ------------------------------------------------ минута затыков
 
     /**
@@ -5791,6 +5855,7 @@ public final class QuoteLoop implements Runnable {
             // Остатки перечитываются раз в минуту: исполнение могло случиться молча.
             refreshBalances();
             trackGhosts(now);
+            checkBudgetUnwind();
             if (budget != null) {
                 PlacementBudget.State state = budget.state(tag.id(), now);
                 double was = budgetPressure;
