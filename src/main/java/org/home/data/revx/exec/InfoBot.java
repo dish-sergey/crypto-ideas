@@ -690,15 +690,22 @@ public final class InfoBot implements Runnable {
             // сборщик, и отчёт раз в двадцать пять секунд обошёлся бы дороже
             // того, что он сторожит.
             long lastTick;
+            long lastStart;
             boolean quoting;
             try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
                 quoting = j.quotingOn();
                 lastTick = j.lastQuoteMs();
+                lastStart = j.lastStartMs();
             } catch (Exception e) {
                 continue;             // журнала нет — про это скажет /all строкой
             }
             String id = w.botId().toLowerCase(Locale.ROOT);
-            boolean silent = quoting && lastTick > 0 && now - lastTick > SILENCE_MS;
+            // ⚠️ Отсчёт тишины — от последнего тика ИЛИ от /start, что позже. Иначе
+            // сразу после /start, пока первый тик нового процесса не записан, сторож
+            // видел тик прежнего процесса минутной давности и кричал «МОЛЧИТ»
+            // (28.09.2026 20:06, бот d).
+            boolean silent = quoting && lastTick > 0
+                    && now - Math.max(lastTick, lastStart) > SILENCE_MS;
             Long told = silenceTold.get(id);
             if (!silent) {
                 if (told != null) {

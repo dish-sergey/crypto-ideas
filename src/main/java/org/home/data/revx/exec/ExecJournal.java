@@ -860,6 +860,17 @@ public final class ExecJournal implements AutoCloseable {
      * которые на самом деле стоят. Замечено 07.09.2026 после выкатки: последний
      * start в 15:04, за ним два boot, а в сводке — шесть зелёных строк.
      */
+    /** Когда котирование последний раз включали ({@code start}); 0 — не включали. */
+    public synchronized long lastStartMs() {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT MAX(ts_ms) FROM exec_event WHERE kind = 'start'");
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? rs.getLong(1) : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     public synchronized boolean quotingOn() {
         try (PreparedStatement ps = connection.prepareStatement(
                 "SELECT kind FROM exec_event WHERE kind IN ('start','stop','boot') "
