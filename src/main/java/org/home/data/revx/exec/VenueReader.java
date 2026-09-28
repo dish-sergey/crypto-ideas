@@ -456,6 +456,14 @@ public class VenueReader {
                 continue;
             }
             for (String[] t : rows) {
+                // ⚠️ Только пара, которой бот торгует СЕЙЧАС. После смены пары
+                // (28.09.2026: c и d с ETH на XRP) его сделки по старой паре лежат в
+                // СТАРОМ журнале, и сверка с новым дала 42 ложных «не записано».
+                if (!ActiveOrder.normalize(t[1]).equals(ActiveOrder.normalize(w.symbol()))) {
+                    exec("UPDATE shadow_diff SET resolved_ms = COALESCE(resolved_ms, ?) WHERE oid = ?",
+                            now, t[0]);
+                    continue;
+                }
                 double traded = Double.parseDouble(t[3]);
                 double own = booked.getOrDefault(t[0], 0.0);
                 boolean differs = Math.abs(traded - own) > 1e-12;
