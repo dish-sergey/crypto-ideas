@@ -90,4 +90,37 @@ class InfoBotVenueTest {
                         + "VALUES('y', 'a', 1, 1, " + now + ")");
         assertEquals(1, bot(db).venueState().unbooked());
     }
+
+    /**
+     * Запертое без заявки: какие монеты, сколько и во что это в USDC. Цена — из
+     * последнего тика бота на этой монете; без бота — «цена ?», не ноль.
+     */
+    @Test
+    void запертоеПоМонетамИВДолларах(@TempDir Path dir) throws Exception {
+        long now = System.currentTimeMillis();
+        Path db = dir.resolve("venue.db");
+        venue(db, now, now,
+                "INSERT INTO reserve_gap VALUES('USDC', 48.4, 33.3, 15.1, " + (now - 600_000) + ", " + now + ")",
+                "INSERT INTO reserve_gap VALUES('SOL', 0.05, 0, 0.05, " + (now - 900_000) + ", " + now + ")",
+                "INSERT INTO reserve_gap VALUES('ADA', 3, 0, 3, " + (now - 900_000) + ", " + now + ")",
+                // свежее пяти минут — ещё не показываем
+                "INSERT INTO reserve_gap VALUES('ETH', 1, 0, 1, " + (now - 60_000) + ", " + now + ")");
+        Path journal = dir.resolve("f.db");
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + journal);
+             Statement st = c.createStatement()) {
+            st.execute("CREATE TABLE exec_quote(ts_ms INTEGER, fair REAL)");
+            st.execute("INSERT INTO exec_quote VALUES(1, 100), (2, 120)");
+        }
+        System.setProperty("revx.info.venue", db.toString());
+        InfoBot bot = new InfoBot("t", 1,
+                List.of(new InfoBot.Watched("f", "SOL/USDC", journal.toString())), "нет-реестра.db");
+        InfoBot.VenueState v = bot.venueState();
+        assertEquals(3, v.reserveGaps());
+        String text = bot.gapLines(v.gaps(), now);
+        assertTrue(text.contains("21.10 USDC + монеты без цены"), text);   // 15.1 + 0.05 × 120
+        assertTrue(text.contains("SOL 0.05000000 (≈ 6.00 USDC)"), text);
+        assertTrue(text.contains("USDC 15.10 (≈ 15.10 USDC)"), text);
+        assertTrue(text.contains("ADA 3.00000000 (цена ?)"), text);
+        assertFalse(text.contains("ETH"), text);
+    }
 }

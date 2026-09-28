@@ -162,12 +162,19 @@ public final class InfoBot implements Runnable {
 
     /** Состояние читателя одной строкой — для сторожа и для /all. */
     record VenueState(boolean deployed, long lastOkMs, long lastCycleMs, long errors,
-                      long throttled, String lastError, int unbooked, int reserveGaps) {
+                      long throttled, String lastError, int unbooked, List<Gap> gaps) {
+        int reserveGaps() {
+            return gaps.size();
+        }
+    }
+
+    /** Заперто без видимой заявки: монета, сколько, с какого момента. */
+    record Gap(String currency, double amount, long sinceMs) {
     }
 
     VenueState venueState() {                              // пакетный доступ: тест
         if (!java.nio.file.Files.exists(java.nio.file.Path.of(venuePath))) {
-            return new VenueState(false, 0, 0, 0, 0, null, 0, 0);
+            return new VenueState(false, 0, 0, 0, 0, null, 0, List.of());
         }
         try (java.sql.Connection c = java.sql.DriverManager.getConnection(
                 "jdbc:sqlite:file:" + venuePath + "?mode=ro");
@@ -192,14 +199,17 @@ public final class InfoBot implements Runnable {
                     "SELECT COUNT(*) FROM shadow_diff WHERE resolved_ms IS NULL")) {
                 unbooked = rs.next() ? rs.getInt(1) : 0;
             }
-            int gaps = 0;
+            List<Gap> gaps = new java.util.ArrayList<>();
             try (java.sql.ResultSet rs = st.executeQuery(
-                    "SELECT COUNT(*) FROM reserve_gap WHERE updated_ms - since_ms > 300000")) {
-                gaps = rs.next() ? rs.getInt(1) : 0;
+                    "SELECT currency, gap, since_ms FROM reserve_gap "
+                            + "WHERE updated_ms - since_ms > 300000 ORDER BY currency")) {
+                while (rs.next()) {
+                    gaps.add(new Gap(rs.getString(1), rs.getDouble(2), rs.getLong(3)));
+                }
             }
             return new VenueState(true, ok, cycle, errors, throttled, last, unbooked, gaps);
         } catch (Exception e) {
-            return new VenueState(true, 0, 0, 0, 0, e.toString(), 0, 0);
+            return new VenueState(true, 0, 0, 0, 0, e.toString(), 0, List.of());
         }
     }
 
@@ -278,8 +288,57 @@ public final class InfoBot implements Runnable {
                 v.errors(), v.throttled(),
                 v.unbooked() > 0 ? String.format(Locale.ROOT, "%n  ⚠️ незаписанных исполнений: %d",
                         v.unbooked()) : "",
-                v.reserveGaps() > 0 ? String.format(Locale.ROOT,
-                        "%n  заперто без заявки дольше 5 мин: %d монет(ы)", v.reserveGaps()) : "");
+                gapLines(v.gaps(), now));
+    }
+
+    /**
+     * Что именно заперто без заявки и сколько это в USDC. Цена монеты — последний
+     * тик бота, который ею торгует; монету без своего бота оцениваем как «цена ?».
+     */
+    String gapLines(List<Gap> gaps, long now) {                 // пакетный доступ: тест
+        if (gaps.isEmpty()) {
+            return "";
+        }
+        StringBuilder out = new StringBuilder();
+        double totalUsdc = 0;
+        boolean unpriced = false;
+        for (Gap g : gaps) {
+            double px = "USDC".equals(g.currency()) ? 1.0 : priceOf(g.currency());
+            String value;
+            if (px > 0) {
+                totalUsdc += g.amount() * px;
+                value = String.format(Locale.ROOT, "≈ %.2f USDC", g.amount() * px);
+            } else {
+                unpriced = true;
+                value = "цена ?";
+            }
+            out.append(String.format(Locale.ROOT, "%n    %s %s (%s), %s",
+                    g.currency(), "USDC".equals(g.currency())
+                            ? String.format(Locale.ROOT, "%.2f", g.amount()) : fmtQty(g.amount()),
+                    value, g.sinceMs() > 0 ? "с " + java.time.format.DateTimeFormatter.ofPattern("dd.MM HH:mm").withZone(java.time.ZoneOffset.UTC).format(java.time.Instant.ofEpochMilli(g.sinceMs())) + " UTC" : "давно"));
+        }
+        return String.format(Locale.ROOT, "%n  🔒 заперто без заявки дольше 5 мин: %.2f USDC%s%s",
+                totalUsdc, unpriced ? " + монеты без цены" : "", out);
+    }
+
+    /** Цена монеты по последнему тику бота на ней; 0 — нет такого бота или тика. */
+    private double priceOf(String currency) {
+        for (Watched w : watched) {
+            if (!w.base().equals(currency)) {
+                continue;
+            }
+            try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                    "jdbc:sqlite:file:" + w.journalPath() + "?mode=ro");
+                 java.sql.ResultSet rs = c.createStatement().executeQuery(
+                         "SELECT fair FROM exec_quote WHERE fair > 0 ORDER BY ts_ms DESC LIMIT 1")) {
+                if (rs.next()) {
+                    return rs.getDouble(1);
+                }
+            } catch (Exception e) {
+                log.debug("цена {} из журнала {} не прочитана: {}", currency, w.botId(), e.toString());
+            }
+        }
+        return 0;
     }
 
     /** Когда последний раз говорили про диск и про залежавшуюся книгу. */
