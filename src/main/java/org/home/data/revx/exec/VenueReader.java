@@ -112,7 +112,7 @@ public class VenueReader {
     public VenueReader(RevxConfig cfg,
                        @Value("${revx.info.bots}") List<String> botSpec,
                        @Value("${revx.venue.db:/home/ubuntu/revx-shared/venue.db}") String dbPath,
-                       @Value("${revx.venue.symbols:BTC-USDC,ETH-USDC,SOL-USDC}") List<String> symbols,
+                       @Value("${revx.venue.symbols:BTC-USDC,XRP-USDC,SOL-USDC}") List<String> symbols,
                        @Value("${revx.venue.cycle-ms:2000}") long cycleMs) {
         this.cycleMs = cycleMs;
         this.cfg = cfg;

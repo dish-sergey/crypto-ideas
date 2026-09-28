@@ -1,5 +1,5 @@
 [Unit]
-Description=Revolut X micro-live BOT D (REAL orders) — ADA/USDC
+Description=Revolut X micro-live BOT D (REAL orders) — XRP/USDC
 After=network-online.target revx-collect.service
 Wants=network-online.target
 
@@ -28,10 +28,10 @@ EnvironmentFile=/etc/revx-exec-d.env
 # а не окна.
 ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -jar /home/ubuntu/revx-exec-d/app.jar --revx-exec \
   --revx.exec.bot-id=d \
-  --revx.exec.symbol=ETH/USDC \
-  --revx.exec.journal=state/exec-d-eth.db \
-  --revx.exec.size=0.00080530 \
-  --revx.exec.inventory-cap=0.00563710 \
+  --revx.exec.symbol=XRP/USDC \
+  --revx.exec.journal=state/exec-d-xrp.db \
+  --revx.exec.size=1.42 \
+  --revx.exec.inventory-cap=9.94 \
   --revx.exec.offset=0.0012 \
   --revx.exec.skew-target=0.3 \
   --revx.exec.max-loss=6.0 \
@@ -67,7 +67,7 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1
 # планового рестарта, где процесс возвращается через секунды.
 #
 # Трогает ТОЛЬКО свои заявки: чужие отличаются по метке в client_order_id.
-ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -Drevx.exec.venue-fills=true -jar /home/ubuntu/revx-exec-d/app.jar --revx-park --revx.exec.bot-id=d --revx.exec.symbol=ETH/USDC --revx.exec.journal=state/exec-d-eth.db || true'
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -Drevx.exec.venue-fills=true -jar /home/ubuntu/revx-exec-d/app.jar --revx-park --revx.exec.bot-id=d --revx.exec.symbol=XRP/USDC --revx.exec.journal=state/exec-d-xrp.db || true'
 
 # Намеренно НЕТ автоперезапуска: перезапуск после падения не должен сам
 # возобновлять торговлю. Котирование в любом случае стартует выключенным.

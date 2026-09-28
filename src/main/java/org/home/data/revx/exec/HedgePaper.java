@@ -69,7 +69,8 @@ public class HedgePaper {
     static final long WAIT_MS = 30_000L;
     static final double MAKER_FEE = 2e-4;
     static final double TAKER_FEE = 4.9e-4;
-    static final Map<String, Double> STEP = Map.of("BTC", 1e-4, "ETH", 1e-3, "SOL", 1e-2);
+    /** Шаг контракта Kraken — общий справочник с сеткой хеджа (там и XRP, и прочие). */
+    static final Map<String, Double> STEP = HedgeGrid.STEP;
 
     enum Kind { BAND, EXCESS, PERIOD }
 
