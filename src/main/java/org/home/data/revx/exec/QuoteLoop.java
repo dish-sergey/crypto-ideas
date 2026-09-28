@@ -2491,8 +2491,21 @@ public final class QuoteLoop implements Runnable {
      * ведро недоступно или ошибочно щедро.
      */
     public long placementsLastDay() {
+        if (!(client instanceof TradeClient) && !(client instanceof VenueReads)) {
+            // ⚠️ Стенд: запросы к площадке в журнал не пишутся, и счёт по журналу там
+            // всегда ноль — предел постановок на стенде не срабатывал НИКОГДА
+            // (найдено 28.09.2026, прогон распродажи у предела). Считаем в памяти.
+            long from = clock.now() - 86_400_000L;
+            while (!placedAt.isEmpty() && placedAt.peekFirst() < from) {
+                placedAt.pollFirst();
+            }
+            return placedAt.size();
+        }
         return journal.placementsSince(clock.now() - 86_400_000L);
     }
+
+    /** Моменты своих постановок за сутки — только для стенда. */
+    private final java.util.ArrayDeque<Long> placedAt = new java.util.ArrayDeque<>();
 
     private void place(Side side, Resting resting, double price, double size) {
         trace("PLACE", side, resting, price, size);
@@ -2539,6 +2552,7 @@ public final class QuoteLoop implements Runnable {
                 .replaceAll("\\s*\\n\\s*", "");
         Venue.Response response = client.place(body);
         placements++;
+        placedAt.addLast(clock.now());
         if (response.ok()) {
             resting.venueId = extract(response.body());
             rememberLevel(side, resting);
