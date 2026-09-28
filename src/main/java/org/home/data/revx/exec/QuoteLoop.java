@@ -1517,6 +1517,7 @@ public final class QuoteLoop implements Runnable {
             // Иначе /status отвечает «котирует (не запущен)»: причина паузы
             // держится до следующего тика и противоречит состоянию.
             pausedReason = null;
+            sellOnly = false;                // новая попытка — распродажа решается заново
             journal.event("start", "котирование включено");
             log.warn("КОТИРОВАНИЕ ВКЛЮЧЕНО: {} по {} USDC", symbol, params.size());
         }
@@ -1862,6 +1863,9 @@ public final class QuoteLoop implements Runnable {
         Quoter.Quotes target = frozenUnwind || budgetUnwind
                 ? unwindQuoter().quotes(quoteFair, inventory, drift)
                 : policy.quotes(quoteFair, inventory, drift);
+        if (sellOnly) {
+            target = new Quoter.Quotes(null, target.ask());   // бид снимается, аск — заменами
+        }
         // ОДНОСТОРОННИЙ СДВИГ: считаем котировку ДВАЖДЫ и берём одну сторону от
         // сдвинутой опоры, другую от нетронутой.
         //
@@ -2505,7 +2509,17 @@ public final class QuoteLoop implements Runnable {
             return;
         }
         long used = placementsLastDay();
-        if (used >= placementCap()) {
+        if (BUDGET_UNWIND) {
+            // 🔑 У ПРЕДЕЛА НЕ ГАСНЕМ, А РАСПРОДАЁМСЯ (владелец 28.09.2026). Замены
+            // суточного лимита не тратят, поэтому стоящие продажи можно двигать к
+            // рынку сколько угодно. Последние постановки берегутся под продажи: к
+            // пределу продажи обязаны уже стоять.
+            int cap = placementCap();
+            if (used >= cap || (side == Side.BUY && used >= cap - levels)) {
+                enterSellOnly(used, cap);
+                return;
+            }
+        } else if (used >= placementCap()) {
             log.error("исчерпан АВАРИЙНЫЙ потолок постановок ({} из {} за 24 ч) — "
                             + "останавливаю котирование",
                     used, placementCap());
@@ -5516,6 +5530,34 @@ public final class QuoteLoop implements Runnable {
     static final double BUDGET_UNWIND_ON = 0.9;
     static final double BUDGET_UNWIND_OFF = 0.7;
     private volatile boolean budgetUnwind;
+    /** У предела постановок: покупок нет, продажи — заменами до нуля, потом остановка. */
+    private volatile boolean sellOnly;
+
+    private void enterSellOnly(long used, int cap) {
+        budgetUnwind = true;
+        if (sellOnly) {
+            return;
+        }
+        sellOnly = true;
+        String text = String.format(java.util.Locale.ROOT,
+                "постановок за сутки %d из %d — покупок больше не ставлю, продаю заменами до нуля, "
+                        + "потом остановка", used, cap);
+        log.warn(text);
+        journal.event("sell_only", text);
+    }
+
+    /** Распродано — останавливаемся, как прежде у предела (дальше /start). */
+    private void finishSellOnly() {
+        if (!sellOnly || inventory >= params.size() - 1e-12) {
+            return;
+        }
+        sellOnly = false;
+        long used = placementsLastDay();
+        journal.event("limit_blocked", "постановки за сутки: " + used + " из " + placementCap()
+                + " — распродано до нуля, остановка");
+        limitStoppedMs = clock.now();
+        stopQuoting();
+    }
 
     /** Гистерезис: включение с 90% предела, выключение на 70%. */
     static boolean budgetUnwindNext(boolean now, double usage) {
@@ -5530,6 +5572,10 @@ public final class QuoteLoop implements Runnable {
 
     private void checkBudgetUnwind() {
         if (!BUDGET_UNWIND) {
+            return;
+        }
+        if (sellOnly) {
+            finishSellOnly();          // распродажу заканчивает только ноль запаса
             return;
         }
         long used = placementsLastDay();
