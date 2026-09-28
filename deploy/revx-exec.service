@@ -46,12 +46,13 @@ EnvironmentFile=/etc/revx-exec.env
 #
 # Механизмы выключены ЯВНО, а не умолчанием: умолчание меняется правкой конфига,
 # и профиль однажды перестанет быть тем, чем задуман, молча.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -jar /home/ubuntu/revx-exec/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -Drevx.exec.quiet-minute=auto -Drevx.exec.budget-unwind=true -jar /home/ubuntu/revx-exec/app.jar --revx-exec \
   --revx.exec.bot-id=a \
   --revx.exec.symbol=BTC/USDC \
   --revx.exec.journal=state/exec.db \
-  --revx.exec.size=0.00003765 \
-  --revx.exec.inventory-cap=0.00026355 \
+  --revx.exec.size=0.00007530 \
+  --revx.exec.inventory-cap=0.00017570 \
+  --revx.exec.max-loss=2.0 \
   --revx.exec.offset=0.0012 \
   --revx.exec.skew-target=0.3 \
   --revx.exec.cost-floor-margin=-1 \
