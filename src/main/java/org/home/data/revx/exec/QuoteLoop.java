@@ -150,6 +150,18 @@ public final class QuoteLoop implements Runnable {
         boolean partial() {
             return partialId != null && partialId.equals(venueId);
         }
+
+        /**
+         * Этап 3, §3.3: снятая нами заявка, судьба которой ещё не окончательна.
+         * Пока она здесь, слот занят: новую не ставим, ресурс под ней держим.
+         */
+        String questioned;
+        Side qSide;
+        double qSize;
+        double qPrice;
+        long qSinceMs;
+        long qAskedMs;
+        long qRecancelMs;
     }
 
     public record Stats(long placements, long replaces, long cancels, long fills,
@@ -959,6 +971,9 @@ public final class QuoteLoop implements Runnable {
             log.error("экспозиция превысила бы предел {} — не ставлю", maxExposure);
             journal.event("limit_blocked", "экспозиция");
             return 0;
+        }
+        if (slot.questioned != null) {
+            return slot.qSize;                // заявка под вопросом: слот занят
         }
         if (clock.now() < slot.blockedUntilMs) {
             return slot.venueId == null ? 0 : slot.size;
@@ -2228,6 +2243,11 @@ public final class QuoteLoop implements Runnable {
         // Пауза после отказа площадки распространяется на ОБА действия. Отказ на
         // замене стоит четырёх запросов, и повторять его каждую секунду так же
         // вредно, как долбиться постановкой.
+        if (resting.questioned != null && resting.venueId == null) {
+            // §3.3: снятая заявка под вопросом — она ещё может исполниться, и
+            // ставить на её место вторую значит рискнуть двойной экспозицией.
+            return resting.qSize;
+        }
         if (clock.now() < resting.blockedUntilMs) {
             // Заявка не тронута, но ресурс под ней всё ещё занят: отдать его
             // дальнему уровню значило бы продать один лот дважды.
@@ -3014,6 +3034,9 @@ public final class QuoteLoop implements Runnable {
         journal.event("adopt", side + " " + keep.id() + " по " + fmt(keep.price())
                 + " (" + why + ")");
         resting.venueId = keep.id();
+        if (keep.id().equals(resting.questioned)) {
+            resting.questioned = null;        // «снятая» оказалась живой — ведём её дальше
+        }
         rememberLevel(side, resting);
         resting.price = keep.price();
         resting.size = keep.size();
@@ -3902,6 +3925,20 @@ public final class QuoteLoop implements Runnable {
         Venue.Response response = client.cancel(dead);
         cancels++;
         journal.event("cancel", side + " " + dead + " (" + why + ") → " + response.status());
+        if (VENUE_SLOTS) {
+            // 🔑 §3.3: ЛЮБОЙ ответ на отмену — не окончательный. В затык 204 бывает
+            // на заявку, которая исполнится через секунды, 404 — на живую. Слот
+            // держим, пока площадка не назовёт окончательную судьбу и после
+            // отмены не пройдёт QUIET_MS тишины.
+            resting.questioned = dead;
+            resting.qSide = side;
+            resting.qSize = resting.size;
+            resting.qPrice = resting.price;
+            resting.qSinceMs = clock.now();
+            resting.qAskedMs = 0;
+            resting.qRecancelMs = clock.now();
+            return;
+        }
         if (response.ok()) {
             journal.closeOrder(dead, "cancelled", clock.now());
         } else {
@@ -5438,8 +5475,79 @@ public final class QuoteLoop implements Runnable {
                               String status, String bot) {
     }
 
+    // ------------------------------------------------ этап 3, §3.3: слот под вопросом
+
+    /** Флаг {@code revx.exec.venue-slots}: снятая заявка держит слот до окончательной судьбы. */
+    static final boolean VENUE_SLOTS =
+            Boolean.parseBoolean(System.getProperty("revx.exec.venue-slots", "false"));
+    /** Тишина после отмены: сделка на живой приходила через 4 с после 204 (b, 22.09). */
+    static final long QUIET_MS = 10_000L;
+    /** Как часто спрашивать судьбу заявки под вопросом. */
+    static final long QUESTION_ASK_MS = 2_000L;
+    /** Жива после отмены — отменяем снова не чаще. */
+    static final long QUESTION_RECANCEL_MS = 5_000L;
+    /** Площадка так и не ответила — слот отпускаем, исполнение подберёт лента. */
+    static final long QUESTION_GIVEUP_MS = 30 * 60_000L;
+
+    private void settleQuestioned(long now) {
+        if (!VENUE_SLOTS) {
+            return;
+        }
+        for (Resting r : bids) {
+            settleQuestioned(r, now);
+        }
+        for (Resting r : asks) {
+            settleQuestioned(r, now);
+        }
+    }
+
+    private void settleQuestioned(Resting r, long now) {
+        if (r.questioned == null || now - r.qAskedMs < QUESTION_ASK_MS) {
+            return;
+        }
+        r.qAskedMs = now;
+        String id = r.questioned;
+        Venue.Response resp = client.order(id);
+        if (resp.ok() && resp.body() != null) {
+            unknownFate.remove(id);
+            String status = book(r.qSide, id, resp.body());      // исполнение — разницей
+            if (status != null && !terminal(status)) {
+                // Жива после нашей отмены (404 на живую, 204 «на словах»): снимаем снова.
+                if (now - r.qRecancelMs >= QUESTION_RECANCEL_MS) {
+                    r.qRecancelMs = now;
+                    Venue.Response again = client.cancel(id);
+                    cancels++;
+                    journal.event("question_recancel", r.qSide + " " + id + ": после отмены «"
+                            + status + "» — снимаю снова → " + again.status());
+                }
+                return;
+            }
+            if (status != null && now - r.qSinceMs >= QUIET_MS) {
+                journal.closeOrder(id, status, now);
+                if (now - r.qSinceMs > QUIET_MS + QUESTION_ASK_MS) {
+                    journal.event("question_settled", String.format(java.util.Locale.ROOT,
+                            "%s %s: судьба «%s» через %d с — слот свободен",
+                            r.qSide, id, status, (now - r.qSinceMs) / 1000));
+                }
+                r.questioned = null;
+            }
+            return;
+        }
+        if (now - r.qSinceMs >= QUESTION_GIVEUP_MS) {
+            String text = String.format(java.util.Locale.ROOT,
+                    "%s %s: судьба не выяснена за %d мин (последний ответ %d) — слот отпускаю, "
+                            + "исполнение, если было, придёт лентой",
+                    r.qSide, id, (now - r.qSinceMs) / 60_000, resp.status());
+            log.warn(text);
+            journal.event("question_expired", text);
+            unknownFate.putIfAbsent(id, new UnknownFate(r.qSide, now));
+            r.questioned = null;
+        }
+    }
+
     private void rollCounters() {
         long now = clock.now();
+        settleQuestioned(now);
         if (VENUE_FILLS && now - lastVenueFillsMs >= VENUE_FILLS_EVERY_MS && ledgerActive()) {
             lastVenueFillsMs = now;
             venueFresh = readerFresh(now);
