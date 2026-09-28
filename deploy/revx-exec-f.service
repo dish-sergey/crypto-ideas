@@ -35,7 +35,7 @@ EnvironmentFile=/etc/revx-exec-f.env
 #
 # Ценность запуска не в деньгах, а в проверке модели очереди на тонком рынке:
 # это единственная гипотеза обхода, которую нельзя закрыть счётом.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -jar /home/ubuntu/revx-exec-f/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -Drevx.exec.venue-fills=true -jar /home/ubuntu/revx-exec-f/app.jar --revx-exec \
   --revx.exec.bot-id=f \
   --revx.exec.symbol=SOL/USDC \
   --revx.exec.journal=state/exec-f-sol.db \
