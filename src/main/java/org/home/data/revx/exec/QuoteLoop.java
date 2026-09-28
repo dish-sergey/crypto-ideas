@@ -1793,6 +1793,14 @@ public final class QuoteLoop implements Runnable {
             // родить не может. Платим постановками за возврат: при суточной
             // тысяче и нашем расходе в 124 это по карману.
             if (clock.now() < stallUntilMs) {
+                if (STALL_FREEZE_MS > 0) {
+                    // 🔑 ЗАМЕРЕТЬ, А НЕ СНИМАТЬ (владелец 28.09.2026). За неделю 75
+                    // затыков из 87 кончились за 5 с; призрак рождается на замене,
+                    // которая УЖЕ в пути, и отмена после первого медленного ответа его
+                    // не спасает. Поэтому STALL_FREEZE_MS никаких запросов записи — ни
+                    // замен, ни отмен — и продолжаем с теми же заявками.
+                    return;
+                }
                 if (STALL_FREEZE_OUTER && levels > 1) {
                     // 🔑 ЗАМОРОЗКА ДАЛЬНИХ (владелец 28.09.2026): снимается только
                     // ближний уровень, дальние минуту стоят как стояли — ни замены
@@ -3261,7 +3269,7 @@ public final class QuoteLoop implements Runnable {
         }
         long now = clock.now();
         boolean fresh = now >= stallUntilMs;
-        stallUntilMs = now + STALL_STAND_ASIDE_MS;
+        stallUntilMs = now + (STALL_FREEZE_MS > 0 ? STALL_FREEZE_MS : STALL_STAND_ASIDE_MS);
         if (!fresh) {
             return;                       // всплеск продолжается — окно продлили, шуметь незачем
         }
@@ -5538,6 +5546,9 @@ public final class QuoteLoop implements Runnable {
     private record VenueTrade(String oid, String side, double qty, double notional, long lastTdt,
                               String status, String bot) {
     }
+
+    /** На затыке замереть на столько секунд вместо минуты с отменой ({@code revx.exec.stall-freeze-sec}). */
+    static final long STALL_FREEZE_MS = Long.getLong("revx.exec.stall-freeze-sec", 0L) * 1000L;
 
     /** На затыке снимать только ближний уровень ({@code revx.exec.stall-freeze-outer}). */
     static final boolean STALL_FREEZE_OUTER =
