@@ -109,11 +109,29 @@ public class VenueReader {
     private String lastError;
     private volatile boolean alive = true;
 
+    /** Зонд затыков ({@link StallProbe}) — единственное, что читатель СТАВИТ на площадку. */
+    private final boolean probeOn;
+    private final String probeSymbol;
+    private final String probeBookDb;
+    private final double probeTick;
+    private final double probeSizeStep;
+    private StallProbe probe;
+
     public VenueReader(RevxConfig cfg,
                        @Value("${revx.info.bots}") List<String> botSpec,
                        @Value("${revx.venue.db:/home/ubuntu/revx-shared/venue.db}") String dbPath,
                        @Value("${revx.venue.symbols:BTC-USDC,XRP-USDC,SOL-USDC}") List<String> symbols,
-                       @Value("${revx.venue.cycle-ms:2000}") long cycleMs) {
+                       @Value("${revx.venue.cycle-ms:2000}") long cycleMs,
+                       @Value("${revx.venue.probe:false}") boolean probeOn,
+                       @Value("${revx.venue.probe-symbol:XRP-USDC}") String probeSymbol,
+                       @Value("${revx.venue.probe-book-db:/home/ubuntu/revx/data/revx.db}") String probeBookDb,
+                       @Value("${revx.venue.probe-tick:0.0001}") double probeTick,
+                       @Value("${revx.venue.probe-size-step:0.00001}") double probeSizeStep) {
+        this.probeOn = probeOn;
+        this.probeSymbol = probeSymbol;
+        this.probeBookDb = probeBookDb;
+        this.probeTick = probeTick;
+        this.probeSizeStep = probeSizeStep;
         this.cycleMs = cycleMs;
         this.cfg = cfg;
         this.botSpec = botSpec;
@@ -139,6 +157,13 @@ public class VenueReader {
                     st.execute(ddl);
                 }
             }
+            st.execute(StallProbe.SCHEMA);
+        }
+        if (probeOn) {
+            probe = new StallProbe(cfg.baseUrl(), auth, http, db, probeSymbol, probeBookDb,
+                    probeTick, probeSizeStep);
+            log.warn("зонд затыков включён: {} — заявка на ~{} USDC на {}% ниже рынка, замена раз в {} мс",
+                    probeSymbol, StallProbe.NOTIONAL, (int) (StallProbe.AWAY * 100), StallProbe.PERIOD_MS);
         }
         try (ResultSet rs = db.createStatement().executeQuery(
                 "SELECT symbol, MAX(tdt) FROM trade GROUP BY symbol")) {
@@ -161,6 +186,9 @@ public class VenueReader {
             boolean ok = false;
             try {
                 ok = snapshotActive();
+                if (probe != null) {
+                    probe.tick(t0);
+                }
                 pullTrades(symbols.get((int) (cycle % symbols.size())));
                 checkOrders();
                 if (cycle % BALANCE_EVERY == 0) {

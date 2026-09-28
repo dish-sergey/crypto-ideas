@@ -25,7 +25,7 @@ EnvironmentFile=/etc/revx-exec.env
 #
 # Цикл 2 с в тени (~65 GET/мин): с шестью ботами по старой логике секундный
 # читатель давал ≈910 GET/мин из 1000 (VenueReader.cycleMs). На этапе 3 — 1 с.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx128m -jar /home/ubuntu/revx-venue/app.jar --revx-venue --revx.venue.cycle-ms=1000
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx128m -jar /home/ubuntu/revx-venue/app.jar --revx-venue --revx.venue.cycle-ms=1000 --revx.venue.probe=true
 
 # Перезапуск разрешён: читатель ничем не рискует, а без него в этапах 2+ боты
 # перестанут ставить заявки.
