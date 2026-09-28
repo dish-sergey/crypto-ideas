@@ -754,6 +754,24 @@ public final class ExecJournal implements AutoCloseable {
         }
     }
 
+    /** Моменты событий одного вида начиная с {@code sinceMs} — для авто-минуты затыков. */
+    public synchronized List<Long> eventTimes(String kind, long sinceMs) {
+        List<Long> out = new java.util.ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT ts_ms FROM exec_event WHERE kind = ? AND ts_ms >= ?")) {
+            ps.setString(1, kind);
+            ps.setLong(2, sinceMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(rs.getLong(1));
+                }
+            }
+        } catch (Exception e) {
+            log.warn("события {} не прочитаны: {}", kind, e.getMessage());
+        }
+        return out;
+    }
+
     /** События уровня решений: запуск, остановка, паника, срабатывание лимита. */
     public synchronized void event(String kind, String detail) {
         try (PreparedStatement ps = connection.prepareStatement(

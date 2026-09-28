@@ -264,7 +264,7 @@ public class Executor {
                         + "\"parkDistance\":%s,\"costFloorMargin\":%s,\"anchorLeash\":%s,"
                         + "\"widening\":%s,\"wideningMaxStep\":%s,\"anchorWidening\":%s,"
                         + "\"ownPosition\":%b,\"levels\":%d,\"levelStep\":%s,"
-                        + "\"innerFirst\":%b,\"levelGrowth\":%s,\"buyFarFirst\":%b,\"venueFills\":%b,\"venueReads\":%b,\"venueLocks\":%b,\"venueSlots\":%b}",
+                        + "\"innerFirst\":%b,\"levelGrowth\":%s,\"buyFarFirst\":%b,\"venueFills\":%b,\"venueReads\":%b,\"venueLocks\":%b,\"venueSlots\":%b,\"quietMinute\":\"%s\"}",
                 symbol, tag.id(), num(size), num(inventoryCap), num(offset),
                 num(cfg.simSkewK()), num(skewTarget), periodMs, num(minNotional()),
                 num(spec.baseStep()), num(quoteStep()), num(parkDistance),
@@ -276,7 +276,7 @@ public class Executor {
                 System.getProperty("revx.sim.level-growth", "1.0"),
                 // Порядок раздачи кассы по бидам (дальние первыми) — тоже вне параметров бота.
                 QuoteLoop.BUY_FAR_FIRST, QuoteLoop.VENUE_FILLS, QuoteLoop.VENUE_READS,
-                QuoteLoop.VENUE_LOCKS, QuoteLoop.VENUE_SLOTS);
+                QuoteLoop.VENUE_LOCKS, QuoteLoop.VENUE_SLOTS, QuoteLoop.QUIET_MINUTE);
     }
 
     private static String num(double v) {

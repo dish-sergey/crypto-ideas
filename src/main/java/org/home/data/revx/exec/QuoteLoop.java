@@ -1755,6 +1755,19 @@ public final class QuoteLoop implements Runnable {
         // Две паузы, обе про площадку, а не про рынок: пока она тормозит на
         // заменах, мы плодим неснимаемый резерв; пока он не отпущен, продать
         // монету всё равно нельзя. В обоих случаях лучшее действие — никакого.
+        learnQuietMinute(clock.now());
+        if (inQuietWindow(clock.now(), quietMinute)) {
+            // Разводим заменой (без постановок) один раз и дальше не трогаем: в
+            // самой минуте ни одного запроса записи — затыку нечего поймать.
+            pausedReason = String.format(java.util.Locale.ROOT,
+                    "минута затыков :%02d — заявки разведены", quietMinute);
+            countTick();
+            journal.quote(fair.price(), null, null, inventory, false, pausedReason);
+            if (parkDistance > 0 && lastTrustedFair > 0) {
+                standAside(pausedReason);
+            }
+            return;
+        }
         String venuePause = venuePauseReason();
         if (venuePause != null) {
             pausedReason = venuePause;
@@ -5473,6 +5486,95 @@ public final class QuoteLoop implements Runnable {
 
     private record VenueTrade(String oid, String side, double qty, double notional, long lastTdt,
                               String status, String bot) {
+    }
+
+    // ------------------------------------------------ минута затыков
+
+    /**
+     * 🔑 МИНУТА ЗАТЫКОВ: заявки разведены заменой ДО неё и не трогаются всю минуту.
+     *
+     * Площадка зависает по расписанию: за сутки до 28.09.2026 18:40 UTC 48 затыков
+     * из 88 пришлись на минуту :38 (секунды 29–32), а за 14 суток — 184 призрака из
+     * 191. Каждый затык стоил отхода в сторону с отменой всех заявок и повторной
+     * постановки: 120 постановок в сутки из 724. Разведение ЗАМЕНОЙ постановок не
+     * тратит, а в самой минуте бот не шлёт ни одного запроса записи — затык не
+     * ловит ни замену (нет призрака), ни отход (нет отмен).
+     *
+     * Минута НЕ зашита (владелец: «она переезжает, раньше была :33»): режим
+     * {@code auto} раз в час берёт гистограмму своих {@code venue_stall} за трое
+     * суток по минуте часа и включается, только если на одну минуту приходится
+     * ≥ {@link #QUIET_SHARE} затыков и их не меньше {@link #QUIET_MIN_EVENTS}.
+     * {@code -Drevx.exec.quiet-minute=off|auto|NN}.
+     */
+    static final String QUIET_MINUTE = System.getProperty("revx.exec.quiet-minute", "off");
+    static final double QUIET_SHARE = 0.30;
+    static final int QUIET_MIN_EVENTS = 5;
+    static final long QUIET_LOOKBACK_MS = 72 * 3_600_000L;
+    /** Разводим за столько до начала минуты: затык в :29–:32, запас с лихвой. */
+    static final long QUIET_LEAD_MS = 10_000L;
+
+    private int quietMinute = -1;
+    private long quietLearnedMs = Long.MIN_VALUE / 2;
+
+    private void learnQuietMinute(long now) {
+        if ("off".equals(QUIET_MINUTE) || now - quietLearnedMs < 3_600_000L) {
+            return;
+        }
+        quietLearnedMs = now;
+        int was = quietMinute;
+        if (!"auto".equals(QUIET_MINUTE)) {
+            quietMinute = Integer.parseInt(QUIET_MINUTE.trim());
+        } else {
+            int picked = pickQuietMinute(journal.eventTimes("venue_stall", now - QUIET_LOOKBACK_MS));
+            // ⚠️ ЛИПКОСТЬ. В разведённую минуту бот ничего не шлёт и затыков в ней
+            // больше НЕ ВИДИТ: через трое суток доказательства бы кончились, режим
+            // выключился, затыки вернулись — и так по кругу. Поэтому выбранная
+            // минута держится, пока ДРУГАЯ не наберёт порог (переезд минуты).
+            if (picked >= 0 || quietMinute < 0) {
+                quietMinute = picked;
+            }
+        }
+        if (quietMinute != was) {
+            String text = quietMinute < 0
+                    ? "минута затыков не выражена — разведения нет"
+                    : String.format(java.util.Locale.ROOT,
+                            "минута затыков :%02d — в неё заявки разведены и не трогаются", quietMinute);
+            log.info(text);
+            journal.event("quiet_minute", text);
+        }
+    }
+
+    /** Минута часа с долей затыков ≥ порога, либо −1. */
+    static int pickQuietMinute(java.util.List<Long> stalls) {
+        if (stalls.size() < QUIET_MIN_EVENTS) {
+            return -1;
+        }
+        int[] byMinute = new int[60];
+        for (long t : stalls) {
+            byMinute[(int) ((t / 60_000L) % 60)]++;
+        }
+        int best = 0;
+        for (int m = 1; m < 60; m++) {
+            if (byMinute[m] > byMinute[best]) {
+                best = m;
+            }
+        }
+        return byMinute[best] >= QUIET_MIN_EVENTS && byMinute[best] >= QUIET_SHARE * stalls.size()
+                ? best : -1;
+    }
+
+    /** [HH:mm − запас, HH:(mm+1)) по секундам часа, с переходом через час. */
+    static boolean inQuietWindow(long nowMs, int minute) {
+        if (minute < 0) {
+            return false;
+        }
+        long sec = (nowMs / 1000) % 3600;
+        long start = minute * 60L - QUIET_LEAD_MS / 1000;
+        long end = (minute + 1) * 60L;
+        if (start < 0) {
+            return sec >= start + 3600 || sec < end;
+        }
+        return sec >= start && sec < end;
     }
 
     // ------------------------------------------------ этап 3, §3.3: слот под вопросом
