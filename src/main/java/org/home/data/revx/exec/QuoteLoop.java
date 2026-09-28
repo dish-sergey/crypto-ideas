@@ -1793,7 +1793,17 @@ public final class QuoteLoop implements Runnable {
             // родить не может. Платим постановками за возврат: при суточной
             // тысяче и нашем расходе в 124 это по карману.
             if (clock.now() < stallUntilMs) {
-                cancelAll(pausedReason);
+                if (STALL_FREEZE_OUTER && levels > 1) {
+                    // 🔑 ЗАМОРОЗКА ДАЛЬНИХ (владелец 28.09.2026): снимается только
+                    // ближний уровень, дальние минуту стоят как стояли — ни замены
+                    // (она рождает призраков), ни отмены (она стоит постановки на
+                    // возврате). У трёхуровневого бота это 2 постановки на затык
+                    // вместо 6: 28.09 у d 64 из 101 ушли на возврат после затыков.
+                    cancel(Side.BUY, bids.get(0), pausedReason);
+                    cancel(Side.SELL, asks.get(0), pausedReason);
+                } else {
+                    cancelAll(pausedReason);
+                }
             } else {
                 standAside(pausedReason);
             }
@@ -5528,6 +5538,10 @@ public final class QuoteLoop implements Runnable {
     private record VenueTrade(String oid, String side, double qty, double notional, long lastTdt,
                               String status, String bot) {
     }
+
+    /** На затыке снимать только ближний уровень ({@code revx.exec.stall-freeze-outer}). */
+    static final boolean STALL_FREEZE_OUTER =
+            Boolean.parseBoolean(System.getProperty("revx.exec.stall-freeze-outer", "false"));
 
     // ------------------------------------------------ распродажа перед пределом постановок
 
