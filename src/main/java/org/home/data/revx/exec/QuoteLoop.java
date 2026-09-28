@@ -1738,6 +1738,18 @@ public final class QuoteLoop implements Runnable {
         // Две паузы, обе про площадку, а не про рынок: пока она тормозит на
         // заменах, мы плодим неснимаемый резерв; пока он не отпущен, продать
         // монету всё равно нельзя. В обоих случаях лучшее действие — никакого.
+        // 🔑 ОКНО :38. Площадка каждый час в HH:38:29–30 зависает на ~3 с, и замена,
+        // попавшая в это окно, становится призраком: предок снят, наследника нет,
+        // резерв заперт на часы. За 14 суток до 28.09.2026 — 184 из 191 таких
+        // отказов 422 именно там (в прочие минуты медленные замены почти никогда
+        // не дают 422: 7 из 297). 28.09 в 09:38:29 все шесть ботов послали по
+        // замене и заперли ~26 USDC. В окне НЕ шлём ни замен, ни постановок —
+        // заявки стоят, как стояли; отмена разрешена всегда.
+        if (QUIET_38 && inQuietWindow(clock.now())) {
+            pausedReason = "окно :38 — площадка в это время зависает";
+            countTick();
+            return;
+        }
         String venuePause = venuePauseReason();
         if (venuePause != null) {
             pausedReason = venuePause;
@@ -5123,6 +5135,15 @@ public final class QuoteLoop implements Runnable {
      * и перезапуск.
      */
     static final long LEDGER_LOOKBACK_MS = 6 * 3_600_000L;
+
+    /** Пауза на окно :38 — свойство {@code revx.exec.quiet-38}, у живых в юнитах. */
+    static final boolean QUIET_38 = Boolean.parseBoolean(System.getProperty("revx.exec.quiet-38", "false"));
+
+    /** HH:38:20 ≤ t < HH:38:40 UTC (сдвиг часового пояса на минуты не влияет). */
+    static boolean inQuietWindow(long nowMs) {
+        long secOfHour = (nowMs / 1000) % 3600;
+        return secOfHour >= 38 * 60 + 20 && secOfHour < 38 * 60 + 40;
+    }
 
     // ================================================================ этап 3
 
