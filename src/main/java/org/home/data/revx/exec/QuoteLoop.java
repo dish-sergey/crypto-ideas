@@ -859,8 +859,8 @@ public final class QuoteLoop implements Runnable {
         }
 
         double buyCash = alloc != null
-                ? Math.max(0, alloc.own(tag.id(), quote)) : Double.MAX_VALUE;
-        double sellPool = Math.max(0, inventory);
+                ? Math.max(0, alloc.own(tag.id(), quote) - lockedQuote()) : Double.MAX_VALUE;
+        double sellPool = Math.max(0, inventory - lockedBase());
         double buyRoom = buyRoom();
         for (var r : current) {
             Resting slot = r.side() == Side.BUY ? bids.get(r.level()) : asks.get(r.level());
@@ -1051,6 +1051,8 @@ public final class QuoteLoop implements Runnable {
      */
     private volatile double baseTotalAccount = Double.NaN;
     private volatile double baseReserved;
+    /** Резерв USDC у площадки — для разрыва «резерв минус видимые покупки» (этап 3, §3.6). */
+    private volatile double quoteReserved;
     private volatile double quoteBalance;
     private volatile double quoteTotal;
     private volatile double lastFair;
@@ -1917,8 +1919,8 @@ public final class QuoteLoop implements Runnable {
         // ближнего начинать или с дальнего» на половине конструкции просто не
         // задан.
         double buyCash = alloc != null
-                ? Math.max(0, alloc.own(tag.id(), quote)) : Double.MAX_VALUE;
-        double sellPool = Math.max(0, inventory);
+                ? Math.max(0, alloc.own(tag.id(), quote) - lockedQuote()) : Double.MAX_VALUE;
+        double sellPool = Math.max(0, inventory - lockedBase());
         levelTicks++;
         for (int i = 0; i < levels; i++) {
             if (bids.get(i).venueId != null) {
@@ -2280,8 +2282,9 @@ public final class QuoteLoop implements Runnable {
         // ниже по общей проверке, и бид просто не выставится.
         // В распродаже покупок нет вовсе: смысл ступени в том, чтобы свести
         // позицию к нулю, а не в том, чтобы менять её состав.
+        // Запертое призраком (§3.6) в позиции есть, а продать его нельзя.
         double ownPositionCap = side == Side.SELL
-                ? Math.max(0, inventory)
+                ? Math.max(0, inventory - lockedBase())
                 : (frozenUnwind ? 0 : Math.max(0, params.inventoryCap() - inventory));
         // Симметрично для покупки: тратить можно только СВОЮ долю кассы, иначе
         // бот покупает на деньги соседа. У бота B это стоило 197 отказов
@@ -2293,7 +2296,7 @@ public final class QuoteLoop implements Runnable {
         // сумме потолков $49.13, и требовать полного покрытия было бы нельзя.
         double ownCashCap = Double.MAX_VALUE;
         if (side == Side.BUY && alloc != null && price > 0) {
-            ownCashCap = Math.max(0, alloc.own(tag.id(), quote)) / price;
+            ownCashCap = Math.max(0, alloc.own(tag.id(), quote) - lockedQuote()) / price;
         }
         // ⚠️ ПРОДАЖУ ОГРАНИЧИВАЕТ И ЗАХВАТ, А НЕ ТОЛЬКО СВОЙ СЧЁТЧИК.
         //
@@ -2316,7 +2319,7 @@ public final class QuoteLoop implements Runnable {
         // чужого. Само расхождение по-прежнему только логируется.
         double ownClaimCap = Double.MAX_VALUE;
         if (side == Side.SELL && alloc != null) {
-            ownClaimCap = Math.max(0, alloc.own(tag.id(), base));
+            ownClaimCap = Math.max(0, alloc.own(tag.id(), base) - lockedBase());
         }
         return Math.min(Math.min(want, ownClaimCap),
                 Math.min(Math.min(affordable, ownPositionCap), ownCashCap));
@@ -2624,6 +2627,14 @@ public final class QuoteLoop implements Runnable {
                 // служит её ИЗМЕНЕНИЕ, а не размер — см. claimHeirIfEvidenceMatches.
                 heir = new Heir(side, size, price, heirClientId, clock.now(), freePot(clock.now()));
                 heirEvidence = 0;
+            }
+            // 🔑 ЭТАП 3, §3.6: МЕДЛЕННЫЙ 422 НА ЗАМЕНЕ — ПОДОЗРЕНИЕ НА ПРИЗРАКА.
+            // Предок снят внутри этого же запроса, наследника нет, а резерв
+            // предка площадка держит часами. Запоминаем, СКОЛЬКО он держал: это
+            // наше, но недоступное, пока сверка не скажет иначе.
+            if (VENUE_LOCKS && response.status() == 422 && heirPossible
+                    && response.latencyMs() >= SLOW_REPLACE_MS && resting.size > 0) {
+                addGhostSuspect(side, resting.size, resting.price);
             }
             // Пауза на сторону: без неё каждый отказ тянет за собой четыре запроса
             // (замена, статус, остатки, активные), и на устойчивом отказе это
@@ -4032,6 +4043,7 @@ public final class QuoteLoop implements Runnable {
                 }
             } else if ("USDC".equals(matcher.group(1))) {
                 quoteBalance = available;     // на что можно поставить новую заявку
+                quoteReserved = Double.parseDouble(matcher.group(3));
                 quoteTotal = total;           // а это — сколько денег у нас есть
             }
         }
@@ -4780,9 +4792,14 @@ public final class QuoteLoop implements Runnable {
         // а у соседа `c` лот втрое крупнее, и до проверки покрытия он не дошёл
         // вовсе. Одна заморозка, один счёт, разное поведение — признак того, что
         // мерка смотрит не туда.
+        // Этап 3, §3.6: запертое призраком — своё и вернётся, в покрытие оно входит.
+        // Распродажа остаётся на настоящую нехватку (претензий больше, чем монет),
+        // а не на то, что площадка держит резерв без заявки.
+        double gapBase = VENUE_LOCKS ? Math.max(0, baseReserved - visible) : 0;
+        double gapQuote = VENUE_LOCKS ? Math.max(0, quoteReserved - visibleBuysQuote) : 0;
         double cover = Math.min(
-                coverage(baseAvailable + visible, claimedAll(base, now)),
-                coverage(quoteBalance + visibleBuysQuote, claimedAll(quote, now)));
+                coverage(baseAvailable + visible + gapBase, claimedAll(base, now)),
+                coverage(quoteBalance + visibleBuysQuote + gapQuote, claimedAll(quote, now)));
         if (cover >= COVERAGE_UNWIND) {
             frozenSinceMs = 0;
             maybeResume(now);
@@ -4884,9 +4901,14 @@ public final class QuoteLoop implements Runnable {
                 visibleBuysQuote += o.size() * o.price();
             }
         }
+        // Этап 3, §3.6: запертое призраком — своё и вернётся, в покрытие оно входит.
+        // Распродажа остаётся на настоящую нехватку (претензий больше, чем монет),
+        // а не на то, что площадка держит резерв без заявки.
+        double gapBase = VENUE_LOCKS ? Math.max(0, baseReserved - visible) : 0;
+        double gapQuote = VENUE_LOCKS ? Math.max(0, quoteReserved - visibleBuysQuote) : 0;
         double cover = Math.min(
-                coverage(baseAvailable + visible, claimedAll(base, now)),
-                coverage(quoteBalance + visibleBuysQuote, claimedAll(quote, now)));
+                coverage(baseAvailable + visible + gapBase, claimedAll(base, now)),
+                coverage(quoteBalance + visibleBuysQuote + gapQuote, claimedAll(quote, now)));
         if (cover < COVERAGE_RESUME) {
             return;
         }
@@ -5151,6 +5173,143 @@ public final class QuoteLoop implements Runnable {
             Boolean.parseBoolean(System.getProperty("revx.exec.venue-reads", "false"));
     private long lastReadsReportMs;
 
+    // ------------------------------------------------ этап 3, §3.5–3.6: запертое
+
+    /**
+     * 🔑 ЗАПЕРТОЕ ПРИЗРАКОМ — СВОЁ, НО НЕДОСТУПНОЕ. Флаг {@code revx.exec.venue-locks}.
+     *
+     * Призрак замены (медленный 422 в затык) снимает предка, наследника не
+     * создаёт, а резерв предка держит 2–32 ч. Монеты и касса бота никуда не
+     * делись — в позиции и скосе они остаются, — но продать или потратить их
+     * нельзя. Без учёта бот видит в {@code available} чужое (ничейное, соседское)
+     * и продаёт его вместо своего запертого.
+     */
+    static final boolean VENUE_LOCKS =
+            Boolean.parseBoolean(System.getProperty("revx.exec.venue-locks", "false"));
+    /** Не подтвердилось разрывом резерва за столько — подозрение ложное. */
+    static final long GHOST_CONFIRM_MS = 5 * 60_000L;
+
+    private static final class GhostSuspect {
+        final Side side;
+        /** Монета (продажа) или касса (покупка), которую держал предок. */
+        final double amount;
+        final long sinceMs;
+        boolean confirmed;
+
+        GhostSuspect(Side side, double amount, long sinceMs) {
+            this.side = side;
+            this.amount = amount;
+            this.sinceMs = sinceMs;
+        }
+    }
+
+    private final java.util.List<GhostSuspect> ghostSuspects = new java.util.ArrayList<>();
+
+    private void addGhostSuspect(Side side, double size, double price) {
+        double amount = side == Side.SELL ? size : size * price;
+        ghostSuspects.add(new GhostSuspect(side, amount, clock.now()));
+        String text = String.format(java.util.Locale.ROOT,
+                "подозрение на призрака: %s, предок держал %s %s — не продаю и не трачу это, "
+                        + "пока разрыв резерва не скажет иначе",
+                side, fmt(amount), side == Side.SELL ? base : quote);
+        log.warn(text);
+        journal.event("ghost_suspect", text);
+    }
+
+    /** Своя монета, запертая призраком: в позиции есть, продать нельзя. */
+    double lockedBase() {
+        double sum = 0;
+        for (GhostSuspect g : ghostSuspects) {
+            if (g.side == Side.SELL) {
+                sum += g.amount;
+            }
+        }
+        return sum;
+    }
+
+    /** Своя касса, запертая призраком покупки. */
+    double lockedQuote() {
+        double sum = 0;
+        for (GhostSuspect g : ghostSuspects) {
+            if (g.side == Side.BUY) {
+                sum += g.amount;
+            }
+        }
+        return sum;
+    }
+
+    /**
+     * Сверка подозрений с разрывом «резерв площадки минус видимые заявки».
+     * Разрыв общий на счёт (в нём и соседские призраки), поэтому правила
+     * осторожные: подтверждаем, если разрыва хватает на подозрение; снимаем
+     * подтверждённые, начиная со старых, когда разрыв стал меньше их суммы.
+     */
+    private void trackGhosts(long now) {
+        if (!VENUE_LOCKS || ghostSuspects.isEmpty()) {
+            return;
+        }
+        Venue.Response active = client.activeOrders();
+        if (!active.ok() || active.body() == null) {
+            return;
+        }
+        double visibleSell = 0;
+        double visibleBuyQuote = 0;
+        for (ActiveOrder o : ActiveOrder.parse(active.body())) {
+            if (o.side() == Side.SELL && ActiveOrder.normalize(symbol).equals(o.symbol())) {
+                visibleSell += o.size();
+            }
+            if (o.side() == Side.BUY && o.symbol() != null && o.symbol().endsWith("/" + quote)) {
+                visibleBuyQuote += o.size() * o.price();
+            }
+        }
+        settleGhosts(Side.SELL, Math.max(0, baseReserved - visibleSell), now);
+        settleGhosts(Side.BUY, Math.max(0, quoteReserved - visibleBuyQuote), now);
+    }
+
+    private void settleGhosts(Side side, double gap, long now) {
+        java.util.List<GhostSuspect> mine = new java.util.ArrayList<>();
+        for (GhostSuspect g : ghostSuspects) {
+            if (g.side == side) {
+                mine.add(g);
+            }
+        }
+        String unit = side == Side.SELL ? base : quote;
+        for (GhostSuspect g : mine) {
+            if (g.confirmed) {
+                continue;
+            }
+            if (gap >= g.amount * 0.9) {
+                g.confirmed = true;
+                journal.event("ghost_confirmed", String.format(java.util.Locale.ROOT,
+                        "%s %s %s заперто: разрыв резерва %s", side, fmt(g.amount), unit, fmt(gap)));
+            } else if (now - g.sinceMs >= GHOST_CONFIRM_MS) {
+                ghostSuspects.remove(g);
+                journal.event("ghost_false", String.format(java.util.Locale.ROOT,
+                        "%s %s %s: разрыва резерва нет (%s) — отказ был без призрака",
+                        side, fmt(g.amount), unit, fmt(gap)));
+            }
+        }
+        double held = 0;
+        for (GhostSuspect g : ghostSuspects) {
+            if (g.side == side && g.confirmed) {
+                held += g.amount;
+            }
+        }
+        // Отпустили — разрыв меньше того, что мы за собой держим. Снимаем старые.
+        for (GhostSuspect g : mine) {
+            if (!g.confirmed || held <= gap * 1.1 + 1e-12) {
+                continue;
+            }
+            ghostSuspects.remove(g);
+            held -= g.amount;
+            String text = String.format(java.util.Locale.ROOT,
+                    "площадка отпустила %s %s (%s, заперто было %d мин); разрыв резерва теперь %s",
+                    fmt(g.amount), unit, side, (now - g.sinceMs) / 60_000, fmt(gap));
+            log.info(text);
+            journal.event("ghost_released", text);
+        }
+    }
+
     /** Лента читателя свежа и бот в неё смотрит — свои GET по предкам не нужны. */
     private boolean venueCovers() {
         return VENUE_FILLS && venueFresh
@@ -5275,6 +5434,7 @@ public final class QuoteLoop implements Runnable {
             checkFrozen(now);
             // Остатки перечитываются раз в минуту: исполнение могло случиться молча.
             refreshBalances();
+            trackGhosts(now);
             if (budget != null) {
                 PlacementBudget.State state = budget.state(tag.id(), now);
                 double was = budgetPressure;

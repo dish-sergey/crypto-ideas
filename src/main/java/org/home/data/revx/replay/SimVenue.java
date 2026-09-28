@@ -113,6 +113,58 @@ public final class SimVenue implements Venue {
         this.minNotional = minNotional;
     }
 
+    // ------------------------------------------------ режим «призрак замены»
+
+    /**
+     * 🔑 ПРИЗРАК ЗАМЕНЫ (ЧИТАТЕЛЬ-ПЛОЩАДКИ.md §1): в затык площадка внутри одного
+     * {@code PUT} снимает предка, наследника НЕ создаёт, отвечает 422 через ~3 с,
+     * а резерв предка держит часами. До 28.09.2026 стенд этого не умел вовсе —
+     * его 422 всегда был «чистым», и логику запертого проверить было негде.
+     *
+     * Окно задаётся секундой часа и шириной ({@code -Drevx.sim.ghost-at-sec=2309}
+     * — это HH:38:29 — и {@code -Drevx.sim.ghost-width-sec=3}), сколько держится
+     * резерв — {@code -Drevx.sim.ghost-hold-min}. По умолчанию выключено.
+     */
+    private final int ghostAtSec = Integer.getInteger("revx.sim.ghost-at-sec", -1);
+    private final int ghostWidthSec = Integer.getInteger("revx.sim.ghost-width-sec", 3);
+    private final long ghostHoldMs = Long.getLong("revx.sim.ghost-hold-min", 120L) * 60_000L;
+    /** Ответ на замену в затык: столько думает площадка. */
+    static final long GHOST_LATENCY_MS = 3_000L;
+
+    private record GhostLock(boolean buy, double amount, long untilMs) {
+    }
+
+    private final List<GhostLock> ghostLocks = new ArrayList<>();
+    private long ghostsMade;
+
+    public long ghostsMade() {
+        return ghostsMade;
+    }
+
+    boolean inGhostWindow(long nowMs) {
+        if (ghostAtSec < 0) {
+            return false;
+        }
+        long sec = (nowMs / 1000) % 3600;
+        return sec >= ghostAtSec && sec < ghostAtSec + ghostWidthSec;
+    }
+
+    /** Резерв, который держат призраки: [монета, касса]. Истёкшие отпускаются. */
+    private double[] ghostReserved() {
+        long now = clock.now();
+        ghostLocks.removeIf(g -> g.untilMs() <= now);
+        double b = 0;
+        double q = 0;
+        for (GhostLock g : ghostLocks) {
+            if (g.buy()) {
+                q += g.amount();
+            } else {
+                b += g.amount();
+            }
+        }
+        return new double[]{b, q};
+    }
+
     public long placements() {
         return placements;
     }
@@ -301,6 +353,10 @@ public final class SimVenue implements Venue {
                 baseReserved += o.size;
             }
         }
+        // Призраки держат резерв без видимой заявки — ровно так площадка и выглядит.
+        double[] ghost = ghostReserved();
+        baseReserved += ghost[0];
+        quoteReserved += ghost[1];
         String body = "{\"data\":["
                 + balance(base, baseTotal, baseReserved) + ","
                 + balance(quote, quoteTotal, quoteReserved) + "]}";
@@ -372,6 +428,19 @@ public final class SimVenue implements Venue {
             replaceRejects++;
             return new Response(422,
                     "{\"message\":\"Cannot replace an order that is not in the 'NEW' state\"}", 0);
+        }
+        if (live.containsKey(id) && inGhostWindow(clock.now())) {
+            // Призрак: предок снят, наследника нет, резерв предка остаётся заперт.
+            Order dead = live.remove(id);
+            gone.put(id, "призраком замены");
+            model.cancelled(id);
+            ghostLocks.add(new GhostLock(dead.buy, dead.buy ? dead.size * dead.price : dead.size,
+                    clock.now() + ghostHoldMs));
+            ghostsMade++;
+            replaceRejects++;
+            return new Response(422,
+                    "{\"message\":\"Cannot replace an order that is not in the 'NEW' state\"}",
+                    GHOST_LATENCY_MS);
         }
         Order old = live.remove(id);
         if (old != null) {
