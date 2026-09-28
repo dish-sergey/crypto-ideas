@@ -141,6 +141,36 @@ public final class SimVenue implements Venue {
         return ghostsMade;
     }
 
+    /**
+     * Прочие повадки площадки в затык (ЧИТАТЕЛЬ-ПЛОЩАДКИ.md §1, прогон 22–23.09):
+     * {@code late204} — отмена отвечает 204, а заявка ещё живёт и исполняется
+     * (b: сделка через 4 с после 204); {@code live404} — отмена отвечает 404 «нет
+     * такой», а заявка жива (f: исполнилась через 3 с); {@code stale} — вопрос о
+     * судьбе ушедшей заявки отвечает 404. Набор — {@code -Drevx.sim.stall-effects}
+     * (по умолчанию только {@code ghost}), срок — {@code -Drevx.sim.stall-late-ms}.
+     */
+    private final java.util.Set<String> stallEffects = java.util.Set.of(
+            System.getProperty("revx.sim.stall-effects", "ghost").split(","));
+    private final long stallLateMs = Long.getLong("revx.sim.stall-late-ms", 4_000L);
+    /** Отменённые «на словах»: в списке активных их нет, а исполниться могут до срока. */
+    private final Map<String, Long> hiddenUntil = new LinkedHashMap<>();
+    private long late204Made;
+    private long live404Made;
+    private long staleMade;
+    /** Исполнения по заявкам, которые бот уже считал отменёнными. */
+    private long fillsAfterCancel;
+
+    /** Сводка несогласованностей за прогон — в отчёт. */
+    public synchronized String stallDiag() {
+        return String.format(Locale.ROOT, "призраков %d, 204-с-жизнью %d, 404-на-живой %d, "
+                        + "404-о-судьбе %d, исполнено после «отмены» %d",
+                ghostsMade, late204Made, live404Made, staleMade, fillsAfterCancel);
+    }
+
+    private boolean effect(String name) {
+        return stallEffects.contains(name) && inGhostWindow(clock.now());
+    }
+
     boolean inGhostWindow(long nowMs) {
         if (ghostAtSec < 0) {
             return false;
@@ -244,7 +274,24 @@ public final class SimVenue implements Venue {
             resting.add(new FillModel.Resting(o.id, o.buy, o.price, o.size, o.createdMs));
         }
         for (FillModel.Filled f : model.advance(clock.now(), resting)) {
+            if (hiddenUntil.containsKey(f.orderId()) && live.containsKey(f.orderId())) {
+                fillsAfterCancel++;
+            }
             apply(f);
+        }
+        // Срок «отменённых на словах» вышел — площадка их действительно сняла.
+        long now = clock.now();
+        var it = hiddenUntil.entrySet().iterator();
+        while (it.hasNext()) {
+            var e = it.next();
+            if (!live.containsKey(e.getKey())) {
+                it.remove();                                   // успела исполниться
+            } else if (e.getValue() <= now) {
+                live.remove(e.getKey());
+                gone.put(e.getKey(), "отменой (поздно)");
+                model.cancelled(e.getKey());
+                it.remove();
+            }
         }
     }
 
@@ -312,6 +359,9 @@ public final class SimVenue implements Venue {
         StringBuilder sb = new StringBuilder("{\"data\":[");
         boolean first = true;
         for (Order o : live.values()) {
+            if (hiddenUntil.containsKey(o.id)) {
+                continue;                     // «отменена» на словах — в списке её нет
+            }
             if (!first) {
                 sb.append(',');
             }
@@ -373,6 +423,10 @@ public final class SimVenue implements Venue {
     @Override
     public synchronized Response order(String id) {
         advance();
+        if ((!live.containsKey(id) || hiddenUntil.containsKey(id)) && effect("stale")) {
+            staleMade++;              // в затык судьба ушедшей заявки ещё не видна
+            return new Response(404, "{\"message\":\"Order not found\"}", 50);
+        }
         double[] acc = done.get(id);
         if (acc != null) {
             inspected.add(id);
@@ -429,7 +483,12 @@ public final class SimVenue implements Venue {
             return new Response(422,
                     "{\"message\":\"Cannot replace an order that is not in the 'NEW' state\"}", 0);
         }
-        if (live.containsKey(id) && inGhostWindow(clock.now())) {
+        if (hiddenUntil.containsKey(id)) {
+            replaceRejects++;         // отменённую «на словах» заменить уже нельзя
+            return new Response(422,
+                    "{\"message\":\"Cannot replace an order that is not in the 'NEW' state\"}", 50);
+        }
+        if (live.containsKey(id) && effect("ghost")) {
             // Призрак: предок снят, наследника нет, резерв предка остаётся заперт.
             Order dead = live.remove(id);
             gone.put(id, "призраком замены");
@@ -483,6 +542,22 @@ public final class SimVenue implements Venue {
     public synchronized Response cancel(String id) {
         advance();
         cancels++;
+        if (live.containsKey(id) && !hiddenUntil.containsKey(id)) {
+            // В затык ответ на отмену не окончателен: заявка живёт ещё stallLateMs.
+            // Два вида поочерёдно, если включены оба.
+            boolean late = effect("late204");
+            boolean ghost404 = effect("live404");
+            if (late || ghost404) {
+                boolean use404 = ghost404 && (!late || (late204Made + live404Made) % 2 == 1);
+                hiddenUntil.put(id, clock.now() + stallLateMs);
+                if (use404) {
+                    live404Made++;
+                    return new Response(404, "{\"message\":\"Order not found\"}", 50);
+                }
+                late204Made++;
+                return new Response(204, "", 50);
+            }
+        }
         if (live.remove(id) == null) {
             gone.putIfAbsent(id, "отменой");
             return new Response(404, "{\"message\":\"not found\"}", 0);

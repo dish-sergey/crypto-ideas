@@ -78,6 +78,73 @@ class SimVenueGhostTest {
         assertEquals(0.0, reservedUsdc(venue), 1e-9);
     }
 
+    /** Модель, исполняющая первую стоящую заявку, когда её включили. */
+    private static final class FillOnDemand implements FillModel {
+        boolean fire;
+
+        @Override
+        public String describe() {
+            return "по команде";
+        }
+
+        @Override
+        public List<Filled> advance(long nowMs, List<Resting> resting) {
+            if (!fire || resting.isEmpty()) {
+                return List.of();
+            }
+            fire = false;
+            return List.of(new Filled(resting.get(0).id(), resting.get(0).size(), resting.get(0).price()));
+        }
+    }
+
+    /** 204 на отмену в затык, а через секунды заявка исполняется (бот b, 22.09 20:02). */
+    @Test
+    void отменаСНепрошедшейЖизнью() {
+        System.setProperty("revx.sim.ghost-at-sec", String.valueOf(38 * 60 + 29));
+        System.setProperty("revx.sim.stall-effects", "late204,stale");
+        try {
+            SimClock clock = new SimClock(IN_WINDOW);
+            FillOnDemand model = new FillOnDemand();
+            SimVenue venue = new SimVenue(clock, model, "SOL/USDC", 0, 100, 0.1);
+            String id = placeBuy(venue);
+
+            Venue.Response c = venue.cancel(id);
+            assertEquals(204, c.status());
+            assertTrue(ActiveOrder.parse(venue.activeOrders().body()).isEmpty(),
+                    "в списке активных её уже нет");
+            assertEquals(404, venue.order(id).status(), "в затык судьба не видна");
+
+            clock.sleep(1_500);                  // ещё в окне, срок жизни 4 с не вышел
+            model.fire = true;
+            venue.activeOrders();                // модель исполняет «отменённую»
+            clock.sleep(10_000);                 // окно прошло
+            assertTrue(venue.order(id).body().contains("\"status\":\"filled\""),
+                    venue.order(id).body());
+            assertTrue(venue.stallDiag().contains("исполнено после «отмены» 1"), venue.stallDiag());
+        } finally {
+            System.clearProperty("revx.sim.stall-effects");
+        }
+    }
+
+    /** 404 на отмену живой заявки: она живёт срок и снимается сама. */
+    @Test
+    void четыреСтаЧетыреНаЖивой() {
+        System.setProperty("revx.sim.ghost-at-sec", String.valueOf(38 * 60 + 29));
+        System.setProperty("revx.sim.stall-effects", "live404");
+        try {
+            SimClock clock = new SimClock(IN_WINDOW);
+            SimVenue venue = new SimVenue(clock, new Never(), "SOL/USDC", 0, 100, 0.1);
+            String id = placeBuy(venue);
+            assertEquals(404, venue.cancel(id).status());
+            assertEquals(6.0, reservedUsdc(venue), 1e-9);   // резерв держится, пока жива
+            clock.sleep(5_000);
+            assertEquals(0.0, reservedUsdc(venue), 1e-9);   // срок вышел — снята
+            assertTrue(venue.order(id).body().contains("\"status\":\"cancelled\""));
+        } finally {
+            System.clearProperty("revx.sim.stall-effects");
+        }
+    }
+
     @Test
     void внеОкнаЗаменаОбычная() {
         System.setProperty("revx.sim.ghost-at-sec", String.valueOf(38 * 60 + 29));
