@@ -1756,7 +1756,8 @@ public final class QuoteLoop implements Runnable {
         // заменах, мы плодим неснимаемый резерв; пока он не отпущен, продать
         // монету всё равно нельзя. В обоих случаях лучшее действие — никакого.
         learnQuietMinute(clock.now());
-        if (inQuietWindow(clock.now(), quietMinute)) {
+        settleQuietProbe(clock.now());
+        if (inQuietWindow(clock.now(), quietMinute) && !quietProbe(clock.now())) {
             // Разводим заменой (без постановок) один раз и дальше не трогаем: в
             // самой минуте ни одного запроса записи — затыку нечего поймать.
             pausedReason = String.format(java.util.Locale.ROOT,
@@ -5524,14 +5525,26 @@ public final class QuoteLoop implements Runnable {
         int was = quietMinute;
         if (!"auto".equals(QUIET_MINUTE)) {
             quietMinute = Integer.parseInt(QUIET_MINUTE.trim());
+        } else if (client instanceof StallFeed feed && feed.observedMs(now) >= QUIET_FEED_TRUST_MS) {
+            // Зонд видит все минуты, включая разведённую: его расписанию верим как есть,
+            // без липкости и без проверочного часа.
+            // 12 ч, а не трое суток: зонд видит КАЖДЫЙ час, дюжины часов хватает с
+            // запасом, а длинная история после переезда минуты перевешивала бы новую.
+            quietMinute = pickQuietMinute(feed.stallTimes(now - QUIET_FEED_LOOKBACK_MS), -1, ignoredBefore);
         } else {
-            int picked = pickQuietMinute(journal.eventTimes("venue_stall", now - QUIET_LOOKBACK_MS));
-            // ⚠️ ЛИПКОСТЬ. В разведённую минуту бот ничего не шлёт и затыков в ней
-            // больше НЕ ВИДИТ: через трое суток доказательства бы кончились, режим
-            // выключился, затыки вернулись — и так по кругу. Поэтому выбранная
-            // минута держится, пока ДРУГАЯ не наберёт порог (переезд минуты).
-            if (picked >= 0 || quietMinute < 0) {
-                quietMinute = picked;
+            java.util.List<Long> own = journal.eventTimes("venue_stall", now - QUIET_LOOKBACK_MS);
+            if (quietMinute < 0) {
+                quietMinute = pickQuietMinute(own, -1, ignoredBefore);
+            } else {
+                // ⚠️ ЛИПКОСТЬ. В разведённую минуту бот ничего не шлёт и затыков в ней
+                // больше НЕ ВИДИТ. Поэтому (1) выбранная минута держится, пока ДРУГАЯ не
+                // наберёт порог, и (2) при этом выборе текущая минута НЕ учитывается —
+                // иначе её старые затыки трое суток перевешивали бы новую минуту после
+                // переезда. Прекращение затыка ловит проверочный час (см. quietProbe).
+                int other = pickQuietMinute(own, quietMinute, ignoredBefore);
+                if (other >= 0) {
+                    quietMinute = other;
+                }
             }
         }
         if (quietMinute != was) {
@@ -5546,12 +5559,27 @@ public final class QuoteLoop implements Runnable {
 
     /** Минута часа с долей затыков ≥ порога, либо −1. */
     static int pickQuietMinute(java.util.List<Long> stalls) {
-        if (stalls.size() < QUIET_MIN_EVENTS) {
-            return -1;
-        }
+        return pickQuietMinute(stalls, -1, new long[60]);
+    }
+
+    /**
+     * То же, но без минуты {@code exclude} (она разведена, затыков в ней не видно)
+     * и без затыков минуты m старше {@code ignoredBefore[m]} (проверки показали,
+     * что там затыка больше нет).
+     */
+    static int pickQuietMinute(java.util.List<Long> stalls, int exclude, long[] ignoredBefore) {
         int[] byMinute = new int[60];
+        int total = 0;
         for (long t : stalls) {
-            byMinute[(int) ((t / 60_000L) % 60)]++;
+            int m = (int) ((t / 60_000L) % 60);
+            if (m == exclude || t < ignoredBefore[m]) {
+                continue;
+            }
+            byMinute[m]++;
+            total++;
+        }
+        if (total < QUIET_MIN_EVENTS) {
+            return -1;
         }
         int best = 0;
         for (int m = 1; m < 60; m++) {
@@ -5559,8 +5587,78 @@ public final class QuoteLoop implements Runnable {
                 best = m;
             }
         }
-        return byMinute[best] >= QUIET_MIN_EVENTS && byMinute[best] >= QUIET_SHARE * stalls.size()
+        // Доля — от УЧТЁННЫХ затыков: исключённая минута в знаменатель не входит.
+        return byMinute[best] >= QUIET_MIN_EVENTS && byMinute[best] >= QUIET_SHARE * total
                 ? best : -1;
+    }
+
+    /** Трём суткам наблюдений зонда верим как есть; меньше — дополняем своими. */
+    static final long QUIET_FEED_TRUST_MS = 24 * 3_600_000L;
+    static final long QUIET_FEED_LOOKBACK_MS = 12 * 3_600_000L;
+    /** Затыки минуты m раньше этого момента не считаются (проверки их опровергли). */
+    private final long[] ignoredBefore = new long[60];
+
+    // --- проверочный час: раз в сутки в разведённую минуту НЕ разводимся
+    static final long QUIET_PROBE_EVERY_MS = 24 * 3_600_000L;
+    static final int QUIET_PROBE_MISSES = 3;
+    private long lastQuietProbeMs = Long.MIN_VALUE / 2;
+    private long quietProbeEndMs;
+    private int quietProbeMisses;
+
+    /**
+     * Проверочный час — только без зонда: раз в сутки минута затыков торгуется как
+     * обычно. Был затык — минута подтверждена; три проверки подряд без затыка —
+     * минута снимается, и её старые затыки больше не считаются.
+     *
+     * @return {@code true}, если сейчас идёт проверка и разводиться не надо
+     */
+    private boolean quietProbe(long now) {
+        boolean feed = client instanceof StallFeed f && f.observedMs(now) >= QUIET_FEED_TRUST_MS;
+        if (feed || quietMinute < 0) {
+            return false;
+        }
+        if (quietProbeEndMs == 0 && now - lastQuietProbeMs >= QUIET_PROBE_EVERY_MS) {
+            lastQuietProbeMs = now;
+            long sec = (now / 1000) % 3600;
+            quietProbeEndMs = now - sec * 1000 + (quietMinute + 1) * 60_000L;
+            if (quietProbeEndMs <= now) {
+                quietProbeEndMs += 3_600_000L;
+            }
+            journal.event("quiet_probe", String.format(java.util.Locale.ROOT,
+                    "проверка минуты :%02d — торгую в неё как обычно", quietMinute));
+        }
+        return quietProbeEndMs > 0 && now < quietProbeEndMs;
+    }
+
+    /** Итог проверочного часа — после его окончания. */
+    private void settleQuietProbe(long now) {
+        if (quietProbeEndMs == 0 || now < quietProbeEndMs) {
+            return;
+        }
+        long from = quietProbeEndMs - 60_000L - QUIET_LEAD_MS;
+        boolean seen = !journal.eventTimes("venue_stall", from).stream()
+                .filter(t -> t < quietProbeEndMs).toList().isEmpty();
+        quietProbeEndMs = 0;
+        if (seen) {
+            quietProbeMisses = 0;
+            journal.event("quiet_confirmed", String.format(java.util.Locale.ROOT,
+                    "проверка: затык в :%02d есть — минута остаётся", quietMinute));
+            return;
+        }
+        quietProbeMisses++;
+        if (quietProbeMisses < QUIET_PROBE_MISSES) {
+            journal.event("quiet_unconfirmed", String.format(java.util.Locale.ROOT,
+                    "проверка: затыка в :%02d не было (%d из %d)", quietMinute,
+                    quietProbeMisses, QUIET_PROBE_MISSES));
+            return;
+        }
+        ignoredBefore[quietMinute] = now;
+        String text = String.format(java.util.Locale.ROOT,
+                "затыка в :%02d нет %d проверок подряд — минуту снимаю", quietMinute, quietProbeMisses);
+        log.info(text);
+        journal.event("quiet_minute", text);
+        quietMinute = -1;
+        quietProbeMisses = 0;
     }
 
     /** [HH:mm − запас, HH:(mm+1)) по секундам часа, с переходом через час. */

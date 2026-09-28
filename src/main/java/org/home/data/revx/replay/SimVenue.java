@@ -37,7 +37,42 @@ import java.util.UUID;
  * идентификатор, 422 не означает, что замены не было. Отдай мы типизированные
  * объекты — проверяли бы не бота, а свою модель бота.
  */
-public final class SimVenue implements Venue {
+public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed {
+
+    /**
+     * Сдвиг минуты затыков посреди прогона: с момента {@code revx.sim.ghost-shift-at}
+     * (ISO) окно встаёт на {@code revx.sim.ghost-at-sec-after}. Проверка того, что
+     * боты замечают переезд.
+     */
+    private final long ghostShiftAtMs = System.getProperty("revx.sim.ghost-shift-at") == null ? Long.MAX_VALUE
+            : java.time.Instant.parse(System.getProperty("revx.sim.ghost-shift-at")).toEpochMilli();
+    private final int ghostAtSecAfter = Integer.getInteger("revx.sim.ghost-at-sec-after", -1);
+    /** Стенд как зонд: {@code revx.sim.stall-feed=true} — боты видят расписание затыков. */
+    private final boolean stallFeed = Boolean.getBoolean("revx.sim.stall-feed");
+    private final long startedMs;
+
+    private int ghostSecAt(long nowMs) {
+        return nowMs >= ghostShiftAtMs ? ghostAtSecAfter : ghostAtSec;
+    }
+
+    @Override
+    public synchronized List<Long> stallTimes(long sinceMs) {
+        List<Long> out = new ArrayList<>();
+        long now = clock.now();
+        for (long h = Math.max(sinceMs, startedMs) / 3_600_000L * 3_600_000L; h <= now; h += 3_600_000L) {
+            int sec = ghostSecAt(h);
+            long t = h + sec * 1000L + 500;
+            if (sec >= 0 && t >= sinceMs && t <= now && t >= startedMs) {
+                out.add(t);
+            }
+        }
+        return out;
+    }
+
+    @Override
+    public long observedMs(long nowMs) {
+        return stallFeed ? Math.max(0, nowMs - startedMs + 72 * 3_600_000L) : 0;
+    }
 
     // ⚠️ Все точки входа synchronized: котировщиков в прогнозе несколько, каждый
     // в своём потоке, а книга заявок и остатки здесь ОДНИ. Без этого гонка за
@@ -111,6 +146,7 @@ public final class SimVenue implements Venue {
         this.baseTotal = baseStart;
         this.quoteTotal = quoteStart;
         this.minNotional = minNotional;
+        this.startedMs = clock.now();
     }
 
     // ------------------------------------------------ режим «призрак замены»
@@ -172,11 +208,12 @@ public final class SimVenue implements Venue {
     }
 
     boolean inGhostWindow(long nowMs) {
-        if (ghostAtSec < 0) {
+        int at = ghostSecAt(nowMs);
+        if (at < 0) {
             return false;
         }
         long sec = (nowMs / 1000) % 3600;
-        return sec >= ghostAtSec && sec < ghostAtSec + ghostWidthSec;
+        return sec >= at && sec < at + ghostWidthSec;
     }
 
     /** Резерв, который держат призраки: [монета, касса]. Истёкшие отпускаются. */

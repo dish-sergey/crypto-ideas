@@ -24,7 +24,42 @@ import java.util.function.LongSupplier;
  * покойника или снимет живую. Плюс предел возраста: при упавшем читателе снимок
  * стареет, и бот сам уходит на свои GET — страховка встроена в то же правило.
  */
-public final class VenueReads implements Venue {
+public final class VenueReads implements Venue, StallFeed {
+
+    /**
+     * Расписание затыков от зонда ({@code stall_probe}). Нет таблицы или зонд
+     * молчит дольше 10 минут — {@link #observedMs} ноль, бот живёт своим журналом.
+     */
+    @Override
+    public java.util.List<Long> stallTimes(long sinceMs) {
+        java.util.List<Long> out = new java.util.ArrayList<>();
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:file:" + dbPath + "?mode=ro");
+             PreparedStatement ps = c.prepareStatement("SELECT ts_ms FROM stall_probe WHERE ts_ms >= ?")) {
+            ps.setLong(1, sinceMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(rs.getLong(1));
+                }
+            }
+        } catch (Exception e) {
+            log.debug("расписание затыков не прочитано: {}", e.toString());
+        }
+        return out;
+    }
+
+    @Override
+    public long observedMs(long nowMs) {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:file:" + dbPath + "?mode=ro");
+             ResultSet rs = c.createStatement().executeQuery(
+                     "SELECT started_ms, last_ok_ms FROM heartbeat WHERE name = 'probe'")) {
+            if (rs.next() && nowMs - rs.getLong(2) <= 10 * 60_000L) {
+                return Math.max(0, nowMs - rs.getLong(1));
+            }
+        } catch (Exception e) {
+            log.debug("сердцебиение зонда не прочитано: {}", e.toString());
+        }
+        return 0;
+    }
 
     private static final Logger log = LoggerFactory.getLogger(VenueReads.class);
 

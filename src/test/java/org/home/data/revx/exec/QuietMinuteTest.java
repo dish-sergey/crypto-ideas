@@ -39,6 +39,32 @@ class QuietMinuteTest {
         assertEquals(-1, QuoteLoop.pickQuietMinute(List.of(t("2026-09-28T09:38:30Z"))));
     }
 
+    /** Переезд: старые затыки текущей минуты не мешают выбрать новую. */
+    @Test
+    void переездНеЖдётСтаройИстории() {
+        List<Long> stalls = new ArrayList<>();
+        for (int h = 0; h < 24; h++) {
+            stalls.add(t(String.format("2026-09-27T%02d:38:30Z", h)));      // сутки старой минуты
+        }
+        for (int h = 0; h < 6; h++) {
+            stalls.add(t(String.format("2026-09-28T%02d:33:30Z", h)));      // шесть часов новой
+        }
+        assertEquals(38, QuoteLoop.pickQuietMinute(stalls));                  // вся история: старая
+        assertEquals(33, QuoteLoop.pickQuietMinute(stalls, 38, new long[60])); // без текущей: новая
+    }
+
+    /** Опровергнутые затыки минуты не считаются. */
+    @Test
+    void опровергнутоеНеСчитается() {
+        List<Long> stalls = new ArrayList<>();
+        for (int h = 0; h < 10; h++) {
+            stalls.add(t(String.format("2026-09-28T%02d:38:30Z", h)));
+        }
+        long[] ignored = new long[60];
+        ignored[38] = t("2026-09-28T12:00:00Z");
+        assertEquals(-1, QuoteLoop.pickQuietMinute(stalls, -1, ignored));
+    }
+
     @Test
     void окноСЗапасомДоМинуты() {
         assertTrue(QuoteLoop.inQuietWindow(t("2026-09-28T09:37:51Z"), 38));
