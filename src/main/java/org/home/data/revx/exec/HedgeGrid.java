@@ -73,9 +73,15 @@ public class HedgeGrid {
     private static final long HOUR = 3_600_000L;
 
     /** Шаг контракта Kraken ({@code contractValueTradePrecision}, A69). */
-    static final Map<String, Double> STEP = Map.of("BTC", 1e-4, "ETH", 1e-3, "SOL", 1e-2);
-    /** Средний спред перпа, б.п. (163, захват 18–19.09). */
-    static final Map<String, Double> SPREAD_BP = Map.of("BTC", 0.16, "ETH", 0.45, "SOL", 1.65);
+    static final Map<String, Double> STEP = Map.of("BTC", 1e-4, "ETH", 1e-3, "SOL", 1e-2,
+            // пять монет стенда micro2 — instruments Kraken 28.09.2026
+            "XRP", 1.0, "LINK", 0.1, "ADA", 1.0, "SUI", 1.0, "DOGE", 1.0);
+    /**
+     * Средний спред перпа, б.п. (163, захват 18–19.09). ⚠️ Для пяти монет micro2 —
+     * ОДИН снимок тикера 28.09.2026, не среднее: оценка порядка, а не замер.
+     */
+    static final Map<String, Double> SPREAD_BP = Map.of("BTC", 0.16, "ETH", 0.45, "SOL", 1.65,
+            "XRP", 4.7, "LINK", 8.2, "ADA", 2.4, "SUI", 4.3, "DOGE", 3.2);
     /**
      * Доля мейкерских исполнений за 10/30/60 с (163, нижняя оценка по тикеру).
      * ⚠️ Для 120 с замера нет — берётся значение 60 с, то есть снова оценка снизу.
@@ -657,7 +663,9 @@ public class HedgeGrid {
         SplittableRandom rnd = new SplittableRandom(seed);
         double step = STEP.get(b.base);
         double halfSpread = SPREAD_BP.get(b.base) / 2e4;
-        double[] probs = FILL.get(b.base);
+        // ⚠️ Доля мейкера замерена только у BTC/ETH/SOL (163); для прочих — SOL,
+        // самая низкая из замеренных, то есть оценка снизу.
+        double[] probs = FILL.getOrDefault(b.base, FILL.get("SOL"));
         double band = cfg.bandLots() * b.lot;
         long period = cfg.periodMin() * 60_000L;
         long wait = cfg.waitSec() * 1000L;
