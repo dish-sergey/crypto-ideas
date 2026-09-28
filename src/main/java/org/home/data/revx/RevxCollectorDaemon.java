@@ -307,7 +307,26 @@ public class RevxCollectorDaemon {
                         + (double) universe.size() / endpoints.tradesPeriodSeconds();
             }
 
-            addBookTasks(queue, normal, bookPeriodMs, now, 1);
+            // Мемкоины в корзину курса не входят (revx.memecoins), и им 30-секундное
+            // окно свежести не нужно: их книгу можно снимать реже. Это единственная
+            // часть хвоста, которую проредить можно, не тронув курс, от которого
+            // считается цена ботов (28.09.2026: 429 по GET у аккаунта до 27%).
+            // ⚠️ Отдельный список: `normal` дальше идёт в задания ленты, а ленту
+            // мемкоинов это не касается.
+            List<PairsCatalog.Leg> bookNormal = new ArrayList<>(normal);
+            long memePeriodMs = Long.getLong("revx.meme-book-period-seconds", 0L) * 1000L;
+            if (memePeriodMs > bookPeriodMs) {
+                List<PairsCatalog.Leg> meme = new ArrayList<>();
+                bookNormal.removeIf(p -> p.memecoin() && meme.add(p));
+                if (!meme.isEmpty()) {
+                    addBookTasks(queue, meme, memePeriodMs, now, 2);
+                    plannedRps -= 2.0 * meme.size() * (1000.0 / bookPeriodMs - 1000.0 / memePeriodMs);
+                    log.warn("мемкоины {} — книга раз в {} с вместо {} с (в корзину курса не входят)",
+                            meme.stream().map(PairsCatalog.Leg::base).toList(),
+                            memePeriodMs / 1000, bookPeriodMs / 1000);
+                }
+            }
+            addBookTasks(queue, bookNormal, bookPeriodMs, now, 1);
             if (!fast.isEmpty()) {
                 // Приоритет 0: быстрый ярус не должен опаздывать из-за хвоста вселенной,
                 // иначе его шаг перестанет быть тем, ради чего он заведён.

@@ -10,7 +10,8 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/revx
 # Куча маленькая: коллектор упирается в лимит площадки (~1 req/s), а не в CPU/RAM
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx160m -jar /home/ubuntu/revx/app.jar --revx-collect
+# Мемкоины (не в корзине курса) — книга раз в 120 с: 28.09.2026 GET аккаунта упирался в 429.
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx160m -Drevx.auth.book-period-seconds=15 -Drevx.book-depth-deep=50 -Drevx.tier1=ETH,BTC,SOL -Drevx.tier2=BNB,AVAX,LINK,XRP,SUI -Drevx.trades-period-tier1-seconds=15 -Drevx.meme-book-period-seconds=120 -jar /home/ubuntu/revx/app.jar --revx-collect
 Restart=always
 RestartSec=15
 # SIGTERM демон обрабатывает сам (shutdown hook): дописывает healthcheck и закрывает БД
