@@ -65,6 +65,12 @@ class QuietMinuteTest {
         assertEquals(-1, QuoteLoop.pickQuietMinute(stalls, -1, ignored));
     }
 
+    /** Проверочный час не наступает сразу после выбора минуты (перезапуск). */
+    @Test
+    void перваяПроверкаЧерезСутки() {
+        assertTrue(QuoteLoop.QUIET_PROBE_EVERY_MS >= 24 * 3_600_000L);
+    }
+
     @Test
     void окноСЗапасомДоМинуты() {
         assertTrue(QuoteLoop.inQuietWindow(t("2026-09-28T09:37:51Z"), 38));

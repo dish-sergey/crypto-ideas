@@ -5547,6 +5547,12 @@ public final class QuoteLoop implements Runnable {
                 }
             }
         }
+        if (quietMinute != was && quietMinute >= 0) {
+            // ⚠️ Первая проверка — через СУТКИ после выбора минуты, а не сразу. Иначе
+            // каждый перезапуск делал первую же минуту затыков проверочной и оставлял
+            // её без защиты (28.09.2026 19:38: a, b, e, f торговали в :38 «проверкой»).
+            lastQuietProbeMs = now;
+        }
         if (quietMinute != was) {
             String text = quietMinute < 0
                     ? "минута затыков не выражена — разведения нет"
