@@ -235,8 +235,21 @@ public final class QuoteLoop implements Runnable {
     private void rememberLevel(Side side, Resting resting) {
         if (resting.venueId != null) {
             levelByOrder.put(resting.venueId, levelOf(side, resting));
+            myOrders.put(resting.venueId, side);
         }
     }
+
+    /**
+     * Свои заявки последнего времени — по ним лента опознаёт свои сделки, не дожидаясь,
+     * пока читатель спросит заявку и узнает её хозяина (этап 3, 28.09.2026).
+     */
+    private final java.util.Map<String, Side> myOrders =
+            new java.util.LinkedHashMap<>(256, 0.75f, false) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, Side> eldest) {
+                    return size() > 4096;
+                }
+            };
 
     private int levelOf(String venueId) {
         Integer v = venueId == null ? null : levelByOrder.get(venueId);
@@ -2556,7 +2569,12 @@ public final class QuoteLoop implements Runnable {
                     price, size, clock.now());
             if (oldId != null && !oldId.equals(resting.venueId)) {
                 journal.closeOrder(oldId, "replaced", clock.now());
-                inspectGoneOrder(side, oldId);
+                // 🔑 ЭТАП 3: при живом читателе предка не допрашиваем — его частичное
+                // исполнение придёт лентой по его oid (myOrders его помнит). Это
+                // ~один GET на замену, ~200 GET/мин на шесть ботов (28.09.2026).
+                if (!venueCovers()) {
+                    inspectGoneOrder(side, oldId);
+                }
             }
             resting.price = price;
             resting.size = size;
@@ -5106,8 +5124,123 @@ public final class QuoteLoop implements Runnable {
      */
     static final long LEDGER_LOOKBACK_MS = 6 * 3_600_000L;
 
+    // ================================================================ этап 3
+
+    /**
+     * 🔑 ЭТАП 3 ЧИТАТЕЛЯ: исполнения из ленты сразу, а не страховкой через 5 минут.
+     * Включается свойством {@code revx.exec.venue-fills=true} — по одному боту.
+     */
+    static final boolean VENUE_FILLS =
+            Boolean.parseBoolean(System.getProperty("revx.exec.venue-fills", "false"));
+    /** Читатель старше этого — считаем, что его нет, и возвращаемся к своим GET. */
+    static final long VENUE_FRESH_MS = 10_000L;
+    /** Как часто бот смотрит в ленту. */
+    static final long VENUE_FILLS_EVERY_MS = 2_000L;
+    /** Глубина быстрого пути; старше — страховочный {@link #bookFromLedger}. */
+    static final long VENUE_FILLS_LOOKBACK_MS = 30 * 60_000L;
+
+    private long lastVenueFillsMs;
+    private boolean venueFresh;
+
+    /** Лента читателя свежа и бот в неё смотрит — свои GET по предкам не нужны. */
+    private boolean venueCovers() {
+        return VENUE_FILLS && venueFresh
+                && clock.now() - lastVenueFillsMs < VENUE_FRESH_MS;
+    }
+
+    /** Последний УСПЕШНЫЙ цикл читателя не старше {@link #VENUE_FRESH_MS}. */
+    private boolean readerFresh(long now) {
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                "jdbc:sqlite:file:" + VENUE_DB + "?mode=ro");
+             java.sql.ResultSet rs = c.createStatement().executeQuery(
+                     "SELECT MAX(last_ok_ms) FROM heartbeat")) {
+            return rs.next() && now - rs.getLong(1) <= VENUE_FRESH_MS;
+        } catch (Exception e) {
+            log.warn("читатель площадки не прочитан: {}", e.toString());
+            return false;
+        }
+    }
+
+    /**
+     * Свои сделки из ленты — по метке бота ИЛИ по памяти своих заявок — пишутся
+     * СРАЗУ тем же {@link #book} (он пишет разницу по заявке, повтор ничего не
+     * сдвигает, и обычный путь с ним не конфликтует). Исполненная целиком заявка
+     * текущего слота освобождает слот: следующий тик поставит новую, не дожидаясь
+     * отказа 422 и вопроса о судьбе.
+     */
+    private void venueFills(long now) {
+        java.util.List<VenueTrade> rows = new java.util.ArrayList<>();
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                "jdbc:sqlite:file:" + VENUE_DB + "?mode=ro");
+             java.sql.PreparedStatement ps = c.prepareStatement(
+                     "SELECT t.oid, MAX(t.side), SUM(t.qty), SUM(t.qty * t.price), MAX(t.tdt), "
+                             + "MAX(o.status), MAX(o.bot) FROM trade t "
+                             + "LEFT JOIN order_info o ON o.oid = t.oid "
+                             + "WHERE t.symbol = ? AND t.tdt >= ? GROUP BY t.oid")) {
+            ps.setString(1, symbol.replace('/', '-'));
+            ps.setLong(2, now - VENUE_FILLS_LOOKBACK_MS);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    rows.add(new VenueTrade(rs.getString(1), rs.getString(2), rs.getDouble(3),
+                            rs.getDouble(4), rs.getLong(5), rs.getString(6), rs.getString(7)));
+                }
+            }
+        } catch (Exception e) {
+            log.warn("лента сделок не прочитана: {}", e.toString());
+            venueFresh = false;
+            return;
+        }
+        for (VenueTrade t : rows) {
+            if (!mine(t.bot(), myOrders.containsKey(t.oid()), tag.id())) {
+                continue;
+            }
+            Side side = "sell".equalsIgnoreCase(t.side()) ? Side.SELL : Side.BUY;
+            double already = bookedByOrder.containsKey(t.oid())
+                    ? bookedByOrder.get(t.oid()) : journal.bookedFor(t.oid());
+            if (t.qty() - already > 1e-12) {
+                double price = t.notional() / t.qty();
+                String status = t.status() == null ? "partially_filled" : t.status();
+                String body = String.format(java.util.Locale.ROOT,
+                        "{\"status\":\"%s\",\"filled_quantity\":\"%s\",\"price\":\"%s\",\"total_fee\":\"0\"}",
+                        status, java.math.BigDecimal.valueOf(t.qty()).toPlainString(),
+                        java.math.BigDecimal.valueOf(price).toPlainString());
+                book(side, t.oid(), body);
+                journal.event("venue_fill", String.format(java.util.Locale.ROOT,
+                        "%s %s по %s (заявка %s, сделка %s, статус %s) — из ленты читателя",
+                        side, fmt(t.qty() - already), fmt(price), t.oid(),
+                        java.time.Instant.ofEpochMilli(t.lastTdt()), status));
+            }
+            if ("filled".equalsIgnoreCase(t.status())) {
+                for (Resting r : side == Side.BUY ? bids : asks) {
+                    if (t.oid().equals(r.venueId)) {
+                        closePartial(r, "добрана");
+                        log.info("заявка {} {} исполнена целиком (лента) — слот свободен",
+                                side, t.oid());
+                        r.venueId = null;
+                    }
+                }
+            }
+        }
+    }
+
+    /** Сделка площадки наша: по метке бота у читателя или по памяти своих заявок. */
+    static boolean mine(String readerBot, boolean remembered, String myId) {
+        return remembered || myId.equals(readerBot);
+    }
+
+    private record VenueTrade(String oid, String side, double qty, double notional, long lastTdt,
+                              String status, String bot) {
+    }
+
     private void rollCounters() {
         long now = clock.now();
+        if (VENUE_FILLS && now - lastVenueFillsMs >= VENUE_FILLS_EVERY_MS && ledgerActive()) {
+            lastVenueFillsMs = now;
+            venueFresh = readerFresh(now);
+            if (venueFresh) {
+                venueFills(now);
+            }
+        }
         if (now - minuteStartMs >= 60_000) {
             minuteStartMs = now;
             replacesThisMinute = 0;
