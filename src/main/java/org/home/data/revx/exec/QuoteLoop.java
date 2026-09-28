@@ -2656,7 +2656,11 @@ public final class QuoteLoop implements Runnable {
             // выдал ложную тревогу про наследника.
             boolean heirPossible = fate == null
                     || (!"filled".equalsIgnoreCase(fate) && !"partially_filled".equalsIgnoreCase(fate));
-            if (response.status() == 422 && heirPossible) {
+            // ⚠️ При ленте и учёте запертого слежка за кассой ради «наследника» не
+            // нужна: исполнения приходят лентой, а 422 в затык — призрак без
+            // наследника. Она давала только ложные тревоги «касса котла изменилась»
+            // на любой /claim, /release или пополнение счёта (28.09.2026).
+            if (response.status() == 422 && heirPossible && !(VENUE_LOCKS && ledgerActive())) {
                 // Запоминаем и СВОБОДНУЮ КАССУ в котле на этот момент: уликой
                 // служит её ИЗМЕНЕНИЕ, а не размер — см. claimHeirIfEvidenceMatches.
                 heir = new Heir(side, size, price, heirClientId, clock.now(), freePot(clock.now()));
