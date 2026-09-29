@@ -26,7 +26,7 @@ EnvironmentFile=/etc/revx-exec-d.env
 # Волатильность окна для ADA была близка к норме (среднее движение 3.97% против
 # базовых 3.31% за два года, отношение 1.20), так что хрупкость — свойство пары,
 # а не окна.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -Drevx.exec.quiet-minute=auto -Drevx.exec.budget-unwind=true -Drevx.exec.stall-freeze-sec=5 -jar /home/ubuntu/revx-exec-d/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -Drevx.exec.quiet-minute=auto -Drevx.exec.budget-unwind=true -Drevx.exec.stall-freeze-sec=5 -Drevx.exec.partial-stale-bp=10 -jar /home/ubuntu/revx-exec-d/app.jar --revx-exec \
   --revx.exec.bot-id=d \
   --revx.exec.symbol=XRP/USDC \
   --revx.exec.journal=state/exec-d-xrp.db \

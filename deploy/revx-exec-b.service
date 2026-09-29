@@ -39,7 +39,7 @@ EnvironmentFile=/etc/revx-exec-b.env
 # ⚠️ Контроль повтора на боте B даёт 72.6% совпавших котировок против 99.92% у
 # A. Причина не разобрана. Это относится к сверке симуляции с живым, а не к
 # самой торговле, но доверие к числам по SOL ниже, чем к биткойновым.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -Drevx.exec.quiet-minute=auto -Drevx.exec.budget-unwind=true -Drevx.exec.stall-freeze-outer=true -jar /home/ubuntu/revx-exec-b/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -Drevx.exec.quiet-minute=auto -Drevx.exec.budget-unwind=true -Drevx.exec.stall-freeze-sec=5 -Drevx.exec.partial-stale-bp=10 -jar /home/ubuntu/revx-exec-b/app.jar --revx-exec \
   --revx.exec.bot-id=b \
   --revx.exec.symbol=SOL/USDC \
   --revx.exec.journal=state/exec-b-sol.db \
