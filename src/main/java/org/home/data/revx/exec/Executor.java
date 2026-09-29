@@ -991,6 +991,87 @@ public class Executor {
         }
     }
 
+    /**
+     * {@code --revx-group-forecast}: несколько ботов на разных парах по одним часам
+     * и с общим ведром постановок (см. {@link org.home.data.revx.replay.GroupForecast}).
+     *
+     * Состав — {@code --bots=id:МОНЕТА:уровни:отступ[:лот$[:лотов в потолке[:предел]]]},
+     * через запятую. Умолчания как у живых: один уровень — лот $6.3, 2.33 лота,
+     * предел 100; три уровня — лот $2.2, 7 лотов, шаг 3 б.п., предел 250.
+     */
+    public void groupForecast(String botsSpec, String from, String to, boolean shareBudget,
+                              String journalOut) {
+        long fromMs = from == null || from.isBlank()
+                ? System.currentTimeMillis() - 7L * 86_400_000
+                : java.time.Instant.parse(from).toEpochMilli();
+        long toMs = to == null || to.isBlank()
+                ? System.currentTimeMillis() : java.time.Instant.parse(to).toEpochMilli();
+        FairPrice.Limits limits = new FairPrice.Limits(cfg.fairMinPairs(),
+                cfg.fairMaxDispersionPct(), cfg.fairMaxReferenceSpreadPct(),
+                cfg.fairMaxResidualPct());
+        record Want(String id, String coin, int levels, double offsetBp, double lotUsd,
+                    double capLots, int cap) {
+        }
+        java.util.Map<String, List<Want>> byCoin = new java.util.LinkedHashMap<>();
+        for (String part : botsSpec.split(",")) {
+            String[] f = part.trim().split(":");
+            int levels = Integer.parseInt(f[2]);
+            boolean multi = levels > 1;
+            Want w = new Want(f[0], f[1].toUpperCase(java.util.Locale.ROOT), levels,
+                    Double.parseDouble(f[3]),
+                    f.length > 4 ? Double.parseDouble(f[4]) : multi ? 2.2 : 6.3,
+                    f.length > 5 ? Double.parseDouble(f[5]) : multi ? 7 : 2.33,
+                    f.length > 6 ? Integer.parseInt(f[6]) : multi ? 250 : 100);
+            byCoin.computeIfAbsent(w.coin(), k -> new java.util.ArrayList<>()).add(w);
+        }
+        try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(), limits,
+                cfg.fairMaxSkewMs())) {
+            List<org.home.data.revx.replay.GroupForecast.Pair> pairs = new java.util.ArrayList<>();
+            for (var e : byCoin.entrySet()) {
+                String sym = e.getKey() + "/USDC";
+                StandReader.PairSpec ps = stand.spec(sym);
+                if (ps == null) {
+                    throw new IllegalStateException("нет спецификации пары " + sym);
+                }
+                var ticks = new org.home.data.revx.replay.StandFair(standDbPath, e.getKey(), limits,
+                        cfg.memecoins(), cfg.fairMaxSkewMs(),
+                        org.home.data.revx.exec.Clock.system(), fromMs, toMs).toTicks();
+                if (ticks.isEmpty()) {
+                    throw new IllegalStateException("нет снимков книги для " + sym);
+                }
+                double price = ticks.get(ticks.size() / 2).fair();
+                List<org.home.data.revx.replay.Forecast.BotSpec> bots = new java.util.ArrayList<>();
+                List<Integer> caps = new java.util.ArrayList<>();
+                double lot0 = 0;
+                for (Want w : e.getValue()) {
+                    double lot = ps.baseStep() > 0
+                            ? Math.max(ps.baseStep(),
+                            Math.round(w.lotUsd() / price / ps.baseStep()) * ps.baseStep())
+                            : w.lotUsd() / price;
+                    lot0 = lot0 > 0 ? lot0 : lot;
+                    double step = w.levels() > 1 ? 3.0 / 10_000 : 0;
+                    bots.add(new org.home.data.revx.replay.Forecast.BotSpec(w.id(),
+                            w.offsetBp() / 10_000, 0.3, lot * w.capLots(), w.levels(), step, lot,
+                            true));
+                    caps.add(w.cap());
+                }
+                var base = new org.home.data.revx.replay.BootParams(sym, "a", lot0, lot0 * 7,
+                        0.0007, cfg.simSkewK(), 0.3, 1000, ps.minNotional(), ps.baseStep(),
+                        ps.quoteStep(), 0.10, -1, -1, 0, 0.02, 0.5, true, 1, 0, true);
+                var market = org.home.data.revx.replay.MarketData.load(standDbPath, sym,
+                        ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
+                pairs.add(new org.home.data.revx.replay.GroupForecast.Pair(sym, ticks,
+                        new org.home.data.revx.replay.MarketFillModel(market), base, bots, caps));
+                log.warn("группа: {} — тиков {}, ботов {}", sym, ticks.size(), bots.size());
+            }
+            var results = org.home.data.revx.replay.GroupForecast.run(pairs, cfg, shareBudget,
+                    journalOut);
+            log.info("{}", org.home.data.revx.replay.GroupForecast.render(results));
+        } catch (Exception e) {
+            log.error("групповой прогон не прошёл: {}", e.toString(), e);
+        }
+    }
+
     private void runLive(QuoteLoop loop, ExecJournal journal, TradeClient client,
                          StandReader stand, AllocRegistry alloc) {
         log.warn("""

@@ -52,7 +52,7 @@ public final class Forecast {
      * ⚠️ Если он сработал — прогон НЕ ДОСЧИТАН, и результат печатать нельзя
      * (см. проверку живых потоков ниже).
      */
-    private static final long JOIN_TIMEOUT_MS = 30 * 60_000L;
+    static final long JOIN_TIMEOUT_MS = 30 * 60_000L;
 
     /** Один котировщик в прогоне: чем отличается от базового. */
     /**
@@ -687,7 +687,7 @@ public final class Forecast {
         }
         return sb.toString();
     }
-    private static BotResult measure(BotSpec spec, ExecJournal journal,
+    static BotResult measure(BotSpec spec, ExecJournal journal,
                                      QuoteLoop loop, BootParams base, double days,
                                      List<ReplayFair.Tick> ticks, double seedQty) {
         FifoLedger ledger = new FifoLedger();
@@ -1015,7 +1015,7 @@ public final class Forecast {
      *   <li>число — доля суммарного потолка.</li>
      * </ul>
      */
-    private static double startInventory(List<ReplayFair.Tick> ticks, List<BotSpec> bots) {
+    static double startInventory(List<ReplayFair.Tick> ticks, List<BotSpec> bots) {
         String mode = System.getProperty("revx.forecast.start-inventory", "").trim();
         if (mode.isEmpty()) {
             return ticks.get(0).inventory();
@@ -1127,7 +1127,7 @@ public final class Forecast {
         return sb.toString();
     }
 
-    private static void delete(Path dir) {
+    static void delete(Path dir) {
         try (var walk = Files.walk(dir)) {
             walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
                 try {

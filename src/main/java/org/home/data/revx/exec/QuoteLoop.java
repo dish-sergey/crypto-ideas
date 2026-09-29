@@ -1213,8 +1213,22 @@ public final class QuoteLoop implements Runnable {
         this.statsCap = cap;
     }
 
+    /** Тиков под давлением бюджета: >0 и ≥0.5 (групповой прогон, 29.09.2026). */
+    private long ticksPressured;
+    private long ticksPressuredHalf;
+
+    public long[] pressureTicks() {
+        return new long[]{ticks, ticksPressured, ticksPressuredHalf};
+    }
+
     private void countTick() {
         ticks++;
+        if (budgetPressure > 0.01) {
+            ticksPressured++;
+            if (budgetPressure >= 0.5) {
+                ticksPressuredHalf++;
+            }
+        }
         if (statsCap > 0 && inventory >= 0.9 * statsCap) {
             ticksAtCap++;
         }

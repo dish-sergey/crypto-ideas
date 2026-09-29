@@ -364,6 +364,14 @@ public class CliRunner implements ApplicationRunner {
                         Double.parseDouble(firstOr(args, "lot-usd", "1")),
                         Double.parseDouble(firstOr(args, "cap-lots", "20")));
             }
+            if (args.containsOption("revx-group-forecast")) {
+                executor.getObject().groupForecast(
+                        firstOr(args, "bots",
+                                "a:BTC:1:12,b:SOL:1:12,c:XRP:1:12,d:XRP:3:12,e:BTC:3:12,f:SOL:3:12"),
+                        firstOr(args, "from", ""), firstOr(args, "to", ""),
+                        !args.containsOption("no-budget"),
+                        firstOr(args, "journal-out", ""));
+            }
             if (args.containsOption("revx-assemble")) {
                 org.home.data.revx.replay.StandAssembler.assemble(
                         firstOr(args, "from-dir", "/d/revx-data"),
