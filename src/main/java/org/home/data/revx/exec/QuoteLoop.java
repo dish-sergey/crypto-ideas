@@ -3699,6 +3699,18 @@ public final class QuoteLoop implements Runnable {
             // ⚠️ updated_date площадка отдаёт ЧИСЛОМ без кавычек — field() его не видит.
             Matcher um = Pattern.compile("\"updated_date\"\\s*:\\s*\"?(\\d+)").matcher(order.body());
             long updated = um.find() ? Long.parseLong(um.group(1)) : 0;
+            // Уже записанное старым не считается: 29.09.2026 у d тревожила покупка,
+            // проведённая двумя частями ещё до перезапуска, — статус остался
+            // partially_filled, и запись о заявке просто не закрылась.
+            double staleQty = number(order.body(), "filled_quantity")
+                    - journal.bookedFor(o.venueId());
+            if (updated > 0 && clock.now() - updated > LEDGER_LOOKBACK_MS
+                    && number(order.body(), "filled_quantity") > 0 && staleQty <= 1e-12) {
+                if (terminal(status)) {
+                    journal.closeOrder(o.venueId(), status, clock.now());
+                }
+                continue;
+            }
             if (updated > 0 && clock.now() - updated > LEDGER_LOOKBACK_MS
                     && number(order.body(), "filled_quantity") > 0) {
                 String message = String.format(java.util.Locale.ROOT,

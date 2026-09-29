@@ -174,8 +174,18 @@ public class Park {
         if (!(filled > 0)) {
             return;
         }
+        // ⚠️ Писать только РАЗНИЦУ с уже записанным. filled_quantity
+        // накопительный, а частичное исполнение бот обычно уже провёл сам (по
+        // ленте читателя или опросом). 29.09.2026 парковка у a и c записала
+        // частичную покупку второй раз — как в QuoteLoop.book, считать от журнала.
+        double already = journal.bookedFor(order.id());
+        double fresh = filled - already;
+        if (fresh <= 1e-12) {
+            return;
+        }
         double price = num(state.body(), "average_fill_price");
         double at = price > 0 ? price : order.price();
+        filled = fresh;
         journal.fill(order.id(), order.side().name(), filled, at, at,
                 num(state.body(), "total_fee"), str(state.body(), "fee_currency"), "filled");
         journal.event("park_fill", order.side() + " " + order.id() + " исполнено "
