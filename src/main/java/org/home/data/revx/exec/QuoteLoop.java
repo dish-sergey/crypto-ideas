@@ -1914,7 +1914,15 @@ public final class QuoteLoop implements Runnable {
         // тратит меньше — то есть подстраивается под остаток сам.
         double pressure = pressureFromRecord != null
                 ? pressureFromRecord.applyAsDouble(clock.now()) : budgetPressure;
+        Quoter.Quotes unwidened = target;
         target = widenForBudget(target, fair.price(), pressure);
+        if (budgetUnwind || sellOnly) {
+            // ⚠️ В РАСПРОДАЖЕ АСК НЕ РАЗДВИГАЕТСЯ. Давление бюджета считает, что
+            // реже исполняться — значит беречь постановки, но распродаже нужно
+            // обратное: 29.09.2026 бот d с 2 лотами XRP пять часов держал аск в
+            // 19 б.п. вместо 12 (давление ~1.0), а цена за это время ушла на 3%.
+            target = new Quoter.Quotes(target.bid(), unwidened.ask());
+        }
         target = pullFirstLot(target, fair.price());
         target = decayAsk(target, fair.price(), params.offset());
         rememberVol(fair.price());
@@ -2111,6 +2119,9 @@ public final class QuoteLoop implements Runnable {
      * кладётся поверх. Так уровни не спорят с политикой, а продолжают её.
      */
     private Double levelPrice(Side side, Double base, double fair, int level) {
+        if (side == Side.BUY && base != null) {
+            base = rebuyCap(base);
+        }
         if (base == null || level == 0 || levelStep <= 0) {
             return base;
         }
@@ -2139,6 +2150,32 @@ public final class QuoteLoop implements Runnable {
             shift = level * levelStep * fair;
         }
         return side == Side.BUY ? base - shift : base + shift;
+    }
+
+    /**
+     * Шаг докупки, б.п.: после покупки следующая покупка ставится не выше
+     * {@code последняя покупка × (1 − шаг)}. Любая продажа условие снимает.
+     * Потолок кладётся на БАЗОВУЮ цену бида, поэтому лестница уровней сдвигается
+     * целиком и сохраняет свои промежутки. 0 — выключено (29.09.2026, опыт
+     * владельца: не докупать выше уже купленного).
+     */
+    static final double REBUY_GAP_BP = Double.parseDouble(
+            System.getProperty("revx.exec.rebuy-gap-bp", "0"));
+    /** Цена последней покупки с момента последней продажи; NaN — условия нет. */
+    private double lastBuyPrice = Double.NaN;
+
+    private void noteRebuy(Side side, double price) {
+        if (REBUY_GAP_BP <= 0) {
+            return;
+        }
+        lastBuyPrice = side == Side.BUY ? price : Double.NaN;
+    }
+
+    private double rebuyCap(double bid) {
+        if (REBUY_GAP_BP <= 0 || Double.isNaN(lastBuyPrice)) {
+            return bid;
+        }
+        return Math.min(bid, lastBuyPrice * (1 - REBUY_GAP_BP / 10_000.0));
     }
 
     /**
@@ -4250,6 +4287,13 @@ public final class QuoteLoop implements Runnable {
      * аккаунта, у второго — ноль, иначе он присвоил бы себе чужой биткойн.
      */
     private void restorePosition() {
+        if (REBUY_GAP_BP > 0) {
+            // Условие докупки переживает перезапуск: последняя сделка из журнала.
+            Object[] last = journal.lastFill();
+            if (last != null && "BUY".equalsIgnoreCase((String) last[0])) {
+                lastBuyPrice = (double) last[1];
+            }
+        }
         if (!ownPosition) {
             return;
         }
@@ -4295,6 +4339,7 @@ public final class QuoteLoop implements Runnable {
      * двух ботах больше нельзя.
      */
     private void applyFill(Side side, double qty, double price) {
+        noteRebuy(side, price);
         if (!ownPosition) {
             return;
         }

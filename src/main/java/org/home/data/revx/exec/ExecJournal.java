@@ -879,6 +879,17 @@ public final class ExecJournal implements AutoCloseable {
         }
     }
 
+    /** Последнее исполнение: {сторона, цена}; null — исполнений нет. */
+    public synchronized Object[] lastFill() {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT side, price FROM exec_fill ORDER BY ts_ms DESC, rowid DESC LIMIT 1");
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? new Object[]{rs.getString(1), rs.getDouble(2)} : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     /** Когда котирование последний раз включали ({@code start}); 0 — не включали. */
     public synchronized long lastStartMs() {
         try (PreparedStatement ps = connection.prepareStatement(
