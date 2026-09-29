@@ -270,6 +270,51 @@ public final class InfoBot implements Runnable {
         }
     }
 
+    /**
+     * В каком режиме бот торгует сейчас — по последнему событию смены режима
+     * (владелец 29.09.2026: «чтобы я понимал, в каком режиме бот»). Цель скоса
+     * обычная — из машинной части boot.
+     */
+    String modeOf(String botId) {
+        Watched w = watched.stream().filter(x -> x.botId().equalsIgnoreCase(botId)).findFirst().orElse(null);
+        if (w == null) {
+            return null;
+        }
+        try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
+            String[] e = j.lastEventOf("boot", "start", "budget_unwind", "sell_only",
+                    "frozen_unwind", "frozen_released", "limit_blocked");
+            String normal = "цель " + normalTarget(j) + "%";
+            if (e == null) {
+                return normal;
+            }
+            String detail = e[1] == null ? "" : e[1];
+            return switch (e[0]) {
+                case "sell_only" -> "ТОЛЬКО ПРОДАЖА до нуля — предел постановок исчерпан";
+                case "frozen_unwind" -> "цель 0% — распродажа: площадка держит запертый резерв";
+                case "budget_unwind" -> detail.contains("цель скоса 0")
+                        ? "цель 0% — распродажа перед пределом ("
+                                + detail.replaceAll(".*постановок за сутки (\\d+ из \\d+).*", "$1") + ")"
+                        : normal;
+                default -> normal;
+            };
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    /** Цель скоса из машинной части последнего boot, в процентах потолка. */
+    private static long normalTarget(ExecJournal j) {
+        ExecJournal.Boot b = j.lastBoot();
+        if (b != null && b.detail() != null) {
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("\"skewTarget\":([0-9.]+)").matcher(b.detail());
+            if (m.find()) {
+                return Math.round(Double.parseDouble(m.group(1)) * 100);
+            }
+        }
+        return 30;
+    }
+
     private static String fmtQty(double q) {
         return String.format(Locale.ROOT, "%.8f", q);
     }
@@ -783,6 +828,10 @@ public final class InfoBot implements Runnable {
             // попадает в итоговую сумму: лучше не показать, чем показать неправду.
             boolean stale = !s.quoting() && now - s.lastEventMs() > 5 * 60_000L;
             long pct = s.cap() > 0 ? 100 * s.placements24() / s.cap() : 0;
+            String mode = s.quoting() ? modeOf(s.botId()) : null;
+            if (mode != null) {
+                what = what + " · " + mode;
+            }
             sb.append(String.format(Locale.ROOT,
                     "%s %s  %s%s — %s%n  закрытых пар 24ч %d, доход %+.4f USDC%n"
                             + "  инвентарь %.2f USDC%s, постановок %d из %d (%d%%)%n"
