@@ -854,6 +854,7 @@ public final class InfoBot implements Runnable {
                 totalRealised, totalInventory, totalPlacements, totalCap));
         // ⚠️ Итоги считаются по ПОКАЗАННЫМ — иначе сумма не сходилась бы со
         // строками выше, а это худший вид неправды в отчёте.
+        sb.append(budgetLine(now));
         sb.append(hiddenNote());
         sb.append(unownedNote());
         sb.append(venueLine());
@@ -867,6 +868,36 @@ public final class InfoBot implements Runnable {
                 sb.append("⚠️ книга лежит дольше плановых 14 суток — ночная чистка "
                         + "не доехала (~/revx-prune.log на micro)\n");
             }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * ОБЩЕЕ ВЕДРО ПОСТАНОВОК и давление каждого бота (29.09.2026, просьба
+     * владельца). Давление раздвигает бид до +50%, и прежде увидеть его можно было
+     * только в журнале: 29.09 бот d пять часов стоял с удвоенным отступом, а
+     * сводка показывала «торгует».
+     */
+    String budgetLine(long now) {
+        java.util.List<String> ids = new java.util.ArrayList<>();
+        for (Watched w : visible()) {
+            ids.add(read(w).botId());
+        }
+        java.util.Map<String, PlacementBudget.State> states =
+                PlacementBudget.readOnly(allocPath, ids, now);
+        if (states == null || states.isEmpty()) {
+            return "";
+        }
+        PlacementBudget.State any = states.values().iterator().next();
+        StringBuilder sb = new StringBuilder(String.format(Locale.ROOT,
+                "%n%nВЕДРО ПОСТАНОВОК: %.0f из %.0f, за сутки выдано %d%n",
+                any.tokens(), PlacementBudget.CAPACITY, any.totalSpendDay()));
+        for (var e : states.entrySet()) {
+            PlacementBudget.State s = e.getValue();
+            double p = s.pressure();
+            sb.append(String.format(Locale.ROOT, "  %s %d/%d гарант., давление %.2f%s%n",
+                    e.getKey().toUpperCase(Locale.ROOT), s.ownSpendDay(), s.ownFloor(), p,
+                    p > 0.01 ? String.format(Locale.ROOT, " → бид +%.0f%%", p * 50) : ""));
         }
         return sb.toString();
     }

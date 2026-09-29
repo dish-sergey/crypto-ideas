@@ -86,7 +86,10 @@ class PlacementBudgetTest {
             while (budget.tryAcquire("a", T0)) {
                 granted++;
             }
-            int reserved = 5 * PlacementBudget.FLOOR_PER_DAY;
+            int reserved = 0;
+            for (String other : new String[]{"b", "c", "d", "e", "f"}) {
+                reserved += PlacementBudget.floorFor(other);
+            }
             int room = (int) PlacementBudget.CAPACITY - reserved;
             assertTrue(granted <= room + 1,
                     "жадный бот взял " + granted + " при потолке " + room);
@@ -96,12 +99,13 @@ class PlacementBudgetTest {
             // И теперь каждый из пятерых обязан получить свой пол целиком.
             for (String other : new String[]{"b", "c", "d", "e", "f"}) {
                 int mine = 0;
-                for (int i = 0; i < PlacementBudget.FLOOR_PER_DAY; i++) {
+                int floor = PlacementBudget.floorFor(other);
+                for (int i = 0; i < floor; i++) {
                     if (budget.tryAcquire(other, T0)) {
                         mine++;
                     }
                 }
-                assertEquals(PlacementBudget.FLOOR_PER_DAY, mine,
+                assertEquals(floor, mine,
                         "бот " + other + " не получил свой гарантированный пол");
             }
         }

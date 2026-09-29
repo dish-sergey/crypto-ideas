@@ -67,7 +67,7 @@ public final class PlacementBudget implements AutoCloseable {
      * разовые команды вроде {@code --revx-order-probe}. Полтораста токенов —
      * плата за то, что зеркало неточно.
      */
-    public static final double CAPACITY = 850.0;
+    public static final double CAPACITY = 900.0;
 
     /** Пополнение: вся ёмкость за сутки, то есть 1 токен на 101.6 с. */
     private static final double REFILL_PER_MS = CAPACITY / 86_400_000.0;
@@ -80,6 +80,29 @@ public final class PlacementBudget implements AutoCloseable {
      * они резервируют 600 из 850. Остальные 250 — общий котёл.
      */
     public static final int FLOOR_PER_DAY = 100;
+
+    /**
+     * Пол ПО БОТУ (29.09.2026, решение владельца): одноуровневым 80, трёхуровневым
+     * 160 — те тратят вдвое больше. Сумма 720 из 900, котёл 180. Бот, которого нет
+     * в карте, получает {@link #FLOOR_PER_DAY}.
+     */
+    static final java.util.Map<String, Integer> FLOORS = parseFloors(
+            System.getProperty("revx.budget.floors", "a:80,b:80,c:80,d:160,e:160,f:160"));
+
+    static java.util.Map<String, Integer> parseFloors(String spec) {
+        java.util.Map<String, Integer> m = new java.util.TreeMap<>();
+        for (String part : spec.split(",")) {
+            String[] kv = part.trim().split(":");
+            if (kv.length == 2) {
+                m.put(kv[0].trim(), Integer.parseInt(kv[1].trim()));
+            }
+        }
+        return m;
+    }
+
+    public static int floorFor(String botId) {
+        return FLOORS.getOrDefault(botId, FLOOR_PER_DAY);
+    }
 
     /** Давление ноль, пока свободно больше этой доли общего котла. */
     public static final double PRESSURE_KNEE = 0.5;
@@ -101,7 +124,12 @@ public final class PlacementBudget implements AutoCloseable {
             """;
 
     /** Что бот узнаёт о бюджете, не тратя его. */
-    public record State(double tokens, long ownSpendDay, long totalSpendDay, double reserve) {
+    public record State(double tokens, long ownSpendDay, long totalSpendDay, double reserve,
+                        int ownFloor) {
+
+        public State(double tokens, long ownSpendDay, long totalSpendDay, double reserve) {
+            this(tokens, ownSpendDay, totalSpendDay, reserve, FLOOR_PER_DAY);
+        }
 
         /**
          * Насколько туго с бюджетом: 0 — ведро полно, 1 — свободного нет вовсе.
@@ -121,7 +149,7 @@ public final class PlacementBudget implements AutoCloseable {
             // не косметическая: у биткойна лестница отступа крутая, переход
             // 10 → 14 б.п. стоит трети дохода, так что лишние 8% — это проценты
             // результата, отданные ни за что.
-            if (ownSpendDay < FLOOR_PER_DAY) {
+            if (ownSpendDay < ownFloor) {
                 return tokens >= 1.0 ? 0.0 : 1.0;
             }
             double free = tokens - reserve;
@@ -175,7 +203,7 @@ public final class PlacementBudget implements AutoCloseable {
             long own = spendSince(botId, nowMs - DAY_MS);
             double reserve = reserveFor(botId, nowMs);
             boolean allowed = tokens >= 1.0
-                    && (own < FLOOR_PER_DAY || tokens - 1.0 >= reserve);
+                    && (own < floorFor(botId) || tokens - 1.0 >= reserve);
             if (allowed) {
                 writeTokens(tokens - 1.0, nowMs);
                 try (PreparedStatement ps = connection.prepareStatement(
@@ -245,7 +273,7 @@ public final class PlacementBudget implements AutoCloseable {
             double tokens = refill(nowMs);
             writeTokens(tokens, nowMs);
             State state = new State(tokens, spendSince(botId, nowMs - DAY_MS),
-                    spendSince(null, nowMs - DAY_MS), reserveFor(botId, nowMs));
+                    spendSince(null, nowMs - DAY_MS), reserveFor(botId, nowMs), floorFor(botId));
             commit();
             return state;
         } catch (Exception e) {
@@ -279,17 +307,68 @@ public final class PlacementBudget implements AutoCloseable {
             // Боты, которые сегодня ещё не ставили, в таблице отсутствуют, но
             // пол за ними числится: иначе молчащий с ночи бот обнаружил бы утром,
             // что его долю уже разобрали.
-            int known = 0;
-            for (var e : spent.entrySet()) {
-                if (e.getKey().equals(botId)) {
-                    continue;
-                }
-                known++;
-                reserve += Math.max(0, FLOOR_PER_DAY - e.getValue());
-            }
-            reserve += (double) Math.max(0, bots - 1 - known) * FLOOR_PER_DAY;
+            reserve = reserveOf(botId, spent, bots);
         }
         return reserve;
+    }
+
+    /**
+     * Бронь под полы остальных. Участники — первые {@code bots} меток карты полов
+     * (на стенде бот один, и брони за несуществующих соседей быть не должно), плюс
+     * все, кто сегодня тратил.
+     */
+    static double reserveOf(String botId, java.util.Map<String, Long> spent, int bots) {
+        java.util.Set<String> ids = new java.util.TreeSet<>(spent.keySet());
+        FLOORS.keySet().stream().limit(bots).forEach(ids::add);
+        double reserve = 0;
+        for (String id : ids) {
+            if (id.equals(botId)) {
+                continue;
+            }
+            reserve += Math.max(0, floorFor(id) - spent.getOrDefault(id, 0L));
+        }
+        // Боты сверх карты, ещё не ставившие сегодня, — с общим полом.
+        return reserve + (double) Math.max(0, bots - ids.size()) * FLOOR_PER_DAY;
+    }
+
+    /**
+     * Снимок ведра ТОЛЬКО НА ЧТЕНИЕ — для сводки. Ничего не пишет (обычный
+     * {@link #state} фиксирует пополнение), поэтому годится процессу, который
+     * бюджетом не пользуется.
+     *
+     * @return токены в ведре и состояние по каждому боту, или null — ведра нет
+     */
+    public static java.util.Map<String, State> readOnly(String path, java.util.List<String> botIds,
+                                                        long nowMs) {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:file:" + path + "?mode=ro");
+             Statement st = c.createStatement()) {
+            double tokens;
+            try (ResultSet rs = st.executeQuery(
+                    "SELECT tokens, updated_ms FROM placement_bucket WHERE id = 1")) {
+                if (!rs.next()) {
+                    return null;
+                }
+                long elapsed = Math.max(0, nowMs - rs.getLong(2));
+                tokens = Math.min(CAPACITY, rs.getDouble(1) + elapsed * REFILL_PER_MS);
+            }
+            java.util.Map<String, Long> spent = new java.util.HashMap<>();
+            try (ResultSet rs = st.executeQuery(
+                    "SELECT bot_id, COUNT(*) FROM placement_spend WHERE ts_ms >= "
+                            + (nowMs - DAY_MS) + " GROUP BY bot_id")) {
+                while (rs.next()) {
+                    spent.put(rs.getString(1), rs.getLong(2));
+                }
+            }
+            long total = spent.values().stream().mapToLong(Long::longValue).sum();
+            java.util.Map<String, State> out = new java.util.LinkedHashMap<>();
+            for (String id : botIds) {
+                out.put(id, new State(tokens, spent.getOrDefault(id, 0L), total,
+                        reserveOf(id, spent, ExecLimits.BOTS_SHARING_ACCOUNT), floorFor(id)));
+            }
+            return out;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private double refill(long nowMs) throws Exception {

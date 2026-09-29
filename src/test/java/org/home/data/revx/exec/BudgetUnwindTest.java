@@ -22,8 +22,9 @@ class BudgetUnwindTest {
     void коленоНаПоловинеКотла() {
         // свой пол выбран (150 ≥ 100), брони чужих нет
         assertEquals(0.0, new PlacementBudget.State(679, 150, 400, 0).pressure(), 1e-9);
-        assertEquals(0.0, new PlacementBudget.State(425, 150, 400, 0).pressure(), 1e-9);
-        assertEquals(0.5, new PlacementBudget.State(212.5, 150, 400, 0).pressure(), 1e-9);
+        double half = PlacementBudget.CAPACITY / 2;
+        assertEquals(0.0, new PlacementBudget.State(half, 150, 400, 0).pressure(), 1e-9);
+        assertEquals(0.5, new PlacementBudget.State(half / 2, 150, 400, 0).pressure(), 1e-9);
         assertEquals(1.0, new PlacementBudget.State(0, 150, 400, 0).pressure(), 1e-9);
     }
 }

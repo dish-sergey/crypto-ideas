@@ -98,16 +98,16 @@ class DynamicOffsetTest {
         Quoter.Quotes onlyAsk = QuoteLoop.widenForBudget(
                 new Quoter.Quotes(null, 100.1), 100.0, 1.0);
         assertEquals(null, onlyAsk.bid());
-        assertTrue(onlyAsk.ask() > 100.1);
+        assertEquals(100.1, onlyAsk.ask(), 1e-12, "продажу давление не двигает");
     }
 
     @Test
-    void дефицитБюджетаРаздвигаетОтступВдвое() {
-        // При полном дефиците отступ обязан удвоиться: BUDGET_WIDEN = 1.
+    void дефицитБюджетаРаздвигаетТолькоБидНаПоловину() {
+        // При полном дефиците отступ бида +50% (BUDGET_WIDEN = 0.5), аск на месте.
         double price = 100.0;
         Quoter.Quotes after = QuoteLoop.widenForBudget(quotes(99.0, 101.0), price, 1.0);
-        assertEquals(98.0, after.bid(), 1e-12);
-        assertEquals(102.0, after.ask(), 1e-12);
+        assertEquals(98.5, after.bid(), 1e-12);
+        assertEquals(101.0, after.ask(), 1e-12);
     }
 
     @Test
@@ -116,8 +116,8 @@ class DynamicOffsetTest {
         // биткойн с узким не должны получать одинаковую прибавку в долларах.
         Quoter.Quotes wide = QuoteLoop.widenForBudget(quotes(97.0, 103.0), 100.0, 0.5);
         Quoter.Quotes narrow = QuoteLoop.widenForBudget(quotes(99.0, 101.0), 100.0, 0.5);
-        assertEquals(1.5, 100.0 - wide.bid() - 3.0, 1e-12);
-        assertEquals(0.5, 100.0 - narrow.bid() - 1.0, 1e-12);
+        assertEquals(0.75, 100.0 - wide.bid() - 3.0, 1e-12);
+        assertEquals(0.25, 100.0 - narrow.bid() - 1.0, 1e-12);
     }
 
     @Test
@@ -131,7 +131,7 @@ class DynamicOffsetTest {
     void давлениеВышеЕдиницыНеРазноситОтступ() {
         // Защита от арифметической неожиданности: доля дефицита ограничена.
         Quoter.Quotes after = QuoteLoop.widenForBudget(quotes(99.0, 101.0), 100.0, 5.0);
-        assertEquals(98.0, after.bid(), 1e-12);
-        assertEquals(102.0, after.ask(), 1e-12);
+        assertEquals(98.5, after.bid(), 1e-12);
+        assertEquals(101.0, after.ask(), 1e-12);
     }
 }

@@ -734,10 +734,14 @@ public final class QuoteLoop implements Runnable {
         if (!(pressure > 0) || !(price > 0)) {
             return target;
         }
+        // 🔑 ДВИГАЕТСЯ ТОЛЬКО ПОКУПКА (29.09.2026, решение владельца). Продажа
+        // закрывает риск, и отодвигать её ради экономии постановок значит держать
+        // запас дольше: бот d 29.09 пять часов стоял с аском в 19–25 б.п. вместо
+        // 12, пока цена уходила на 3%.
         double m = BUDGET_WIDEN * Math.min(1.0, pressure);
         return new Quoter.Quotes(
                 target.bid() == null ? null : target.bid() - (price - target.bid()) * m,
-                target.ask() == null ? null : target.ask() + (target.ask() - price) * m);
+                target.ask());
     }
 
     public void scaleLimitsForLot(double lotUsd) {
@@ -1051,7 +1055,8 @@ public final class QuoteLoop implements Runnable {
      * Заявки при этом продолжают жить: перестановка идёт через PUT, у которого
      * суточного лимита нет вовсе.
      */
-    private static final double BUDGET_WIDEN = 1.0;
+    /** При давлении 1 отступ бида растёт на половину (было вдвое — 29.09.2026). */
+    private static final double BUDGET_WIDEN = 0.5;
 
     private volatile double inventory;
     private volatile double baseAvailable;
@@ -1914,15 +1919,7 @@ public final class QuoteLoop implements Runnable {
         // тратит меньше — то есть подстраивается под остаток сам.
         double pressure = pressureFromRecord != null
                 ? pressureFromRecord.applyAsDouble(clock.now()) : budgetPressure;
-        Quoter.Quotes unwidened = target;
         target = widenForBudget(target, fair.price(), pressure);
-        if (budgetUnwind || sellOnly) {
-            // ⚠️ В РАСПРОДАЖЕ АСК НЕ РАЗДВИГАЕТСЯ. Давление бюджета считает, что
-            // реже исполняться — значит беречь постановки, но распродаже нужно
-            // обратное: 29.09.2026 бот d с 2 лотами XRP пять часов держал аск в
-            // 19 б.п. вместо 12 (давление ~1.0), а цена за это время ушла на 3%.
-            target = new Quoter.Quotes(target.bid(), unwidened.ask());
-        }
         target = pullFirstLot(target, fair.price());
         target = decayAsk(target, fair.price(), params.offset());
         rememberVol(fair.price());
@@ -2582,11 +2579,11 @@ public final class QuoteLoop implements Runnable {
         // сутки пустовало 240 постановок. Пропущенная постановка обратима сама
         // собой: ведро пополнится, отступ сузится обратно. Выключенный бот сам
         // не возвращается.
-        if (budget != null && !budget.tryAcquire(tag.id(), clock.now())) {
-            journal.event("budget_denied", side + " по " + fmt(price)
-                    + ": общий бюджет постановок исчерпан, отхожу от цены");
-            return;
-        }
+        // ⚠️ СВОЙ ПРЕДЕЛ ПРОВЕРЯЕТСЯ ДО ОБЩЕГО ВЕДРА. Прежде токен брался первым
+        // и при отказе своего предела не возвращался: 29.09.2026 бот d в
+        // распродаже пробовал поставить заявку каждую секунду и за час 15:00
+        // списал из ведра 720 токенов при одной настоящей постановке. Ведро
+        // опустело, давление у d, e и f дошло до 1.0 и удвоило им отступы.
         long used = placementsLastDay();
         if (BUDGET_UNWIND) {
             // 🔑 У ПРЕДЕЛА НЕ ГАСНЕМ, А РАСПРОДАЁМСЯ (владелец 28.09.2026). Замены
@@ -2607,6 +2604,11 @@ public final class QuoteLoop implements Runnable {
                             + placementCap());
             limitStoppedMs = clock.now();
             stopQuoting();
+            return;
+        }
+        if (budget != null && !budget.tryAcquire(tag.id(), clock.now())) {
+            journal.event("budget_denied", side + " по " + fmt(price)
+                    + ": общий бюджет постановок исчерпан, отхожу от цены");
             return;
         }
         String body = """
