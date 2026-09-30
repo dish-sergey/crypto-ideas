@@ -2035,7 +2035,7 @@ public final class QuoteLoop implements Runnable {
             int ib = BUY_FAR_FIRST ? levels - 1 - k : i;
             Double bidPrice = onTick(Side.BUY, noCross(Side.BUY,
                     levelPrice(Side.BUY, target.bid(), fair.price(), ib), fair));
-            Double askPrice = onTick(Side.SELL, noCross(Side.SELL,
+            Double askPrice = askLevelOff(i) ? null : onTick(Side.SELL, noCross(Side.SELL,
                     levelPrice(Side.SELL, target.ask(), fair.price(), i), fair));
 
             double cashCap = bidPrice != null && bidPrice > 0
@@ -2086,7 +2086,7 @@ public final class QuoteLoop implements Runnable {
                             levelPrice(Side.BUY, target.bid(), fair.price(), i), fair)),
                     best);
             best = considerSlot(Side.SELL, i, asks.get(i),
-                    onTick(Side.SELL, noCross(Side.SELL,
+                    askLevelOff(i) ? null : onTick(Side.SELL, noCross(Side.SELL,
                             levelPrice(Side.SELL, target.ask(), fair.price(), i), fair)),
                     best);
         }
@@ -2131,6 +2131,16 @@ public final class QuoteLoop implements Runnable {
      */
     private Double levelPrice(Side side, Double base, double fair, int level) {
         if (side == Side.BUY && base != null) {
+            base = pullback(base, fair);
+        }
+        if (side == Side.BUY && base != null && inBuyCooldown()) {
+            // Отвод на 5%: заявка остаётся в книге (замена бесплатна), но не исполнится.
+            base = Math.min(base, fair * 0.95);
+        }
+        if (base != null) {
+            base = behindBest(side, base, fair);
+        }
+        if (side == Side.BUY && base != null) {
             base = rebuyCap(base);
         }
         if (base == null || level == 0 || levelStep <= 0) {
@@ -2164,18 +2174,153 @@ public final class QuoteLoop implements Runnable {
     }
 
     /**
+     * НЕ СТОЯТЬ ПЕРВЫМ (29.09.2026, идея владельца). На XRP почти половина принтов —
+     * ровно $0.10 (чей-то робот щупает верх книги), и они надкусывают нашу заявку,
+     * если она лучшая. Правило: если наша цена лучше всех чужих (между нами и
+     * справедливой ценой никого), встать ЗА ближайшей чужой заявкой. Крупная
+     * сделка дойдёт и до нас, мелкая съест соседа.
+     *
+     * {@code revx.exec.behind-bp}: насколько за чужой — 0 = один шаг цены, иначе
+     * столько б.п. (не меньше шага); отрицательное — ВРОВЕНЬ с чужой.
+     * {@code revx.exec.behind-max-bp}: не отодвигать дальше этого (чужая далеко —
+     * стоим где стояли). Выключено, пока нет источника книги.
+     */
+    static final String BEHIND_MODE = System.getProperty("revx.exec.behind-bp", "");
+    static final double BEHIND_MAX_BP = Double.parseDouble(
+            System.getProperty("revx.exec.behind-max-bp", "5"));
+    private java.util.function.LongFunction<org.home.data.revx.sim.BookView> bookSource;
+    private long behindShifts;
+
+    /** Книга без наших заявок — источник для правила «не стоять первым». */
+    public void bookSource(java.util.function.LongFunction<org.home.data.revx.sim.BookView> src) {
+        this.bookSource = src;
+    }
+
+    public long behindShifts() {
+        return behindShifts;
+    }
+
+    private double behindBest(Side side, double base, double fair) {
+        if (BEHIND_MODE.isBlank() || bookSource == null) {
+            return base;
+        }
+        org.home.data.revx.sim.BookView book = bookSource.apply(clock.now());
+        if (book == null) {
+            return base;
+        }
+        java.util.List<org.home.data.revx.sim.BookView.Level> levels =
+                side == Side.BUY ? book.bids() : book.asks();
+        if (levels.isEmpty()) {
+            return base;
+        }
+        double best = levels.get(0).price();
+        double step = Math.max(params.quoteStep(), 1e-12);
+        if ("front".equalsIgnoreCase(BEHIND_MODE.trim())) {
+            // ПРИЖАТЬСЯ ПЕРЕД чужой (вариант владельца 30.09.2026): остаёмся
+            // первыми, но не дальше одного шага цены впереди лучшей чужой.
+            double front = side == Side.BUY ? best + step : best - step;
+            boolean ahead = side == Side.BUY ? base > front : base < front;
+            if (!ahead || Math.abs(base - front) / fair * 10_000 > BEHIND_MAX_BP) {
+                return base;
+            }
+            behindShifts++;
+            return front;
+        }
+        double behindBp = Double.parseDouble(BEHIND_MODE);
+        double gap = behindBp < 0 ? 0 : Math.max(step, fair * behindBp / 10_000);
+        double target;
+        if (side == Side.BUY) {
+            if (base <= best) {
+                return base;              // впереди нас уже кто-то есть
+            }
+            target = best - gap;
+            if ((base - target) / fair * 10_000 > BEHIND_MAX_BP) {
+                return base;
+            }
+        } else {
+            if (base >= best) {
+                return base;
+            }
+            target = best + gap;
+            if ((target - base) / fair * 10_000 > BEHIND_MAX_BP) {
+                return base;
+            }
+        }
+        behindShifts++;
+        return target;
+    }
+
+    /**
      * Шаг докупки, б.п.: после покупки следующая покупка ставится не выше
      * {@code последняя покупка × (1 − шаг)}. Любая продажа условие снимает.
      * Потолок кладётся на БАЗОВУЮ цену бида, поэтому лестница уровней сдвигается
      * целиком и сохраняет свои промежутки. 0 — выключено (29.09.2026, опыт
      * владельца: не докупать выше уже купленного).
      */
+    /**
+     * РАЗДЕЛЬНЫЙ ЛОТ (30.09.2026, идея владельца): покупка тремя уровнями по лоту,
+     * продажа — одной заявкой на ближнем уровне размером во весь запас.
+     * {@code revx.exec.ask-levels} — сколько уровней у продажи (0 — как у покупки);
+     * {@code revx.exec.ask-lot-mult} — предел продажи в лотах (1 — как было, 0 — без предела).
+     */
+    static final int ASK_LEVELS = Integer.getInteger("revx.exec.ask-levels", 0);
+    static final double ASK_LOT_MULT = Double.parseDouble(
+            System.getProperty("revx.exec.ask-lot-mult", "1"));
+
+    private boolean askLevelOff(int level) {
+        return ASK_LEVELS > 0 && level >= ASK_LEVELS;
+    }
+
     static final double REBUY_GAP_BP = Double.parseDouble(
             System.getProperty("revx.exec.rebuy-gap-bp", "0"));
     /** Цена последней покупки с момента последней продажи; NaN — условия нет. */
     private double lastBuyPrice = Double.NaN;
 
+    /**
+     * ПАУЗА ПОСЛЕ ПОКУПКИ (30.09.2026, идея владельца): после исполнения покупки
+     * бот N секунд не покупает — бид отводится далеко заменой (постановка не
+     * тратится). Любая продажа паузу снимает. Против «пилы» ±2%, где боты
+     * докупают всю дорогу вниз. 0 — выключено.
+     */
+    static final long BUY_COOLDOWN_MS = Long.getLong("revx.exec.buy-cooldown-sec", 0L) * 1000L;
+    private long lastBuyFillMs;
+
+    private boolean inBuyCooldown() {
+        return BUY_COOLDOWN_MS > 0 && lastBuyFillMs > 0
+                && clock.now() - lastBuyFillMs < BUY_COOLDOWN_MS;
+    }
+
+    /**
+     * ОТТЯЖКА ПОСЛЕ ПОКУПКИ (30.09.2026, идея владельца): бид после покупки уходит
+     * на {@code buy-pullback-bp} б.п. дальше и за {@code buy-pullback-min} минут
+     * линейно возвращается на место. Вторая покупка подряд — только с премией.
+     * Продажа оттяжку снимает. 0 — выключено.
+     */
+    static final double PULLBACK_BP = Double.parseDouble(
+            System.getProperty("revx.exec.buy-pullback-bp", "0"));
+    static final long PULLBACK_MS = (long) (Double.parseDouble(
+            System.getProperty("revx.exec.buy-pullback-min", "10")) * 60_000);
+    private long pullbackFromMs;
+
+    private double pullback(double base, double fair) {
+        if (PULLBACK_BP <= 0 || pullbackFromMs <= 0 || PULLBACK_MS <= 0) {
+            return base;
+        }
+        double left = 1.0 - (double) (clock.now() - pullbackFromMs) / PULLBACK_MS;
+        return left <= 0 ? base : base - fair * PULLBACK_BP * left / 10_000;
+    }
+
+    /** Снимает ли продажа отсчёт паузы и оттяжки ({@code revx.exec.sell-resets}, да по умолчанию). */
+    static final boolean SELL_RESETS = !"false".equalsIgnoreCase(
+            System.getProperty("revx.exec.sell-resets", "true"));
+
     private void noteRebuy(Side side, double price) {
+        if (PULLBACK_BP > 0 && (side == Side.BUY || SELL_RESETS)) {
+            pullbackFromMs = side == Side.BUY ? clock.now() : 0;
+        }
+        if (BUY_COOLDOWN_MS > 0 && (side == Side.BUY || SELL_RESETS)) {
+            lastBuyFillMs = side == Side.BUY ? clock.now() : 0;
+        }
         if (REBUY_GAP_BP <= 0) {
             return;
         }
@@ -2362,6 +2507,14 @@ public final class QuoteLoop implements Runnable {
             place(side, resting, targetPrice, size);
         } else if (quoter.shouldRequote(resting.price, targetPrice) && mayReplace(side, level)) {
             replace(side, resting, targetPrice, size);
+        } else if (side == Side.SELL && ASK_LOT_MULT != 1.0 && replaceSlotSide == null
+                && !resting.partial() && Math.abs(resting.size - size) > 1e-12
+                && size * targetPrice >= minNotional) {
+            // Запас изменился — продажа меняет РАЗМЕР заменой, даже если цена на месте.
+            // Только когда в этот тик замену никто не занял: одна замена за тик.
+            replaceSlotSide = side;
+            replaceSlotLevel = level;
+            replace(side, resting, targetPrice, size);
         }
         return size;
     }
@@ -2374,6 +2527,11 @@ public final class QuoteLoop implements Runnable {
         // params.sizeFor учитывает асимметрию набора: покупаем медленнее, чем
         // разгружаемся (док. 98 §6). При симметричной настройке это прежний size().
         double want = params.sizeFor(side, inventory);
+        if (side == Side.SELL && ASK_LOT_MULT != 1.0) {
+            // Продажа крупнее покупки: весь запас одной заявкой, до ASK_LOT_MULT лотов
+            // (0 — без предела). Покупки — прежние лоты на своих уровнях.
+            want = ASK_LOT_MULT > 0 ? params.size() * ASK_LOT_MULT : Double.MAX_VALUE;
+        }
         double ownSize = resting.venueId == null ? 0 : resting.size;
         double affordable = affordable(side, price, baseAvailable, quoteBalance,
                 ownSize, resting.price);
@@ -2605,8 +2763,20 @@ public final class QuoteLoop implements Runnable {
             // рынку сколько угодно. Последние постановки берегутся под продажи: к
             // пределу продажи обязаны уже стоять.
             int cap = placementCap();
-            if (used >= cap || (side == Side.BUY && used >= cap - levels)) {
+            // ⚠️ ХВОСТ РАСПРОДАЖИ: продаже можно чуть сверх предела. Иначе остаток
+            // без стоящей заявки продать нечем, и бот висит в распродаже без заявок
+            // (d 29.09.2026). Сверх SELL_TAIL — остановка, как раньше.
+            boolean sellTail = side == Side.SELL && sellOnly && used < cap + SELL_TAIL;
+            if ((used >= cap && !sellTail) || (side == Side.BUY && used >= cap - levels)) {
                 enterSellOnly(used, cap);
+                if (used >= cap + SELL_TAIL && sellOnly) {
+                    sellOnly = false;
+                    journal.event("limit_blocked", "постановки за сутки: " + used + " из " + cap
+                            + " (+" + SELL_TAIL + " на хвост распродажи) — остановка с остатком "
+                            + fmt(inventory));
+                    limitStoppedMs = clock.now();
+                    stopQuoting();
+                }
                 return;
             }
         } else if (used >= placementCap()) {
@@ -5665,6 +5835,8 @@ public final class QuoteLoop implements Runnable {
      */
     static final boolean BUDGET_UNWIND =
             Boolean.parseBoolean(System.getProperty("revx.exec.budget-unwind", "false"));
+    /** Сколько постановок сверх суточного предела разрешено распродаже. */
+    static final int SELL_TAIL = 5;
     static final double BUDGET_UNWIND_ON = 0.9;
     static final double BUDGET_UNWIND_OFF = 0.7;
     private volatile boolean budgetUnwind;
@@ -5686,7 +5858,11 @@ public final class QuoteLoop implements Runnable {
 
     /** Распродано — останавливаемся, как прежде у предела (дальше /start). */
     private void finishSellOnly() {
-        if (!sellOnly || inventory >= params.size() - 1e-12) {
+        // ⚠️ «Распродано» — это остаток мельче минимальной заявки площадки, а не
+        // меньше лота. Порог в целый лот 30.09.2026 оставил боту a треть лота
+        // (0.0000228 BTC ≈ $2): её можно продать заменой той же заявки.
+        double px = lastFair > 0 ? lastFair : 0;
+        if (!sellOnly || px <= 0 || inventory * px >= minNotional) {
             return;
         }
         sellOnly = false;

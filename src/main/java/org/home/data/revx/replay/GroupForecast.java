@@ -93,6 +93,8 @@ public final class GroupForecast {
         PlacementBudget budget = shareBudget
                 ? new PlacementBudget(dir.resolve("budget.db").toString(),
                 pairs.stream().mapToInt(p -> p.bots().size()).sum())
+                .members(pairs.stream().flatMap(p -> p.bots().stream())
+                        .map(Forecast.BotSpec::botId).toList())
                 : null;
         List<AllocRegistry> allocs = new ArrayList<>();
         List<ExecJournal> journals = new ArrayList<>();
@@ -162,6 +164,9 @@ public final class GroupForecast {
                     loop.scaleLimitsForLot(spec.size() * refPrice);
                     if (spec.dynOffsetK() > 0) {
                         loop.dynamicOffset(spec.dynOffsetK(), 1.0);
+                    }
+                    if (p.model() instanceof MarketFillModel mfm) {
+                        loop.bookSource(mfm.market().fresh()::bookAt);
                     }
                     loop.statsInventoryCap(spec.inventoryCap());
                     loops.add(loop);

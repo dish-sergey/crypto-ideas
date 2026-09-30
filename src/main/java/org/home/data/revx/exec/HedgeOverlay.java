@@ -209,6 +209,12 @@ public class HedgeOverlay {
             double lot = s.lot;
             double price = s.fair[0];
             double step = stepUsd > 0 ? stepUsd / price : STEP.getOrDefault(base, 1e-4);
+            // Шаг в ДОЛЯХ ЛОТА (30.09.2026): одна мерка на все пары, чтобы отличать
+            // «идея не работает» от «лот мельче шага контракта» (BTC: шаг 0.0001 ≈ $11).
+            double stepLots = Double.parseDouble(System.getProperty("revx.hedge.step-lots", "0"));
+            if (stepLots > 0 && lot > 0) {
+                step = lot * stepLots;
+            }
             // Сырые USD-марки — для П2.6: нога Kraken живёт в USD, и разница с
             // USDC-пересчётом и есть базис, которым возражал док. 150.
             NavigableMap<Long, Double> markUsd = marks.marks(PerpMarkSource.perpFor(base),
@@ -448,6 +454,16 @@ public class HedgeOverlay {
         TreeMap<Long, double[]> carryHour = new TreeMap<>();
         // П2.10: собственные исполнения хеджа {время, сторона, марка}.
         List<double[]> hedgeFills = new ArrayList<>();
+        // 🔑 ХЕДЖ НА РЕЗКИЙ НАБОР (30.09.2026, идея владельца): шорт открывается,
+        // когда за BURST_MIN минут куплено не меньше BURST_LOTS лотов, держится
+        // равным запасу и закрывается, когда запас опустился до одного лота.
+        long burstMs = (long) (Double.parseDouble(System.getProperty("revx.hedge.burst-min", "0"))
+                * 60_000);
+        double burstLots = Double.parseDouble(System.getProperty("revx.hedge.burst-lots", "2"));
+        double lot = medianBuy(s);
+        java.util.ArrayDeque<double[]> recentBuys = new java.util.ArrayDeque<>();
+        boolean burstOn = false;
+        int burstStarts = 0;
 
         for (int i = 0; i < s.ts.length; i++) {
             long t = s.ts[i];
@@ -462,7 +478,15 @@ public class HedgeOverlay {
                 ch[0] += got;
                 ch[1]++;
                 turnover += Math.abs(s.fillDq[fi]) * s.fillPx[fi];
+                if (burstMs > 0 && s.fillDq[fi] > 0) {
+                    recentBuys.addLast(new double[]{s.fillTs[fi], s.fillDq[fi]});
+                }
                 fi++;
+            }
+            if (burstMs > 0) {
+                while (!recentBuys.isEmpty() && recentBuys.peekFirst()[0] < t - burstMs) {
+                    recentBuys.pollFirst();
+                }
             }
             double m = 0;
             if (mark != null) {
@@ -495,7 +519,29 @@ public class HedgeOverlay {
             }
             // Перевешивание ПОСЛЕ переоценки: решение принимается по состоянию,
             // которое уже отмечено в капитале.
-            if (mark != null && m > 0 && (band > 0 || periodMs > 0)) {
+            if (burstMs > 0 && mark != null && m > 0 && lot > 0) {
+                double bought = recentBuys.stream().mapToDouble(x -> x[1]).sum();
+                if (!burstOn && bought >= burstLots * lot * 0.99) {
+                    burstOn = true;
+                    burstStarts++;
+                }
+                if (burstOn && inv <= lot * 1.01) {
+                    burstOn = false;
+                }
+                double want = burstOn ? -inv : 0;
+                double delta = want - perp;
+                double rounded = Math.signum(delta) * Math.floor(Math.abs(delta) / step) * step;
+                // закрытие шорта — до нуля целиком, чтобы остаток шага не висел
+                if (!burstOn && perp != 0) {
+                    rounded = -perp;
+                }
+                if (Math.abs(rounded) >= step || (!burstOn && rounded != 0)) {
+                    perp += rounded;
+                    fees += Math.abs(rounded) * m * fee;
+                    trades++;
+                    hedgeFills.add(new double[]{t, Math.signum(rounded), m});
+                }
+            } else if (mark != null && m > 0 && (band > 0 || periodMs > 0)) {
                 double net = inv + perp;
                 // 🔑 Два правила перевешивания, и второе нужно для П2.8: полоса
                 // отвечает на вопрос «насколько далеко пускаем», период — «как
@@ -551,6 +597,12 @@ public class HedgeOverlay {
                 exBetaByHour(hourly, meanPos), hourly, capHour,
                 new Legs(capture + spotCarry, hedgeCarry - fees,
                         hedgeCarryUsd - fees, mirror, fees), carryHour, hedgeFills);
+    }
+
+    /** Типичный лот бота — медиана покупок. */
+    private static double medianBuy(Series s) {
+        double[] buys = java.util.Arrays.stream(s.fillDq).filter(x -> x > 0).sorted().toArray();
+        return buys.length == 0 ? 0 : buys[buys.length / 2];
     }
 
     /**

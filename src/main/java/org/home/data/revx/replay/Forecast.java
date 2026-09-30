@@ -488,6 +488,9 @@ public final class Forecast {
                     watches.add(watch);
                     loop.sweepWatch(watch, spec.sweepSide());
                 }
+                if (model instanceof MarketFillModel mfm) {
+                    loop.bookSource(mfm.market().fresh()::bookAt);
+                }
                 loop.statsInventoryCap(spec.inventoryCap());
                 loops.add(loop);
             }
@@ -575,6 +578,7 @@ public final class Forecast {
                         levelBreakdown(journals.get(i), bots.get(i).size()));
                 log.warn("по уровням, бот {}:%n{}", l.botId(), l.levelPresence());
                 log.warn("бот {}: {}", l.botId(), l.effectiveOffset());
+                log.warn("бот {}: не стоять первым — сдвигов {}", l.botId(), l.behindShifts());
             }
             if (sharedBudget != null) {
                 // Ради чего всё и затевалось: сколько ведра осталось и кто

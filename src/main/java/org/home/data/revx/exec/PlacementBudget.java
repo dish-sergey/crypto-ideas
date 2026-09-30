@@ -165,6 +165,14 @@ public final class PlacementBudget implements AutoCloseable {
 
     private final Connection connection;
     private final int bots;
+    /** Явный список участников (групповой прогон); null — первые {@code bots} меток карты. */
+    private java.util.List<String> members;
+
+    /** Участники ведра поимённо: в составе без a, b, c их брони быть не должно. */
+    public PlacementBudget members(java.util.List<String> ids) {
+        this.members = ids == null ? null : java.util.List.copyOf(ids);
+        return this;
+    }
 
     public PlacementBudget(String path, int bots) {
         this.bots = Math.max(1, bots);
@@ -307,7 +315,20 @@ public final class PlacementBudget implements AutoCloseable {
             // Боты, которые сегодня ещё не ставили, в таблице отсутствуют, но
             // пол за ними числится: иначе молчащий с ночи бот обнаружил бы утром,
             // что его долю уже разобрали.
-            reserve = reserveOf(botId, spent, bots);
+            reserve = members != null
+                    ? reserveOf(botId, spent, members) : reserveOf(botId, spent, bots);
+        }
+        return reserve;
+    }
+
+    /** Бронь под полы остальных, когда участники названы поимённо. */
+    static double reserveOf(String botId, java.util.Map<String, Long> spent,
+                            java.util.List<String> members) {
+        double reserve = 0;
+        for (String id : members) {
+            if (!id.equals(botId)) {
+                reserve += Math.max(0, floorFor(id) - spent.getOrDefault(id, 0L));
+            }
         }
         return reserve;
     }

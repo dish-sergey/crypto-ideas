@@ -243,6 +243,11 @@ public final class MarketFillModel implements FillModel {
      * @param decayPerSecond доля очереди, уходящая отменами за секунду;
      *                       0 — прежнее поведение, очередь неподвижна
      */
+    /** Рынок модели — источник книги для правила «не стоять первым». */
+    public MarketData market() {
+        return market;
+    }
+
     public MarketFillModel(MarketData market, double decayPerSecond) {
         this.market = market;
         this.decayPerSecond = Math.max(0, decayPerSecond);
