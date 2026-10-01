@@ -2515,8 +2515,21 @@ public final class QuoteLoop implements Runnable {
             replaceSlotSide = side;
             replaceSlotLevel = level;
             replace(side, resting, targetPrice, size);
+        } else if (side == Side.SELL && resting.venueId != null && !resting.partial()
+                && resting.size > size + 1e-12) {
+            // 🔑 ПРОДАЖА БОЛЬШЕ ОСТАТКА ПУЛА — УМЕНЬШИТЬ СРАЗУ, вне очереди замен.
+            // Сумма стоящих продаж обязана не превышать запас: 01.10.2026 d на росте
+            // XRP держал четыре продажи по лоту при запасе 3.95 лота, все исполнились,
+            // и площадка продала 0.067 XRP из ничейного остатка счёта.
+            journal.event("sell_shrink", String.format(java.util.Locale.ROOT,
+                    "ур%d: продажа %s больше остатка запаса %s — уменьшаю",
+                    level, fmt(resting.size), fmt(size)));
+            replace(side, resting, targetPrice, size);
         }
-        return size;
+        // Пул продаж уменьшается на ФАКТИЧЕСКИ стоящий размер, а не на целевой:
+        // если уменьшить не вышло (частичная, пауза, отказ), следующим уровням
+        // достаётся меньше — сумма заявок не превысит запас.
+        return side == Side.SELL && resting.venueId != null ? Math.max(size, resting.size) : size;
     }
 
     /**

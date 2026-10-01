@@ -13,5 +13,6 @@ dbs:
         access-key-id: ${LITESTREAM_ACCESS_KEY_ID}
         secret-access-key: ${LITESTREAM_SECRET_ACCESS_KEY}
         # Полный снапшот раз в сутки + хранить WAL 72ч → PITR на трое суток назад.
+        sync-interval: 60s   # 01.10.2026: секундный по умолчанию выбрал суточный лимит класса C в B2
         snapshot-interval: 24h
         retention: 72h

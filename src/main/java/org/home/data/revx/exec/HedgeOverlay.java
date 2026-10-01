@@ -1144,4 +1144,465 @@ public class HedgeOverlay {
     private static String round(double v, int digits) {
         return String.format(Locale.ROOT, "%." + digits + "f", v);
     }
+
+    // ------------------------------------------------ хедж по сделкам (30.09.2026)
+
+    /** Набор условий: тип (A — пик, B — спуск), N, порог плюса P, доля минуса L, порог минуса X, выход E. */
+    record RoundRule(char type, int n, double p, double l, double x, double e) {
+        String code() {
+            return type == 'A'
+                    ? String.format(Locale.ROOT, "A%d-%.0f-%.0f-%.0f", n, p, l * 100, e)
+                    : String.format(Locale.ROOT, "B%d-%.0f-%.0f", n, x, e);
+        }
+
+        String name() {
+            return type == 'A'
+                    ? String.format(Locale.ROOT, "A пик: %d плюс, сумма ≥%.0f п., минус ≥%.0f%% суммы, выход ≥%.0f п.",
+                    n, p, l * 100, e)
+                    : String.format(Locale.ROOT, "B спуск: %d минус, сумма ≥%.0f п., выход ≥%.0f п.", n, x, e);
+        }
+    }
+
+    /** Закрытая сделка: момент продажи и её результат в б.п. к цене входа (FIFO). */
+    private record Round(long ts, double usd) {
+    }
+
+    private static List<Round> rounds(Series s) {
+        java.util.ArrayDeque<double[]> lots = new java.util.ArrayDeque<>();   // {qty, px}
+        List<Round> out = new ArrayList<>();
+        for (int i = 0; i < s.fillTs.length; i++) {
+            double dq = s.fillDq[i];
+            double px = s.fillPx[i];
+            if (dq > 0) {
+                lots.addLast(new double[]{dq, px});
+                continue;
+            }
+            double left = -dq;
+            double cost = 0;
+            double matched = 0;
+            while (left > 1e-15 && !lots.isEmpty()) {
+                double[] l = lots.peekFirst();
+                double take = Math.min(left, l[0]);
+                cost += take * l[1];
+                matched += take;
+                l[0] -= take;
+                left -= take;
+                if (l[0] <= 1e-15) {
+                    lots.pollFirst();
+                }
+            }
+            if (matched > 0) {
+                double avg = cost / matched;
+                out.add(new Round(s.fillTs[i], (px - avg) * matched));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * {@code --revx-hedge-rounds}: хедж, включаемый по РЕЗУЛЬТАТАМ СДЕЛОК, на всей сетке
+     * условий сразу. Вход A — «пик»: N плюсовых сделок (сумма ≥ P б.п.), затем минус
+     * не меньше L от этой суммы. Вход B — «спуск»: N минусовых подряд, каждая ≤ −X.
+     * Хедж — шорт на весь запас, следует за запасом; выход — плюсовые сделки с
+     * начала режима набрали ≥ E б.п., шорт закрывается целиком.
+     */
+    public void runRoundGrid(String journals, String fromIso, String toIso, double stepLots,
+                             double feeBp, String out) {
+        long from = fromIso == null || fromIso.isBlank() ? 0 : Instant.parse(fromIso).toEpochMilli();
+        long to = toIso == null || toIso.isBlank() ? Long.MAX_VALUE : Instant.parse(toIso).toEpochMilli();
+        List<RoundRule> rules = new ArrayList<>();
+        double[] exits = {0, 1, 2, 5, 10};
+        for (int n : new int[]{2, 3}) {
+            for (double p : new double[]{0, 10, 20, 30, 40}) {
+                for (double l : new double[]{0, 0.2, 0.3, 0.4, 0.5}) {
+                    for (double e : exits) {
+                        rules.add(new RoundRule('A', n, p, l, 0, e));
+                    }
+                }
+            }
+            for (double x : new double[]{0, 5, 10, 15, 20}) {
+                for (double e : exits) {
+                    rules.add(new RoundRule('B', n, 0, 0, x, e));
+                }
+            }
+        }
+        double[][] acc = new double[rules.size()][5];   // {нога перпа, пошлина, режимов, минут в режиме, сделок}
+        List<PriceRule> prules = new ArrayList<>();
+        for (double h : new double[]{1, 2, 3}) {
+            for (double r : new double[]{0.7, 1, 1.5, 2}) {
+                for (double f : new double[]{0.25, 0.33, 0.5}) {
+                    for (double y : new double[]{0.3, 0.5, 0.8, 99}) {
+                        for (double tt : new double[]{1, 2, 4, 99}) {
+                            prules.add(new PriceRule(h, r, f, y, tt));
+                        }
+                    }
+                }
+            }
+        }
+        double[][] pacc = new double[prules.size()][5];
+        double[] invN = {1, 2, 3, 4, 5, 6};
+        double[][] iacc = new double[invN.length][5];
+        double spot = 0;
+        int minutes = 0;
+        StringBuilder perBot = new StringBuilder();
+        for (String part : journals.split(",")) {
+            String[] kv = part.split("=", 2);
+            if (kv.length != 2) {
+                continue;
+            }
+            String id = kv[0].trim();
+            String base = id.contains(":") ? id.substring(id.indexOf(':') + 1) : null;
+            Bot b = new Bot(id.contains(":") ? id.substring(0, id.indexOf(':')) : id, base,
+                    kv[1].split("\\+"));
+            Series s = readSeries(b, from, to);
+            if (s == null || s.ts.length < 100) {
+                continue;
+            }
+            String cur = b.base() != null ? b.base() : guessBase(s.fair[0]);
+            NavigableMap<Long, Double> mark = marks.marksInQuote(PerpMarkSource.perpFor(cur), cur,
+                    s.ts[0] - 120_000, s.ts[s.ts.length - 1] + 120_000);
+            if (mark.isEmpty()) {
+                continue;
+            }
+            double lot = s.lot > 0 ? s.lot : medianBuy(s);
+            double step = stepLots > 0 && lot > 0 ? lot * stepLots : STEP.getOrDefault(cur, 1e-4);
+            // Пункт — доля ДЕНЕЖНОГО ПОТОЛКА бота (владелец 30.09.2026): 10 п. от $7 = 0.7 цента.
+            double capLots = Double.parseDouble(System.getProperty("revx.hedge.cap-lots",
+                    lot * s.fair[0] > 4 ? "2.33" : "7"));
+            double unit = capLots * lot * s.fair[s.ts.length / 2] / 1e4;
+            List<Round> rs = rounds(s);
+            double cash = 0;
+            int fi = 0;
+            for (int i = 0; i < s.ts.length; i++) {
+                while (fi < s.fillTs.length && s.fillTs[fi] <= s.ts[i]) {
+                    cash -= s.fillDq[fi] * s.fillPx[fi];
+                    fi++;
+                }
+            }
+            double botSpot = cash + s.inv[s.ts.length - 1] * s.fair[s.ts.length - 1];
+            spot += botSpot;
+            minutes = Math.max(minutes, s.ts.length);
+            perBot.append(String.format(Locale.ROOT, "%s %s: сделок %d, спот %+.4f, шаг %.2f лота%n",
+                    b.id(), cur, rs.size(), botSpot, lot > 0 ? step / lot : 0));
+            if (!TRACE.isBlank()) {
+                log.info("--- бот {} {}: режимы набора «{}»", b.id(), cur, TRACE);
+            }
+            for (int r = 0; r < rules.size(); r++) {
+                simulateRule(rules.get(r), s, rs, mark, step, feeBp / 1e4, acc[r], unit);
+            }
+            MinuteSeries ms = minutes(s, mark);
+            for (int r = 0; r < prules.size(); r++) {
+                simulatePrice(prules.get(r), ms, step, feeBp / 1e4, pacc[r]);
+            }
+            for (int r = 0; r < invN.length; r++) {
+                simulateInv(invN[r], lot, ms, step, feeBp / 1e4, iacc[r]);
+            }
+        }
+        Integer[] order = new Integer[rules.size()];
+        for (int i = 0; i < order.length; i++) {
+            order[i] = i;
+        }
+        java.util.Arrays.sort(order, (x, y) -> Double.compare(acc[y][0] - acc[y][1], acc[x][0] - acc[x][1]));
+        StringBuilder sb = new StringBuilder("# Хедж по сделкам\n\n").append(perBot)
+                .append(String.format(Locale.ROOT, "%nспот всех ботов без хеджа: %+.4f $%n%n", spot))
+                .append("| условия | режимов | часов в хедже | перевешиваний | нога перпа | пошлина | итог хеджа | спот + хедж |\n")
+                .append("|---|---:|---:|---:|---:|---:|---:|---:|\n");
+        for (int k = 0; k < order.length; k++) {
+            int r = order[k];
+            if (k >= 25 && k < order.length - 5) {
+                if (k == 25) {
+                    sb.append("| … | | | | | | | |\n");
+                }
+                continue;
+            }
+            double net = acc[r][0] - acc[r][1];
+            sb.append(String.format(Locale.ROOT, "| %s | %.0f | %.1f | %.0f | %+.4f | %.4f | **%+.4f** | %+.4f |%n",
+                    rules.get(r).name(), acc[r][2], acc[r][3] / 60.0, acc[r][4], acc[r][0], acc[r][1],
+                    net, spot + net));
+        }
+        log.info("\n{}", sb);
+        if (out != null && !out.isBlank()) {
+            try {
+                StringBuilder csv = new StringBuilder("условия;режимов;часов;перевешиваний;нога;пошлина;итог\n");
+                for (int r = 0; r < rules.size(); r++) {
+                    csv.append(String.format(Locale.ROOT, "%s;%.0f;%.1f;%.0f;%.4f;%.4f;%.4f%n",
+                            rules.get(r).name(), acc[r][2], acc[r][3] / 60.0, acc[r][4],
+                            acc[r][0], acc[r][1], acc[r][0] - acc[r][1]));
+                }
+                for (int r = 0; r < prules.size(); r++) {
+                    csv.append(String.format(Locale.ROOT, "%s;%.0f;%.1f;%.0f;%.4f;%.4f;%.4f%n",
+                            prules.get(r).name(), pacc[r][2], pacc[r][3] / 60.0, pacc[r][4],
+                            pacc[r][0], pacc[r][1], pacc[r][0] - pacc[r][1]));
+                }
+                for (int r = 0; r < invN.length; r++) {
+                    csv.append(String.format(Locale.ROOT, "I запас: хедж с %.0f лотов до распродажи;%.0f;%.1f;%.0f;%.4f;%.4f;%.4f%n",
+                            invN[r], iacc[r][2], iacc[r][3] / 60.0, iacc[r][4],
+                            iacc[r][0], iacc[r][1], iacc[r][0] - iacc[r][1]));
+                }
+                Files.writeString(Path.of(out + ".csv"), csv.toString(), StandardCharsets.UTF_8);
+                Files.writeString(Path.of(out), sb.toString(), StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                log.warn("не записать {}: {}", out, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * ВХОД И ВЫХОД ПО ЦЕНЕ (30.09.2026): рост за H ч от минимума к максимуму ≥ R%,
+     * затем откат от максимума ≥ F от этого роста — шорт на весь запас. Выход:
+     * отскок от минимума за время хеджа ≥ Y% (99 — без условия) или прошло T ч
+     * (99 — без условия). Повторный вход — только на новом пике. Считается по минутам.
+     */
+    record PriceRule(double h, double r, double f, double y, double t) {
+        String name() {
+            return String.format(Locale.ROOT, "P цена: рост ≥%.1f%% за %.0f ч, откат ≥%.0f%%, выход: отскок %s, время %s",
+                    r, h, f * 100, y >= 99 ? "—" : String.format(Locale.ROOT, "%.1f%%", y),
+                    t >= 99 ? "—" : String.format(Locale.ROOT, "%.0f ч", t));
+        }
+
+        String code() {
+            return String.format(Locale.ROOT, "P%.1f-%.0f-%.0f-%.1f-%.0f", r, h, f * 100, y, t);
+        }
+    }
+
+    /** Поминутный ряд бота и заготовки «максимум / минимум до максимума» за H часов. */
+    private static final class MinuteSeries {
+        long[] ts;
+        double[] p;
+        double[] inv;
+        double[] mark;
+        Map<Integer, int[][]> hiLo = new java.util.HashMap<>();   // H → {индекс максимума, индекс минимума до него}
+    }
+
+    private static MinuteSeries minutes(Series s, NavigableMap<Long, Double> mark) {
+        List<Integer> idx = new ArrayList<>();
+        long last = Long.MIN_VALUE;
+        for (int i = 0; i < s.ts.length; i++) {
+            if (s.ts[i] / 60_000 != last) {
+                idx.add(i);
+                last = s.ts[i] / 60_000;
+            }
+        }
+        MinuteSeries m = new MinuteSeries();
+        int n = idx.size();
+        m.ts = new long[n];
+        m.p = new double[n];
+        m.inv = new double[n];
+        m.mark = new double[n];
+        for (int k = 0; k < n; k++) {
+            int i = idx.get(k);
+            m.ts[k] = s.ts[i];
+            m.p[k] = s.fair[i];
+            m.inv[k] = s.inv[i];
+            Map.Entry<Long, Double> e = mark.floorEntry(s.ts[i]);
+            m.mark[k] = e == null ? 0 : e.getValue();
+        }
+        for (int hours : new int[]{1, 2, 3}) {
+            int[][] hl = new int[n][2];
+            long win = hours * 3_600_000L;
+            for (int k = 0; k < n; k++) {
+                int hi = k;
+                for (int j = k; j >= 0 && m.ts[k] - m.ts[j] <= win; j--) {
+                    if (m.p[j] > m.p[hi]) {
+                        hi = j;
+                    }
+                }
+                int lo = hi;
+                for (int j = hi; j >= 0 && m.ts[k] - m.ts[j] <= win; j--) {
+                    if (m.p[j] < m.p[lo]) {
+                        lo = j;
+                    }
+                }
+                hl[k][0] = hi;
+                hl[k][1] = lo;
+            }
+            m.hiLo.put(hours, hl);
+        }
+        return m;
+    }
+
+    private static void simulatePrice(PriceRule rule, MinuteSeries m, double step, double fee,
+                                      double[] acc) {
+        int[][] hl = m.hiLo.get((int) rule.h());
+        boolean on = false;
+        double perp = 0;
+        double minSince = 0;
+        long since = 0;
+        int lastPeak = -1;
+        for (int k = 0; k < m.ts.length; k++) {
+            if (k > 0 && m.mark[k] > 0 && m.mark[k - 1] > 0) {
+                acc[0] += perp * (m.mark[k] - m.mark[k - 1]);
+            }
+            double p = m.p[k];
+            int hi = hl[k][0];
+            int lo = hl[k][1];
+            if (!on) {
+                double rise = m.p[hi] / m.p[lo] - 1;
+                double back = m.p[hi] - m.p[lo] > 0 ? (m.p[hi] - p) / (m.p[hi] - m.p[lo]) : 0;
+                if (hi != lastPeak && rise * 100 >= rule.r() && back >= rule.f()) {
+                    on = true;
+                    lastPeak = hi;
+                    minSince = p;
+                    since = m.ts[k];
+                    acc[2]++;
+                    if (rule.code().equals(TRACE)) {
+                        traceLeg = acc[0] - acc[1];
+                        tracePx = p;
+                        log.info("ВХОД {}: пик {} в {}, рост {}%, цена {}", Instant.ofEpochMilli(m.ts[k]),
+                                round(m.p[hi], 4), Instant.ofEpochMilli(m.ts[hi]), round(rise * 100, 2), round(p, 4));
+                    }
+                }
+            } else {
+                minSince = Math.min(minSince, p);
+                boolean bounce = rule.y() < 99 && p >= minSince * (1 + rule.y() / 100);
+                boolean timeUp = rule.t() < 99 && m.ts[k] - since >= rule.t() * 3_600_000L;
+                if (bounce || timeUp) {
+                    on = false;
+                    if (rule.code().equals(TRACE)) {
+                        log.info("ВЫХОД {} ({}): цена {} → {} ({}%), нога {}", Instant.ofEpochMilli(m.ts[k]),
+                                bounce ? "отскок" : "время", round(tracePx, 4), round(p, 4),
+                                round((p / tracePx - 1) * 100, 2), money(acc[0] - acc[1] - traceLeg));
+                    }
+                }
+            }
+            if (m.mark[k] > 0) {
+                double want = on ? -m.inv[k] : 0;
+                double delta = want - perp;
+                double rounded = on ? Math.signum(delta) * Math.floor(Math.abs(delta) / step) * step : -perp;
+                if (Math.abs(rounded) > 1e-15 && (Math.abs(rounded) >= step || !on)) {
+                    perp += rounded;
+                    acc[1] += Math.abs(rounded) * m.mark[k] * fee;
+                    acc[4]++;
+                }
+            }
+            if (on && k > 0) {
+                acc[3] += (m.ts[k] - m.ts[k - 1]) / 60_000.0;
+            }
+        }
+    }
+
+    /**
+     * ХЕДЖ ПО ЗАПАСУ ДО РАСПРОДАЖИ (30.09.2026, идея владельца для раздельного лота):
+     * запас дошёл до N лотов — шорт на весь запас, следует за ним; запас упал ниже
+     * половины лота (бот продал всё) — шорт закрывается целиком.
+     */
+    private static void simulateInv(double nLots, double lot, MinuteSeries m, double step,
+                                    double fee, double[] acc) {
+        boolean on = false;
+        double perp = 0;
+        for (int k = 0; k < m.ts.length; k++) {
+            if (k > 0 && m.mark[k] > 0 && m.mark[k - 1] > 0) {
+                acc[0] += perp * (m.mark[k] - m.mark[k - 1]);
+            }
+            if (!on && m.inv[k] >= nLots * lot * 0.99) {
+                on = true;
+                acc[2]++;
+            } else if (on && m.inv[k] < 0.5 * lot) {
+                on = false;
+            }
+            if (m.mark[k] > 0) {
+                double want = on ? -m.inv[k] : 0;
+                double delta = want - perp;
+                double rounded = on ? Math.signum(delta) * Math.floor(Math.abs(delta) / step) * step : -perp;
+                if (Math.abs(rounded) > 1e-15 && (Math.abs(rounded) >= step || !on)) {
+                    perp += rounded;
+                    acc[1] += Math.abs(rounded) * m.mark[k] * fee;
+                    acc[4]++;
+                }
+            }
+            if (on && k > 0) {
+                acc[3] += (m.ts[k] - m.ts[k - 1]) / 60_000.0;
+            }
+        }
+    }
+
+    /** Набор условий, чьи режимы хеджа печатаются поимённо ({@code revx.hedge.trace}). */
+    static final String TRACE = System.getProperty("revx.hedge.trace", "");
+    private static long traceFrom;
+    private static double traceLeg;
+    private static double tracePx;
+
+    private static void simulateRule(RoundRule rule, Series s, List<Round> rs,
+                                     NavigableMap<Long, Double> mark, double step, double fee,
+                                     double[] acc, double unit) {
+        boolean on = false;
+        double winSum = 0;
+        double perp = 0;
+        double prevM = 0;
+        int ri = 0;
+        List<Double> hist = new ArrayList<>();
+        long prevT = 0;
+        for (int i = 0; i < s.ts.length; i++) {
+            long t = s.ts[i];
+            Map.Entry<Long, Double> e = mark.floorEntry(t);
+            double m = e == null ? 0 : e.getValue();
+            if (prevM > 0 && m > 0) {
+                acc[0] += perp * (m - prevM);
+            }
+            while (ri < rs.size() && rs.get(ri).ts() <= t) {
+                double bp = rs.get(ri++).usd();
+                if (!on) {
+                    boolean enter = false;
+                    int n = rule.n();
+                    if (rule.type() == 'A' && bp < 0 && hist.size() >= n) {
+                        double sum = 0;
+                        boolean allPlus = true;
+                        for (int k = hist.size() - n; k < hist.size(); k++) {
+                            allPlus &= hist.get(k) > 0;
+                            sum += hist.get(k);
+                        }
+                        enter = allPlus && sum >= rule.p() * unit && -bp >= rule.l() * sum;
+                    } else if (rule.type() == 'B' && bp < 0 && hist.size() >= n - 1) {
+                        boolean all = true;
+                        double lossSum = -bp;
+                        for (int k = hist.size() - (n - 1); k < hist.size(); k++) {
+                            double v = hist.get(k);
+                            all &= v < 0;
+                            lossSum -= v;
+                        }
+                        enter = all && lossSum >= rule.x() * unit;
+                    }
+                    if (enter) {
+                        on = true;
+                        winSum = 0;
+                        acc[2]++;
+                        if (rule.code().equals(TRACE)) {
+                            traceFrom = t;
+                            traceLeg = acc[0] - acc[1];
+                            tracePx = s.fair[i];
+                        }
+                    }
+                } else if (bp > 0) {
+                    winSum += bp;
+                    if (winSum >= rule.e() * unit) {
+                        on = false;
+                        if (rule.code().equals(TRACE)) {
+                            log.info("ХЕДЖ {} → {}: цена {} → {} ({}%), нога {}",
+                                    Instant.ofEpochMilli(traceFrom), Instant.ofEpochMilli(t),
+                                    round(tracePx, 4), round(s.fair[i], 4),
+                                    round((s.fair[i] / tracePx - 1) * 100, 2),
+                                    money(acc[0] - acc[1] - traceLeg));
+                        }
+                    }
+                }
+                hist.add(bp);
+            }
+            if (m > 0) {
+                double want = on ? -s.inv[i] : 0;
+                double delta = want - perp;
+                double rounded = on ? Math.signum(delta) * Math.floor(Math.abs(delta) / step) * step
+                        : -perp;
+                if (Math.abs(rounded) > 1e-15 && (Math.abs(rounded) >= step || !on)) {
+                    perp += rounded;
+                    acc[1] += Math.abs(rounded) * m * fee;
+                    acc[4]++;
+                }
+            }
+            if (on && prevT > 0) {
+                acc[3] += (t - prevT) / 60_000.0;
+            }
+            prevT = t;
+            prevM = m;
+        }
+    }
 }
