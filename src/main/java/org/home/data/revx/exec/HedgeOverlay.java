@@ -1239,9 +1239,19 @@ public class HedgeOverlay {
                 }
             }
         }
+        for (double[] base : new double[][]{{1, 1.5, 0.25, 0.8, 2}, {1, 1.5, 0.25, 99, 1}, {2, 2.0, 0.25, 0.8, 1}}) {
+            for (double rw : new double[]{30, 60, 120}) {
+                for (double rm : new double[]{0, 0.3, 0.5, 1.0}) {
+                    prules.add(new PriceRule(base[0], base[1], base[2], base[3], base[4], rw, rm));
+                }
+            }
+        }
         double[][] pacc = new double[prules.size()][5];
         double[] invN = {1, 2, 3, 4, 5, 6};
         double[][] iacc = new double[invN.length][5];
+        double[] surN = {2, 3, 4};
+        double[] surW = {1, 3, 5, 10, 20};
+        double[][] sacc = new double[surN.length * surW.length][5];
         double spot = 0;
         int minutes = 0;
         StringBuilder perBot = new StringBuilder();
@@ -1297,6 +1307,12 @@ public class HedgeOverlay {
             for (int r = 0; r < invN.length; r++) {
                 simulateInv(invN[r], lot, ms, step, feeBp / 1e4, iacc[r]);
             }
+            for (int a = 0; a < surN.length; a++) {
+                for (int w = 0; w < surW.length; w++) {
+                    simulateSurge(surN[a], (long) (surW[w] * 60_000), lot, s, mark, step, feeBp / 1e4,
+                            sacc[a * surW.length + w]);
+                }
+            }
         }
         Integer[] order = new Integer[rules.size()];
         for (int i = 0; i < order.length; i++) {
@@ -1339,6 +1355,13 @@ public class HedgeOverlay {
                             invN[r], iacc[r][2], iacc[r][3] / 60.0, iacc[r][4],
                             iacc[r][0], iacc[r][1], iacc[r][0] - iacc[r][1]));
                 }
+                for (int a = 0; a < surN.length; a++) {
+                    for (int w = 0; w < surW.length; w++) {
+                        double[] q = sacc[a * surW.length + w];
+                        csv.append(String.format(Locale.ROOT, "S крупное: %.0f лота за %.0f мин, хедж до распродажи;%.0f;%.1f;%.0f;%.4f;%.4f;%.4f%n",
+                                surN[a], surW[w], q[2], q[3] / 60.0, q[4], q[0], q[1], q[0] - q[1]));
+                    }
+                }
                 Files.writeString(Path.of(out + ".csv"), csv.toString(), StandardCharsets.UTF_8);
                 Files.writeString(Path.of(out), sb.toString(), StandardCharsets.UTF_8);
             } catch (IOException e) {
@@ -1353,15 +1376,21 @@ public class HedgeOverlay {
      * отскок от минимума за время хеджа ≥ Y% (99 — без условия) или прошло T ч
      * (99 — без условия). Повторный вход — только на новом пике. Считается по минутам.
      */
-    record PriceRule(double h, double r, double f, double y, double t) {
+    record PriceRule(double h, double r, double f, double y, double t, double rw, double rm) {
+        PriceRule(double h, double r, double f, double y, double t) {
+            this(h, r, f, y, t, 0, 0);
+        }
+
         String name() {
-            return String.format(Locale.ROOT, "P цена: рост ≥%.1f%% за %.0f ч, откат ≥%.0f%%, выход: отскок %s, время %s",
+            String base = String.format(Locale.ROOT, "P цена: рост ≥%.1f%% за %.0f ч, откат ≥%.0f%%, выход: отскок %s, время %s",
                     r, h, f * 100, y >= 99 ? "—" : String.format(Locale.ROOT, "%.1f%%", y),
                     t >= 99 ? "—" : String.format(Locale.ROOT, "%.0f ч", t));
+            return rw > 0 ? base + String.format(Locale.ROOT, "; повтор: %.0f мин, ниже выхода на %.1f%%", rw, rm) : base;
         }
 
         String code() {
-            return String.format(Locale.ROOT, "P%.1f-%.0f-%.0f-%.1f-%.0f", r, h, f * 100, y, t);
+            String base = String.format(Locale.ROOT, "P%.1f-%.0f-%.0f-%.1f-%.0f", r, h, f * 100, y, t);
+            return rw > 0 ? base + String.format(Locale.ROOT, "-R%.0f-%.1f", rw, rm) : base;
         }
     }
 
@@ -1428,6 +1457,11 @@ public class HedgeOverlay {
         double perp = 0;
         double minSince = 0;
         long since = 0;
+        double exitPx = 0;
+        long exitAt = 0;
+        int reentries = 0;
+        // Не больше REENTRY_MAX повторов после начального входа — против лесенки (0 — без предела).
+        int reMax = Integer.getInteger("revx.hedge.reentry-max", 0);
         int lastPeak = -1;
         for (int k = 0; k < m.ts.length; k++) {
             if (k > 0 && m.mark[k] > 0 && m.mark[k - 1] > 0) {
@@ -1437,10 +1471,22 @@ public class HedgeOverlay {
             int hi = hl[k][0];
             int lo = hl[k][1];
             if (!on) {
+                // ПОВТОРНЫЙ ВХОД (01.10.2026): вышли по отскоку, а цена в окне rw ушла ниже
+                // уровня выхода на rm% — отскок был ложный, хедж включается снова.
+                if (rule.rw() > 0 && exitAt > 0 && m.ts[k] - exitAt <= rule.rw() * 60_000L
+                        && p <= exitPx * (1 - rule.rm() / 100) && (reMax == 0 || reentries < reMax)) {
+                    reentries++;
+                    on = true;
+                    minSince = p;
+                    since = m.ts[k];
+                    exitAt = 0;
+                    acc[2]++;
+                }
                 double rise = m.p[hi] / m.p[lo] - 1;
                 double back = m.p[hi] - m.p[lo] > 0 ? (m.p[hi] - p) / (m.p[hi] - m.p[lo]) : 0;
-                if (hi != lastPeak && rise * 100 >= rule.r() && back >= rule.f()) {
+                if (!on && hi != lastPeak && rise * 100 >= rule.r() && back >= rule.f()) {
                     on = true;
+                    reentries = 0;
                     lastPeak = hi;
                     minSince = p;
                     since = m.ts[k];
@@ -1458,6 +1504,8 @@ public class HedgeOverlay {
                 boolean timeUp = rule.t() < 99 && m.ts[k] - since >= rule.t() * 3_600_000L;
                 if (bounce || timeUp) {
                     on = false;
+                    exitPx = p;
+                    exitAt = m.ts[k];
                     if (rule.code().equals(TRACE)) {
                         log.info("ВЫХОД {} ({}): цена {} → {} ({}%), нога {}", Instant.ofEpochMilli(m.ts[k]),
                                 bounce ? "отскок" : "время", round(tracePx, 4), round(p, 4),
@@ -1513,6 +1561,61 @@ public class HedgeOverlay {
             if (on && k > 0) {
                 acc[3] += (m.ts[k] - m.ts[k - 1]) / 60_000.0;
             }
+        }
+    }
+
+    /**
+     * ХЕДЖ НА КРУПНОЕ ИСПОЛНЕНИЕ (01.10.2026, идея владельца для больших лотов): за
+     * W минут куплено ≥ N лотов — значит, кто-то крупный продаёт; шорт на весь запас,
+     * следует за ним, закрывается, когда бот распродался (запас < половины лота).
+     */
+    private static void simulateSurge(double nLots, long windowMs, double lot, Series s,
+                                      NavigableMap<Long, Double> mark, double step, double fee,
+                                      double[] acc) {
+        java.util.ArrayDeque<double[]> buys = new java.util.ArrayDeque<>();
+        boolean on = false;
+        double perp = 0;
+        double prevM = 0;
+        long prevT = 0;
+        int fi = 0;
+        for (int i = 0; i < s.ts.length; i++) {
+            long t = s.ts[i];
+            Map.Entry<Long, Double> e = mark.floorEntry(t);
+            double m = e == null ? 0 : e.getValue();
+            if (prevM > 0 && m > 0) {
+                acc[0] += perp * (m - prevM);
+            }
+            while (fi < s.fillTs.length && s.fillTs[fi] <= t) {
+                if (s.fillDq[fi] > 0) {
+                    buys.addLast(new double[]{s.fillTs[fi], s.fillDq[fi]});
+                }
+                fi++;
+            }
+            while (!buys.isEmpty() && buys.peekFirst()[0] < t - windowMs) {
+                buys.pollFirst();
+            }
+            double bought = buys.stream().mapToDouble(x -> x[1]).sum();
+            if (!on && bought >= nLots * lot * 0.99) {
+                on = true;
+                acc[2]++;
+            } else if (on && s.inv[i] < 0.5 * lot) {
+                on = false;
+            }
+            if (m > 0) {
+                double want = on ? -s.inv[i] : 0;
+                double delta = want - perp;
+                double rounded = on ? Math.signum(delta) * Math.floor(Math.abs(delta) / step) * step : -perp;
+                if (Math.abs(rounded) > 1e-15 && (Math.abs(rounded) >= step || !on)) {
+                    perp += rounded;
+                    acc[1] += Math.abs(rounded) * m * fee;
+                    acc[4]++;
+                }
+            }
+            if (on && prevT > 0) {
+                acc[3] += (t - prevT) / 60_000.0;
+            }
+            prevT = t;
+            prevM = m;
         }
     }
 
