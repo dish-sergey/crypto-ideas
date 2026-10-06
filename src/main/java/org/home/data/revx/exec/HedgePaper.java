@@ -72,7 +72,7 @@ public class HedgePaper {
     /** Шаг контракта Kraken — общий справочник с сеткой хеджа (там и XRP, и прочие). */
     static final Map<String, Double> STEP = HedgeGrid.STEP;
 
-    enum Kind { BAND, EXCESS, PERIOD }
+    enum Kind { BAND, EXCESS, PERIOD, PRICE }
 
     /** Правило: вид и параметр (лоты для полосы и излишка, минуты для периода). */
     record Rule(String name, Kind kind, double param) {
@@ -82,7 +82,98 @@ public class HedgePaper {
             new Rule("полоса 1 лот", Kind.BAND, 1),
             new Rule("полоса 2 лота", Kind.BAND, 2),
             new Rule("излишек сверх 2 лотов", Kind.EXCESS, 2),
-            new Rule("раз в 60 мин", Kind.PERIOD, 60));
+            new Rule("раз в 60 мин", Kind.PERIOD, 60),
+            // ЦЕНОВОЕ ПРАВИЛО (06.10.2026, лучшее для XRP на стенде x10): рост ≥1.5% за
+            // 1 ч, откат ≥25% роста → шорт на весь запас на 1 ч; повтор в течение 120 мин,
+            // если цена ниже цены выхода на 1%, не больше 3 раз. Цена — марка перпа раз в
+            // минуту (на стенде — справедливая цена бота; разница — доли б.п.).
+            new Rule("цена: рост 1.5%/1ч, откат 25%, 1 ч, повтор 2ч/1%", Kind.PRICE, 0));
+
+    static final long PRICE_WIN_MS = 3_600_000L;
+    static final double PRICE_RISE = 0.015;
+    static final double PRICE_BACK = 0.25;
+    static final long PRICE_HOLD_MS = 3_600_000L;
+    static final long PRICE_REENTRY_MS = 120 * 60_000L;
+    static final double PRICE_REENTRY_DROP = 0.01;
+    static final int PRICE_REENTRY_MAX = 3;
+
+    /** Поминутный ряд марки перпа по монете — общий для всех ботов этой монеты. */
+    private final Map<String, java.util.ArrayDeque<double[]>> minutes = new HashMap<>();
+
+    /** Состояние ценового правила по боту. */
+    static final class PriceState {
+        boolean on;
+        long since;
+        double lastPeakTs = -1;
+        long exitAt;
+        double exitPx;
+        int reentries;
+    }
+
+    private final Map<String, PriceState> priceStates = new HashMap<>();
+
+    private void noteMinute(String base, double px, long now) {
+        var d = minutes.computeIfAbsent(base, k -> new java.util.ArrayDeque<>());
+        if (px > 0 && (d.isEmpty() || (long) d.peekLast()[0] / 60_000 != now / 60_000)) {
+            d.addLast(new double[]{now, px});
+        }
+        while (!d.isEmpty() && now - (long) d.peekFirst()[0] > PRICE_WIN_MS) {
+            d.pollFirst();
+        }
+    }
+
+    /** Включён ли ценовой режим сейчас — та же логика, что HedgeOverlay.simulatePrice. */
+    private boolean priceOn(InfoBot.Watched w, Rule r, double px, long now) throws Exception {
+        PriceState s = priceStates.computeIfAbsent(w.botId() + "|" + r.name(), k -> new PriceState());
+        var d = minutes.get(w.base());
+        if (d == null || d.isEmpty()) {
+            return s.on;
+        }
+        if (s.on) {
+            if (now - s.since >= PRICE_HOLD_MS) {
+                s.on = false;
+                s.exitAt = now;
+                s.exitPx = px;
+                event(w, r, now, "выход из ценового режима", 0, px, 0, 0, "прошёл час");
+            }
+            return s.on;
+        }
+        if (s.exitAt > 0 && now - s.exitAt <= PRICE_REENTRY_MS
+                && px <= s.exitPx * (1 - PRICE_REENTRY_DROP) && s.reentries < PRICE_REENTRY_MAX) {
+            s.reentries++;
+            s.on = true;
+            s.since = now;
+            s.exitAt = 0;
+            event(w, r, now, "повторный вход", 0, px, 0, 0, "повтор " + s.reentries);
+            return true;
+        }
+        double[] hi = null;
+        for (double[] m : d) {
+            if (hi == null || m[1] > hi[1]) {
+                hi = m;
+            }
+        }
+        double[] lo = hi;
+        for (double[] m : d) {
+            if (m[0] > hi[0]) {
+                break;
+            }
+            if (m[1] < lo[1]) {
+                lo = m;
+            }
+        }
+        double rise = hi[1] / lo[1] - 1;
+        double back = hi[1] - lo[1] > 0 ? (hi[1] - px) / (hi[1] - lo[1]) : 0;
+        if (hi[0] != s.lastPeakTs && rise >= PRICE_RISE && back >= PRICE_BACK) {
+            s.on = true;
+            s.since = now;
+            s.lastPeakTs = hi[0];
+            s.reentries = 0;
+            event(w, r, now, "вход в ценовой режим", 0, px, 0, 0,
+                    String.format(Locale.ROOT, "рост %.2f%%, откат %.0f%%", rise * 100, back * 100));
+        }
+        return s.on;
+    }
 
     /** Виртуальная нога по одному боту и правилу. */
     static final class Leg {
@@ -148,6 +239,7 @@ public class HedgePaper {
                     if (q == null) {
                         continue;
                     }
+                    noteMinute(w.base(), q.mark(), now);
                     double[] invLot = position(w);
                     if (invLot == null) {
                         continue;
@@ -196,10 +288,13 @@ public class HedgePaper {
             save(w, r, leg, q.mark(), now);
             return;
         }
-        double hedged = r.kind() == Kind.EXCESS ? Math.max(0, inv - r.param() * lot) : inv;
+        double hedged = r.kind() == Kind.EXCESS ? Math.max(0, inv - r.param() * lot)
+                : r.kind() == Kind.PRICE ? (priceOn(w, r, q.mark(), now) ? inv : 0) : inv;
         double want = -hedged;
         double dev = leg.perp - want;
         boolean due = switch (r.kind()) {
+            // Ценовой режим: следовать за запасом с точностью до шага контракта; вне режима — в ноль.
+            case PRICE -> Math.abs(dev) >= step;
             case BAND -> Math.abs(dev) > r.param() * lot;
             case EXCESS -> Math.abs(dev) > lot;
             case PERIOD -> {

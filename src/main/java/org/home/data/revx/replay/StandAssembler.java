@@ -102,6 +102,7 @@ public final class StandAssembler {
                                     parts.get(i).getFileName(), t, e.getMessage());
                         }
                     }
+                    copyStalls(st);
                     st.execute("DETACH s");
                 }
                 log.warn("{} → книг всего {}", parts.get(i).getFileName(), count(out, "revx_book"));
@@ -109,6 +110,7 @@ public final class StandAssembler {
             Files.deleteIfExists(tmp);
             index(out);
             report(out);
+            writeSchedule(out);
         } catch (Exception e) {
             log.error("сборка базы не прошла: {}", e.toString(), e);
         }
@@ -155,6 +157,64 @@ public final class StandAssembler {
             // медленно. Но молчать нельзя — именно молчание и стоило прогонов.
             log.error("⚠️ ИНДЕКСЫ НЕ ПОСТРОЕНЫ: {}. База пригодна, но запросы по "
                     + "ленте и книге пойдут полным сканом", e.toString());
+        }
+    }
+
+    /** Таблицы затыков площадки (deploy/revx-stall-extract.sh) — объединяются из всех частей. */
+    private static final List<String> STALL_TABLES = List.of("revx_stall", "revx_stall_cover");
+
+    private static void copyStalls(Statement st) {
+        for (String t : STALL_TABLES) {
+            try {
+                if (columns(st, "s", t).isEmpty()) {
+                    continue;                                     // в раннем инкременте их нет
+                }
+                if (columns(st, "main", t).isEmpty()) {
+                    st.execute("CREATE TABLE main." + t + " AS SELECT * FROM s." + t + " WHERE 0");
+                }
+                st.executeUpdate("INSERT INTO main." + t + " SELECT * FROM s." + t
+                        + " EXCEPT SELECT * FROM main." + t);
+            } catch (Exception e) {
+                log.warn("таблица {} не перенеслась — {}", t, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * РАСПИСАНИЕ ЗАТЫКОВ рядом с базой: {@code <база>.stalls.txt}, строки «начало_мс
+     * конец_мс» для {@code -Drevx.sim.stall-schedule}. Окно — медленный ответ площадки
+     * плюс 5 с запаса, соседние ближе 10 с сливаются (как в ручной выжимке 03.10.2026).
+     * ⚠️ Часы, где боты не ставили замен (revx_stall_cover), — «не наблюдали», а не
+     * «затыков не было»: стенд там идёт без затыков, то есть оптимистичнее живого.
+     */
+    private static void writeSchedule(Path out) {
+        try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + out);
+             Statement st = c.createStatement()) {
+            if (columns(st, "main", "revx_stall").isEmpty()) {
+                log.warn("затыков площадки в частях нет — расписание не записано");
+                return;
+            }
+            List<long[]> w = new ArrayList<>();
+            try (var rs = st.executeQuery("SELECT ts_ms, latency_ms FROM revx_stall ORDER BY ts_ms")) {
+                while (rs.next()) {
+                    long s = rs.getLong(1);
+                    long e = s + rs.getLong(2) + 5_000;
+                    if (!w.isEmpty() && s <= w.get(w.size() - 1)[1] + 10_000) {
+                        w.get(w.size() - 1)[1] = Math.max(w.get(w.size() - 1)[1], e);
+                    } else {
+                        w.add(new long[]{s, e});
+                    }
+                }
+            }
+            Path file = Path.of(out + ".stalls.txt");
+            StringBuilder sb = new StringBuilder();
+            for (long[] x : w) {
+                sb.append(x[0]).append(' ').append(x[1]).append('\n');
+            }
+            Files.writeString(file, sb.toString());
+            log.warn("расписание затыков: {} окон → {}", w.size(), file);
+        } catch (Exception e) {
+            log.warn("расписание затыков не записано: {}", e.toString());
         }
     }
 

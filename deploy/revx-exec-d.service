@@ -1,5 +1,5 @@
 [Unit]
-Description=Revolut X micro-live BOT D (REAL orders) — XRP/USDC
+Description=Revolut X micro-live BOT D (REAL orders) — ETH/USDC
 After=network-online.target revx-collect.service
 Wants=network-online.target
 
@@ -26,12 +26,12 @@ EnvironmentFile=/etc/revx-exec-d.env
 # Волатильность окна для ADA была близка к норме (среднее движение 3.97% против
 # базовых 3.31% за два года, отношение 1.20), так что хрупкость — свойство пары,
 # а не окна.
-ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -Drevx.exec.quiet-minute=auto -Drevx.exec.budget-unwind=true -Drevx.exec.stall-freeze-sec=5 -Drevx.exec.partial-stale-bp=10 -jar /home/ubuntu/revx-exec-d/app.jar --revx-exec \
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1.6666667 -Drevx.exec.venue-fills=true -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -Drevx.exec.quiet-minute=auto -Drevx.exec.budget-unwind=true -Drevx.exec.stall-freeze-sec=5 -Drevx.exec.partial-stale-bp=10 -Drevx.fair.live-hybrid=true -Drevx.fair.hybrid-mix=0.25 -Drevx.fair.hybrid-depth-k=10 -Drevx.fair.hybrid-tau-sec=180 -Drevx.bnb.db=/home/ubuntu/revx-shared/bnb.db -jar /home/ubuntu/revx-exec-d/app.jar --revx-exec \
   --revx.exec.bot-id=d \
-  --revx.exec.symbol=XRP/USDC \
-  --revx.exec.journal=state/exec-d-xrp.db \
-  --revx.exec.size=1.42 \
-  --revx.exec.inventory-cap=9.94 \
+  --revx.exec.symbol=ETH/USDC \
+  --revx.exec.journal=state/exec-d-eth2.db \
+  --revx.exec.size=0.00079 \
+  --revx.exec.inventory-cap=0.00553 \
   --revx.exec.offset=0.0012 \
   --revx.exec.skew-target=0.3 \
   --revx.exec.max-loss=6.0 \
@@ -67,7 +67,7 @@ ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.sim.level-growth=1
 # планового рестарта, где процесс возвращается через секунды.
 #
 # Трогает ТОЛЬКО свои заявки: чужие отличаются по метке в client_order_id.
-ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -Drevx.exec.venue-fills=true -jar /home/ubuntu/revx-exec-d/app.jar --revx-park --revx.exec.bot-id=d --revx.exec.symbol=XRP/USDC --revx.exec.journal=state/exec-d-xrp.db || true'
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -Drevx.exec.venue-fills=true -jar /home/ubuntu/revx-exec-d/app.jar --revx-park --revx.exec.bot-id=d --revx.exec.symbol=ETH/USDC --revx.exec.journal=state/exec-d-eth2.db || true'
 
 # Намеренно НЕТ автоперезапуска: перезапуск после падения не должен сам
 # возобновлять торговлю. Котирование в любом случае стартует выключенным.

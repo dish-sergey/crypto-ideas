@@ -33,10 +33,10 @@ public class CliMode {
             "revx-pairs", "revx-probe-limits", "revx-collect", "revx-basis",
             "revx-sim", "revx-flow", "revx-screen", "revx-exec-report", "revx-perp-basis", "revx-mirror",
             "revx-trade-check", "revx-order-probe", "revx-panic", "revx-park", "revx-exec", "revx-regimes",
-            "revx-replay", "revx-forecast", "revx-ladder", "revx-sweep-run", "revx-pair-forecast", "revx-group-forecast",
+            "revx-replay", "revx-forecast", "revx-ladder", "revx-sweep-run", "revx-pair-forecast", "revx-group-forecast", "revx-hedge-rounds",
             "revx-pair-sweep", "revx-info", "revx-assemble", "revx-fill-check",
             "revx-order", "revx-book", "revx-depth-probe", "revx-flow-markout",
-            "revx-hold-check", "revx-fate-probe", "revx-rate-check", "revx-offset-axis", "revx-order-status", "revx-audit", "revx-history-probe", "revx-venue", "revx-budget-facts", "revx-hedge-grid", "revx-hedge-paper", "revx-hedge-paper-report",
+            "revx-hold-check", "revx-fate-probe", "revx-rate-check", "revx-offset-axis", "revx-order-status", "revx-audit", "revx-history-probe", "revx-venue", "revx-bnb-feed", "revx-hybrid-probe", "revx-budget-facts", "revx-hedge-grid", "revx-hedge-paper", "revx-hedge-paper-report",
             "revx-paired", "revx-release-stale", "revx-unbook", "revx-carry", "revx-lead", "revx-hedge", "revx-core", "revx-surface", "revx-seed-gain", "revx-flow-signal");
 
     /**
@@ -50,7 +50,7 @@ public class CliMode {
     private static final Set<String> PARAMS = Set.of(
             "symbol", "symbols", "hours", "from", "to", "interval",
             "out", "table", "bucket-seconds", "days", "edge", "up", "down", "flat",
-            "journal", "offset", "model", "offsets", "bots", "no-budget", "share-cap", "levels", "level-step", "size-mult", "outer-first", "inner-first", "lots", "thin", "dyn-offset", "cap-usd", "from-dir", "stand-db", "sigma", "offset-bp", "taker-cost-bp", "order-id", "client-id", "db", "journals", "placed", "segment", "a", "b", "name-a", "name-b", "alloc", "bot", "currency", "apply", "captures", "band", "fee-bp", "step-usd", "hours-out", "stand", "horizon-ms", "lot", "classes", "delta-bp", "period-min", "perp-usd", "min-trades", "crypto-db", "coefs", "sweep-coef", "sweep-delay-ms", "sides", "journal-out", "flow-coefs", "flow-delay-ms", "watch-min", "period-ms", "heirs", "windows", "seeds", "lot-usd", "cap-lots");
+            "journal", "offset", "model", "offsets", "bots", "no-budget", "step-lots", "share-cap", "levels", "level-step", "size-mult", "outer-first", "inner-first", "lots", "thin", "dyn-offset", "cap-usd", "from-dir", "stand-db", "sigma", "offset-bp", "taker-cost-bp", "order-id", "client-id", "db", "journals", "placed", "segment", "a", "b", "name-a", "name-b", "alloc", "bot", "currency", "apply", "captures", "band", "fee-bp", "step-usd", "hours-out", "stand", "horizon-ms", "lot", "classes", "delta-bp", "period-min", "perp-usd", "min-trades", "crypto-db", "coefs", "sweep-coef", "sweep-delay-ms", "sides", "journal-out", "flow-coefs", "flow-delay-ms", "watch-min", "period-ms", "heirs", "windows", "seeds", "lot-usd", "cap-lots", "seconds");
 
     private final boolean scheduleMode;
     private final Set<String> unknownOptions;

@@ -76,6 +76,15 @@ create table d.revx_uptime  as select * from main.revx_uptime;
 create table d.revx_probe   as select * from main.revx_probe;
 create table d.revx_run     as select * from main.revx_run;
 SQL
+# ЗАТЫКИ ПЛОЩАДКИ (03.10.2026): отдельная маленькая база, которую ведёт
+# revx-stall-extract.sh из журналов ботов. Кладётся ЦЕЛИКОМ, как мелкие таблицы:
+# последний инкремент несёт всю историю, стенд строит из неё расписание затыков.
+STALLS="$HOME/revx/data/stalls.db"
+if [ -f "$STALLS" ]; then
+    nice -n 19 ionice -c3 sqlite3 "$OUT" "attach '$STALLS' as s;
+        create table revx_stall       as select * from s.revx_stall;
+        create table revx_stall_cover as select * from s.revx_stall_cover;"
+fi
 nice -n 19 ionice -c3 gzip -6 "$OUT"
 echo "$book_max $trade_max" > "$CUR.new"
 echo "снимок: строк книги $((book_max-book_cur)), сделок $((trade_max-trade_cur))"

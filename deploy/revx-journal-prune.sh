@@ -29,8 +29,10 @@ BATCH=${BATCH:-5000}
 ARCH=${ARCH:-/home/ubuntu/revx-journal-archive}
 JOURNALS=${JOURNALS:-"/home/ubuntu/revx-exec/state/exec.db
 /home/ubuntu/revx-exec-b/state/exec-b-sol.db
-/home/ubuntu/revx-exec-c/state/exec-c-eth.db
-/home/ubuntu/revx-exec-d/state/exec-d-eth.db
+/home/ubuntu/revx-exec-c/state/exec-c-eth2.db
+/home/ubuntu/revx-exec-d/state/exec-d-eth2.db
+/home/ubuntu/revx-exec-c/state/exec-c-xrp.db
+/home/ubuntu/revx-exec-d/state/exec-d-xrp.db
 /home/ubuntu/revx-exec-e/state/exec-e-btc.db
 /home/ubuntu/revx-exec-f/state/exec-f-sol.db"}
 

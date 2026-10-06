@@ -1,0 +1,20 @@
+[Unit]
+Description=Revolut X — ЦЕНА БИНАНСА для опоры ботов (публичный bookTicker раз в секунду, пишет revx-shared/bnb.db)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx-bnb
+# Сбой этой службы безопасен: боты с revx.fair.live-hybrid сами откатываются к
+# прежней опоре, если цене Бинанса больше 5 с (событие hybrid_fallback).
+ExecStart=/home/ubuntu/jre25/bin/java -Xms16m -Xmx64m -jar /home/ubuntu/revx-bnb/app.jar --revx-bnb-feed --db=/home/ubuntu/revx-shared/bnb.db --symbols=BTCUSDC,SOLUSDC,ETHUSDC,XRPUSDC
+
+Restart=always
+RestartSec=10
+SuccessExitStatus=143
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -199,15 +199,146 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
     /** Сводка несогласованностей за прогон — в отчёт. */
     public synchronized String stallDiag() {
         return String.format(Locale.ROOT, "призраков %d, 204-с-жизнью %d, 404-на-живой %d, "
-                        + "404-о-судьбе %d, исполнено после «отмены» %d",
-                ghostsMade, late204Made, live404Made, staleMade, fillsAfterCancel);
+                        + "404-о-судьбе %d, исполнено после «отмены» %d; затыков по ходу цены %d, "
+                        + "гонок замены %d, невидимых свежих %d",
+                ghostsMade, late204Made, live404Made, staleMade, fillsAfterCancel,
+                volStalls, raceMade, fresh404Made);
     }
 
     private boolean effect(String name) {
         return stallEffects.contains(name) && inGhostWindow(clock.now());
     }
 
+    /**
+     * ЗАТЫК ПО ВОЛАТИЛЬНОСТИ (03.10.2026, разбор 02.10 18:39). Живьём самые дорогие
+     * затыки совпадают с обвалом: XRP −2% за минуту, и площадка в ту же секунду
+     * отвечает на замены по 1.8 с. Окно затыка открывается, когда середина книги
+     * за {@code WIN} секунд прошла ≥ {@code BP} б.п., и держится {@code DUR} секунд:
+     * {@code -Drevx.sim.vol-stall=BP,WIN,DUR}. Внутри окна действуют те же эффекты,
+     * что в окне по расписанию, плюс два новых (включаются в {@code stall-effects}):
+     * {@code race} — замена отвечает через 1.8 с, и старая заявка ещё живёт и может
+     * исполниться (вместе с наследником — двойная покупка); {@code fresh404} — свежая
+     * заявка 6 с невидима: запрос, замена и отмена отвечают 404, а исполниться она может.
+     */
+    private final double[] volStall = parseVolStall(System.getProperty("revx.sim.vol-stall", ""));
+    private final java.util.ArrayDeque<double[]> volMids = new java.util.ArrayDeque<>();
+    private long volStallUntil;
+    private long volStalls;
+    private long raceMade;
+    private long stallReplaces;
+    private long fresh404Made;
+    static final long RACE_MS = Long.getLong("revx.sim.race-ms", 1_800L);
+    /** В затыке каждая N-я замена — призрак, остальные — гонка (живьём 02.10: 3–4 призрака в сутки на бота). */
+    static final int GHOST_EVERY = Integer.getInteger("revx.sim.ghost-every", 3);
+    static final long FRESH_MS = Long.getLong("revx.sim.fresh404-ms", 6_000L);
+    private final Map<String, Long> freshUntil = new LinkedHashMap<>();
+
+    private static double[] parseVolStall(String s) {
+        if (s == null || s.isBlank()) {
+            return null;
+        }
+        String[] p = s.split(",");
+        return new double[]{Double.parseDouble(p[0]), Double.parseDouble(p[1]), Double.parseDouble(p[2])};
+    }
+
+    /** Следит за серединой книги и открывает окно затыка на резком ходе. */
+    private void watchVolatility() {
+        if (volStall == null || !(model instanceof MarketFillModel mfm)) {
+            return;
+        }
+        long now = clock.now();
+        org.home.data.revx.sim.BookView b = mfm.market().bookAt(now);
+        if (b == null || b.empty()) {
+            return;
+        }
+        double mid = (b.bestBid() + b.bestAsk()) / 2;
+        if (volMids.isEmpty() || now - (long) volMids.peekLast()[0] >= 1_000) {
+            volMids.addLast(new double[]{now, mid});
+        }
+        while (now - (long) volMids.peekFirst()[0] > volStall[1] * 1000) {
+            volMids.pollFirst();
+        }
+        double mx = 0;
+        double mn = Double.MAX_VALUE;
+        for (double[] v : volMids) {
+            mx = Math.max(mx, v[1]);
+            mn = Math.min(mn, v[1]);
+        }
+        if (mn > 0 && (mx / mn - 1) * 1e4 >= volStall[0]) {
+            if (now >= volStallUntil) {
+                volStalls++;
+            }
+            volStallUntil = now + (long) (volStall[2] * 1000);
+        }
+    }
+
+    /**
+     * РЕАЛЬНОЕ РАСПИСАНИЕ ЗАТЫКОВ (03.10.2026, идея владельца): вместо придуманных
+     * окон — моменты, когда площадка живьём отвечала на замены, постановки и отмены
+     * дольше секунды (журналы всех шести ботов, слияние с запасом 5 с). Файл
+     * {@code revx.sim.stall-schedule}: строки «начало_мс конец_мс». Внутри окна
+     * действуют эффекты затыка, включая race и fresh404.
+     */
+    private final long[][] schedule = loadSchedule(System.getProperty("revx.sim.stall-schedule", ""));
+
+    private static long[][] loadSchedule(String path) {
+        if (path == null || path.isBlank()) {
+            return null;
+        }
+        try {
+            List<long[]> w = new ArrayList<>();
+            for (String line : java.nio.file.Files.readAllLines(java.nio.file.Path.of(path))) {
+                String[] p = line.trim().split("\\s+");
+                if (p.length >= 2) {
+                    w.add(new long[]{Long.parseLong(p[0]), Long.parseLong(p[1])});
+                }
+            }
+            w.sort(java.util.Comparator.comparingLong(x -> x[0]));
+            return w.toArray(new long[0][]);
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("не прочитать расписание затыков " + path, e);
+        }
+    }
+
+    private boolean inSchedule(long now) {
+        if (schedule == null) {
+            return false;
+        }
+        int lo = 0;
+        int hi = schedule.length - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (schedule[mid][1] < now) {
+                lo = mid + 1;
+            } else if (schedule[mid][0] > now) {
+                hi = mid - 1;
+            } else {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean inVolStall() {
+        return clock.now() < volStallUntil || inSchedule(clock.now());
+    }
+
+    private boolean fresh(String id) {
+        Long until = freshUntil.get(id);
+        if (until == null) {
+            return false;
+        }
+        if (until <= clock.now()) {
+            freshUntil.remove(id);
+            return false;
+        }
+        return true;
+    }
+
     boolean inGhostWindow(long nowMs) {
+        if (nowMs < volStallUntil || inSchedule(nowMs)) {
+            return true;
+        }
         int at = ghostSecAt(nowMs);
         if (at < 0) {
             return false;
@@ -298,6 +429,7 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
      * ответ» обязан совпадать с живым.
      */
     private void advance() {
+        watchVolatility();
         probes++;
         for (Order o : live.values()) {
             if (o.buy) {
@@ -396,8 +528,8 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         StringBuilder sb = new StringBuilder("{\"data\":[");
         boolean first = true;
         for (Order o : live.values()) {
-            if (hiddenUntil.containsKey(o.id)) {
-                continue;                     // «отменена» на словах — в списке её нет
+            if (hiddenUntil.containsKey(o.id) || fresh(o.id)) {
+                continue;                     // «отменена» на словах или свежая в затык — в списке её нет
             }
             if (!first) {
                 sb.append(',');
@@ -460,6 +592,10 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
     @Override
     public synchronized Response order(String id) {
         advance();
+        if (fresh(id)) {
+            fresh404Made++;
+            return new Response(404, "{\"message\":\"Order not found\"}", 50);
+        }
         if ((!live.containsKey(id) || hiddenUntil.containsKey(id)) && effect("stale")) {
             staleMade++;              // в затык судьба ушедшей заявки ещё не видна
             return new Response(404, "{\"message\":\"Order not found\"}", 50);
@@ -498,12 +634,84 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         o.price = limit.path("price").asDouble();
         o.size = limit.path("base_size").asDouble();
         o.createdMs = clock.now();
+        if (!json.contains("post_only") && model instanceof MarketFillModel mfm) {
+            Response r = takeLiquidity(o, mfm);
+            if (r != null) {
+                return r;
+            }
+        }
         live.put(o.id, o);
+        if (inVolStall() && effect("fresh404")) {
+            freshUntil.put(o.id, clock.now() + FRESH_MS);
+        }
         model.placed(new FillModel.Resting(o.id, o.buy, o.price, o.size, o.createdMs));
         placements++;
         return new Response(200, String.format(
                 "{\"data\":{\"venue_order_id\":\"%s\",\"client_order_id\":\"%s\",\"state\":\"new\"}}",
                 o.id, o.clientId), 0);
+    }
+
+    /** Тейкерская комиссия площадки (опубликованный тариф 0.09%). */
+    static final double TAKER_FEE = Double.parseDouble(System.getProperty("revx.sim.taker-fee-bp", "9")) / 1e4;
+    private long takerOrders;
+    private double takerBase;
+    private double takerFeeQuote;
+
+    /**
+     * ТЕЙКЕР (02.10.2026, экстренная продажа): заявка без post_only, пересекающая
+     * книгу, исполняется сразу по видимым уровням не хуже своей цены; остаток
+     * снимается (в книгу не встаёт). Комиссия заложена в среднюю цену исполнения —
+     * бот учитывает её через {@code price} ответа, а не через {@code total_fee}
+     * (ненулевой fee останавливает бота как смену тарифа).
+     *
+     * @return ответ, если заявка пересекла книгу; null — обычная постановка
+     */
+    private Response takeLiquidity(Order o, MarketFillModel mfm) {
+        org.home.data.revx.sim.BookView book = mfm.market().bookAt(clock.now());
+        if (book == null) {
+            return null;
+        }
+        List<org.home.data.revx.sim.BookView.Level> side = o.buy ? book.asks() : book.bids();
+        if (side.isEmpty() || (o.buy ? side.get(0).price() > o.price : side.get(0).price() < o.price)) {
+            return null;
+        }
+        double left = o.size;
+        double qty = 0;
+        double net = 0;
+        for (org.home.data.revx.sim.BookView.Level l : side) {
+            if (left <= 1e-12 || (o.buy ? l.price() > o.price : l.price() < o.price)) {
+                break;
+            }
+            double q = Math.min(left, l.qty());
+            qty += q;
+            net += q * l.price() * (o.buy ? 1 + TAKER_FEE : 1 - TAKER_FEE);
+            takerFeeQuote += q * l.price() * TAKER_FEE;
+            left -= q;
+        }
+        placements++;
+        if (qty > 0) {
+            if (o.buy) {
+                baseTotal += qty;
+                quoteTotal -= net;
+            } else {
+                baseTotal -= qty;
+                quoteTotal += net;
+            }
+            done.put(o.id, new double[]{qty, net});
+            filledOrders++;
+            filledBase += qty;
+            takerOrders++;
+            takerBase += qty;
+        }
+        gone.put(o.id, qty > 0 ? "тейкером" : "тейкером (пусто)");
+        return new Response(200, String.format(
+                "{\"data\":{\"venue_order_id\":\"%s\",\"client_order_id\":\"%s\",\"state\":\"%s\"}}",
+                o.id, o.clientId, qty > 0 ? "filled" : "cancelled"), 0);
+    }
+
+    public synchronized String takerDiag() {
+        return String.format(Locale.ROOT, "тейкером %d заявок, %.8g монеты, комиссия %.4f",
+                takerOrders, takerBase, takerFeeQuote);
     }
 
     @Override
@@ -525,7 +733,19 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
             return new Response(422,
                     "{\"message\":\"Cannot replace an order that is not in the 'NEW' state\"}", 50);
         }
-        if (live.containsKey(id) && effect("ghost")) {
+        if (fresh(id)) {
+            fresh404Made++;
+            return new Response(404, "{\"message\":\"Order not found\"}", 400);
+        }
+        // Гонка: в затык по ходу цены две замены из трёх «медленные» (старая заявка
+        // живёт ещё RACE_MS и может исполниться), третья — призрак, как живьём 02.10.
+        boolean stallRace = live.containsKey(id) && inVolStall() && effect("race");
+        boolean race = stallRace
+                && !(stallEffects.contains("ghost") && stallReplaces % GHOST_EVERY == GHOST_EVERY - 1);
+        if (stallRace) {
+            stallReplaces++;          // счёт ВСЕХ замен в затыке, а не только гонок
+        }
+        if (!race && live.containsKey(id) && effect("ghost")) {
             // Призрак: предок снят, наследника нет, резерв предка остаётся заперт.
             Order dead = live.remove(id);
             gone.put(id, "призраком замены");
@@ -538,9 +758,18 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
                     "{\"message\":\"Cannot replace an order that is not in the 'NEW' state\"}",
                     GHOST_LATENCY_MS);
         }
-        Order old = live.remove(id);
-        if (old != null) {
-            gone.put(id, "заменой");
+        Order old;
+        if (race) {
+            // Старая остаётся в книге (исполнима) и уходит сама через RACE_MS.
+            old = live.get(id);
+            hiddenUntil.put(id, clock.now() + RACE_MS);
+            gone.put(id, "заменой (гонка)");
+            raceMade++;
+        } else {
+            old = live.remove(id);
+            if (old != null) {
+                gone.put(id, "заменой");
+            }
         }
         if (old == null) {
             // Та самая 422 из док. 111. Проверено зондом 04.09.2026: наследника
@@ -549,10 +778,14 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
             return new Response(422,
                     "{\"message\":\"Cannot replace an order that is not in the 'NEW' state\"}", 0);
         }
-        model.cancelled(id);
+        if (!race) {
+            model.cancelled(id);
+        }
         JsonNode n = read(json);
         if (n == null) {
-            live.put(id, old);
+            if (!race) {
+                live.put(id, old);
+            }
             return new Response(400, "{\"message\":\"bad body\"}", 0);
         }
         Order o = new Order();
@@ -570,15 +803,22 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         live.put(o.id, o);
         model.placed(new FillModel.Resting(o.id, o.buy, o.price, o.size, o.createdMs));
         replaces++;
+        if (inVolStall() && effect("fresh404")) {
+            freshUntil.put(o.id, clock.now() + FRESH_MS);
+        }
         return new Response(200, String.format(
                 "{\"data\":{\"venue_order_id\":\"%s\",\"client_order_id\":\"%s\",\"state\":\"new\"}}",
-                o.id, o.clientId), 0);
+                o.id, o.clientId), race ? RACE_MS : 0);
     }
 
     @Override
     public synchronized Response cancel(String id) {
         advance();
         cancels++;
+        if (fresh(id)) {
+            fresh404Made++;
+            return new Response(404, "{\"message\":\"Order not found\"}", 60);   // свежая: снять нельзя
+        }
         if (live.containsKey(id) && !hiddenUntil.containsKey(id)) {
             // В затык ответ на отмену не окончателен: заявка живёт ещё stallLateMs.
             // Два вида поочерёдно, если включены оба.

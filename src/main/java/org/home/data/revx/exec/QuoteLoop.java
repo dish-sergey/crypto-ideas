@@ -1763,6 +1763,10 @@ public final class QuoteLoop implements Runnable {
         StandReader.Fair fair = stand.latest(base, 30_000);
         lastFair = fair.price();
         rememberFair(fair.price());
+        lossStopTick();
+        if (lossStopUntil == 0) {
+            panicWatch(fair.price());
+        }
         if (fair.price() > 0) {
             efficiency.accept(clock.now(), fair.price());
             checkSizing(fair.price());
@@ -1897,11 +1901,26 @@ public final class QuoteLoop implements Runnable {
                         sw.side() > 0 ? "вверх" : "вниз", sw.notional(), sweepBp));
             }
         }
+        Double rampTgt = rampTarget();
         Quoter.Quotes target = frozenUnwind || budgetUnwind
                 ? unwindQuoter().quotes(quoteFair, inventory, drift)
+                : rampTgt != null ? rampQuoter(rampTgt).quotes(quoteFair, inventory, drift)
                 : policy.quotes(quoteFair, inventory, drift);
         if (sellOnly) {
             target = new Quoter.Quotes(null, target.ask());   // бид снимается, аск — заменами
+        }
+        // ОПОРА НАРУШЕНА (06.10.2026, решение владельца): распродажа с целью запаса 0 по
+        // аварийной опоре, распродался — пауза до возврата опоры в норму.
+        if (stand instanceof LiveHybridFair h && h.degraded()) {
+            if (inventory * fair.price() >= minNotional) {
+                target = new Quoter.Quotes(null, unwindQuoter().quotes(quoteFair, inventory, drift).ask());
+            } else {
+                pausedReason = "опора нарушена (" + h.degradedWhy() + ") — пауза до нормы";
+                countTick();
+                journal.quote(fair.price(), null, null, inventory, false, pausedReason);
+                cancelAll(pausedReason);
+                return;
+            }
         }
         // ОДНОСТОРОННИЙ СДВИГ: считаем котировку ДВАЖДЫ и берём одну сторону от
         // сдвинутой опоры, другую от нетронутой.
@@ -1934,6 +1953,12 @@ public final class QuoteLoop implements Runnable {
         double pressure = pressureFromRecord != null
                 ? pressureFromRecord.applyAsDouble(clock.now()) : budgetPressure;
         target = widenForBudget(target, fair.price(), pressure);
+        target = freqWiden(target, fair.price());
+        if (STALL_NOBID_MS > 0 || REBUY_VEL_K > 0) {
+            lastMove60 = move60(fair.price());
+            target = new Quoter.Quotes(crashBid(target.bid()), target.ask());
+        }
+        target = new Quoter.Quotes(bidSlew(target.bid()), askSlew(target.ask()));
         target = pullFirstLot(target, fair.price());
         target = decayAsk(target, fair.price(), params.offset());
         rememberVol(fair.price());
@@ -1973,6 +1998,10 @@ public final class QuoteLoop implements Runnable {
         }
         journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null,
                 pressure);
+        if (panicOn) {
+            panicTick(fair);
+            return;
+        }
 
         // ⚠️ Пул РАЗДЕЛЯЕТСЯ между уровнями, и порядок задаётся innerFirst.
         //
@@ -2310,6 +2339,573 @@ public final class QuoteLoop implements Runnable {
         return left <= 0 ? base : base - fair * PULLBACK_BP * left / 10_000;
     }
 
+    /**
+     * ЭКСТРЕННАЯ ПРОДАЖА ВМЕСТО ХЕДЖА (02.10.2026, идея владельца). Триггер тот же,
+     * что у ценового хеджа ({@code HedgeOverlay.simulatePrice}): за H ч рост от
+     * минимума к максимуму ≥ R%, затем откат от максимума ≥ F доли роста, новый пик.
+     * В режиме биды снимаются, весь запас одной продажей ставится на шаг цены выше
+     * лучшего бида книги и тянется за ним; распродались — стоим. Через T ч режим
+     * кончается, бот работает как обычно. Повтор: в течение RW мин после выхода цена
+     * ниже цены выхода на RM% — режим снова, не больше MAX раз после начального.
+     * {@code revx.exec.panic} = "R,H,F,T[,RW,RM,MAX]", F в долях; пусто — выключено.
+     */
+    static final double[] PANIC = parsePanic(System.getProperty("revx.exec.panic", ""));
+    private final java.util.ArrayDeque<double[]> panicMin = new java.util.ArrayDeque<>();   // {минута, цена}
+    private boolean panicOn;
+    private long panicSince;
+    private double panicLastPeak = -1;
+    private double panicExitPx;
+    private long panicExitAt;
+    private int panicReentries;
+    private long panicEntries;
+    private long panicSellTicks;
+
+    private static double[] parsePanic(String s) {
+        if (s == null || s.isBlank()) {
+            return null;
+        }
+        String[] p = s.split(",");
+        double[] v = new double[7];
+        for (int i = 0; i < p.length && i < 7; i++) {
+            v[i] = Double.parseDouble(p[i].trim());
+        }
+        return v;
+    }
+
+    public long panicEntries() {
+        return panicEntries;
+    }
+
+    /** Ряд по минутам (первый тик минуты, как у прибора хеджа) и решение о режиме. */
+    private void panicWatch(double p) {
+        if (PANIC == null || !(p > 0)) {
+            return;
+        }
+        long now = clock.now();
+        long minute = now / 60_000;
+        if (!panicMin.isEmpty() && (long) panicMin.peekLast()[0] == minute) {
+            return;
+        }
+        long win = (long) (PANIC[1] * 3_600_000L);
+        panicMin.addLast(new double[]{minute, p, now});
+        while (now - (long) panicMin.peekFirst()[2] > win) {
+            panicMin.pollFirst();
+        }
+        if (panicOn) {
+            if (now - panicSince >= PANIC[3] * 3_600_000L) {
+                panicOn = false;
+                panicExitPx = p;
+                panicExitAt = now;
+                journal.event("panic_off", String.format(java.util.Locale.ROOT,
+                        "%s: выход из экстренной продажи, цена %.6f, запас %s", symbol, p, fmt(inventory)));
+            }
+            return;
+        }
+        if (PANIC[4] > 0 && panicExitAt > 0 && now - panicExitAt <= PANIC[4] * 60_000L
+                && p <= panicExitPx * (1 - PANIC[5] / 100) && (PANIC[6] <= 0 || panicReentries < PANIC[6])) {
+            panicReentries++;
+            enterPanic(p, "повтор " + panicReentries);
+            return;
+        }
+        double[] hi = null;
+        for (double[] m : panicMin) {
+            if (hi == null || m[1] > hi[1]) {
+                hi = m;
+            }
+        }
+        double[] lo = hi;
+        for (double[] m : panicMin) {
+            if (m[2] > hi[2]) {
+                break;
+            }
+            if (m[1] < lo[1]) {
+                lo = m;
+            }
+        }
+        double rise = hi[1] / lo[1] - 1;
+        double back = hi[1] - lo[1] > 0 ? (hi[1] - p) / (hi[1] - lo[1]) : 0;
+        if (PANIC[2] < 0) {
+            // БЫСТРОЕ ПАДЕНИЕ (02.10.2026): F < 0 — без условия про рост, цена ниже
+            // максимума последних H часов на R% и больше (H бывает 0.25 = 15 мин).
+            if (hi[2] != panicLastPeak && (1 - p / hi[1]) * 100 >= PANIC[0]) {
+                panicLastPeak = hi[2];
+                panicReentries = 0;
+                enterPanic(p, String.format(java.util.Locale.ROOT, "падение %.2f%% от максимума",
+                        (1 - p / hi[1]) * 100));
+            }
+            return;
+        }
+        if (hi[2] != panicLastPeak && rise * 100 >= PANIC[0] && back >= PANIC[2]) {
+            panicLastPeak = hi[2];
+            panicReentries = 0;
+            enterPanic(p, String.format(java.util.Locale.ROOT, "рост %.2f%%, откат %.0f%%",
+                    rise * 100, back * 100));
+        }
+    }
+
+    /**
+     * ЦЕЛЬ ЗАПАСА ВМЕСТО РАСПРОДАЖИ (03.10.2026, идея владельца). На тот же сигнал
+     * (падение — {@code revx.exec.panic}, убыток продаж — {@code loss-stop-pct}) бот
+     * не продаёт всё и не останавливается, а торгует дальше с пониженной целью скоса
+     * по графику {@code revx.exec.target-ramp} = «цель:минут,…», например
+     * «0:60,0.1:60,0.2:60» — час цель 0, час 10% потолка, час 20%, потом обычная.
+     * Новый сигнал начинает график заново. Включается {@code panic-mode=target}.
+     */
+    static final boolean TARGET_MODE = "target".equalsIgnoreCase(
+            System.getProperty("revx.exec.panic-mode", "sell"));
+    static final double[][] TARGET_RAMP = parseRamp(System.getProperty("revx.exec.target-ramp", "0:60"));
+    private long rampStart;
+    private long ramps;
+    private final java.util.Map<Double, Quoter> rampQuoters = new java.util.HashMap<>();
+
+    private static double[][] parseRamp(String s) {
+        String[] parts = s.split(",");
+        double[][] r = new double[parts.length][2];
+        for (int i = 0; i < parts.length; i++) {
+            String[] kv = parts[i].trim().split(":");
+            r[i][0] = Double.parseDouble(kv[0]);
+            r[i][1] = Double.parseDouble(kv[1]) * 60_000;
+        }
+        return r;
+    }
+
+    public long ramps() {
+        return ramps;
+    }
+
+    private void startRamp(String why) {
+        rampStart = clock.now();
+        ramps++;
+        journal.event("target_ramp", String.format(java.util.Locale.ROOT,
+                "%s: цель запаса по графику (%s), запас %s", symbol, why, fmt(inventory)));
+        log.info("ЦЕЛЬ ПО ГРАФИКУ {} {}: {}, запас {}", symbol,
+                java.time.Instant.ofEpochMilli(clock.now()), why, fmt(inventory));
+    }
+
+    /** Текущая цель по графику или null — график не идёт. */
+    private Double rampTarget() {
+        if (rampStart == 0) {
+            return null;
+        }
+        long t = clock.now() - rampStart;
+        for (double[] step : TARGET_RAMP) {
+            if (t < step[1]) {
+                return step[0];
+            }
+            t -= (long) step[1];
+        }
+        rampStart = 0;
+        journal.event("target_ramp_end", symbol + ": цель запаса снова обычная");
+        return null;
+    }
+
+    private Quoter rampQuoter(double target) {
+        return rampQuoters.computeIfAbsent(target, x -> new Quoter(params.withSkewTarget(x)));
+    }
+
+    private void enterPanic(double p, String why) {
+        if (TARGET_MODE) {
+            startRamp(why);
+            return;
+        }
+        panicOn = true;
+        panicSince = clock.now();
+        panicExitAt = 0;
+        panicEntries++;
+        journal.event("panic_on", String.format(java.util.Locale.ROOT,
+                "%s: экстренная продажа (%s), цена %.6f, запас %s", symbol, why, p, fmt(inventory)));
+        log.info("ЭКСТРЕННАЯ ПРОДАЖА {} {}: {}, цена {}, запас {}", symbol,
+                java.time.Instant.ofEpochMilli(clock.now()), why, p, fmt(inventory));
+    }
+
+    /** Тик в режиме: бидов нет, весь запас — одна продажа у лучшего бида; распродались — стоим. */
+    private void panicTick(StandReader.Fair fair) {
+        for (int i = 0; i < levels; i++) {
+            if (bids.get(i).venueId != null) {
+                cancel(Side.BUY, bids.get(i), "экстренная продажа");
+            }
+            if (i > 0 && asks.get(i).venueId != null) {
+                cancel(Side.SELL, asks.get(i), "экстренная продажа");
+            }
+        }
+        double step = Math.max(params.quoteStep(), 1e-9);
+        double ref = fair.bookBid() > 0 ? fair.bookBid() : fair.price();
+        Double px = onTick(Side.SELL, ref + step);
+        double pool = Math.max(0, inventory - lockedBaseEff());
+        if (px != null && px > 0) {
+            pool = Math.min(pool, maxOrderNotional / px * 0.999);
+        }
+        Resting a = asks.get(0);
+        if (pool * fair.price() < minNotional) {
+            if (a.venueId != null) {
+                cancel(Side.SELL, a, "экстренная продажа: распродано");
+            }
+            return;
+        }
+        panicSellTicks++;
+        long now = clock.now();
+        if (PANIC_TAKER_MS >= 0 && now - panicSince >= PANIC_TAKER_MS && now >= panicTakerNextMs) {
+            // 🔑 НЕ ИСПОЛНИЛОСЬ ЗА МИНУТУ — ТЕЙКЕРОМ (владелец 02.10.2026). На падении
+            // мейкерская продажа отстаёт от цены; остаток бьём по биду книги до глубины
+            // PANIC_TAKER_DEPTH_BP. Сначала снять стоящую — продать дважды нельзя.
+            if (a.venueId != null) {
+                cancel(Side.SELL, a, "экстренная продажа: перехожу на тейкера");
+                return;
+            }
+            panicTakerNextMs = now + 10_000;
+            Double tpx = onTick(Side.BUY, ref * (1 - PANIC_TAKER_DEPTH_BP / 1e4));
+            if (tpx != null && tpx > 0 && pool * tpx >= minNotional) {
+                panicTakers++;
+                journal.event("panic_taker", String.format(java.util.Locale.ROOT,
+                        "%s: продажа тейкером %s по цене не ниже %.6f (бид %.6f)", symbol, fmt(pool), tpx, ref));
+                takerNext = true;
+                try {
+                    place(Side.SELL, a, tpx, pool);
+                } finally {
+                    takerNext = false;
+                }
+                return;
+            }
+        }
+        replaceSlotSide = Side.SELL;      // одна замена за тик — она у продажи
+        replaceSlotLevel = 0;
+        panicSizing = true;
+        try {
+            syncSide(Side.SELL, 0, a, px, fair.price(), pool);
+        } finally {
+            panicSizing = false;
+        }
+    }
+
+    /**
+     * СТОП ПО УБЫТКУ СДЕЛОК (02.10.2026, идея владельца). После каждой продажи —
+     * результаты продаж (против стоимости покупок по FIFO) складываются С ПОСЛЕДНЕЙ
+     * назад, до 24 ч или до запуска, что ближе; худшая накопленная сумма ниже
+     * −{@code loss-stop-pct}% денежного потолка —
+     * бот пошёл против волны: экстренная распродажа (как в режиме panic) и остановка.
+     * На стенде через {@code loss-stop-resume-h} ч бот запускается снова со свежим
+     * счётом — как владелец после ручного /start. 0 — выключено.
+     */
+    static final double LOSS_STOP_PCT = Double.parseDouble(System.getProperty("revx.exec.loss-stop-pct", "0"));
+    static final long LOSS_STOP_RESUME_MS = (long) (Double.parseDouble(
+            System.getProperty("revx.exec.loss-stop-resume-h", "6")) * 3_600_000L);
+    private final java.util.ArrayDeque<double[]> costLots = new java.util.ArrayDeque<>();   // {кол-во, цена}
+    private final java.util.ArrayDeque<double[]> sellPnl = new java.util.ArrayDeque<>();    // {время, результат}
+    private long lossWindowFrom = -1;
+    private long lossStopUntil;
+    private long lossStops;
+
+    public long lossStops() {
+        return lossStops;
+    }
+
+    private void lossWatch(Side side, double qty, double price) {
+        if (LOSS_STOP_PCT <= 0) {
+            return;
+        }
+        long now = clock.now();
+        if (lossWindowFrom < 0) {
+            lossWindowFrom = now;
+        }
+        if (side == Side.BUY) {
+            costLots.addLast(new double[]{qty, price});
+            return;
+        }
+        double left = qty;
+        double pnl = 0;
+        while (left > 1e-15 && !costLots.isEmpty()) {
+            double[] head = costLots.peekFirst();
+            double take = Math.min(left, head[0]);
+            pnl += take * (price - head[1]);
+            head[0] -= take;
+            left -= take;
+            if (head[0] <= 1e-15) {
+                costLots.pollFirst();
+            }
+        }
+        sellPnl.addLast(new double[]{now, pnl});      // остаток без покупок (затравка) — по цене продажи, ноль
+        long from = Math.max(lossWindowFrom, now - 86_400_000L);
+        while (!sellPnl.isEmpty() && sellPnl.peekFirst()[0] < from) {
+            sellPnl.pollFirst();
+        }
+        // СЧЁТ С ПОСЛЕДНЕЙ ПРОДАЖИ НАЗАД (уточнение владельца): ранний плюс поздний
+        // минус не гасит. Берётся худшая накопленная сумма «от этой продажи до
+        // последней» — то есть если последние продажи за час набрали −порог, стоп сразу.
+        double sum = 0;
+        double run = 0;
+        var back = sellPnl.descendingIterator();
+        while (back.hasNext()) {
+            run += back.next()[1];
+            sum = Math.min(sum, run);
+        }
+        double capUsd = params.inventoryCap() * (lastFair > 0 ? lastFair : price);
+        if (TARGET_MODE && capUsd > 0 && sum < -LOSS_STOP_PCT / 100 * capUsd) {
+            // Вместо распродажи и остановки — график цели; счёт заново, как после запуска.
+            startRamp(String.format(java.util.Locale.ROOT, "продажи за окно %+.4f", sum));
+            sellPnl.clear();
+            lossWindowFrom = now;
+            return;
+        }
+        if (lossStopUntil == 0 && capUsd > 0 && sum < -LOSS_STOP_PCT / 100 * capUsd) {
+            lossStops++;
+            lossStopUntil = now + LOSS_STOP_RESUME_MS;
+            panicOn = true;
+            panicSince = now;
+            journal.event("loss_stop", String.format(java.util.Locale.ROOT,
+                    "%s: продажи за окно дали %+.4f при пороге −%.2f%% потолка $%.2f — распродажа и остановка",
+                    symbol, sum, LOSS_STOP_PCT, capUsd));
+            log.info("СТОП ПО УБЫТКУ {} {}: продажи за окно {} при потолке ${}, запас {}", symbol,
+                    java.time.Instant.ofEpochMilli(now), String.format(java.util.Locale.ROOT, "%+.4f", sum),
+                    String.format(java.util.Locale.ROOT, "%.2f", capUsd), fmt(inventory));
+        }
+    }
+
+    /** Стоп по убытку держит режим распродажи до срока; потом свежий счёт, как после запуска. */
+    private void lossStopTick() {
+        if (lossStopUntil > 0 && clock.now() >= lossStopUntil) {
+            lossStopUntil = 0;
+            panicOn = false;
+            sellPnl.clear();
+            lossWindowFrom = clock.now();
+            journal.event("loss_resume", symbol + ": запуск после стопа по убытку, счёт с нуля");
+        }
+    }
+
+    /**
+     * РАЗДВИЖКА ПО ЧАСТОТЕ ИСПОЛНЕНИЙ (03.10.2026, идея владельца). Пункт = +1 б.п. к
+     * отступу, живёт {@code freq-life-min} (10) минут, не больше {@code freq-max} (3);
+     * сверх — новый вытесняет самый старый. Пункты даёт промежуток с прошлого
+     * исполнения: &lt;10 мин — 1, &lt;5 — 2, &lt;2 — 3. Прострел: каждое следующее
+     * исполнение той же стороны в пределах 3 с (два уровня за раз, три) — ещё +1.
+     * {@code freq-src}: buy — считаются покупки, all — любые исполнения (пусто —
+     * выключено); {@code freq-sides}: bid — пункты только к покупке, both — к обеим.
+     */
+    static final String FREQ_SRC = System.getProperty("revx.exec.freq-src", "");
+    static final boolean FREQ_BOTH = "both".equalsIgnoreCase(System.getProperty("revx.exec.freq-sides", "bid"));
+    static final int FREQ_MAX = Integer.getInteger("revx.exec.freq-max", 3);
+    static final long FREQ_LIFE_MS = Long.getLong("revx.exec.freq-life-min", 10L) * 60_000L;
+    private final java.util.List<Long> freqExp = new java.util.ArrayList<>();
+    private long freqLastBuy;
+    private long freqLastSell;
+    private long freqLastAny;
+    private long freqPointsAdded;
+
+    public long freqPointsAdded() {
+        return freqPointsAdded;
+    }
+
+    private void freqFill(Side side) {
+        if (FREQ_SRC.isBlank()) {
+            return;
+        }
+        boolean all = "all".equalsIgnoreCase(FREQ_SRC);
+        boolean counted = all || side == Side.BUY;
+        long now = clock.now();
+        long lastSame = side == Side.BUY ? freqLastBuy : freqLastSell;
+        int add = 0;
+        if (lastSame > 0 && now - lastSame <= 3_000) {
+            add = counted ? 1 : 0;                        // прострел ещё одного уровня
+        } else if (counted) {
+            long prev = all ? freqLastAny : freqLastBuy;
+            if (prev > 0) {
+                long gap = now - prev;
+                add = gap < 120_000 ? 3 : gap < 300_000 ? 2 : gap < 600_000 ? 1 : 0;
+            }
+        }
+        for (int i = 0; i < add; i++) {
+            freqExp.removeIf(e -> e <= now);
+            if (freqExp.size() >= FREQ_MAX) {
+                freqExp.remove(java.util.Collections.min(freqExp));
+            }
+            freqExp.add(now + FREQ_LIFE_MS);
+            freqPointsAdded++;
+        }
+        if (add > 0) {
+            journal.event("freq_widen", String.format(java.util.Locale.ROOT,
+                    "%s: %s, +%d п., активно %d", symbol, side, add, freqExp.size()));
+        }
+        if (side == Side.BUY) {
+            freqLastBuy = now;
+        } else {
+            freqLastSell = now;
+        }
+        freqLastAny = now;
+    }
+
+    /** Активные пункты частоты отодвигают бид (и аск в режиме both) на 1 б.п. каждый. */
+    private Quoter.Quotes freqWiden(Quoter.Quotes q, double fair) {
+        if (FREQ_SRC.isBlank() || freqExp.isEmpty()) {
+            return q;
+        }
+        long now = clock.now();
+        freqExp.removeIf(e -> e <= now);
+        int pts = freqExp.size();
+        if (pts == 0) {
+            return q;
+        }
+        double d = fair * pts / 1e4;
+        Double bid = q.hasBid() ? q.bid() - d : q.bid();
+        Double ask = FREQ_BOTH && q.hasAsk() ? q.ask() + d : q.ask();
+        return new Quoter.Quotes(bid, ask);
+    }
+
+    /**
+     * ЗАЩИТА ОТ ОБВАЛА С ЗАТЫКОМ (03.10.2026, разбор 02.10 18:39: XRP и SOL −1.5…−2%
+     * за минуту, площадка тормозит; бот покупает, через секунду ставит новый бид в
+     * 0.2% ниже, и его тоже забирают).
+     * <ul>
+     * <li>подход 1, {@code stall-nobid-sec}: покупка и затык в пределах N секунд друг от
+     * друга — бид снимается и N секунд после последнего затыка не ставится;</li>
+     * <li>подход 2, {@code rebuy-vel-k}: после покупки по P следующий бид не выше
+     * P·(1 − k·|ход опоры за 60 с|) — на ходе 1% при k=1 это 100 б.п., а не 3.
+     * Продажа снимает ограничение.</li>
+     * </ul>
+     */
+    static final long STALL_NOBID_MS = Long.getLong("revx.exec.stall-nobid-sec", 0L) * 1000L;
+    static final double REBUY_VEL_K = Double.parseDouble(System.getProperty("revx.exec.rebuy-vel-k", "0"));
+    private long lastStallMs;
+    private long lastBuyAnyMs;
+    private long noBidUntilMs;
+    private double velLastBuy = Double.NaN;
+    private final java.util.ArrayDeque<double[]> velFair = new java.util.ArrayDeque<>();   // {время, опора}
+    private long noBidTicks;
+
+    public long noBidTicks() {
+        return noBidTicks;
+    }
+
+    private void crashFill(Side side, double price) {
+        long now = clock.now();
+        if (side == Side.BUY) {
+            lastBuyAnyMs = now;
+            velLastBuy = price;
+            if (STALL_NOBID_MS > 0 && lastStallMs > 0 && now - lastStallMs < STALL_NOBID_MS) {
+                noBidUntilMs = Math.max(noBidUntilMs, lastStallMs + STALL_NOBID_MS);
+            }
+        } else {
+            velLastBuy = Double.NaN;
+        }
+    }
+
+    /** Ход опоры за последние 60 с (доля), для подхода 2. */
+    private double move60(double fair) {
+        long now = clock.now();
+        if (fair > 0) {
+            velFair.addLast(new double[]{now, fair});
+        }
+        while (!velFair.isEmpty() && now - (long) velFair.peekFirst()[0] > 60_000) {
+            velFair.pollFirst();
+        }
+        double mx = 0;
+        double mn = Double.MAX_VALUE;
+        for (double[] v : velFair) {
+            mx = Math.max(mx, v[1]);
+            mn = Math.min(mn, v[1]);
+        }
+        return mx > 0 && mn < Double.MAX_VALUE ? mx / mn - 1 : 0;
+    }
+
+    /** Бид с учётом подходов 1 и 2; null — бид не ставится. */
+    private Double crashBid(Double bid) {
+        if (bid == null) {
+            return null;
+        }
+        if (STALL_NOBID_MS > 0 && clock.now() < noBidUntilMs) {
+            noBidTicks++;
+            return null;
+        }
+        if (REBUY_VEL_K > 0 && !Double.isNaN(velLastBuy)) {
+            double cap = velLastBuy * (1 - REBUY_VEL_K * lastMove60);
+            return Math.min(bid, cap);
+        }
+        return bid;
+    }
+
+    private double lastMove60;
+
+    /**
+     * ПОДХОД 4 (03.10.2026, идея владельца): аск опускается не быстрее
+     * {@code ask-slew-pct}% за {@code ask-slew-min} минут — на обвале бот не продаёт
+     * на самом дне, а дожидается отскока. Вверх аск двигается свободно; без запаса
+     * (аска нет) счёт начинается заново. 0 — выключено.
+     */
+    static final double ASK_SLEW_PCT = Double.parseDouble(System.getProperty("revx.exec.ask-slew-pct", "0"));
+    static final double ASK_SLEW_MIN = Double.parseDouble(System.getProperty("revx.exec.ask-slew-min", "5"));
+    private double slewAsk = Double.NaN;
+    private long slewAskMs;
+    private long slewHeldTicks;
+
+    public long slewHeldTicks() {
+        return slewHeldTicks;
+    }
+
+    /**
+     * То же для покупки (05.10.2026, владелец): бид ПОДНИМАЕТСЯ вслед за ростом цены не
+     * быстрее {@code bid-slew-pct}% за {@code bid-slew-min} минут — бот не гонится за
+     * выстрелом вверх и не покупает на его вершине. Вниз бид двигается свободно.
+     */
+    static final double BID_SLEW_PCT = Double.parseDouble(System.getProperty("revx.exec.bid-slew-pct", "0"));
+    static final double BID_SLEW_MIN = Double.parseDouble(System.getProperty("revx.exec.bid-slew-min", "5"));
+    private double slewBid = Double.NaN;
+    private long slewBidMs;
+
+    private Double bidSlew(Double bid) {
+        if (BID_SLEW_PCT <= 0) {
+            return bid;
+        }
+        long now = clock.now();
+        if (bid == null) {
+            slewBid = Double.NaN;
+            return null;
+        }
+        if (!Double.isNaN(slewBid)) {
+            double maxRise = BID_SLEW_PCT / 100 * (now - slewBidMs) / (BID_SLEW_MIN * 60_000);
+            double ceiling = slewBid * (1 + Math.min(maxRise, 0.5));
+            if (bid > ceiling) {
+                bid = ceiling;
+            }
+        }
+        slewBid = bid;
+        slewBidMs = now;
+        return bid;
+    }
+
+    private Double askSlew(Double ask) {
+        if (ASK_SLEW_PCT <= 0) {
+            return ask;
+        }
+        long now = clock.now();
+        if (ask == null) {
+            slewAsk = Double.NaN;
+            return null;
+        }
+        if (!Double.isNaN(slewAsk)) {
+            double maxDrop = ASK_SLEW_PCT / 100 * (now - slewAskMs) / (ASK_SLEW_MIN * 60_000);
+            double floor = slewAsk * (1 - Math.min(maxDrop, 0.5));
+            if (ask < floor) {
+                slewHeldTicks++;
+                ask = floor;
+            }
+        }
+        slewAsk = ask;
+        slewAskMs = now;
+        return ask;
+    }
+
+    private boolean panicSizing;
+    private boolean takerNext;
+    private long panicTakerNextMs;
+    private long panicTakers;
+    /** Через сколько секунд экстренного режима непроданный остаток бьётся тейкером (0 — сразу, −1 — никогда). */
+    static final long PANIC_TAKER_MS = Long.getLong("revx.exec.panic-taker-sec", -1L) * 1000L;
+    /** Насколько ниже лучшего бида тейкер готов продать (глубина прохода по книге). */
+    static final double PANIC_TAKER_DEPTH_BP = Double.parseDouble(
+            System.getProperty("revx.exec.panic-taker-depth-bp", "30"));
+
+    public long panicTakers() {
+        return panicTakers;
+    }
+
     /** Снимает ли продажа отсчёт паузы и оттяжки ({@code revx.exec.sell-resets}, да по умолчанию). */
     static final boolean SELL_RESETS = !"false".equalsIgnoreCase(
             System.getProperty("revx.exec.sell-resets", "true"));
@@ -2540,7 +3136,9 @@ public final class QuoteLoop implements Runnable {
         // params.sizeFor учитывает асимметрию набора: покупаем медленнее, чем
         // разгружаемся (док. 98 §6). При симметричной настройке это прежний size().
         double want = params.sizeFor(side, inventory);
-        if (side == Side.SELL && ASK_LOT_MULT != 1.0) {
+        if (side == Side.SELL && panicSizing) {
+            want = Double.MAX_VALUE;          // экстренная продажа: весь запас одной заявкой
+        } else if (side == Side.SELL && ASK_LOT_MULT != 1.0) {
             // Продажа крупнее покупки: весь запас одной заявкой, до ASK_LOT_MULT лотов
             // (0 — без предела). Покупки — прежние лоты на своих уровнях.
             want = ASK_LOT_MULT > 0 ? params.size() * ASK_LOT_MULT : Double.MAX_VALUE;
@@ -2815,6 +3413,10 @@ public final class QuoteLoop implements Runnable {
                 .formatted(tag.newClientOrderId(), symbol.replace('/', '-'),
                         side == Side.BUY ? "buy" : "sell", fmtSize(size), fmt(price))
                 .replaceAll("\\s*\\n\\s*", "");
+        if (takerNext) {
+            // Тейкерская продажа экстренного режима: без post_only, пересекает книгу.
+            body = body.replace(",\"execution_instructions\":[\"post_only\"]", "");
+        }
         Venue.Response response = client.place(body);
         placements++;
         placedAt.addLast(clock.now());
@@ -3515,6 +4117,10 @@ public final class QuoteLoop implements Runnable {
             return;
         }
         long now = clock.now();
+        lastStallMs = now;
+        if (STALL_NOBID_MS > 0 && lastBuyAnyMs > 0 && now - lastBuyAnyMs < STALL_NOBID_MS) {
+            noBidUntilMs = Math.max(noBidUntilMs, now + STALL_NOBID_MS);   // покупка была — в затык не докупаем
+        }
         boolean fresh = now >= stallUntilMs;
         stallUntilMs = now + (STALL_FREEZE_MS > 0 ? STALL_FREEZE_MS : STALL_STAND_ASIDE_MS);
         if (!fresh) {
@@ -4539,6 +5145,9 @@ public final class QuoteLoop implements Runnable {
      */
     private void applyFill(Side side, double qty, double price) {
         noteRebuy(side, price);
+        lossWatch(side, qty, price);
+        freqFill(side);
+        crashFill(side, price);
         if (!ownPosition) {
             return;
         }
@@ -5326,7 +5935,12 @@ public final class QuoteLoop implements Runnable {
         double drift = Math.abs(claimed - inventory);
         // Пыль: позиция и претензия считаются в double, и на длинной серии
         // сделок последние знаки расходятся законно.
-        double dust = Math.max(1e-12, params.size() * 1e-6);
+        // ⚠️ Пол — две единицы восьмого знака, а не 1e-12: 06.10.2026 бот d на ETH
+        // (лот 0.00079, порог от лота 7.9e-10) каждые 5 минут кричал о расхождении
+        // на 1e-8 ETH — хвосте округлений ETH-периода до 28.09, который реестр
+        // хранил с 11.09, а новый журнал начал с нуля. При XRP-лоте порог был 1.4e-6
+        // и этот хвост не замечал.
+        double dust = Math.max(2e-8, params.size() * 1e-6);
         if (drift <= dust || now - registryWarnedMs < MISMATCH_REPEAT_MS) {
             return;
         }

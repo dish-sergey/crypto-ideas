@@ -281,6 +281,10 @@ public final class InfoBot implements Runnable {
             return null;
         }
         try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
+            String[] h = j.lastEventOf("hybrid_degraded", "hybrid_recovered", "boot");
+            if (h != null && "hybrid_degraded".equals(h[0])) {
+                return "ОПОРА НАРУШЕНА — распродажа и пауза до нормы";
+            }
             String[] e = j.lastEventOf("boot", "start", "budget_unwind", "sell_only",
                     "frozen_unwind", "frozen_released", "limit_blocked");
             String normal = "цель " + normalTarget(j) + "%";
@@ -386,6 +390,20 @@ public final class InfoBot implements Runnable {
         return 0;
     }
 
+    /**
+     * ДОХОД «СЕГОДНЯ» — С ПОЛУНОЧИ, а не за скользящие 24 часа (06.10.2026, просьба
+     * владельца). Полночь — по его часам, а не по UTC сервера; пояс задаётся
+     * {@code -Drevx.info.day-zone}. Постановки остаются за скользящие 24 часа:
+     * так считает суточное ведро площадки.
+     */
+    private static final java.time.ZoneId DAY_ZONE =
+            java.time.ZoneId.of(System.getProperty("revx.info.day-zone", "Europe/Berlin"));
+
+    static long dayStartMs(long now) {
+        return java.time.Instant.ofEpochMilli(now).atZone(DAY_ZONE).toLocalDate()
+                .atStartOfDay(DAY_ZONE).toInstant().toEpochMilli();
+    }
+
     /** Когда последний раз говорили про диск и про залежавшуюся книгу. */
     private long diskTold;
     private long bookTold;
@@ -442,7 +460,7 @@ public final class InfoBot implements Runnable {
         registerCommands();
         dropBacklog();
         send("Сводка запущена. Наблюдаю " + watched.size() + " исполнителей.\n"
-                + "/all — состояние всех, /pnl — доход за сутки и неделю.\n"
+                + "/all — состояние всех, /pnl — доход сегодня (с 00:00) и за неделю.\n"
                 + "/alloc — кто что держит за собой и сколько ничейного.\n"
                 + "/hide d e f — убрать лишних с глаз, /show all — вернуть.");
         while (alive) {
@@ -453,6 +471,7 @@ public final class InfoBot implements Runnable {
                     continue;
                 }
                 watchSilence();
+                watchHybrid();
                 watchVenue();
                 watchDisk();
                 for (JsonNode update : JSON.readTree(body).path("result")) {
@@ -493,7 +512,7 @@ public final class InfoBot implements Runnable {
                     Сводка по всем исполнителям. Только смотрит, ничего не меняет.
 
                     /all — котирование, форма сетки, инвентарь, сделки и доход
-                    /pnl — доход за 24 часа и за 7 суток, плюс нереализованное
+                    /pnl — доход сегодня (с 00:00) и за 7 суток, плюс нереализованное
                     /alloc — кто что держит за собой и сколько ничейного
 
                     Снизу в /all — состояние диска: свободно, прирост книги и
@@ -684,9 +703,9 @@ public final class InfoBot implements Runnable {
             return new Snapshot(w.botId(), w.symbol(), quoting, trading,
                     q.reason(), j.parksSince(now - 3_600_000L), q.tsMs(),
                     pos == null ? 0 : pos, j.lastFair(),
-                    ledger.tradingClosedSince(now - 86_400_000L),
-                    ledger.tradingRealisedSince(now - 86_400_000L),
-                    ledger.tradingClosedNotionalSince(now - 86_400_000L),
+                    ledger.tradingClosedSince(dayStartMs(now)),
+                    ledger.tradingRealisedSince(dayStartMs(now)),
+                    ledger.tradingClosedNotionalSince(dayStartMs(now)),
                     j.placementsSince(now - 86_400_000L),
                     ExecLimits.maxPlacementsPerDay(w.botId()), null, formOf(j));
         } catch (Exception e) {
@@ -727,6 +746,37 @@ public final class InfoBot implements Runnable {
      * он не работает и сам об этом сказать не может. Повтор не чаще раза в час,
      * и отдельным сообщением — когда ожил.
      */
+    /**
+     * ОПОРА НАРУШЕНА (06.10.2026, решение владельца): бот с опорой «смесь + глубина +
+     * Бинанс» при сбое источника распродаётся и встаёт в паузу — об этом надо будить,
+     * сам бот сказать не может. Сообщение одно на сбой и одно на возврат.
+     */
+    private final java.util.Map<String, String> hybridTold = new java.util.HashMap<>();
+
+    void watchHybrid() {
+        for (Watched w : watched) {
+            String[] e;
+            try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
+                e = j.lastEventOf("hybrid_degraded", "hybrid_recovered", "boot");
+            } catch (Exception ex) {
+                continue;
+            }
+            String id = w.botId().toLowerCase(Locale.ROOT);
+            if (e != null && "hybrid_degraded".equals(e[0])) {
+                if (!(e[1] + "").equals(hybridTold.get(id))) {
+                    hybridTold.put(id, e[1] + "");
+                    send("⚠️ " + w.botId().toUpperCase(Locale.ROOT) + " " + w.symbol()
+                            + " ОПОРА НАРУШЕНА: " + e[1] + "\nБот распродаёт запас и встанет в паузу; "
+                            + "вернётся сам, когда источники будут в норме.");
+                }
+            } else if (hybridTold.remove(id) != null) {
+                send("🟢 " + w.botId().toUpperCase(Locale.ROOT) + " " + w.symbol()
+                        + (e != null && "boot".equals(e[0]) ? " перезапущен — аварийный режим опоры снят."
+                        : " опора снова в норме — обычная торговля."));
+            }
+        }
+    }
+
     void watchSilence() {                                // пакетный доступ: тест
         long now = System.currentTimeMillis();
         for (Watched w : watched) {
@@ -833,9 +883,9 @@ public final class InfoBot implements Runnable {
                 what = what + " · " + mode;
             }
             sb.append(String.format(Locale.ROOT,
-                    "%s %s  %s%s — %s%n  закрытых пар 24ч %d, доход %+.4f USDC%n"
-                            + "  инвентарь %.2f USDC%s, постановок %d из %d (%d%%)%n"
-                            + "  оборот 24ч %.2f USDC, доход %+.1f б.п. оборота%n"
+                    "%s %s  %s%s — %s%n  закрытых пар сегодня %d, доход %+.4f USDC%n"
+                            + "  инвентарь %.2f USDC%s, постановок за 24ч %d из %d (%d%%)%n"
+                            + "  оборот сегодня %.2f USDC, доход %+.1f б.п. оборота%n"
                             + "  отводов за час %d, тик %s%s%n%n",
                     mark, s.botId().toUpperCase(Locale.ROOT), s.symbol(),
                     s.form() == null || s.form().isEmpty() ? "" : " · " + s.form(), what,
@@ -848,7 +898,7 @@ public final class InfoBot implements Runnable {
                     s.note() == null ? "" : "\n  ⚠️ " + s.note()));
         }
         sb.append(String.format(Locale.ROOT,
-                "ИТОГО за 24 ч: %+.4f USDC%n"
+                "ИТОГО сегодня (с 00:00): %+.4f USDC%n"
                         + "инвентарь %.2f USDC (только работающие), "
                         + "постановок %d из %d (аккаунту дают 1000)",
                 totalRealised, totalInventory, totalPlacements, totalCap));
@@ -1397,14 +1447,14 @@ public final class InfoBot implements Runnable {
         long now = System.currentTimeMillis();
         StringBuilder sb = new StringBuilder("ДОХОД ПО ИСПОЛНИТЕЛЯМ\n\n");
         sb.append(String.format(Locale.ROOT, "%-4s %-10s %10s %10s %10s%n",
-                "бот", "пара", "24 часа", "7 суток", "в позиции"));
+                "бот", "пара", "сегодня", "7 суток", "в позиции"));
         double d1 = 0;
         double d7 = 0;
         double unreal = 0;
         for (Watched w : visible()) {
             try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
                 FifoLedger ledger = PnlReport.build(j);
-                double a = ledger.tradingRealisedSince(now - 86_400_000L);
+                double a = ledger.tradingRealisedSince(dayStartMs(now));
                 double b = ledger.tradingRealisedSince(now - 7 * 86_400_000L);
                 double fair = j.lastFair();
                 double u = ledger.position().unrealised(fair);
@@ -1443,7 +1493,7 @@ public final class InfoBot implements Runnable {
         try {
             String response = call("setMyCommands", "commands=" + URLEncoder.encode("""
                     [{"command":"all","description":"состояние всех исполнителей"},
-                     {"command":"pnl","description":"доход за 24 часа и 7 суток"},
+                     {"command":"pnl","description":"доход сегодня и за 7 суток"},
                      {"command":"alloc","description":"кто что держит и сколько ничейного"},
                      {"command":"hide","description":"убрать ботов из сводок: /hide d e f"},
                      {"command":"show","description":"вернуть: /show d или /show all"},

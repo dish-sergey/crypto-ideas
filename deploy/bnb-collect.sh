@@ -45,7 +45,9 @@
 # Одна отметка времени даёт и миллисекунды, и дату — то же число вызовов `date`.
 set -u
 OUT="${OUT:-$HOME/binance-book}"
-SYMS='"btcusdc@bookTicker","ethusdc@bookTicker","solusdc@bookTicker"'
+# XRP добавлен 04.10.2026: c и d торгуют XRP, а гибридная справедливая цена
+# (уровень — своя книга Revolut, движение — Бинанс) без живого XRP не проверяется.
+SYMS='"btcusdc@bookTicker","ethusdc@bookTicker","solusdc@bookTicker","xrpusdc@bookTicker"'
 PING_INTERVAL="${PING_INTERVAL:-20}"
 PING_TIMEOUT="${PING_TIMEOUT:-30}"
 mkdir -p "$OUT"

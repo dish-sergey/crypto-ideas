@@ -285,6 +285,12 @@ public class CliRunner implements ApplicationRunner {
                 fateProbe.getObject().run(firstOr(args, "order-id", ""),
                         firstOr(args, "client-id", ""));
             }
+            if (args.containsOption("revx-hybrid-probe")) {
+                // Только чтение: прежняя опора и «смесь+глубина+Бинанс» рядом по живым данным.
+                executor.getObject().hybridProbe(firstOr(args, "symbol", "XRP/USDC"),
+                        Double.parseDouble(firstOr(args, "lot", "4.2")),
+                        Integer.parseInt(firstOr(args, "seconds", "30")));
+            }
             if (args.containsOption("revx-order-status")) {
                 // Только GET: спросить площадку про конкретные заявки целиком.
                 fateProbe.getObject().status(firstOr(args, "order-id", ""));
@@ -454,6 +460,14 @@ public class CliRunner implements ApplicationRunner {
                         firstOr(args, "to", "2026-09-22T00:00:00Z"),
                         firstOr(args, "out", "reports/revx_budget_facts.md"));
             }
+            if (args.containsOption("revx-bnb-feed")) {
+                // Цена Бинанса для живой опоры: один GET раз в секунду, пишет revx-shared/bnb.db.
+                var feed = new org.home.data.revx.exec.BnbFeed(
+                        firstOr(args, "db", "/home/ubuntu/revx-shared/bnb.db"),
+                        firstOr(args, "symbols", "BTCUSDC,SOLUSDC,XRPUSDC"));
+                Runtime.getRuntime().addShutdownHook(new Thread(feed::stop));
+                feed.run();                          // блокирует: демон
+            }
             if (args.containsOption("revx-venue")) {
                 // Читатель площадки: единственный, кто спрашивает её GET-ами, пишет
                 // revx-shared/venue.db. Этап 1 — в тени (ЧИТАТЕЛЬ-ПЛОЩАДКИ.md).
@@ -527,6 +541,14 @@ public class CliRunner implements ApplicationRunner {
                         firstOr(args, "hours-out", ""),
                         Double.parseDouble(firstOr(args, "period-min", "0")),
                         Boolean.parseBoolean(firstOr(args, "perp-usd", "false")));
+            }
+            if (args.containsOption("revx-hedge-rounds")) {
+                hedgeOverlay.getObject().runRoundGrid(
+                        firstOr(args, "journals", ""),
+                        firstOr(args, "from", ""), firstOr(args, "to", ""),
+                        Double.parseDouble(firstOr(args, "step-lots", "0")),
+                        Double.parseDouble(firstOr(args, "fee-bp", "2")),
+                        firstOr(args, "out", ""));
             }
             if (args.containsOption("revx-core")) {
                 coreRegression.getObject().run(

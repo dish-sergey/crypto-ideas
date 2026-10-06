@@ -308,6 +308,11 @@ public final class Forecast {
                                             String journalOut,
                                             List<org.home.data.revx.exec.FlowWatch> flows)
             throws Exception {
+        if (HybridFair.enabled() && model instanceof MarketFillModel mfm) {
+            // ⚠️ fresh(): у книги свой курсор, и пробег до конца дня по общему объекту
+            // оставил бы модель исполнения с книгой конца суток — все заявки «невидимы».
+            ticks = HybridFair.apply(ticks, base.symbol(), mfm.market().fresh(), base.size());   // уровень Revolut, движение Бинанс
+        }
         long start = ticks.get(0).tsMs();
         long end = ticks.get(ticks.size() - 1).tsMs();
 
@@ -560,6 +565,7 @@ public final class Forecast {
                     venue.appliedFills());
             log.warn("объём: {}", venue.fillDiag());
             log.warn("затыки площадки: {}", venue.stallDiag());
+            log.warn("ТЕЙКЕР: {}", venue.takerDiag());
             log.warn("присутствие в книге: {}", venue.presence());
             // ⚠️ Почему исполнений мало — вопрос, на который до 08.09.2026 нечем
             // было ответить: модель считала пропуски, но никуда их не выводила.

@@ -1246,7 +1246,30 @@ public class HedgeOverlay {
                 }
             }
         }
+        for (double h : new double[]{1, 2}) {
+            for (double x : new double[]{1, 1.5, 2}) {
+                for (double[] ex : new double[][]{{0.8, 2}, {99, 1}, {0.8, 1}}) {
+                    prules.add(new PriceRule(h, x, -1, ex[0], ex[1], 0, 0));
+                    prules.add(new PriceRule(h, x, -1, ex[0], ex[1], 120, 1.0));
+                    prules.add(new PriceRule(h, x, -1, ex[0], ex[1], 60, 0.5));
+                }
+            }
+        }
+        // БЫСТРОЕ ПАДЕНИЕ (02.10.2026, идея владельца): цена ниже максимума последних
+        // 15/30 минут на X% — без условия про предшествующий рост. Бот теряет на резких
+        // часах (ход > ~1%), а рисунок «рост, потом откат» падения не предсказывает.
+        for (double h : new double[]{0.25, 0.5}) {
+            for (double x : new double[]{0.5, 0.75, 1, 1.5}) {
+                for (double[] ex : new double[][]{{99, 0.5}, {99, 1}, {99, 2}, {0.5, 2}}) {
+                    prules.add(new PriceRule(h, x, -1, ex[0], ex[1], 0, 0));
+                }
+            }
+        }
         double[][] pacc = new double[prules.size()][5];
+        long dayBase = from / 86_400_000L;
+        int days = to == Long.MAX_VALUE ? 1 : (int) Math.max(1, (to - 1) / 86_400_000L - dayBase + 1);
+        double[][] pday = new double[prules.size()][days];
+        double[] spotDay = new double[days];
         double[] invN = {1, 2, 3, 4, 5, 6};
         double[][] iacc = new double[invN.length][5];
         double[] surN = {2, 3, 4};
@@ -1283,10 +1306,23 @@ public class HedgeOverlay {
             List<Round> rs = rounds(s);
             double cash = 0;
             int fi = 0;
+            double dayCap = s.inv[0] * s.fair[0];
+            long curDay = s.ts[0] / 86_400_000L;
             for (int i = 0; i < s.ts.length; i++) {
                 while (fi < s.fillTs.length && s.fillTs[fi] <= s.ts[i]) {
                     cash -= s.fillDq[fi] * s.fillPx[fi];
                     fi++;
+                }
+                // Спот по суткам: капитал (касса + запас по справедливой цене) на границе суток.
+                long d = s.ts[i] / 86_400_000L;
+                double cap = cash + s.inv[i] * s.fair[i];
+                if (d != curDay || i == s.ts.length - 1) {
+                    int k = (int) (curDay - dayBase);
+                    if (k >= 0 && k < days) {
+                        spotDay[k] += cap - dayCap;
+                    }
+                    dayCap = cap;
+                    curDay = d;
                 }
             }
             double botSpot = cash + s.inv[s.ts.length - 1] * s.fair[s.ts.length - 1];
@@ -1302,7 +1338,7 @@ public class HedgeOverlay {
             }
             MinuteSeries ms = minutes(s, mark);
             for (int r = 0; r < prules.size(); r++) {
-                simulatePrice(prules.get(r), ms, step, feeBp / 1e4, pacc[r]);
+                simulatePrice(prules.get(r), ms, step, feeBp / 1e4, pacc[r], pday[r], dayBase);
             }
             for (int r = 0; r < invN.length; r++) {
                 simulateInv(invN[r], lot, ms, step, feeBp / 1e4, iacc[r]);
@@ -1363,6 +1399,24 @@ public class HedgeOverlay {
                     }
                 }
                 Files.writeString(Path.of(out + ".csv"), csv.toString(), StandardCharsets.UTF_8);
+                // По суткам: спот всех ботов и нога шорта каждого ценового правила (после пошлины).
+                StringBuilder dc = new StringBuilder("правило");
+                for (int k = 0; k < days; k++) {
+                    dc.append(';').append(Instant.ofEpochMilli((dayBase + k) * 86_400_000L).toString(), 0, 10);
+                }
+                dc.append("\nспот");
+                for (double v : spotDay) {
+                    dc.append(String.format(Locale.ROOT, ";%.4f", v));
+                }
+                dc.append('\n');
+                for (int r = 0; r < prules.size(); r++) {
+                    dc.append(prules.get(r).name());
+                    for (double v : pday[r]) {
+                        dc.append(String.format(Locale.ROOT, ";%.4f", v));
+                    }
+                    dc.append('\n');
+                }
+                Files.writeString(Path.of(out + ".days.csv"), dc.toString(), StandardCharsets.UTF_8);
                 Files.writeString(Path.of(out), sb.toString(), StandardCharsets.UTF_8);
             } catch (IOException e) {
                 log.warn("не записать {}: {}", out, e.getMessage());
@@ -1382,14 +1436,19 @@ public class HedgeOverlay {
         }
 
         String name() {
-            String base = String.format(Locale.ROOT, "P цена: рост ≥%.1f%% за %.0f ч, откат ≥%.0f%%, выход: отскок %s, время %s",
+            String base = f < 0 ? String.format(Locale.ROOT, "D падение ≥%.2f%% от максимума за %s, выход: отскок %s, время %s", r, dur(h), y >= 99 ? "—" : String.format(Locale.ROOT, "%.1f%%", y), t >= 99 ? "—" : dur(t)) : String.format(Locale.ROOT, "P цена: рост ≥%.1f%% за %.0f ч, откат ≥%.0f%%, выход: отскок %s, время %s",
                     r, h, f * 100, y >= 99 ? "—" : String.format(Locale.ROOT, "%.1f%%", y),
                     t >= 99 ? "—" : String.format(Locale.ROOT, "%.0f ч", t));
             return rw > 0 ? base + String.format(Locale.ROOT, "; повтор: %.0f мин, ниже выхода на %.1f%%", rw, rm) : base;
         }
 
+        static String dur(double hours) {
+            return hours < 1 ? String.format(Locale.ROOT, "%.0f мин", hours * 60)
+                    : String.format(Locale.ROOT, "%.0f ч", hours);
+        }
+
         String code() {
-            String base = String.format(Locale.ROOT, "P%.1f-%.0f-%.0f-%.1f-%.0f", r, h, f * 100, y, t);
+            String base = String.format(Locale.ROOT, "P%.2f-%.0f-%.0f-%.1f-%.1f", r, h * 60, f * 100, y, t);
             return rw > 0 ? base + String.format(Locale.ROOT, "-R%.0f-%.1f", rw, rm) : base;
         }
     }
@@ -1426,9 +1485,9 @@ public class HedgeOverlay {
             Map.Entry<Long, Double> e = mark.floorEntry(s.ts[i]);
             m.mark[k] = e == null ? 0 : e.getValue();
         }
-        for (int hours : new int[]{1, 2, 3}) {
+        for (int mins : new int[]{15, 30, 60, 120, 180}) {
             int[][] hl = new int[n][2];
-            long win = hours * 3_600_000L;
+            long win = mins * 60_000L;
             for (int k = 0; k < n; k++) {
                 int hi = k;
                 for (int j = k; j >= 0 && m.ts[k] - m.ts[j] <= win; j--) {
@@ -1445,14 +1504,16 @@ public class HedgeOverlay {
                 hl[k][0] = hi;
                 hl[k][1] = lo;
             }
-            m.hiLo.put(hours, hl);
+            m.hiLo.put(mins, hl);
         }
         return m;
     }
 
     private static void simulatePrice(PriceRule rule, MinuteSeries m, double step, double fee,
-                                      double[] acc) {
-        int[][] hl = m.hiLo.get((int) rule.h());
+                                      double[] acc, double[] day, long dayBase) {
+        int[][] hl = m.hiLo.get((int) Math.round(rule.h() * 60));
+        double before = acc[0] - acc[1];
+        long curDay = m.ts.length > 0 ? m.ts[0] / 86_400_000L : 0;
         boolean on = false;
         double perp = 0;
         double minSince = 0;
@@ -1484,7 +1545,13 @@ public class HedgeOverlay {
                 }
                 double rise = m.p[hi] / m.p[lo] - 1;
                 double back = m.p[hi] - m.p[lo] > 0 ? (m.p[hi] - p) / (m.p[hi] - m.p[lo]) : 0;
-                if (!on && hi != lastPeak && rise * 100 >= rule.r() && back >= rule.f()) {
+                if (rule.f() < 0) {
+                    // РЕЖИМ «ПАДЕНИЕ» (01.10.2026): без предшествующего роста — цена ниже
+                    // максимума последних H часов на r% и больше.
+                    rise = (1 - p / m.p[hi]) * 100 >= rule.r() ? 1 : 0;
+                    back = rise;
+                }
+                if (!on && hi != lastPeak && (rule.f() < 0 ? rise > 0 : rise * 100 >= rule.r() && back >= rule.f())) {
                     on = true;
                     reentries = 0;
                     lastPeak = hi;
@@ -1525,6 +1592,15 @@ public class HedgeOverlay {
             }
             if (on && k > 0) {
                 acc[3] += (m.ts[k] - m.ts[k - 1]) / 60_000.0;
+            }
+            long d = m.ts[k] / 86_400_000L;
+            if (d != curDay || k == m.ts.length - 1) {
+                int i = (int) (curDay - dayBase);
+                if (i >= 0 && i < day.length) {
+                    day[i] += acc[0] - acc[1] - before;
+                }
+                before = acc[0] - acc[1];
+                curDay = d;
             }
         }
     }

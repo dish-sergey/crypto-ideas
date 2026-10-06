@@ -187,7 +187,18 @@ public class Executor {
         QuotePolicy policy = buildPolicy(params);
         // Этап 3б: списочные GET — из снимков читателя (флаг revx.exec.venue-reads).
         Venue venue = QuoteLoop.VENUE_READS ? new VenueReads(client, QuoteLoop.VENUE_DB) : client;
-        QuoteLoop loop = new QuoteLoop(venue, Clock.system(), stand, journal, params, symbol,
+        // Опора «смесь + глубина + Бинанс» — только флагом revx.fair.live-hybrid; без него
+        // бот котирует от прежней опоры, как раньше. При молчании Бинанса или старой книге
+        // обёртка сама возвращает прежнюю опору (событие hybrid_fallback).
+        FairSource fair = LiveHybridFair.ENABLED
+                ? new LiveHybridFair(stand, standDbPath, symbol, params.size(), journal) : stand;
+        if (LiveHybridFair.ENABLED) {
+            journal.event("hybrid_on", "опора смесь+глубина+Бинанс: смесь "
+                    + System.getProperty("revx.fair.hybrid-mix", "0.25") + ", глубина "
+                    + System.getProperty("revx.fair.hybrid-depth-k", "10") + " лота, τ "
+                    + System.getProperty("revx.fair.hybrid-tau-sec", "180") + " с");
+        }
+        QuoteLoop loop = new QuoteLoop(venue, Clock.system(), fair, journal, params, symbol,
                 periodMs, minNotional(), tag, policy, ownPosition, positionSeed, spec.baseStep(),
                 parkDistance, alloc, levels, levelStep, innerFirst);
         // Ведро постановок живёт в том же файле, что и реестр владения, и по той
@@ -316,6 +327,32 @@ public class Executor {
      * ошибается в правиле исполнения или просто уводит траекторию. Подробности —
      * в {@link org.home.data.revx.replay.FillCheck}.
      */
+    /**
+     * {@code --revx-hybrid-probe}: ТОЛЬКО ЧТЕНИЕ — рядом прежняя опора и новая
+     * («смесь + глубина + Бинанс») по живым данным, раз в секунду {@code seconds} раз.
+     * Проверка перед включением на ботах: книга свежая, Бинанс пишется, расхождение
+     * разумное (на стенде в среднем +1…+3 б.п.).
+     */
+    public void hybridProbe(String sym, double lotQty, int seconds) throws Exception {
+        try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
+                new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
+                        cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
+                cfg.fairMaxSkewMs())) {
+            ExecJournal j = new ExecJournal(System.getProperty("java.io.tmpdir") + "/hybrid-probe.db");
+            LiveHybridFair h = new LiveHybridFair(stand, standDbPath, sym, lotQty, j);
+            String base = sym.substring(0, sym.indexOf('/'));
+            for (int i = 0; i < seconds; i++) {
+                StandReader.Fair old = stand.latest(base, 30_000);
+                StandReader.Fair neu = h.latest(base, 30_000);
+                log.warn(String.format(java.util.Locale.ROOT,
+                        "%s прежняя %.6f (котир %s) | новая %.6f (котир %s) | разница %+.2f б.п. | книга %.6f/%.6f",
+                        sym, old.price(), old.quotable(), neu.price(), neu.quotable(),
+                        (neu.price() / old.price() - 1) * 1e4, neu.bookBid(), neu.bookAsk()));
+                Thread.sleep(1000);
+            }
+        }
+    }
+
     public void fillCheck(String journalPath, String from, String to) {
         org.home.data.revx.replay.FillCheck.run(journalPath, standDbPath, from, to);
     }
