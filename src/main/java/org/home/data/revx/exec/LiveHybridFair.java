@@ -135,6 +135,7 @@ public final class LiveHybridFair implements FairSource {
                     why = "нет прежней опоры";
                 } else {
                     hybridTicks++;
+                    clampReport(now);
                     if (!(f.price() > 0) && now - lastNoBasketEventMs >= 600_000) {
                         // Не сбой (07.10.2026): уровень на это время — своя книга.
                         lastNoBasketEventMs = now;
@@ -161,6 +162,40 @@ public final class LiveHybridFair implements FairSource {
                     f.asOfMs(), f.pairsUsed(), b.bestBid(), b.bestAsk(), f.referenceSpreadPct());
         }
         return f;
+    }
+
+    /**
+     * ДОЛЯ ПОВОДКА ЗА ЧАС (07.10.2026, просьба владельца): событие {@code hybrid_clamp}
+     * раз в {@link #CLAMP_REPORT_MS} — сколько тиков поводок к Бинансу удержал опору.
+     * Большая доля — своя книга упорно уходит от Бинанса (застывшая книга, ETH 06.10).
+     */
+    static final long CLAMP_REPORT_MS = Long.getLong("revx.fair.hybrid-clamp-report-ms", 3_600_000L);
+    private long clampFromMs;
+    private long clampSteps0;
+    private long clampHits0;
+
+    private void clampReport(long now) {
+        if (core.clampBp() <= 0) {
+            return;
+        }
+        if (clampFromMs == 0) {
+            clampFromMs = now;
+            clampSteps0 = core.steps();
+            clampHits0 = core.clamped();
+            return;
+        }
+        if (now - clampFromMs < CLAMP_REPORT_MS) {
+            return;
+        }
+        long n = core.steps() - clampSteps0;
+        long hit = core.clamped() - clampHits0;
+        journal.event("hybrid_clamp", String.format(java.util.Locale.ROOT,
+                "%s: поводок ±%.0f б.п. — %.1f%% тиков за %d мин (%d из %d), базис к Бинансу %+.1f б.п.",
+                symbol, core.clampBp(), n == 0 ? 0 : 100.0 * hit / n, (now - clampFromMs) / 60_000,
+                hit, n, core.basisBp()));
+        clampFromMs = now;
+        clampSteps0 = core.steps();
+        clampHits0 = core.clamped();
     }
 
     private void healthy(long now) {

@@ -64,6 +64,21 @@ public final class HybridCore {
         this.basisTauMs = Double.parseDouble(System.getProperty("revx.fair.hybrid-basis-tau-sec", "1800")) * 1000;
     }
 
+    /** Шагов с поводком (счётчик растёт, только если поводок задан). */
+    public long steps() {
+        return steps;
+    }
+
+    /** Из них опору удержал поводок. */
+    public long clamped() {
+        return clamped;
+    }
+
+    /** Текущий обычный базис уровня к Бинансу, б.п.; NaN — ещё не набран. */
+    public double basisBp() {
+        return basisBp;
+    }
+
     /** Доля шагов, на которых поводок к Бинансу удержал опору. */
     public double clampedShare() {
         return steps == 0 ? 0 : (double) clamped / steps;

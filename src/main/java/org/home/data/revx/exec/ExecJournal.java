@@ -860,19 +860,19 @@ public final class ExecJournal implements AutoCloseable {
      * которые на самом деле стоят. Замечено 07.09.2026 после выкатки: последний
      * start в 15:04, за ним два boot, а в сводке — шесть зелёных строк.
      */
-    /** Последнее событие одного из видов: {kind, detail}; null — не было. */
+    /** Последнее событие одного из видов: {kind, detail, ts_ms}; null — не было. */
     public synchronized String[] lastEventOf(String... kinds) {
         if (kinds.length == 0) {
             return null;
         }
         String in = String.join(",", java.util.Collections.nCopies(kinds.length, "?"));
         try (PreparedStatement ps = connection.prepareStatement(
-                "SELECT kind, detail FROM exec_event WHERE kind IN (" + in + ") ORDER BY ts_ms DESC LIMIT 1")) {
+                "SELECT kind, detail, ts_ms FROM exec_event WHERE kind IN (" + in + ") ORDER BY ts_ms DESC LIMIT 1")) {
             for (int i = 0; i < kinds.length; i++) {
                 ps.setString(i + 1, kinds[i]);
             }
             try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? new String[]{rs.getString(1), rs.getString(2)} : null;
+                return rs.next() ? new String[]{rs.getString(1), rs.getString(2), rs.getString(3)} : null;
             }
         } catch (Exception e) {
             return null;

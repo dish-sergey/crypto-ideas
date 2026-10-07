@@ -2166,6 +2166,9 @@ public final class QuoteLoop implements Runnable {
      * кладётся поверх. Так уровни не спорят с политикой, а продолжают её.
      */
     private Double levelPrice(Side side, Double base, double fair, int level) {
+        if (side == Side.BUY && levelCooling(level)) {
+            return null;
+        }
         if (side == Side.BUY && base != null) {
             base = pullback(base, fair);
         }
@@ -2320,6 +2323,77 @@ public final class QuoteLoop implements Runnable {
      */
     static final long BUY_COOLDOWN_MS = Long.getLong("revx.exec.buy-cooldown-sec", 0L) * 1000L;
     private long lastBuyFillMs;
+
+    /**
+     * ПАУЗА УРОВНЯ ПОСЛЕ ПОКУПКИ (07.10.2026, идея владельца): исполнилась покупка на
+     * уровне i — на этот уровень N секунд новая покупка не ставится, остальные уровни
+     * котируют как обычно. В отличие от {@link #BUY_COOLDOWN_MS} снимает не весь бид,
+     * а только сработавший уровень; продажа паузу НЕ снимает. У ботов в один уровень
+     * это то же, что общая пауза без снятия продажей. 0 — выключено (опыт стенда).
+     */
+    public static final long LEVEL_COOLDOWN_MS = Long.getLong("revx.exec.buy-level-cooldown-sec", 0L) * 1000L;
+    /**
+     * ВОССТАНОВЛЕНИЕ ЦЕПОЧКОЙ (07.10.2026, идея владельца, {@code buy-level-cooldown-chain}):
+     * взятые уровни возвращаются ПО ОДНОМУ, начиная с дальнего, через N после последнего
+     * события — исполнения или предыдущего возврата. Сквиз взял 1-й и 2-й: через N
+     * вернулся 2-й, ещё через N — 1-й. Взяли снова во время ожидания — отсчёт заново,
+     * и первым опять возвращается дальний из взятых.
+     */
+    public static final boolean LEVEL_COOLDOWN_CHAIN = Boolean.getBoolean("revx.exec.buy-level-cooldown-chain");
+    private long[] levelCoolUntil = new long[0];
+    private boolean[] levelTaken = new boolean[0];
+    private long chainFromMs;
+    private long levelCoolStarts;
+
+    private void noteLevelBuy(Side side, int level) {
+        if (LEVEL_COOLDOWN_MS <= 0 || side != Side.BUY || level < 0) {
+            return;
+        }
+        levelCoolStarts++;
+        if (LEVEL_COOLDOWN_CHAIN) {
+            if (levelTaken.length <= level) {
+                levelTaken = java.util.Arrays.copyOf(levelTaken, level + 1);
+            }
+            levelTaken[level] = true;
+            chainFromMs = clock.now();
+            return;
+        }
+        if (levelCoolUntil.length <= level) {
+            levelCoolUntil = java.util.Arrays.copyOf(levelCoolUntil, level + 1);
+        }
+        levelCoolUntil[level] = clock.now() + LEVEL_COOLDOWN_MS;
+    }
+
+    private boolean levelCooling(int level) {
+        if (LEVEL_COOLDOWN_MS <= 0 || level < 0) {
+            return false;
+        }
+        if (LEVEL_COOLDOWN_CHAIN) {
+            long now = clock.now();
+            // Возврат по одному, дальний первым; пропущенные тики догоняются.
+            while (now - chainFromMs >= LEVEL_COOLDOWN_MS) {
+                int far = -1;
+                for (int i = levelTaken.length - 1; i >= 0; i--) {
+                    if (levelTaken[i]) {
+                        far = i;
+                        break;
+                    }
+                }
+                if (far < 0) {
+                    break;
+                }
+                levelTaken[far] = false;
+                chainFromMs += LEVEL_COOLDOWN_MS;
+            }
+            return level < levelTaken.length && levelTaken[level];
+        }
+        return level < levelCoolUntil.length && clock.now() < levelCoolUntil[level];
+    }
+
+    /** Сколько раз уровень вставал на паузу после покупки. */
+    public long levelCoolStarts() {
+        return levelCoolStarts;
+    }
 
     private boolean inBuyCooldown() {
         return BUY_COOLDOWN_MS > 0 && lastBuyFillMs > 0
@@ -4841,6 +4915,7 @@ public final class QuoteLoop implements Runnable {
             // Своя позиция и касса меняются ЗДЕСЬ, а не по остаткам аккаунта:
             // при двух ботах остатки содержат чужие сделки.
             applyFill(side, filled, price);
+            noteLevelBuy(side, levelOf(venueId));
             // Политике, чьи цены зависят от собственных сделок (пол по
             // себестоимости), факт исполнения нужен раньше следующего тика.
             policy.onFill(new org.home.data.revx.sim.Fill(

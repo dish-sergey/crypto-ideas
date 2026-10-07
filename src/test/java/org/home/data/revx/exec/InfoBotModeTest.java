@@ -52,6 +52,19 @@ class InfoBotModeTest {
     }
 
     @Test
+    void поводокВСводке(@TempDir Path dir) throws Exception {
+        String path = dir.resolve("f.db").toString();
+        try (ExecJournal j = new ExecJournal(path)) {
+            j.event("hybrid_clamp", "SOL/USDC: поводок ±5 б.п. — 2.4% тиков за 60 мин (86 из 3600), "
+                    + "базис к Бинансу +3.1 б.п.");
+        }
+        InfoBot bot = new InfoBot("t", 1, List.of(new InfoBot.Watched("f", "SOL/USDC", path)), "нет.db");
+        long now = System.currentTimeMillis();
+        assertEquals("поводок 2.4% за 60 мин", bot.clampOf("f", now));
+        assertEquals(null, bot.clampOf("f", now + 3 * 3_600_000L));   // старое — не показываем
+    }
+
+    @Test
     void толькоПродажа(@TempDir Path dir) throws Exception {
         assertEquals("ТОЛЬКО ПРОДАЖА до нуля — предел постановок исчерпан",
                 mode(dir, "sell_only", "постановок за сутки 250 из 250"));

@@ -310,6 +310,28 @@ public final class InfoBot implements Runnable {
         }
     }
 
+    /**
+     * Доля поводка к Бинансу из последнего {@code hybrid_clamp}: «поводок 2.4% за 60 мин»;
+     * null — события нет или оно старше двух часов (после перезапуска первое — через час).
+     */
+    String clampOf(String botId, long now) {
+        Watched w = watched.stream().filter(x -> x.botId().equalsIgnoreCase(botId)).findFirst().orElse(null);
+        if (w == null) {
+            return null;
+        }
+        try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
+            String[] e = j.lastEventOf("hybrid_clamp");
+            if (e == null || e[1] == null || e.length < 3 || now - Long.parseLong(e[2]) > 2 * 3_600_000L) {
+                return null;
+            }
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("([0-9.]+%) тиков за (\\d+ мин)").matcher(e[1]);
+            return m.find() ? "поводок " + m.group(1) + " за " + m.group(2) : null;
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
     /** Цель скоса из машинной части последнего boot, в процентах потолка. */
     private static long normalTarget(ExecJournal j) {
         ExecJournal.Boot b = j.lastBoot();
@@ -887,11 +909,12 @@ public final class InfoBot implements Runnable {
             if (mode != null) {
                 what = what + " · " + mode;
             }
+            String clamp = s.quoting() ? clampOf(s.botId(), now) : null;
             sb.append(String.format(Locale.ROOT,
                     "%s %s  %s%s — %s%n  закрытых пар сегодня %d, доход %+.4f USDC%n"
                             + "  инвентарь %.2f USDC%s, постановок за 24ч %d из %d (%d%%)%n"
                             + "  оборот сегодня %.2f USDC, доход %+.1f б.п. оборота%n"
-                            + "  отводов за час %d, тик %s%s%n%n",
+                            + "  отводов за час %d, тик %s%s%s%n%n",
                     mark, s.botId().toUpperCase(Locale.ROOT), s.symbol(),
                     s.form() == null || s.form().isEmpty() ? "" : " · " + s.form(), what,
                     s.fills24(), s.realised24(), s.position() * s.fair(),
@@ -899,7 +922,7 @@ public final class InfoBot implements Runnable {
                     s.placements24(), s.cap(), pct,
                     s.notional24(),
                     s.notional24() > 0 ? s.realised24() / s.notional24() * 10_000 : 0,
-                    s.parks1h(), age,
+                    s.parks1h(), age, clamp == null ? "" : ", " + clamp,
                     s.note() == null ? "" : "\n  ⚠️ " + s.note()));
         }
         sb.append(String.format(Locale.ROOT,
