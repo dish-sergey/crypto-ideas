@@ -52,6 +52,21 @@ public final class LiveHybridFair implements FairSource {
     private Connection book;
     private Connection bnb;
     private long lastFallbackEventMs;
+    private long lastNoBasketEventMs;
+    /** Когда последний раз видели свою книгу и цену Бинанса (любой давности). */
+    private long lastBookMs;
+    private long lastBnbMs;
+    /**
+     * Состояние бота для сообщения о сбое: {запас, опора, котирует ли (1/0)}. Без него
+     * сводка писала «распродаёт запас», даже когда запаса не было (просьба владельца
+     * 07.10.2026: «что именно нарушено и какие действия делает бот»).
+     */
+    private java.util.function.Supplier<double[]> botState;
+
+    /** Подключить состояние бота ({@link QuoteLoop} делает это сам). */
+    public void attach(java.util.function.Supplier<double[]> state) {
+        this.botState = state;
+    }
     private long hybridTicks;
     private long fallbackTicks;
 
@@ -120,6 +135,12 @@ public final class LiveHybridFair implements FairSource {
                     why = "нет прежней опоры";
                 } else {
                     hybridTicks++;
+                    if (!(f.price() > 0) && now - lastNoBasketEventMs >= 600_000) {
+                        // Не сбой (07.10.2026): уровень на это время — своя книга.
+                        lastNoBasketEventMs = now;
+                        journal.event("hybrid_no_basket", symbol + ": прежней опоры (корзины) нет — "
+                                + "уровень по своей книге, движение по Бинансу, торгую как обычно");
+                    }
                     healthy(now);
                     return new StandReader.Fair(o.fair(), o.quotable(), o.quotable() ? null : f.pausedReason(),
                             f.asOfMs(), f.pairsUsed(), b.bestBid(), b.bestAsk(), f.referenceSpreadPct());
@@ -130,9 +151,9 @@ public final class LiveHybridFair implements FairSource {
             closeQuietly();
         }
         fallbackTicks++;
-        broken(now, why);
         // Аварийная опора: уровень по своей книге без Бинанса, если книга есть.
         Double level = b == null ? null : core.levelOnly(now, f.price(), b, lotQty);
+        broken(now, why, f, level);
         if (level != null) {
             boolean ok = (b.bestAsk() - b.bestBid()) / ((b.bestAsk() + b.bestBid()) / 2) * 1e4
                     <= Double.parseDouble(System.getProperty("revx.fair.hybrid-max-spread-bp", "50"));
@@ -158,13 +179,58 @@ public final class LiveHybridFair implements FairSource {
         }
     }
 
-    private void broken(long now, String why) {
+    /** Сколько назад: «3 с», «нет данных». */
+    private static String age(long now, long ts) {
+        return ts <= 0 ? "нет данных" : (now - ts) / 1000 + " с назад";
+    }
+
+    /**
+     * Полный текст сбоя для журнала и сводного бота: что нарушено, в каком состоянии
+     * каждый источник, от какой опоры котируем и что делаем.
+     */
+    private String describe(long now, String why, StandReader.Fair f, Double level) {
+        String base = symbol.substring(0, symbol.indexOf('/'));
+        boolean bookOk = lastBookMs > 0 && now - lastBookMs <= MAX_AGE_MS;
+        boolean bnbOk = lastBnbMs > 0 && now - lastBnbMs <= MAX_AGE_MS;
+        boolean oldOk = f != null && f.price() > 0;
+        StringBuilder sb = new StringBuilder(symbol).append(": ").append(why).append('\n');
+        sb.append("Источники: своя книга — ").append(bookOk ? "в норме" : "НЕТ")
+                .append(" (").append(age(now, lastBookMs)).append("); Бинанс ").append(bnbSymbol)
+                .append(" — ").append(bnbOk ? "в норме" : "МОЛЧИТ").append(" (").append(age(now, lastBnbMs))
+                .append("); прежняя опора (корзина) — ").append(oldOk ? "есть" : "нет").append('\n');
+        sb.append("Опора на время сбоя: ").append(level != null
+                ? "уровень по своей книге и прежней опоре, без движения Бинанса"
+                : oldOk ? "прежняя опора (корзина пар)" : "нет — котировать не от чего").append('\n');
+        double[] st = botState == null ? null : botState.get();
+        String act;
+        if (st == null) {
+            act = "покупки снимаю; запас, если есть, продаю аском с целью 0; без запаса — пауза";
+        } else if (st[2] < 0.5) {
+            act = "котирование и так выключено — только жду";
+        } else if (level == null && !oldOk) {
+            act = "все заявки снимаю — опоры нет; пауза";
+        } else if (st[0] * st[1] >= 1) {
+            act = String.format(java.util.Locale.ROOT,
+                    "покупки снял; запас %s %s (≈$%.2f) продаю аском по этой опоре с целью 0, "
+                            + "распродав — пауза", fmt(st[0]), base, st[0] * st[1]);
+        } else {
+            act = "запаса нет — заявки снял, пауза";
+        }
+        sb.append("Делаю: ").append(act).append('\n');
+        sb.append("Вернусь сам, когда все источники будут в норме ").append(RECOVER_MS / 1000).append(" с подряд.");
+        return sb.toString();
+    }
+
+    private static String fmt(double v) {
+        return String.format(java.util.Locale.ROOT, "%.8f", v).replaceAll("0+$", "").replaceAll("\\.$", "");
+    }
+
+    private void broken(long now, String why, StandReader.Fair f, Double level) {
         healthySince = 0;
         if (!degraded) {
             degraded = true;
             degradedWhy = why;
-            journal.event("hybrid_degraded", symbol + ": " + why
-                    + " — распродажа и пауза, пока опора не будет в норме " + RECOVER_MS / 1000 + " с подряд");
+            journal.event("hybrid_degraded", describe(now, why, f, level));
             log.error("опора {} нарушена: {} — распродажа и пауза", symbol, why);
         } else if (now - lastFallbackEventMs >= 600_000) {
             lastFallbackEventMs = now;
@@ -183,7 +249,11 @@ public final class LiveHybridFair implements FairSource {
                         + " FROM revx_book WHERE symbol = ? ORDER BY t_recv_ms DESC LIMIT 1")) {
             ps.setString(1, symbol);
             try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next() || now - rs.getLong(1) > MAX_AGE_MS) {
+                if (!rs.next()) {
+                    return null;
+                }
+                lastBookMs = rs.getLong(1);
+                if (now - lastBookMs > MAX_AGE_MS) {
                     return null;
                 }
                 List<BookView.Level> bids = new ArrayList<>();
@@ -215,7 +285,11 @@ public final class LiveHybridFair implements FairSource {
                 "SELECT ts_ms, bid, ask FROM bnb_tick WHERE symbol = ? ORDER BY ts_ms DESC LIMIT 1")) {
             ps.setString(1, bnbSymbol);
             try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next() || now - rs.getLong(1) > MAX_AGE_MS) {
+                if (!rs.next()) {
+                    return Double.NaN;
+                }
+                lastBnbMs = rs.getLong(1);
+                if (now - lastBnbMs > MAX_AGE_MS) {
                     return Double.NaN;
                 }
                 return (rs.getDouble(2) + rs.getDouble(3)) / 2;

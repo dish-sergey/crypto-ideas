@@ -30,17 +30,47 @@ public final class HybridCore {
     private final double depthK;
     private final double tauMs;
     private final double maxSpreadBp;
+    /**
+     * ПОВОДОК К БИНАНСУ (06.10.2026, идея владельца): своя книга двигает опору не
+     * дальше ±{@code clampBp} от «Бинанс × обычный базис», где базис — EMA за
+     * {@code basisTauMs} от ln(уровень / Бинанс). Повод — ETH 06.10 18:15–18:19:
+     * книга площадки застыла на +25…+29 б.п. к Бинансу при обычном базисе +8…+10,
+     * опора ушла от базиса на +7.9 б.п., и обе покупки c и d легли на ~10 б.п.
+     * выше рынка. 0 — поводка нет (как было до 06.10).
+     */
+    private final double clampBp;
+    private final double basisTauMs;
     private double emaM = Double.NaN;
     private double emaB = Double.NaN;
+    private double basisBp = Double.NaN;
     private long prev;
     private long depthUsed;
     private long depthShort;
+    private long steps;
+    private long clamped;
+    private long noOldSteps;
+
+    /** Шагов без прежней опоры (уровень целиком по своей книге). */
+    public long noOldSteps() {
+        return noOldSteps;
+    }
 
     public HybridCore(double mix, double depthK, double tauSec, double maxSpreadBp) {
         this.mix = mix;
         this.depthK = depthK;
         this.tauMs = tauSec * 1000;
         this.maxSpreadBp = maxSpreadBp;
+        this.clampBp = Double.parseDouble(System.getProperty("revx.fair.hybrid-clamp-bp", "0"));
+        this.basisTauMs = Double.parseDouble(System.getProperty("revx.fair.hybrid-basis-tau-sec", "1800")) * 1000;
+    }
+
+    /** Доля шагов, на которых поводок к Бинансу удержал опору. */
+    public double clampedShare() {
+        return steps == 0 ? 0 : (double) clamped / steps;
+    }
+
+    public double clampBp() {
+        return clampBp;
     }
 
     public long depthUsed() {
@@ -98,8 +128,18 @@ public final class HybridCore {
      */
     public Out step(long tsMs, double oldFair, boolean oldQuotable, BookView book, double lotQty,
                     double bnb) {
-        if (book == null || book.empty() || !(bnb > 0) || !(Double.isFinite(oldFair) && oldFair > 0)) {
+        if (book == null || book.empty() || !(bnb > 0)) {
             return null;
+        }
+        // 🔑 НЕТ ПРЕЖНЕЙ ОПОРЫ — НЕ СБОЙ (07.10.2026). Корзина пар пропадает, когда
+        // курс USDC/USD ненадёжен: в ночь сквиза это 20 раз у шести ботов, и каждый
+        // раз бот уходил в аварийный режим на две минуты, хотя своя книга и Бинанс
+        // были в порядке. Тогда уровень — целиком своя книга (смесь 0; на стенде
+        // x10 такая опора даёт 168 против 179 у смеси 0.25), а котировать можно по
+        // гейту своей книги.
+        boolean noOld = !(Double.isFinite(oldFair) && oldFair > 0);
+        if (noOld) {
+            noOldSteps++;
         }
         double topMid = (book.bestBid() + book.bestAsk()) / 2;
         double spreadBp = (book.bestAsk() - book.bestBid()) / topMid * 1e4;
@@ -114,7 +154,7 @@ public final class HybridCore {
                 depthShort++;
             }
         }
-        double level = mix * oldFair + (1 - mix) * bookMid;
+        double level = noOld ? bookMid : mix * oldFair + (1 - mix) * bookMid;
         if (Double.isNaN(emaM) || tauMs <= 0) {
             emaM = level;
             emaB = bnb;
@@ -127,8 +167,24 @@ public final class HybridCore {
             emaM += a * (level - emaM);
             emaB += a * (bnb - emaB);
         }
+        double fair = emaM * bnb / emaB;
+        if (clampBp > 0) {
+            double x = Math.log(level / bnb) * 1e4;
+            if (Double.isNaN(basisBp)) {
+                basisBp = x;
+            } else {
+                basisBp += (1 - Math.exp(-(tsMs - prev) / basisTauMs)) * (x - basisBp);
+            }
+            double dev = Math.log(fair / bnb) * 1e4 - basisBp;
+            steps++;
+            if (Math.abs(dev) > clampBp) {
+                clamped++;
+                fair = bnb * Math.exp((basisBp + Math.signum(dev) * clampBp) / 1e4);
+            }
+        }
         prev = tsMs;
         boolean ok = spreadBp <= maxSpreadBp;
-        return new Out(emaM * bnb / emaB, ok || oldQuotable, ok && !oldQuotable);
+        boolean oldOk = !noOld && oldQuotable;
+        return new Out(fair, ok || oldOk, ok && !oldOk);
     }
 }

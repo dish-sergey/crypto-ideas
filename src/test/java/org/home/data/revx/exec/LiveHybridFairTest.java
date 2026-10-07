@@ -70,7 +70,12 @@ class LiveHybridFairTest {
         assertTrue(h.degraded(), "молчащий Бинанс обязан включить аварийный режим");
         assertTrue(h.degradedWhy().contains("Бинанс"));
         assertTrue(f2.price() > 0, "аварийная опора — уровень по своей книге");
-        assertEquals("hybrid_degraded", j.lastEventOf("hybrid_degraded", "hybrid_recovered")[0]);
+        String[] ev = j.lastEventOf("hybrid_degraded", "hybrid_recovered");
+        assertEquals("hybrid_degraded", ev[0]);
+        // Сообщение называет состояние каждого источника и действие (07.10.2026).
+        assertTrue(ev[1].contains("Бинанс XRPUSDC — МОЛЧИТ"), ev[1]);
+        assertTrue(ev[1].contains("своя книга — в норме"), ev[1]);
+        assertTrue(ev[1].contains("Делаю:"), ev[1]);
 
         bnb(bnbDb, System.currentTimeMillis(), 1.5010);
         h.latest("XRP", 30_000);                         // первый здоровый тик — отсчёт нормы
@@ -83,6 +88,31 @@ class LiveHybridFairTest {
         bnb(bnbDb, System.currentTimeMillis() + 1, 1.5160);   // +1% на Бинансе
         double moved = h.latest("XRP", 30_000).price();
         assertTrue(moved > calm * 1.005, "ход Бинанса обязан двигать опору сразу: " + calm + " → " + moved);
+        h.close();
+        j.close();
+    }
+
+    @Test
+    void missingBasketIsNotAFailure() throws Exception {
+        // Ночь 07.10.2026: корзина пар пропадала 20 раз, своя книга и Бинанс были в
+        // порядке — опора обязана считаться по своей книге без аварийного режима.
+        String standDb = dir.resolve("stand2.db").toString();
+        String bnbDb = dir.resolve("bnb2.db").toString();
+        System.setProperty("revx.bnb.db", bnbDb);
+        System.setProperty("revx.fair.hybrid-mix", "0.25");
+        System.setProperty("revx.fair.hybrid-depth-k", "10");
+        FairSource noBasket = (base, lb) -> new StandReader.Fair(Double.NaN, false, "курс ненадёжен",
+                System.currentTimeMillis(), 3);
+        ExecJournal j = new ExecJournal(dir.resolve("j2.db").toString());
+        long now = System.currentTimeMillis();
+        book(standDb, now);
+        bnb(bnbDb, now, 1.5000);
+        LiveHybridFair h = new LiveHybridFair(noBasket, standDb, "XRP/USDC", 50, j);
+        StandReader.Fair f = h.latest("XRP", 30_000);
+        assertFalse(h.degraded(), "нет корзины — не сбой");
+        assertEquals((1.4980 + 1.5030) / 2, f.price(), 1e-9);
+        assertTrue(f.quotable(), "котировать по гейту своей книги");
+        assertEquals("hybrid_no_basket", j.lastEventOf("hybrid_no_basket", "hybrid_degraded")[0]);
         h.close();
         j.close();
     }

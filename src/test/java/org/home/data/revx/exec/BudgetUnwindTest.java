@@ -10,11 +10,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class BudgetUnwindTest {
 
     @Test
-    void гистерезис90и70() {
+    void гистерезис90и80() {
         assertFalse(QuoteLoop.budgetUnwindNext(false, 0.85));
         assertTrue(QuoteLoop.budgetUnwindNext(false, 0.90));
-        assertTrue(QuoteLoop.budgetUnwindNext(true, 0.80));   // между порогами — держим
-        assertFalse(QuoteLoop.budgetUnwindNext(true, 0.70));
+        assertTrue(QuoteLoop.budgetUnwindNext(true, 0.85));   // между порогами — держим
+        assertFalse(QuoteLoop.budgetUnwindNext(true, 0.80));  // возврат цели на 80% (07.10.2026)
     }
 
     /** Ведро на 80% полно — давления нет; на четверти — половинное. */

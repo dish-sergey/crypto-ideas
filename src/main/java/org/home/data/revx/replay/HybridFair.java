@@ -153,8 +153,9 @@ final class HybridFair {
             }
             log.warn(String.format(Locale.ROOT, "ГИБРИД %s (общий расчёт): смесь %.2f, глубина %.1f лота, "
                             + "τ %.0f с — пересчитано %d из %d, котируем вопреки корзине %d, "
-                            + "глубины не хватило на %d", symbol, LEVEL_MIX, DEPTH_K, TAU_MS / 1000, done,
-                    ticks.size(), gate, core.depthShort()));
+                            + "глубины не хватило на %d, поводок к Бинансу ±%.1f б.п. держал %.2f%% тиков",
+                    symbol, LEVEL_MIX, DEPTH_K, TAU_MS / 1000, done,
+                    ticks.size(), gate, core.depthShort(), core.clampBp(), 100 * core.clampedShare()));
             return out;
         }
         List<ReplayFair.Tick> out = new ArrayList<>(ticks.size());

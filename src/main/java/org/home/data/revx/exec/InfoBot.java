@@ -285,22 +285,26 @@ public final class InfoBot implements Runnable {
             if (h != null && "hybrid_degraded".equals(h[0])) {
                 return "ОПОРА НАРУШЕНА — распродажа и пауза до нормы";
             }
-            String[] e = j.lastEventOf("boot", "start", "budget_unwind", "sell_only",
-                    "frozen_unwind", "frozen_released", "limit_blocked");
+            // ⚠️ КАЖДЫЙ РЕЖИМ — ПО СВОЕЙ ЦЕПОЧКЕ СОБЫТИЙ (07.10.2026). Прежде брался
+            // последний из общего набора, и у a после «цель 0» в 02:56 сотня отказов
+            // limit_blocked «экспозиция» до 03:00 показывала в сводке «цель 30%», хотя
+            // бот стоял на нуле.
             String normal = "цель " + normalTarget(j) + "%";
-            if (e == null) {
-                return normal;
+            String[] s = j.lastEventOf("boot", "start", "stop", "sell_only");
+            if (s != null && "sell_only".equals(s[0])) {
+                return "ТОЛЬКО ПРОДАЖА до нуля — предел постановок исчерпан";
             }
-            String detail = e[1] == null ? "" : e[1];
-            return switch (e[0]) {
-                case "sell_only" -> "ТОЛЬКО ПРОДАЖА до нуля — предел постановок исчерпан";
-                case "frozen_unwind" -> "цель 0% — распродажа: площадка держит запертый резерв";
-                case "budget_unwind" -> detail.contains("цель скоса 0")
-                        ? "цель 0% — распродажа перед пределом ("
-                                + detail.replaceAll(".*постановок за сутки (\\d+ из \\d+).*", "$1") + ")"
-                        : normal;
-                default -> normal;
-            };
+            String[] f = j.lastEventOf("boot", "frozen_unwind", "frozen_released");
+            if (f != null && "frozen_unwind".equals(f[0])) {
+                return "цель 0% — распродажа: площадка держит запертый резерв";
+            }
+            String[] b = j.lastEventOf("boot", "budget_unwind");
+            if (b != null && "budget_unwind".equals(b[0]) && b[1] != null && b[1].contains("цель скоса 0")) {
+                return "цель 0% — распродажа перед пределом ("
+                        + b[1].replaceAll(".*постановок за сутки (\\d+ из \\d+).*", "$1")
+                        + ", обычная цель вернётся на 80%)";
+            }
+            return normal;
         } catch (Exception ex) {
             return null;
         }
@@ -765,9 +769,10 @@ public final class InfoBot implements Runnable {
             if (e != null && "hybrid_degraded".equals(e[0])) {
                 if (!(e[1] + "").equals(hybridTold.get(id))) {
                     hybridTold.put(id, e[1] + "");
+                    // Текст события уже полный (07.10.2026): что нарушено, состояние
+                    // источников, опора на время сбоя и фактическое действие бота.
                     send("⚠️ " + w.botId().toUpperCase(Locale.ROOT) + " " + w.symbol()
-                            + " ОПОРА НАРУШЕНА: " + e[1] + "\nБот распродаёт запас и встанет в паузу; "
-                            + "вернётся сам, когда источники будут в норме.");
+                            + " ОПОРА НАРУШЕНА\n" + e[1]);
                 }
             } else if (hybridTold.remove(id) != null) {
                 send("🟢 " + w.botId().toUpperCase(Locale.ROOT) + " " + w.symbol()

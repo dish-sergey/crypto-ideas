@@ -876,7 +876,7 @@ public final class QuoteLoop implements Runnable {
 
         double buyCash = alloc != null
                 ? Math.max(0, alloc.own(tag.id(), quote) - lockedQuoteEff()) : Double.MAX_VALUE;
-        double sellPool = Math.max(0, inventory - lockedBaseEff());
+        double sellPool = Math.max(0, inventory - lockedBaseEff() - pendingUncertain(Side.SELL));
         double buyRoom = buyRoom();
         for (var r : current) {
             Resting slot = r.side() == Side.BUY ? bids.get(r.level()) : asks.get(r.level());
@@ -929,7 +929,9 @@ public final class QuoteLoop implements Runnable {
     static final boolean BUY_FAR_FIRST = Boolean.getBoolean("revx.exec.buy-far-first");
 
     private double buyRoom() {
-        return frozenUnwind ? 0 : Math.max(0, params.inventoryCap() - inventory);
+        // Потолок считает и то, что может стоять в книге без ведома бота (07.10.2026).
+        return frozenUnwind ? 0
+                : Math.max(0, params.inventoryCap() - inventory - pendingUncertain(Side.BUY));
     }
 
     private org.home.data.revx.place.RestingOrder restingOf(Side side, int level) {
@@ -1337,6 +1339,11 @@ public final class QuoteLoop implements Runnable {
         this.minuteStartMs = this.clock.now();
         this.lastReconcileMs = this.minuteStartMs;
         this.stand = stand;
+        if (stand instanceof LiveHybridFair h) {
+            // Сообщение о сбое опоры называет фактическое действие: сколько запаса
+            // продаём или что встаём в паузу (владелец, 07.10.2026).
+            h.attach(() -> new double[]{inventory, lastFair, quoting.get() ? 1 : 0});
+        }
         this.journal = journal;
         this.params = params;
         this.quoter = new Quoter(params);
@@ -2026,7 +2033,7 @@ public final class QuoteLoop implements Runnable {
         // задан.
         double buyCash = alloc != null
                 ? Math.max(0, alloc.own(tag.id(), quote) - lockedQuoteEff()) : Double.MAX_VALUE;
-        double sellPool = Math.max(0, inventory - lockedBaseEff());
+        double sellPool = Math.max(0, inventory - lockedBaseEff() - pendingUncertain(Side.SELL));
         levelTicks++;
         for (int i = 0; i < levels; i++) {
             if (bids.get(i).venueId != null) {
@@ -3255,6 +3262,11 @@ public final class QuoteLoop implements Runnable {
         if (resting != (side == Side.BUY ? bids : asks).get(0)) {
             return;
         }
+        // Продавать пыль мельче минимальной заявки нечем и незачем — это не
+        // нехватка средств (у a 07.10.2026 так шла запись раз в минуту на 1e-8 BTC).
+        if (side == Side.SELL && lastFair > 0 && inventory * lastFair < minNotional) {
+            return;
+        }
         long now = clock.now();
         if (now - resting.fundsWarnedMs < 60_000) {
             return;
@@ -3355,6 +3367,23 @@ public final class QuoteLoop implements Runnable {
 
     private void place(Side side, Resting resting, double price, double size) {
         trace("PLACE", side, resting, price, size);
+        // 🔑 НЕ СТАВИТЬ ПОКУПКУ, ПОКА НЕ ЗНАЕМ СУДЬБУ ПРЕЖНЕЙ (владелец, 07.10.2026).
+        // Продажам отдельный запрет не нужен: их пул уже уменьшен на всё, что может
+        // стоять, и продать сверх своего запаса нельзя по построению.
+        if (side == Side.BUY) {
+            double uncertain = pendingUncertain(Side.BUY);
+            if (uncertain > 0) {
+                long now = clock.now();
+                if (now - uncertainWarnedMs >= 60_000) {
+                    uncertainWarnedMs = now;
+                    journal.event("uncertain_hold", String.format(java.util.Locale.ROOT,
+                            "покупку не ставлю: в книге может стоять ещё %s (судьба неизвестна "
+                                    + "или площадка показывает снятую) — жду ответа",
+                            fmt(uncertain)));
+                }
+                return;
+            }
+        }
         // Сначала общее ведро: оно и есть настоящий предел аккаунта.
         //
         // ⚠️ Отказ НЕ выключает бота. Прежде выключал, и 07.09.2026 это стоило
@@ -3513,7 +3542,7 @@ public final class QuoteLoop implements Runnable {
                 // исполнение придёт лентой по его oid (myOrders его помнит). Это
                 // ~один GET на замену, ~200 GET/мин на шесть ботов (28.09.2026).
                 if (!venueCovers()) {
-                    inspectGoneOrder(side, oldId);
+                    inspectGoneOrder(side, oldId, resting.size);
                 }
             }
             resting.price = price;
@@ -3752,6 +3781,15 @@ public final class QuoteLoop implements Runnable {
         if (foreign > 0) {
             log.debug("в книге {} чужих заявок по {} — не трогаю", foreign, symbol);
         }
+        // Что площадка сейчас показывает своим: бесхозные, которых в списке больше
+        // нет, из учёта «возможно стоящих» уходят; остальные снова попадут туда при
+        // повторной отмене ниже.
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (ActiveOrder o : orders) {
+            seen.add(o.id());
+        }
+        lastOwnActive = seen;
+        strayOwn.keySet().retainAll(seen);
         forgetHeirIfVisible(orders);
         if (!quoting.get()) {
             // Правило 1: пока котирование выключено, наших ТОРГУЮЩИХ заявок в
@@ -3889,7 +3927,7 @@ public final class QuoteLoop implements Runnable {
         if (keep == null) {
             boolean fresh = clock.now() - resting.sinceMs < ADOPT_GRACE_MS;
             if (resting.venueId != null && !fresh) {
-                String status = inspectGoneOrder(side, resting.venueId);
+                String status = inspectGoneOrder(side, resting.venueId, resting.size);
                 // 🔑 «НЕТ В СПИСКЕ АКТИВНЫХ» НЕ ЗНАЧИТ «ЗАЯВКИ НЕТ».
                 //
                 // Прежде слот очищался при ЛЮБОМ ответе, и если площадка
@@ -3938,7 +3976,7 @@ public final class QuoteLoop implements Runnable {
             // с лотом $3 так терялось 33% объёма (08.09.2026), и при переходе
             // на крупный лот боевой бот начал бы терять сделки молча.
             if (keep.size() < resting.size - 1e-12) {
-                inspectGoneOrder(side, resting.venueId);
+                inspectGoneOrder(side, resting.venueId, Math.max(0, resting.size - keep.size()));
                 resting.size = keep.size();
             }
             return;
@@ -3948,7 +3986,7 @@ public final class QuoteLoop implements Runnable {
         // если он исполнился, запись должна появиться. Повторного счёта нет —
         // {@link #bookedByOrder} помнит, сколько по нему уже записано.
         if (resting.venueId != null) {
-            String status = inspectGoneOrder(side, resting.venueId);
+            String status = inspectGoneOrder(side, resting.venueId, resting.size);
             closePartial(resting, "сменилась наследником (" + status + ")");
         }
         log.warn("усыновляю заявку {} {} по {} ({})", side, keep.id(), keep.price(), why);
@@ -3974,6 +4012,10 @@ public final class QuoteLoop implements Runnable {
     }
 
     private void cancelStray(ActiveOrder order, String why) {
+        // Пока площадка её показывает, она может исполниться: её объём — в учёт
+        // «возможно стоящих» (см. pendingUncertain). Ночью 07.10.2026 одна и та же
+        // заявка снималась с ответом 204 десятки раз и оставалась в списке.
+        strayOwn.put(order.id(), new double[]{order.side().ordinal(), order.size()});
         Venue.Response response = client.cancel(order.id());
         cancels++;
         log.warn("снимаю бесхозную заявку {} {} по {} ({}) → {}", order.side(), order.id(),
@@ -3996,7 +4038,7 @@ public final class QuoteLoop implements Runnable {
      * не промо), и появление любой ненулевой комиссии означает смену экономики, а
      * не параметра. Решение принимает человек.
      */
-    private String inspectGoneOrder(Side side, String venueId) {
+    private String inspectGoneOrder(Side side, String venueId, double size) {
         Venue.Response order = client.order(venueId);
         if (!order.ok() || order.body() == null) {
             // ⚠️ СУДЬБА НЕИЗВЕСТНА — И ЗАБЫВАТЬ ЭТОТ ВОПРОС НЕЛЬЗЯ.
@@ -4015,10 +4057,12 @@ public final class QuoteLoop implements Runnable {
             // площадка не ответит. Повторный учёт не страшен: {@link #book}
             // записывает РАЗНИЦУ по {@code bookedByOrder}, поэтому один и тот же
             // ответ дважды инвентарь не сдвинет.
-            if (unknownFate.putIfAbsent(venueId, new UnknownFate(side, clock.now())) == null) {
+            if (unknownFate.putIfAbsent(venueId, new UnknownFate(side, clock.now(), size)) == null) {
+                lastUnknownMs = clock.now();
                 journal.event("fate_unknown", String.format(java.util.Locale.ROOT,
-                        "%s %s: площадка не ответила о судьбе (%d), спрошу ещё",
-                        side, venueId, order.status()));
+                        "%s %s: площадка не ответила о судьбе (%d), спрошу ещё; до ответа "
+                                + "считаю, что %s стоит в книге",
+                        side, venueId, order.status(), fmt(size)));
                 log.warn("судьба заявки {} неизвестна (ответ {}) — вопрос поставлен в очередь",
                         venueId, order.status());
             }
@@ -4457,7 +4501,9 @@ public final class QuoteLoop implements Runnable {
             Venue.Response order = client.order(id);
             asked++;
             if (!order.ok() || order.body() == null) {
-                unknownFate.putIfAbsent(id, new UnknownFate(Side.BUY, clock.now()));
+                // Сторона и объём хвоста из журнала тут не известны: объём 0, чтобы
+                // старый хвост не запирал покупки — он лишь переспрашивается.
+                unknownFate.putIfAbsent(id, new UnknownFate(Side.BUY, clock.now(), 0));
                 continue;                 // переспросим через минуту
             }
             String status = field(order.body(), "status");
@@ -4620,13 +4666,59 @@ public final class QuoteLoop implements Runnable {
     private static final class UnknownFate {
         final Side side;
         final long sinceMs;
+        /** Сколько по ней могло стоять — столько же могло и исполниться. */
+        final double size;
         volatile boolean warned;
 
-        UnknownFate(Side side, long sinceMs) {
+        UnknownFate(Side side, long sinceMs, double size) {
             this.side = side;
             this.sinceMs = sinceMs;
+            this.size = size;
         }
     }
+
+    /**
+     * 🔑 НЕ ЗНАЕМ — ЗНАЧИТ, СТОИТ (07.10.2026, ночь лонг-сквиза). С 02:00 до 03:10
+     * площадка отвечала 404 о живых заявках и держала в списке активных снятые
+     * (204). Бот считал слот свободным и ставил новую заявку поверх, возможно,
+     * живой: у a на сливе исполнилось девять покупок, запас дошёл до 249% потолка;
+     * у c и f две «потерянные» продажи по лоту исполнились обе, и бот ушёл в −60%,
+     * то есть продал ЧУЖИЕ монеты со счёта.
+     *
+     * Теперь всё, что может стоять в книге, считается стоящим: заявки с неизвестной
+     * судьбой ({@link #unknownFate}) и свои «бесхозные», которые площадка всё ещё
+     * показывает после отмены ({@link #strayOwn}). Новая покупка не ставится, пока
+     * на стороне покупок есть хоть одна такая; потолок и пул продаж считают их
+     * объём. Продать больше своего запаса бот не может по построению.
+     */
+    private final java.util.Map<String, double[]> strayOwn =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** Свои заявки, которые площадка показала в последнем списке активных. */
+    private volatile java.util.Set<String> lastOwnActive = java.util.Set.of();
+    /** Когда последний раз площадка ответила 404 о нашей заявке. */
+    private volatile long lastUnknownMs;
+    private long uncertainWarnedMs;
+
+    /** Объём, который может стоять в книге на стороне, хотя бот его не ведёт. */
+    double pendingUncertain(Side side) {
+        double sum = 0;
+        for (UnknownFate f : unknownFate.values()) {
+            if (f.side == side) {
+                sum += f.size;
+            }
+        }
+        for (double[] s : strayOwn.values()) {
+            if ((int) s[0] == side.ordinal()) {
+                sum += s[1];
+            }
+        }
+        return sum;
+    }
+
+    /** Через сколько молчания площадки заявку с неизвестной судьбой считаем снятой. */
+    static final long FATE_ASSUME_MS = 10 * 60_000L;
+    /** Сколько без новых 404 нужно, чтобы считать, что площадка снова отвечает. */
+    static final long VENUE_CALM_MS = 5 * 60_000L;
 
     private final java.util.Map<String, UnknownFate> unknownFate =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -4645,6 +4737,24 @@ public final class QuoteLoop implements Runnable {
         for (java.util.Map.Entry<String, UnknownFate> e : unknownFate.entrySet()) {
             String venueId = e.getKey();
             UnknownFate fate = e.getValue();
+            // ⚠️ СТРАХОВКА ОТ ВЕЧНОГО 404: заявки нет в списке активных, новых заявок
+            // с неизвестной судьбой пять минут не появлялось (затык кончился), а об
+            // этой площадка молчит десять — считаем снятой, иначе сторона была бы
+            // заперта навсегда. Повторные 404 по ней же затыком не считаются: тогда
+            // вечный 404 сам бы продлевал себе ожидание.
+            // Снятая вручную сюда не попадает: о ней площадка отвечает 200 cancelled.
+            if (now - fate.sinceMs > FATE_ASSUME_MS && now - lastUnknownMs > VENUE_CALM_MS
+                    && !lastOwnActive.contains(venueId)) {
+                unknownFate.remove(venueId);
+                String message = String.format(java.util.Locale.ROOT,
+                        "%s %s (%s): площадка не говорит о заявке %d мин, в списке активных её нет — "
+                                + "считаю снятой. Если она исполнилась, сверка позиции это покажет.",
+                        fate.side, venueId, fmt(fate.size), (now - fate.sinceMs) / 60_000);
+                log.error(message);
+                journal.event("fate_assumed", message);
+                alert.accept(message);
+                continue;
+            }
             Venue.Response order = client.order(venueId);
             if (order.ok() && order.body() != null) {
                 unknownFate.remove(venueId);
@@ -4880,7 +4990,7 @@ public final class QuoteLoop implements Runnable {
             journal.closeOrder(dead, "cancelled", clock.now());
         } else {
             log.info("отмена {} не прошла ({}), выясняю судьбу заявки", side, response.status());
-            inspectGoneOrder(side, dead);
+            inspectGoneOrder(side, dead, resting.size);
             refreshBalances();
         }
     }
@@ -6465,7 +6575,10 @@ public final class QuoteLoop implements Runnable {
     /** Сколько постановок сверх суточного предела разрешено распродаже. */
     static final int SELL_TAIL = 5;
     static final double BUDGET_UNWIND_ON = 0.9;
-    static final double BUDGET_UNWIND_OFF = 0.7;
+    // Возврат обычной цели на 80%, а не на 70% (владелец, 07.10.2026): расход за
+    // скользящие сутки после всплеска падает медленно, и на 70% цель 0 держалась
+    // дольше, чем нужно.
+    static final double BUDGET_UNWIND_OFF = 0.8;
     private volatile boolean budgetUnwind;
     /** У предела постановок: покупок нет, продажи — заменами до нуля, потом остановка. */
     private volatile boolean sellOnly;
@@ -6500,7 +6613,7 @@ public final class QuoteLoop implements Runnable {
         stopQuoting();
     }
 
-    /** Гистерезис: включение с 90% предела, выключение на 70%. */
+    /** Гистерезис: включение с 90% предела, выключение на 80%. */
     static boolean budgetUnwindNext(boolean now, double usage) {
         if (!now && usage >= BUDGET_UNWIND_ON) {
             return true;
@@ -6801,7 +6914,7 @@ public final class QuoteLoop implements Runnable {
                     r.qSide, id, (now - r.qSinceMs) / 60_000, resp.status());
             log.warn(text);
             journal.event("question_expired", text);
-            unknownFate.putIfAbsent(id, new UnknownFate(r.qSide, now));
+            unknownFate.putIfAbsent(id, new UnknownFate(r.qSide, now, r.qSize));
             r.questioned = null;
         }
     }
