@@ -158,7 +158,7 @@ public final class ExecBot implements Runnable {
                 }
             }
             case "/stop" -> {
-                loop.stopQuoting();
+                loop.stopByOwner();
                 send("Котирование выключено, заявки сняты.\n" + status());
             }
             case "/panic" -> {

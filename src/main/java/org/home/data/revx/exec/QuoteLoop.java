@@ -1560,6 +1560,7 @@ public final class QuoteLoop implements Runnable {
             // держится до следующего тика и противоречит состоянию.
             pausedReason = null;
             sellOnly = false;                // новая попытка — распродажа решается заново
+            limitStoppedMs = 0;
             journal.event("start", "котирование включено");
             log.warn("КОТИРОВАНИЕ ВКЛЮЧЕНО: {} по {} USDC", symbol, params.size());
         }
@@ -1969,6 +1970,11 @@ public final class QuoteLoop implements Runnable {
 
         if (!quoting.get()) {
             pausedReason = "не запущен";
+            if (LIMIT_AUTO_RESUME && limitStoppedMs > 0 && AUTO_RESUME_MS <= 0
+                    && placementsLastDay() <= placementCap() * BUDGET_UNWIND_OFF) {
+                autoResume();
+                return;
+            }
             if (AUTO_RESUME_MS > 0 && limitStoppedMs > 0
                     && clock.now() - limitStoppedMs >= AUTO_RESUME_MS
                     && placementsLastDay() < placementCap() * BUDGET_UNWIND_OFF) {
@@ -7034,7 +7040,49 @@ public final class QuoteLoop implements Runnable {
      */
     static final long AUTO_RESUME_MS =
             Long.getLong("revx.sim.auto-resume-min", 0L) * 60_000L;
-    private long limitStoppedMs;
+    private volatile long limitStoppedMs;
+
+    /**
+     * 🔑 САМ ВКЛЮЧАЕТСЯ ПОСЛЕ ОСТАНОВКИ ПО ПРЕДЕЛУ (08.10.2026, владелец). Бот, который
+     * сам остановился у предела постановок (распродал до нуля или исчерпал хвост),
+     * включается снова, когда расход за скользящие сутки опустится до
+     * {@link #BUDGET_UNWIND_OFF} (80%) — той же границы, на которой возвращается обычная
+     * цель. Как /start: сначала касса под потолок, потом те же проверки допуска.
+     * Остановка человеком (/stop) и любые другие предохранители это не включают.
+     * Флаг {@code revx.exec.limit-auto-resume}, по умолчанию включён.
+     */
+    static final boolean LIMIT_AUTO_RESUME = !"false".equalsIgnoreCase(
+            System.getProperty("revx.exec.limit-auto-resume", "true"));
+    private long autoResumeTriedMs;
+
+    private void autoResume() {
+        long now = clock.now();
+        if (now - autoResumeTriedMs < 60_000) {
+            return;                           // не чаще раза в минуту, если допуск не пускает
+        }
+        autoResumeTriedMs = now;
+        String taken = topUpCash();
+        String blocked = cannotStart();
+        long used = placementsLastDay();
+        if (blocked != null) {
+            journal.event("auto_resume_blocked", "постановок за сутки " + used + " из " + placementCap()
+                    + " — включился бы, но: " + blocked);
+            return;
+        }
+        limitStoppedMs = 0;
+        String text = "постановок за сутки " + used + " из " + placementCap()
+                + " (≤ 80%) — включаюсь сам после остановки по пределу"
+                + (taken == null ? "" : ". " + taken);
+        journal.event("auto_resume", text);
+        alert.accept(symbol + ": " + text);
+        startQuoting();
+    }
+
+    /** /stop человеком: остановка по пределу больше не считается — сам не включится. */
+    public void stopByOwner() {
+        limitStoppedMs = 0;
+        stopQuoting();
+    }
 
     // ------------------------------------------------ минута затыков
 
