@@ -46,7 +46,7 @@ public final class LiveHybridFair implements FairSource {
     private final String bnbDbPath;
     private final String symbol;
     private final String bnbSymbol;
-    private final double lotQty;
+    private double lotQty;
     private final ExecJournal journal;
     private final HybridCore core;
     private Connection book;
@@ -108,6 +108,28 @@ public final class LiveHybridFair implements FairSource {
     private long healthySince;
     private String degradedWhy = "";
 
+    /**
+     * ЧЕСТНАЯ ПРИЧИНА ПАУЗЫ (08.10.2026). Опора котирует, если своя книга не шире
+     * порога ИЛИ надёжна прежняя опора. Пауза значит, что не выполнено ни то, ни
+     * другое, а сводка печатала только причину корзины («курс ненадёжен») — и выглядело
+     * так, будто запасной опоры нет. Во втором сквизе книга SOL была шире 64–90 б.п.
+     */
+    static String pauseWhy(HybridCore.Out o, StandReader.Fair f, double maxSpreadBp, String symbol) {
+        String own = String.format(java.util.Locale.ROOT, "своя книга %s шире %.0f б.п. (%.0f б.п.)",
+                symbol, maxSpreadBp, o.spreadBp());
+        String old = f.pausedReason() == null ? "корзина ненадёжна" : f.pausedReason();
+        return own + " и " + old;
+    }
+
+    private String pauseWhy(HybridCore.Out o, StandReader.Fair f) {
+        return pauseWhy(o, f, core.maxSpreadBp(), symbol);
+    }
+
+    /** Новый лот после пересчёта из долларов: глубина «k лотов» считается от него. */
+    public void setLotQty(double lotQty) {
+        this.lotQty = lotQty;
+    }
+
     public boolean degraded() {
         return degraded;
     }
@@ -143,7 +165,7 @@ public final class LiveHybridFair implements FairSource {
                                 + "уровень по своей книге, движение по Бинансу, торгую как обычно");
                     }
                     healthy(now);
-                    return new StandReader.Fair(o.fair(), o.quotable(), o.quotable() ? null : f.pausedReason(),
+                    return new StandReader.Fair(o.fair(), o.quotable(), o.quotable() ? null : pauseWhy(o, f),
                             f.asOfMs(), f.pairsUsed(), b.bestBid(), b.bestAsk(), f.referenceSpreadPct());
                 }
             }

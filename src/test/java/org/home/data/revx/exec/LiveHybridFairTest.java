@@ -116,4 +116,14 @@ class LiveHybridFairTest {
         h.close();
         j.close();
     }
+
+    /** 08.10.2026: сводка писала только «курс ненадёжен», хотя пауза — от книги SOL шире 50 б.п. */
+    @Test
+    void паузаНазываетОбеПричины() {
+        HybridCore.Out o = new HybridCore.Out(108.9, false, false, 85.2);
+        StandReader.Fair f = new StandReader.Fair(108.9, false,
+                "курс ненадёжен: разброс implied 0.114% выше порога 0.1%", 0, 18, 108.52, 109.449, 0.114);
+        assertEquals("своя книга SOL/USDC шире 50 б.п. (85 б.п.) и курс ненадёжен: разброс implied 0.114% "
+                + "выше порога 0.1%", LiveHybridFair.pauseWhy(o, f, 50, "SOL/USDC"));
+    }
 }

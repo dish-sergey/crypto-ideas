@@ -23,7 +23,8 @@ import java.util.List;
  */
 public final class HybridCore {
 
-    public record Out(double fair, boolean quotable, boolean ownGate) {
+    /** {@code spreadBp} — ширина своей книги по верху, б.п. (для честной причины паузы). */
+    public record Out(double fair, boolean quotable, boolean ownGate, double spreadBp) {
     }
 
     private final double mix;
@@ -82,6 +83,10 @@ public final class HybridCore {
     /** Доля шагов, на которых поводок к Бинансу удержал опору. */
     public double clampedShare() {
         return steps == 0 ? 0 : (double) clamped / steps;
+    }
+
+    public double maxSpreadBp() {
+        return maxSpreadBp;
     }
 
     public double clampBp() {
@@ -200,6 +205,6 @@ public final class HybridCore {
         prev = tsMs;
         boolean ok = spreadBp <= maxSpreadBp;
         boolean oldOk = !noOld && oldQuotable;
-        return new Out(fair, ok || oldOk, ok && !oldOk);
+        return new Out(fair, ok || oldOk, ok && !oldOk, spreadBp);
     }
 }

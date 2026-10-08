@@ -33,6 +33,13 @@ public final class Quoter implements QuotePolicy {
             double requoteThreshold,  // порог перевыставления, доля цены
             double quoteStep) {       // шаг цены пары
 
+        /** Тот же набор с другим лотом и потолком (пересчёт лота из долларов, 07.10.2026). */
+        public Params withSize(double newSize, double newCap) {
+            return new Params(offset, newSize, newCap, skewK, skewTarget, driftBeta, buySizeRatio,
+                    driftWindowMs, sizeShapeEta, driftGateEr, erWindowMs, erSampleMs, stopDrawdownPct,
+                    sticky, frozen, hedge, stopCoolOffMs, requoteThreshold, quoteStep);
+        }
+
         /** Совместимость: цель — пустой инвентарь, дрейф выключен, набор симметричен. */
         public Params(double offset, double size, double inventoryCap, double skewK,
                       double requoteThreshold, double quoteStep) {

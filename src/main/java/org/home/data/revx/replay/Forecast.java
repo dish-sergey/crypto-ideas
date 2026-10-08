@@ -735,6 +735,7 @@ public final class Forecast {
         // дал 39 МБ/с записи и 666 операций в секунду при чтении 0.4 МБ/с —
         // обход упирался в собственный журнал, а не в данные.
         QuoteLoop.Stats st = loop.stats();
+        log.warn("{}", loop.inventoryRange());
         if (QuoteLoop.LEVEL_COOLDOWN_MS > 0) {
             log.warn("пауза уровня после покупки {} с: включалась {} раз",
                     QuoteLoop.LEVEL_COOLDOWN_MS / 1000, loop.levelCoolStarts());
