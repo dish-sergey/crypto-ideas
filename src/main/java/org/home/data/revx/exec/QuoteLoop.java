@@ -3608,7 +3608,10 @@ public final class QuoteLoop implements Runnable {
         }
         // Продавать пыль мельче минимальной заявки нечем и незачем — это не
         // нехватка средств (у a 07.10.2026 так шла запись раз в минуту на 1e-8 BTC).
-        if (side == Side.SELL && lastFair > 0 && inventory * lastFair < minNotional) {
+        // 09.10.2026: и то, что уже стоит в продажах или ниже порога постановки (×1.5
+        // минимума) — у f 30 ложных записей за 3 ч на 0.0009 SOL при стоящей продаже.
+        if (side == Side.SELL && lastFair > 0
+                && Math.max(0, inventory - sellsMaybeAlive(null)) * lastFair < minNotional * DUST_PLACE_MULT) {
             return;
         }
         long now = clock.now();
