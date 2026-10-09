@@ -3319,6 +3319,16 @@ public final class QuoteLoop implements Runnable {
         }
         // Пул уже урезан внутренними уровнями: дальний получает только остаток.
         double size = Math.min(sizeFor(side, targetPrice, resting), Math.max(0, pool));
+        // 🔑 ПЫЛЬ — В ЗАЯВКУ, А НЕ ОТДЕЛЬНО (09.10.2026, f остановился с лотом на руках).
+        // Остаток пула меньше полутора минимумов площадки отдельной продажей не живёт:
+        // на грани 0.1 USDC его стоимость гуляет с ценой, и бот ставил его, через тик
+        // снимал «нечем котировать» и ставил снова — 9 постановок за 23 мин сожгли хвост
+        // распродажи, и бот встал с лотом. Такой остаток продаётся вместе с этой заявкой.
+        if (side == Side.SELL && size > 0 && pool > size
+                && (pool - size) * targetPrice < minNotional * DUST_PLACE_MULT
+                && pool * targetPrice <= maxOrderNotional) {
+            size = pool;
+        }
         dump(String.format(java.util.Locale.ROOT,
                 "ВСТР %s ур%d: слот=%s цена=%.8f размер=%.6f | цель=%.8f | пул=%.6f | размер=%.6f",
                 side, level, resting.venueId == null ? "пуст" : "есть",
@@ -3327,7 +3337,11 @@ public final class QuoteLoop implements Runnable {
         // Ниже минимума площадки заявка не встанет, а попытка потратит суточный
         // лимит постановок. Остаток от частичного исполнения бывает мельче
         // минимума (5.5e-7 BTC = 0.04 USDC при пороге 0.1) — это не повод стучаться.
-        if (size <= 0 || notional < minNotional) {
+        // Гистерезис у минимума площадки: новую заявку ставим с запасом (×1.5), стоящую
+        // снимаем, только если её стоимость ушла заметно ниже (×0.7) — иначе цена на грани
+        // 0.1 USDC гоняет «поставил → снял → поставил», и каждая постановка из суточных.
+        double minHere = resting.venueId == null ? minNotional * DUST_PLACE_MULT : minNotional * 0.7;
+        if (size <= 0 || notional < minHere) {
             if (resting.venueId != null) {
                 cancel(side, resting, "нечем котировать эту сторону");
             }
@@ -3437,6 +3451,9 @@ public final class QuoteLoop implements Runnable {
     }
 
     private long sellGuardWarnedMs;
+
+    /** Новая заявка — не дешевле стольких минимумов площадки (гистерезис против пыли). */
+    static final double DUST_PLACE_MULT = 1.5;
 
     private static double stillHeld(Resting resting) {
         return resting.venueId == null && resting.questioned != null ? resting.qSize : 0;
