@@ -30,10 +30,25 @@ public final class MarketData {
 
     private final List<MarketTrade> trades;
     private final long[] bookTs;
-    private final List<BookView> books;
+    /**
+     * 🔑 КНИГА ПЛОТНЫМИ МАССИВАМИ (09.10.2026). Прежде каждый снимок жил списками
+     * объектов {@code Level}: ~2 млн снимков × ~100 уровней за 24 дня — 200 млн мелких
+     * объектов, 8–9 ГБ кучи, и два прогона длинного окна в 32 ГБ не помещались.
+     * Теперь цены и объёмы лежат в двух {@code double[]} подряд, снимок собирается в
+     * {@link BookView} только при обращении (с кэшем последнего). Значения те же до
+     * бита — {@code double}, как и были.
+     * Снимок {@code i}: биды в {@code [bidOff[i], askOff[i])}, аски в
+     * {@code [askOff[i], bidOff[i+1])}.
+     */
+    private final int[] bidOff;
+    private final int[] askOff;
+    private final double[] px;
+    private final double[] qty;
     private int tradeCursor;
     private int bookCursor;
     private int afterCursor;
+    private int cachedIdx = -1;
+    private BookView cached;
 
     /**
      * Рынок из готовых рядов — для тестов.
@@ -43,13 +58,106 @@ public final class MarketData {
      * подобраны под проверку, а не на тех, где всё и так сходится.
      */
     public static MarketData of(List<MarketTrade> trades, long[] bookTs, List<BookView> books) {
-        return new MarketData(trades, bookTs, books);
+        Packer p = new Packer();
+        for (BookView b : books) {
+            p.add(b.bids(), b.asks());
+        }
+        return new MarketData(trades, bookTs, p.bidOff(), p.askOff(), p.px(), p.qty());
     }
 
-    private MarketData(List<MarketTrade> trades, long[] bookTs, List<BookView> books) {
+    private MarketData(List<MarketTrade> trades, long[] bookTs, int[] bidOff, int[] askOff,
+                       double[] px, double[] qty) {
         this.trades = trades;
         this.bookTs = bookTs;
-        this.books = books;
+        this.bidOff = bidOff;
+        this.askOff = askOff;
+        this.px = px;
+        this.qty = qty;
+    }
+
+    /** Накопитель плотной книги: растущие массивы без промежуточных объектов. */
+    private static final class Packer {
+        private int n;
+        private int m;
+        private int[] bo = new int[1024];
+        private int[] ao = new int[1024];
+        private double[] p = new double[16384];
+        private double[] q = new double[16384];
+
+        void level(double price, double size) {
+            if (m == p.length) {
+                p = java.util.Arrays.copyOf(p, p.length + (p.length >> 1));
+                q = java.util.Arrays.copyOf(q, q.length + (q.length >> 1));
+            }
+            p[m] = price;
+            q[m] = size;
+            m++;
+        }
+
+        void startBids() {
+            if (n + 1 >= bo.length) {
+                bo = java.util.Arrays.copyOf(bo, bo.length * 2);
+                ao = java.util.Arrays.copyOf(ao, ao.length * 2);
+            }
+            bo[n] = m;
+        }
+
+        void startAsks() {
+            ao[n] = m;
+        }
+
+        void end() {
+            n++;
+            bo[n] = m;
+        }
+
+        void add(List<BookView.Level> bids, List<BookView.Level> asks) {
+            startBids();
+            for (BookView.Level l : bids) {
+                level(l.price(), l.qty());
+            }
+            startAsks();
+            for (BookView.Level l : asks) {
+                level(l.price(), l.qty());
+            }
+            end();
+        }
+
+        int[] bidOff() {
+            int[] out = java.util.Arrays.copyOf(bo, n + 1);
+            out[n] = m;
+            return out;
+        }
+
+        int[] askOff() {
+            return java.util.Arrays.copyOf(ao, n);
+        }
+
+        double[] px() {
+            return p;                    // без обрезки: копия на пике удвоила бы память
+        }
+
+        double[] qty() {
+            return q;
+        }
+    }
+
+    /** Снимок {@code i} как {@link BookView}; последний собранный держится в кэше. */
+    private BookView view(int i) {
+        if (i == cachedIdx) {
+            return cached;
+        }
+        List<BookView.Level> bids = new ArrayList<>(askOff[i] - bidOff[i]);
+        for (int k = bidOff[i]; k < askOff[i]; k++) {
+            bids.add(new BookView.Level(px[k], qty[k]));
+        }
+        List<BookView.Level> asks = new ArrayList<>(bidOff[i + 1] - askOff[i]);
+        for (int k = askOff[i]; k < bidOff[i + 1]; k++) {
+            asks.add(new BookView.Level(px[k], qty[k]));
+        }
+        cached = new BookView(bids, asks);
+        cachedIdx = i;
+        return cached;
     }
 
     /**
@@ -60,7 +168,7 @@ public final class MarketData {
      * пару по нескольким отступам и двум моделям, поэтому копия обязательна.
      */
     public MarketData fresh() {
-        return new MarketData(trades, bookTs, books);
+        return new MarketData(trades, bookTs, bidOff, askOff, px, qty);
     }
 
     public int tradeCount() {
@@ -80,7 +188,7 @@ public final class MarketData {
     }
 
     public int bookCount() {
-        return books.size();
+        return bookTs.length;
     }
 
     /**
@@ -151,7 +259,7 @@ public final class MarketData {
         if (bookTs.length == 0 || bookTs[bookCursor] > tsMs) {
             return null;
         }
-        return books.get(bookCursor);
+        return view(bookCursor);
     }
 
     /**
@@ -169,7 +277,7 @@ public final class MarketData {
         while (afterCursor < bookTs.length && bookTs[afterCursor] <= tsMs) {
             afterCursor++;
         }
-        return afterCursor < bookTs.length ? books.get(afterCursor) : null;
+        return afterCursor < bookTs.length ? view(afterCursor) : null;
     }
 
     /**
@@ -182,7 +290,7 @@ public final class MarketData {
     public static MarketData load(String standDbPath, String symbol, long fromMs, long toMs) {
         List<MarketTrade> trades = new ArrayList<>();
         List<Long> ts = new ArrayList<>();
-        List<BookView> books = new ArrayList<>();
+        Packer books = new Packer();
         try (Connection c = StandDb.open(standDbPath);
              Statement st = c.createStatement()) {
             try (ResultSet rs = st.executeQuery(
@@ -234,7 +342,7 @@ public final class MarketData {
                     appendDeep(bids, rs.getString(22));
                     appendDeep(asks, rs.getString(23));
                     ts.add(rs.getLong(1));
-                    books.add(new BookView(bids, asks));
+                    books.add(bids, asks);      // временные списки уходят в GC сразу
                 }
             }
         } catch (Exception e) {
@@ -244,7 +352,7 @@ public final class MarketData {
         for (int i = 0; i < arr.length; i++) {
             arr[i] = ts.get(i);
         }
-        log.warn("рынок {}: сделок {}, снимков книги {}", symbol, trades.size(), books.size());
-        return new MarketData(trades, arr, books);
+        log.warn("рынок {}: сделок {}, снимков книги {}", symbol, trades.size(), arr.length);
+        return new MarketData(trades, arr, books.bidOff(), books.askOff(), books.px(), books.qty());
     }
 }

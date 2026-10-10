@@ -1359,6 +1359,9 @@ public final class QuoteLoop implements Runnable {
             // Сообщение о сбое опоры называет фактическое действие: сколько запаса
             // продаём или что встаём в паузу (владелец, 07.10.2026).
             h.attach(() -> new double[]{inventory, lastFair, quoting.get() ? 1 : 0});
+            // Живая своя книга — для очереди перед надкушенной заявкой; в ней стоим и мы сами.
+            this.bookSource = h::bookNow;
+            this.bookHasOwn = true;
         }
         this.journal = journal;
         this.params = params;
@@ -3612,6 +3615,12 @@ public final class QuoteLoop implements Runnable {
         // минимума) — у f 30 ложных записей за 3 ч на 0.0009 SOL при стоящей продаже.
         if (side == Side.SELL && lastFair > 0
                 && Math.max(0, inventory - sellsMaybeAlive(null)) * lastFair < minNotional * DUST_PLACE_MULT) {
+            return;
+        }
+        // 10.10.2026: покупать некуда — потолок запаса выбран (или занят заявками с
+        // неизвестной судьбой). Это не нехватка денег: у b 10 записей за 12 ч
+        // «BUY: доступно 96.97, позиция 0.132159» при потолке 0.13216.
+        if (side == Side.BUY && lastFair > 0 && buyRoom() * lastFair < minNotional * DUST_PLACE_MULT) {
             return;
         }
         long now = clock.now();
@@ -6946,6 +6955,46 @@ public final class QuoteLoop implements Runnable {
     static final long PARTIAL_BAD_MS = Long.getLong("revx.exec.partial-stale-bad-sec",
             PARTIAL_STALE_MS / 1000) * 1000L;
 
+    /** Сколько лотов чужой очереди терпит надкушенная заявка в безопасную сторону; 0 — по пунктам. */
+    public static final double PARTIAL_QUEUE_LOTS = Double.parseDouble(
+            System.getProperty("revx.exec.partial-queue-lots", "0"));
+    private boolean bookHasOwn;
+    private long partialQueueKeeps;
+    private long partialQueueDrops;
+
+    /** Для стенда: «надкушенная держится» (тиков) и «снята по очереди» (раз). */
+    public String partialQueueStats() {
+        return "надкушенные по очереди: держались " + partialQueueKeeps + " тиков, сняты " + partialQueueDrops + " раз";
+    }
+
+    /**
+     * Объём впереди заявки: всё по лучшим ценам и стоящее на нашей цене (в живой книге —
+     * без нашего остатка). NaN — книги нет; тогда заявку не трогаем.
+     */
+    private double queueAhead(Side side, Resting r) {
+        if (bookSource == null) {
+            return Double.NaN;
+        }
+        org.home.data.revx.sim.BookView book = bookSource.apply(clock.now());
+        if (book == null) {
+            return Double.NaN;
+        }
+        double ahead = 0;
+        double atOurs = 0;
+        for (org.home.data.revx.sim.BookView.Level l : side == Side.BUY ? book.bids() : book.asks()) {
+            boolean better = side == Side.BUY ? l.price() > r.price + 1e-12 : l.price() < r.price - 1e-12;
+            if (better) {
+                ahead += l.qty();
+            } else if (Math.abs(l.price() - r.price) <= 1e-12) {
+                atOurs += l.qty();
+            }
+        }
+        if (bookHasOwn) {
+            atOurs = Math.max(0, atOurs - Math.max(0, r.size - r.partialFilled));
+        }
+        return ahead + atOurs;
+    }
+
     private boolean partialStale(Side side, Resting r, double targetPrice, long now) {
         if (!r.partial() || !(targetPrice > 0)) {
             return false;
@@ -6953,6 +7002,23 @@ public final class QuoteLoop implements Runnable {
         double gapBp = (r.price - targetPrice) / targetPrice * 1e4;
         // Опасно: покупка выше цели, продажа ниже цели.
         boolean bad = side == Side.BUY ? gapBp > 0 : gapBp < 0;
+        if (!bad && PARTIAL_QUEUE_LOTS > 0) {
+            // 🔑 ПО ОЧЕРЕДИ, А НЕ ПО ПУНКТАМ (09.10.2026, владелец). Цель ушла от заявки —
+            // она просто дальше от рынка. Пока перед ней мало (≤ N лотов), крупная сделка
+            // дойдёт и до неё, и снимать незачем: снятие стоит постановки. Перед ней
+            // наставили больше — ждать бессмысленно, снимаем (выдержка прежняя).
+            if (now - r.partialSinceMs < PARTIAL_STALE_MS) {
+                return false;
+            }
+            double ahead = queueAhead(side, r);
+            boolean drop = !Double.isNaN(ahead) && ahead > PARTIAL_QUEUE_LOTS * params.size();
+            if (drop) {
+                partialQueueDrops++;
+            } else {
+                partialQueueKeeps++;
+            }
+            return drop;
+        }
         double limit = bad ? PARTIAL_BAD_BP : PARTIAL_GOOD_BP;
         long age = bad ? PARTIAL_BAD_MS : PARTIAL_STALE_MS;
         return limit > 0 && now - r.partialSinceMs >= age && Math.abs(gapBp) > limit;

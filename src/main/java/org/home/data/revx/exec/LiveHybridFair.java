@@ -296,6 +296,15 @@ public final class LiveHybridFair implements FairSource {
         }
     }
 
+    /** Своя книга для котировщика (очередь перед надкушенной заявкой); null — нет свежей. */
+    public synchronized BookView bookNow(long now) {
+        try {
+            return ownBook(now);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private BookView ownBook(long now) throws Exception {
         if (book == null) {
             book = DriverManager.getConnection("jdbc:sqlite:file:" + standDbPath + "?mode=ro");

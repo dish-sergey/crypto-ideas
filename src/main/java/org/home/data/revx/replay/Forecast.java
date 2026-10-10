@@ -736,6 +736,9 @@ public final class Forecast {
         // обход упирался в собственный журнал, а не в данные.
         QuoteLoop.Stats st = loop.stats();
         log.warn("{}", loop.inventoryRange());
+        if (QuoteLoop.PARTIAL_QUEUE_LOTS > 0) {
+            log.warn("{}", loop.partialQueueStats());
+        }
         if (QuoteLoop.LEVEL_COOLDOWN_MS > 0) {
             log.warn("пауза уровня после покупки {} с: включалась {} раз",
                     QuoteLoop.LEVEL_COOLDOWN_MS / 1000, loop.levelCoolStarts());

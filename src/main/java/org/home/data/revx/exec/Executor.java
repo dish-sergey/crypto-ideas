@@ -972,6 +972,9 @@ public class Executor {
                     cfg.memecoins(), cfg.fairMaxSkewMs(),
                     org.home.data.revx.exec.Clock.system(), fromMs, toMs);
             var ticks = fair.toTicks();
+            // Срезы корзины курса (~0.8 ГБ на 24 днях) больше не нужны — отпустить до прогона.
+            int fairPairs = fair.pairs();
+            fair = null;
             if (ticks.isEmpty()) {
                 throw new IllegalStateException("нет снимков книги для " + pairSymbol);
             }
@@ -989,7 +992,7 @@ public class Executor {
                     levels, levelStepBp / 10_000, innerFirst);
 
             log.warn("прогноз {}: тиков {}, пар в расчёте курса {}, цена {}, лот {} (${})",
-                    pairSymbol, ticks.size(), fair.pairs(), Math.round(price),
+                    pairSymbol, ticks.size(), fairPairs, Math.round(price),
                     lot, Math.round(lot * price * 100) / 100.0);
             long quotable = ticks.stream().filter(
                     org.home.data.revx.replay.ReplayFair.Tick::quotable).count();
