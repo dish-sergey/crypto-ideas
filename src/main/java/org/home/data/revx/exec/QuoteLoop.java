@@ -6574,7 +6574,9 @@ public final class QuoteLoop implements Runnable {
         }
         String sql = "SELECT t.oid, MAX(t.side), SUM(t.qty), SUM(t.qty * t.price), MAX(t.tdt), "
                 + "MAX(o.status) FROM trade t JOIN order_info o ON o.oid = t.oid "
-                + "WHERE o.bot = ? AND o.symbol = ? AND t.tdt >= ? GROUP BY t.oid "
+                // Окно отбирает ЗАЯВКИ, сумма — по всем их сделкам (см. venueTotals).
+                + "WHERE o.bot = ? AND o.symbol = ? "
+                + "AND t.oid IN (SELECT oid FROM trade WHERE tdt >= ?) GROUP BY t.oid "
                 // Отсрочка по ПОСЛЕДНЕЙ сделке заявки: пока добивка частичной свежая,
                 // её ведёт обычный путь, и половину заявки лента не трогает.
                 + "HAVING MAX(t.tdt) <= ?";
@@ -6868,22 +6870,10 @@ public final class QuoteLoop implements Runnable {
      * отказа 422 и вопроса о судьбе.
      */
     private void venueFills(long now) {
-        java.util.List<VenueTrade> rows = new java.util.ArrayList<>();
+        java.util.List<VenueTrade> rows;
         try (java.sql.Connection c = java.sql.DriverManager.getConnection(
-                "jdbc:sqlite:file:" + VENUE_DB + "?mode=ro");
-             java.sql.PreparedStatement ps = c.prepareStatement(
-                     "SELECT t.oid, MAX(t.side), SUM(t.qty), SUM(t.qty * t.price), MAX(t.tdt), "
-                             + "MAX(o.status), MAX(o.bot) FROM trade t "
-                             + "LEFT JOIN order_info o ON o.oid = t.oid "
-                             + "WHERE t.symbol = ? AND t.tdt >= ? GROUP BY t.oid")) {
-            ps.setString(1, symbol.replace('/', '-'));
-            ps.setLong(2, now - VENUE_FILLS_LOOKBACK_MS);
-            try (java.sql.ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    rows.add(new VenueTrade(rs.getString(1), rs.getString(2), rs.getDouble(3),
-                            rs.getDouble(4), rs.getLong(5), rs.getString(6), rs.getString(7)));
-                }
-            }
+                "jdbc:sqlite:file:" + VENUE_DB + "?mode=ro")) {
+            rows = venueTotals(c, symbol.replace('/', '-'), now - VENUE_FILLS_LOOKBACK_MS);
         } catch (Exception e) {
             log.warn("лента сделок не прочитана: {}", e.toString());
             venueFresh = false;
@@ -6922,12 +6912,43 @@ public final class QuoteLoop implements Runnable {
         }
     }
 
+    /**
+     * Итог по каждой заявке, у которой есть сделка не старше {@code since}.
+     *
+     * ⚠️ ОКНО ОТБИРАЕТ ЗАЯВКИ, А СУММА ИДЁТ ПО ВСЕМ ИХ СДЕЛКАМ (10.10.2026). Сумма
+     * сравнивается с записанным по заявке НАКОПИТЕЛЬНО, а прежний запрос складывал
+     * только сделки внутри окна. Заявку d надкусили шесть раз за полчаса по $0.10;
+     * когда пришёл остаток, первый укус уже выпал из окна, и остаток записался на
+     * укус меньше. Хвост добирала сверка через пять минут — тревогой «обычный путь
+     * его пропустил», а до неё запас был завышен на укус.
+     */
+    static java.util.List<VenueTrade> venueTotals(java.sql.Connection c, String symbol, long since)
+            throws java.sql.SQLException {
+        java.util.List<VenueTrade> rows = new java.util.ArrayList<>();
+        try (java.sql.PreparedStatement ps = c.prepareStatement(
+                "SELECT t.oid, MAX(t.side), SUM(t.qty), SUM(t.qty * t.price), MAX(t.tdt), "
+                        + "MAX(o.status), MAX(o.bot) FROM trade t "
+                        + "LEFT JOIN order_info o ON o.oid = t.oid "
+                        + "WHERE t.oid IN (SELECT oid FROM trade WHERE symbol = ? AND tdt >= ?) "
+                        + "GROUP BY t.oid")) {
+            ps.setString(1, symbol);
+            ps.setLong(2, since);
+            try (java.sql.ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    rows.add(new VenueTrade(rs.getString(1), rs.getString(2), rs.getDouble(3),
+                            rs.getDouble(4), rs.getLong(5), rs.getString(6), rs.getString(7)));
+                }
+            }
+        }
+        return rows;
+    }
+
     /** Сделка площадки наша: по метке бота у читателя или по памяти своих заявок. */
     static boolean mine(String readerBot, boolean remembered, String myId) {
         return remembered || myId.equals(readerBot);
     }
 
-    private record VenueTrade(String oid, String side, double qty, double notional, long lastTdt,
+    record VenueTrade(String oid, String side, double qty, double notional, long lastTdt,
                               String status, String bot) {
     }
 
