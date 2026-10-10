@@ -934,6 +934,7 @@ public final class InfoBot implements Runnable {
         // строками выше, а это худший вид неправды в отчёте.
         sb.append(budgetLine(now));
         sb.append(hiddenNote());
+        sb.append(bufferLine());
         sb.append(unownedNote());
         sb.append(venueLine());
         // Диск — не про ботов, но это единственный прибор, который на него
@@ -978,6 +979,93 @@ public final class InfoBot implements Runnable {
                     p > 0.01 ? String.format(Locale.ROOT, " → бид +%.0f%%", p * 50) : ""));
         }
         return sb.toString();
+    }
+
+    /** Порог буфера в монетах — доля суммы потолков ботов этой монеты. */
+    static final double BUFFER_COIN_MIN = 0.30;
+    /** Порог буфера в USDC — доля суммы потолков всех ботов в деньгах. */
+    static final double BUFFER_USDC_MIN = 0.60;
+
+    /**
+     * БУФЕР — ничейное как доля потолков ботов (10.10.2026, правило владельца по
+     * сквизам 07–08.10: монет не меньше 30% потолков ботов пары, USDC не меньше
+     * 60% потолков всех). В затык площадки боты продают чужое и покупают сверх
+     * потолка, и буфер — то, во что это упирается вместо нехватки средств.
+     *
+     * Потолки берутся из машинной части {@code boot} КАЖДОГО бота, включая
+     * скрытых: буфер общий на счёт, а скрытый бот тоже торгует.
+     */
+    private String bufferLine() {
+        java.util.Map<String, Double> caps = new java.util.TreeMap<>();
+        for (Watched w : watched) {
+            try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
+                ExecJournal.Boot boot = j.lastBoot();
+                org.home.data.revx.replay.BootParams p = boot == null ? null
+                        : org.home.data.revx.replay.BootParams.parse(boot.detail());
+                if (p != null && p.inventoryCap() > 0) {
+                    caps.merge(w.symbol().split("/")[0], p.inventoryCap(), Double::sum);
+                }
+            } catch (Exception ignore) {
+                // журнала нет — бот в буфер не входит, про журнал скажет строка бота
+            }
+        }
+        if (caps.isEmpty()) {
+            return "";
+        }
+        java.util.Map<String, Double> claimed = new java.util.HashMap<>();
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                "jdbc:sqlite:file:" + allocPath + "?mode=ro");
+             java.sql.Statement st = c.createStatement();
+             java.sql.ResultSet rs = st.executeQuery(
+                     "SELECT currency, sum(qty) FROM claim GROUP BY currency")) {
+            while (rs.next()) {
+                claimed.put(rs.getString(1), rs.getDouble(2));
+            }
+        } catch (Exception e) {
+            return "";
+        }
+        Balances bal = venueBalances();
+        if (bal.byCurrency().isEmpty()) {
+            return "";
+        }
+        java.util.Map<String, Double> free = new java.util.HashMap<>();
+        for (var e : bal.byCurrency().entrySet()) {
+            free.put(e.getKey(), e.getValue().total() - claimed.getOrDefault(e.getKey(), 0.0));
+        }
+        return bufferText(caps, free, prices(caps.keySet()));
+    }
+
+    /**
+     * Строка буфера. Чистая функция — ради теста.
+     *
+     * @param caps   сумма потолков ботов по базовой монете (в монетах)
+     * @param free   ничейное по валютам (остаток минус претензии реестра)
+     * @param prices курс монет в USDC; без курса монета в долю USDC не входит
+     */
+    static String bufferText(java.util.Map<String, Double> caps, java.util.Map<String, Double> free,
+                             java.util.Map<String, Double> prices) {
+        StringBuilder sb = new StringBuilder();
+        boolean low = false;
+        double capUsd = 0;
+        for (var e : caps.entrySet()) {
+            double share = free.getOrDefault(e.getKey(), 0.0) / e.getValue();
+            boolean bad = share < BUFFER_COIN_MIN;
+            low |= bad;
+            sb.append(String.format(Locale.ROOT, "%s %s %.0f%%", sb.length() == 0 ? "" : " ·",
+                    e.getKey(), share * 100)).append(bad ? "⚠️" : "");
+            Double p = prices.get(e.getKey());
+            if (p != null && p > 0) {
+                capUsd += e.getValue() * p;
+            }
+        }
+        if (capUsd > 0) {
+            double share = free.getOrDefault("USDC", 0.0) / capUsd;
+            boolean bad = share < BUFFER_USDC_MIN;
+            low |= bad;
+            sb.append(String.format(Locale.ROOT, " · USDC %.0f%%", share * 100)).append(bad ? "⚠️" : "");
+        }
+        return String.format(Locale.ROOT, "%n%n%sБУФЕР к потолкам ботов:%s%n  порог: монеты %.0f%%, USDC %.0f%%",
+                low ? "⚠️ " : "", sb, BUFFER_COIN_MIN * 100, BUFFER_USDC_MIN * 100);
     }
 
     /**
