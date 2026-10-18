@@ -36,6 +36,13 @@ public final class ReplayFair implements FairSource {
     private final List<Tick> ticks;
     private final Clock clock;
     private int cursor;
+    /** Книга для лучших цен (18.10.2026, край аска перед событием); null — нули, как раньше. */
+    private MarketData book;
+
+    public ReplayFair withBook(MarketData book) {
+        this.book = book;
+        return this;
+    }
 
     public ReplayFair(List<Tick> ticks, Clock clock) {
         this.ticks = ticks;
@@ -56,14 +63,22 @@ public final class ReplayFair implements FairSource {
     }
 
     @Override
-    public StandReader.Fair latest(String base, long lookbackMs) {
+    public synchronized StandReader.Fair latest(String base, long lookbackMs) {
         Tick t = current();
         if (t == null) {
             return new StandReader.Fair(0, false, "запись кончилась", 0, 0);
         }
         // pairsUsed=8 — любое число, проходящее гейт: сам гейт уже отработал в
         // живом боте, и его вердикт записан в quotable.
+        double bb = 0, ba = 0;
+        if (book != null) {
+            var b = book.bookAt(t.tsMs());
+            if (b != null && !b.empty()) {
+                bb = b.bestBid();
+                ba = b.bestAsk();
+            }
+        }
         return new StandReader.Fair(t.fair(), t.quotable(), t.reason(), t.tsMs(), 8,
-                0, 0);
+                bb, ba);
     }
 }

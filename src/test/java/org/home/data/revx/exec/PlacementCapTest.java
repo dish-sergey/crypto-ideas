@@ -20,34 +20,45 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class PlacementCapTest {
 
     @Test
-    void singleLevelBotsGetHundred() {
+    void singleLevelBotsGetNinetyFive() {
+        // 15.10.2026: 100 → 95, пять отдано пилоту g (решение владельца).
         for (String bot : new String[]{"a", "b", "c"}) {
-            assertEquals(100, ExecLimits.maxPlacementsPerDay(bot), "бот " + bot);
+            assertEquals(95, ExecLimits.maxPlacementsPerDay(bot), "бот " + bot);
         }
     }
 
     @Test
-    void threeLevelBotsGetTwoFifty() {
+    void threeLevelBotsGetTwoThirtyFive() {
         for (String bot : new String[]{"d", "e", "f"}) {
-            assertEquals(250, ExecLimits.maxPlacementsPerDay(bot), "бот " + bot);
+            assertEquals(235, ExecLimits.maxPlacementsPerDay(bot), "бот " + bot);
         }
     }
 
     /** ⚠️ Опечатка в метке не должна давать БОЛЬШЕ, чем настроено. */
     @Test
     void unknownBotGetsTheSmallestShare() {
-        assertEquals(100, ExecLimits.maxPlacementsPerDay("zzz"));
-        assertEquals(100, ExecLimits.maxPlacementsPerDay(""));
-        assertEquals(100, ExecLimits.maxPlacementsPerDay(null));
+        assertEquals(60, ExecLimits.maxPlacementsPerDay("zzz"));
+        assertEquals(60, ExecLimits.maxPlacementsPerDay(""));
+        assertEquals(60, ExecLimits.maxPlacementsPerDay(null));
     }
 
-    /** Доля вдвое выше предсказанного спроса самого прожорливого. */
+    /** Пилот ADA (бот g): ~15 на укусы и исполнения + ~18 на возврат после рывков. */
+    @Test
+    void pilotGetsSixty() {
+        assertEquals(60, ExecLimits.maxPlacementsPerDay("g"));
+    }
+
+    /**
+     * Доля вдвое выше СРЕДНЕГО живого спроса самого прожорливого (f, SOL на трёх уровнях:
+     * 110 в сутки за 08–14.10). ⚠️ Пиковые скользящие сутки выше (f 255, c 103, a 101) —
+     * в такие дни бот упирается в долю, и это осознанная плата за пилот.
+     */
     @Test
     void capIsAboveMeasuredDemand() {
-        assertTrue(ExecLimits.maxPlacementsPerDay("f") >= 2 * 176 * 0.7,
-                "трёхуровневый SOL: предсказано 176 постановок в сутки");
+        assertTrue(ExecLimits.maxPlacementsPerDay("f") >= 2 * 110,
+                "трёхуровневый SOL: в среднем 110 постановок в сутки");
         assertTrue(ExecLimits.maxPlacementsPerDay("b") >= 53,
-                "одноуровневый SOL: предсказано 53");
+                "одноуровневый SOL: 52 в сутки");
     }
 
     /**
@@ -59,7 +70,7 @@ class PlacementCapTest {
     @Test
     void sumExceedsVenueLimitButOnlySlightly() {
         int sum = 0;
-        for (String bot : new String[]{"a", "b", "c", "d", "e", "f"}) {
+        for (String bot : new String[]{"a", "b", "c", "d", "e", "f", "g"}) {
             sum += ExecLimits.maxPlacementsPerDay(bot);
         }
         assertEquals(1050, sum);

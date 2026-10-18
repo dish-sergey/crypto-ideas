@@ -1,0 +1,52 @@
+[Unit]
+Description=Revolut X micro-live BOT G (REAL orders) — ADA/USDC, пилот под хеджем (docs/pairs/ПИЛОТ-ADA.md)
+After=network-online.target revx-collect.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/revx-exec-g
+# ⚠️ СВОЙ Telegram-токен (REVX_BOT_TOKEN): два потребителя getUpdates на одном токене
+# дают 409 и отбирают управление друг у друга. Ключ площадки — тот же, что у всех.
+EnvironmentFile=/etc/revx-exec-g.env
+
+# Пилот ADA (15.10.2026, решения владельца 14.10): лот $10, один уровень, потолок 3 лота.
+#   опора   — только Бинанс по websocket: ADAUSDT ÷ USDCUSDT (fast-bnb), тик от события;
+#   бид     — опора −30 б.п. (offset 0.0030), скоса нет (skew-k 0);
+#   аск     — max(опора +20; лучший ЧУЖОЙ аск): ask-offset-bp 20 + behind-bp −1 только на аске;
+#   рывок   — опора ≥ 20 б.п. за 1 с против стороны → отмена, возврат через 2 с тишины;
+#   надкус  — держать в коридоре 5 (опасно) / 10 (безопасно) б.п.;
+#   Бинанс молчит > 3 с — отвод на 10% (park-distance);
+#   стоп    — спот + бумажный хедж (шаг 1 ADA, 6 б.п.) < −$3;
+#   постановок 60 в сутки (ExecLimits, метка g → 7777…).
+# venue-fills ВЫКЛЮЧЕН: читатель площадки ленту ADA не собирает (revx.venue.symbols),
+# исполнения — прежним путём, GET /orders/{id}.
+ExecStart=/home/ubuntu/jre25/bin/java -Xms32m -Xmx192m -Drevx.exec.venue-reads=true -Drevx.exec.venue-locks=true -Drevx.exec.venue-slots=true -Drevx.exec.quiet-minute=auto -Drevx.exec.budget-unwind=true -Drevx.exec.stall-freeze-sec=5 -Drevx.fair.fast-bnb=true -Drevx.exec.wake-bp=2 -Drevx.exec.wake-min-ms=400 -Drevx.exec.jump-bp=20 -Drevx.exec.jump-window-ms=1000 -Drevx.exec.jump-calm-ms=2000 -Drevx.exec.ask-offset-bp=20 -Drevx.exec.behind-bp=-1 -Drevx.exec.behind-sides=ask -Drevx.exec.behind-max-bp=1000 -Drevx.exec.partial-stale-bp=10 -Drevx.exec.partial-stale-bad-bp=5 -Drevx.exec.partial-stale-good-bp=10 -Drevx.exec.hedge-paper-step=1 -Drevx.exec.hedge-paper-fee-bp=6 -Drevx.exec.lot-usd=10 -Drevx.sim.skew-k=0 -Drevx.sim.requote-threshold=0.0003 -jar /home/ubuntu/revx-exec-g/app.jar --revx-exec \
+  --revx.exec.bot-id=g \
+  --revx.exec.symbol=ADA/USDC \
+  --revx.exec.journal=state/exec-g-ada.db \
+  --revx.exec.size=44 \
+  --revx.exec.inventory-cap=132 \
+  --revx.exec.max-loss=3.0 \
+  --revx.exec.offset=0.0030 \
+  --revx.exec.skew-target=0 \
+  --revx.exec.cost-floor-margin=-1 \
+  --revx.exec.anchor-leash=-1 \
+  --revx.exec.own-position=true \
+  --revx.exec.position-seed=0 \
+  --revx.exec.park-distance=0.10 \
+  --revx.exec.levels=1 \
+  --revx.exec.level-step=0.0002 \
+  --revx.exec.inner-first=false
+
+# Размер 44 ADA и потолок 132 — заготовка под цену ~$0.228; живой лот считается из
+# долларов (lot-usd=10) по первой надёжной цене, потолок остаётся 3 лота.
+ExecStopPost=/bin/bash -c '/home/ubuntu/jre25/bin/java -Xmx192m -jar /home/ubuntu/revx-exec-g/app.jar --revx-park --revx.exec.bot-id=g --revx.exec.symbol=ADA/USDC --revx.exec.journal=state/exec-g-ada.db || true'
+
+SuccessExitStatus=143
+Restart=no
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

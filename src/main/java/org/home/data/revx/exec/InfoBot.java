@@ -935,6 +935,7 @@ public final class InfoBot implements Runnable {
         sb.append(budgetLine(now));
         sb.append(hiddenNote());
         sb.append(bufferLine());
+        sb.append(newsLine(now));
         sb.append(unownedNote());
         sb.append(venueLine());
         // Диск — не про ботов, но это единственный прибор, который на него
@@ -1592,6 +1593,59 @@ public final class InfoBot implements Runnable {
         sb.append("\n«В позиции» — переоценка непроданного остатка по последней "
                 + "справедливой цене. В «доход» она не входит.");
         sb.append(hiddenNote());
+        return sb.toString();
+    }
+
+    /** Календарь защиты; {@code null}, если сводке не задан файл ({@code revx.exec.news-file}). */
+    private final NewsGuard news = NewsGuard.fromProperties();
+
+    /**
+     * КАЛЕНДАРЬ ЗАЩИТЫ (владелец 17.10.2026): когда ближайшая защита по статистике сработает,
+     * идёт ли она сейчас и свеж ли файл календаря — без него защита молча не включится.
+     */
+    String newsLine(long now) {
+        if (news == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder("\n\n📅 ЗАЩИТА ПО КАЛЕНДАРЮ (уводим ближние уровни):\n");
+        long age = news.fileAgeMs(now);
+        if (age < 0) {
+            return sb.append("  ⚠️ файла календаря нет — защита НЕ сработает\n").toString();
+        }
+        java.time.format.DateTimeFormatter f = java.time.format.DateTimeFormatter
+                .ofPattern("EE dd.MM HH:mm", Locale.of("ru")).withZone(java.time.ZoneOffset.UTC);
+        java.time.format.DateTimeFormatter hms = java.time.format.DateTimeFormatter
+                .ofPattern("HH:mm:ss").withZone(java.time.ZoneOffset.UTC);
+        NewsGuard.Event a = news.active(now);
+        NewsGuard.Event n = a != null ? a : news.next(now);
+        long flat = QuoteLoop.NEWS_FLAT_MS;
+        NewsGuard.Event prep = a == null && flat > 0 ? news.within(now, flat) : null;
+        if (a != null) {
+            sb.append(String.format(Locale.ROOT, "  🛡 ИДЁТ СЕЙЧАС: %s %s, уровни вернутся в %s UTC%n",
+                    a.country(), a.title(), hms.format(java.time.Instant.ofEpochMilli(a.endMs()))));
+        } else if (prep != null) {
+            sb.append(String.format(Locale.ROOT, "  ⏳ ГОТОВИМСЯ к %s %s в %s UTC: покупки стоят, запас сбрасываем%n",
+                    prep.country(), prep.title(), hms.format(java.time.Instant.ofEpochMilli(prep.tsMs()))));
+        } else if (n != null) {
+            if (flat > 0) {
+                sb.append(String.format(Locale.ROOT, "  за %d мин до события покупки стоят и запас сбрасывается%n",
+                        flat / 60_000L));
+            }
+            long in = n.tsMs() - news.beforeMs() - now;
+            sb.append(String.format(Locale.ROOT, "  ближайшая: %s UTC — %s %s%n  уходим %s – %s UTC, через %s%n",
+                    f.format(java.time.Instant.ofEpochMilli(n.tsMs())), n.country(), n.title(),
+                    hms.format(java.time.Instant.ofEpochMilli(n.tsMs() - news.beforeMs())),
+                    hms.format(java.time.Instant.ofEpochMilli(n.endMs())),
+                    in >= 86_400_000L ? in / 86_400_000L + " д " + in % 86_400_000L / 3_600_000L + " ч"
+                            : in >= 3_600_000L ? in / 3_600_000L + " ч " + in % 3_600_000L / 60_000L + " мин"
+                            : in / 60_000L + " мин"));
+        } else {
+            sb.append("  до конца недели событий нет (новая неделя у ForexFactory — в воскресенье)\n");
+        }
+        if (age > 26 * 3_600_000L) {
+            sb.append(String.format(Locale.ROOT, "  ⚠️ календарь не обновлялся %d ч — новые события не видны%n",
+                    age / 3_600_000L));
+        }
         return sb.toString();
     }
 

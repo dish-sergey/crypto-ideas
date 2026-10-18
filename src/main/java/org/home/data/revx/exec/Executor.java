@@ -190,9 +190,16 @@ public class Executor {
         // Опора «смесь + глубина + Бинанс» — только флагом revx.fair.live-hybrid; без него
         // бот котирует от прежней опоры, как раньше. При молчании Бинанса или старой книге
         // обёртка сама возвращает прежнюю опору (событие hybrid_fallback).
-        FairSource fair = LiveHybridFair.ENABLED
+        // Быстрая опора только от Бинанса по websocket (пилот ADA, docs/pairs/ПИЛОТ-ADA.md) —
+        // флагом revx.fair.fast-bnb; она же будит тик котировщика на каждое движение.
+        FairSource fair = FastBnbFair.ENABLED ? FastBnbFair.fromProperties(symbol, standDbPath)
+                : LiveHybridFair.ENABLED
                 ? new LiveHybridFair(stand, standDbPath, symbol, params.size(), journal) : stand;
-        if (LiveHybridFair.ENABLED) {
+        if (fair instanceof FastBnbFair fb) {
+            journal.event("fast_bnb_on", "опора только Бинанс по websocket: " + fb.describe()
+                    + ", пробуждение от " + QuoteLoop.WAKE_BP + " б.п., тик не чаще " + QuoteLoop.WAKE_MIN_MS
+                    + " мс, рывок " + QuoteLoop.JUMP_BP + " б.п. за " + QuoteLoop.JUMP_WINDOW_MS + " мс");
+        } else if (LiveHybridFair.ENABLED) {
             journal.event("hybrid_on", "опора смесь+глубина+Бинанс: смесь "
                     + System.getProperty("revx.fair.hybrid-mix", "0.25") + ", глубина "
                     + System.getProperty("revx.fair.hybrid-depth-k", "10") + " лота, τ "
@@ -211,6 +218,11 @@ public class Executor {
         if (sweepCoef > 0) {
             loop.sweepWatch(new SweepWatch(standDbPath, symbol, sweepMinNotional,
                     sweepChainMs, sweepCoef, sweepMaxBp));
+        }
+        // Тишина в покупках (18.10.2026): только явной настройкой, живьём не включалась.
+        if (Boolean.getBoolean("revx.exec.quiet-nobuy")
+                || Double.parseDouble(System.getProperty("revx.exec.quiet-shift-bp", "0")) > 0) {
+            loop.buyQuiet(BuyQuiet.live(standDbPath, symbol, Long.getLong("revx.exec.quiet-delay-ms", 2000)));
         }
         loop.maxTradingLoss(maxLossUsdc);
 
@@ -275,7 +287,9 @@ public class Executor {
                         + "\"parkDistance\":%s,\"costFloorMargin\":%s,\"anchorLeash\":%s,"
                         + "\"widening\":%s,\"wideningMaxStep\":%s,\"anchorWidening\":%s,"
                         + "\"ownPosition\":%b,\"levels\":%d,\"levelStep\":%s,"
-                        + "\"innerFirst\":%b,\"levelGrowth\":%s,\"buyFarFirst\":%b,\"venueFills\":%b,\"venueReads\":%b,\"venueLocks\":%b,\"venueSlots\":%b,\"quietMinute\":\"%s\"}",
+                        + "\"innerFirst\":%b,\"levelGrowth\":%s,\"buyFarFirst\":%b,\"venueFills\":%b,\"venueReads\":%b,\"venueLocks\":%b,\"venueSlots\":%b,\"quietMinute\":\"%s\","
+                        + "\"fastBnb\":%b,\"wakeBp\":%s,\"wakeMinMs\":%d,\"jumpBp\":%s,\"jumpWindowMs\":%d,\"askOffsetBp\":%s,"
+                        + "\"behind\":\"%s\",\"behindSides\":\"%s\",\"behindMaxBp\":%s,\"hedgePaperStep\":%s}",
                 symbol, tag.id(), num(size), num(inventoryCap), num(offset),
                 num(cfg.simSkewK()), num(skewTarget), periodMs, num(minNotional()),
                 num(spec.baseStep()), num(quoteStep()), num(parkDistance),
@@ -287,7 +301,11 @@ public class Executor {
                 System.getProperty("revx.sim.level-growth", "1.0"),
                 // Порядок раздачи кассы по бидам (дальние первыми) — тоже вне параметров бота.
                 QuoteLoop.BUY_FAR_FIRST, QuoteLoop.VENUE_FILLS, QuoteLoop.VENUE_READS,
-                QuoteLoop.VENUE_LOCKS, QuoteLoop.VENUE_SLOTS, QuoteLoop.QUIET_MINUTE);
+                QuoteLoop.VENUE_LOCKS, QuoteLoop.VENUE_SLOTS, QuoteLoop.QUIET_MINUTE,
+                // Пилот ADA: без них повтор журнала g котировал бы симметрично и по часам.
+                FastBnbFair.ENABLED, num(QuoteLoop.WAKE_BP), QuoteLoop.WAKE_MIN_MS, num(QuoteLoop.JUMP_BP),
+                QuoteLoop.JUMP_WINDOW_MS, num(QuoteLoop.ASK_OFFSET_BP), QuoteLoop.BEHIND_MODE,
+                QuoteLoop.BEHIND_SIDES, num(QuoteLoop.BEHIND_MAX_BP), num(QuoteLoop.HEDGE_PAPER_STEP));
     }
 
     private static String num(double v) {
@@ -351,6 +369,56 @@ public class Executor {
                 Thread.sleep(1000);
             }
         }
+    }
+
+    /**
+     * {@code --revx-dry-bot}: СУХОЙ ПРОГОН — тот же котировщик с теми же параметрами
+     * ({@code --revx.exec.*} и {@code -D…}), на живых ценах, но против {@link DryVenue}:
+     * ни одного запроса к площадке, реестр владения и ведро постановок не трогаются,
+     * Telegram не поднимается. Котирование включается сразу. Через {@code minutes} минут
+     * печатает, сколько раз тик будила опора, сколько было постановок, замен, отмен на
+     * рывке. Журнал — {@code revx.exec.journal} (дайте отдельный файл).
+     */
+    public void dryBot(int minutes, double cash) throws Exception {
+        ExecJournal journal = new ExecJournal(journalPath);
+        StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
+                new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
+                        cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
+                cfg.fairMaxSkewMs());
+        this.spec = stand.spec(symbol);
+        if (spec == null) {
+            throw new IllegalStateException("нет спецификации пары " + symbol);
+        }
+        Quoter.Params params = buildParams();
+        FairSource fair = FastBnbFair.ENABLED ? FastBnbFair.fromProperties(symbol, standDbPath)
+                : LiveHybridFair.ENABLED ? new LiveHybridFair(stand, standDbPath, symbol, params.size(), journal)
+                : stand;
+        DryVenue venue = new DryVenue(symbol, cash);
+        QuoteLoop loop = new QuoteLoop(venue, Clock.system(), fair, journal, params, symbol,
+                periodMs, minNotional(), tag, buildPolicy(params), ownPosition, positionSeed, spec.baseStep(),
+                parkDistance, null, levels, levelStep, innerFirst);
+        loop.maxTradingLoss(maxLossUsdc);
+        journal.event("boot", "СУХОЙ ПРОГОН (DryVenue) — " + bootDetail());
+        Thread t = new Thread(loop, "revx-quote-loop");
+        t.start();
+        loop.startQuoting();
+        long end = System.currentTimeMillis() + minutes * 60_000L;
+        while (System.currentTimeMillis() < end && t.isAlive()) {
+            Thread.sleep(Math.min(60_000, Math.max(1, end - System.currentTimeMillis())));
+            log.warn("сухой прогон {}: тиков от опоры {}, отмен на рывке {}, {}; бумажный хедж: {}",
+                    symbol, loop.wakeups(), loop.jumpCancels(), venue.stats(), loop.paperHedgeState());
+        }
+        loop.shutdown();
+        t.join(10_000);
+        if (fair instanceof FastBnbFair fb) {
+            log.warn("переподключений к Бинансу: {}, ответов на пинг: {}", fb.stream().reconnects(), fb.stream().pongs());
+            fb.close();
+        }
+        if (fair instanceof LiveHybridFair h && h.ws() != null) {
+            log.warn("переподключений к Бинансу: {}, ответов на пинг: {}", h.ws().stream().reconnects(), h.ws().stream().pongs());
+            h.close();
+        }
+        log.warn("СУХОЙ ПРОГОН {} окончен: {}", symbol, venue.stats());
     }
 
     public void fillCheck(String journalPath, String from, String to) {
@@ -966,15 +1034,18 @@ public class Executor {
                     ? System.currentTimeMillis() : java.time.Instant.parse(to).toEpochMilli();
 
             String pairBase = pairSymbol.substring(0, pairSymbol.indexOf('/'));
-            var fair = new org.home.data.revx.replay.StandFair(standDbPath, pairBase,
-                    new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
-                            cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
-                    cfg.memecoins(), cfg.fairMaxSkewMs(),
-                    org.home.data.revx.exec.Clock.system(), fromMs, toMs);
-            var ticks = fair.toTicks();
-            // Срезы корзины курса (~0.8 ГБ на 24 днях) больше не нужны — отпустить до прогона.
-            int fairPairs = fair.pairs();
-            fair = null;
+            FairPrice.Limits fairLimits = new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
+                    cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct());
+            // Ряд опоры одинаков у всех прогонов окна и пары — берём из кэша, если он включён
+            // (revx.forecast.cache-dir). Срезы корзины курса (~0.8 ГБ на 24 днях) после постройки
+            // не держим.
+            var cached = org.home.data.revx.replay.FairCache.ticks(standDbPath, pairBase, fromMs, toMs,
+                    fairLimits + "|" + cfg.memecoins() + "|" + cfg.fairMaxSkewMs(),
+                    () -> new org.home.data.revx.replay.StandFair(standDbPath, pairBase, fairLimits,
+                            cfg.memecoins(), cfg.fairMaxSkewMs(),
+                            org.home.data.revx.exec.Clock.system(), fromMs, toMs));
+            var ticks = cached.ticks();
+            int fairPairs = cached.pairs();
             if (ticks.isEmpty()) {
                 throw new IllegalStateException("нет снимков книги для " + pairSymbol);
             }
@@ -1009,7 +1080,9 @@ public class Executor {
                         levelStepBp / 10_000, lot, innerFirst));
             }
             StringBuilder out = new StringBuilder();
-            for (String name : new String[]{"market", "touch"}) {
+            // Верхняя граница («touch») — ещё один полный прогон (на w24 11 мин из 71), а в
+            // очередях стенда её не читают: -Drevx.forecast.models=market её снимает.
+            for (String name : System.getProperty("revx.forecast.models", "market,touch").split(",")) {
                 var market = org.home.data.revx.replay.MarketData.load(standDbPath, pairSymbol,
                         ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
                 org.home.data.revx.replay.FillModel model = "touch".equals(name)

@@ -291,6 +291,11 @@ public class CliRunner implements ApplicationRunner {
                         Double.parseDouble(firstOr(args, "lot", "4.2")),
                         Integer.parseInt(firstOr(args, "seconds", "30")));
             }
+            if (args.containsOption("revx-dry-bot")) {
+                // Ни одного запроса к площадке: бот на живых ценах против DryVenue (пилот ADA).
+                executor.getObject().dryBot(Integer.parseInt(firstOr(args, "minutes", "60")),
+                        Double.parseDouble(firstOr(args, "dry-cash", "40")));
+            }
             if (args.containsOption("revx-order-status")) {
                 // Только GET: спросить площадку про конкретные заявки целиком.
                 fateProbe.getObject().status(firstOr(args, "order-id", ""));
@@ -584,6 +589,16 @@ public class CliRunner implements ApplicationRunner {
                         Integer.parseInt(firstOr(args, "min-trades", "5")),
                         firstOr(args, "out", ""),
                         firstOr(args, "crypto-db", ""));
+            }
+            if (args.containsOption("revx-fill-quality")) {
+                // Качество сделки к середине Бинанса: отступ, проспали, отбор (только чтение).
+                org.home.data.revx.exec.FillQuality.run(
+                        firstOr(args, "journals", ""),
+                        firstOr(args, "db", ""),
+                        firstOr(args, "captures", ""),
+                        firstOr(args, "from", ""),
+                        firstOr(args, "to", ""),
+                        firstOr(args, "out", ""));
             }
             if (args.containsOption("revx-lead")) {
                 leadCheck.getObject().run(

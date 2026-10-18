@@ -20,28 +20,41 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  */
 class FrozenAnchorTest {
 
-    /** {@code Slice} и {@code freeze} приватны: дёргаем отражением, API не расширяем. */
-    private static Object slice(long ts, double mid) throws Exception {
-        Class<?> c = Class.forName("org.home.data.revx.replay.StandFair$Slice");
-        Constructor<?> ctor = c.getDeclaredConstructors()[0];
-        ctor.setAccessible(true);
-        return ctor.newInstance(ts, mid, mid, 0.0, 0.0, mid, mid, 0.0, 0.0, 0.0);
+    /**
+     * Снимки серии {@code StandFair$Series} (колонки, 18.10.2026) и {@code freeze} приватны: дёргаем
+     * отражением, API не расширяем. Снимок здесь — пара (время, середина).
+     */
+    private static Object slice(long ts, double mid) {
+        return new double[]{ts, mid};
     }
 
     private static List<Double> freeze(List<Object> slices, List<Long> trades, long holdMs)
             throws Exception {
-        Class<?> sliceClass = Class.forName("org.home.data.revx.replay.StandFair$Slice");
-        Method m = StandFair.class.getDeclaredMethod("freeze", List.class, List.class, long.class);
+        Class<?> series = Class.forName("org.home.data.revx.replay.StandFair$Series");
+        Constructor<?> ctor = series.getDeclaredConstructor(int.class);
+        ctor.setAccessible(true);
+        Object s = ctor.newInstance(slices.size());
+        long[] recv = (long[]) field(series, s, "recvMs");
+        double[] mid = (double[]) field(series, s, "midUsdc");
+        for (int i = 0; i < slices.size(); i++) {
+            double[] x = (double[]) slices.get(i);
+            recv[i] = (long) x[0];
+            mid[i] = x[1];
+        }
+        Method m = StandFair.class.getDeclaredMethod("freeze", series, List.class, long.class);
         m.setAccessible(true);
-        @SuppressWarnings("unchecked")
-        List<Object> out = (List<Object>) m.invoke(null, slices, trades, holdMs);
-        Method smooth = sliceClass.getDeclaredMethod("smooth");
-        smooth.setAccessible(true);
+        m.invoke(null, s, trades, holdMs);
         List<Double> values = new ArrayList<>();
-        for (Object o : out) {
-            values.add((double) smooth.invoke(o));
+        for (double v : (double[]) field(series, s, "smooth")) {
+            values.add(v);
         }
         return values;
+    }
+
+    private static Object field(Class<?> c, Object o, String name) throws Exception {
+        java.lang.reflect.Field f = c.getDeclaredField(name);
+        f.setAccessible(true);
+        return f.get(o);
     }
 
     /** Без сделок опора равна середине на каждом снимке. */

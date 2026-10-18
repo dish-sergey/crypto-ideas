@@ -49,10 +49,30 @@ public final class StandFair implements FairSource {
 
     private static final Logger log = LoggerFactory.getLogger(StandFair.class);
 
-    /** Сшитый снимок одной пары: обе ноги из одного цикла. */
-    private record Slice(long recvMs, double midUsdc, double midUsd,
-                         double spreadUsdc, double spreadUsd, double bid, double ask,
-                         double bq, double aq, double smooth) {
+    /**
+     * Сшитые снимки одной пары по времени: обе ноги из одного цикла. Колонками (18.10.2026):
+     * объект на снимок стоил ~100 байт, а снимков в корзине курса за месяц ~12 млн — 1.2 ГБ кучи
+     * на прогон, и вдвое больше на двух месяцах. Колонки — 80 байт и без объектов.
+     */
+    private static final class Series {
+        final int n;
+        final long[] recvMs;
+        final double[] midUsdc, midUsd, spreadUsdc, spreadUsd, bid, ask, bq, aq, smooth;
+        int cur;
+
+        Series(int n) {
+            this.n = n;
+            recvMs = new long[n];
+            midUsdc = new double[n];
+            midUsd = new double[n];
+            spreadUsdc = new double[n];
+            spreadUsd = new double[n];
+            bid = new double[n];
+            ask = new double[n];
+            bq = new double[n];
+            aq = new double[n];
+            smooth = new double[n];
+        }
     }
 
     private final String base;
@@ -61,9 +81,8 @@ public final class StandFair implements FairSource {
     private final long maxSkewMs;
     private Clock clock;
 
-    /** По каждой паре — её снимки по времени и курсор чтения. */
-    private final Map<String, List<Slice>> byPair = new LinkedHashMap<>();
-    private final Map<String, Integer> cursor = new HashMap<>();
+    /** По каждой паре — её снимки по времени (курсор чтения — в самой серии). */
+    private final Map<String, Series> byPair = new LinkedHashMap<>();
 
     /**
      * ОТКУДА БРАТЬ КУРС USDC/USD — прибор под задачу A45, а не боевая настройка.
@@ -135,8 +154,8 @@ public final class StandFair implements FairSource {
 
     /** Сколько снимков у пары: мера покрытия, у разных пар оно РАЗНОЕ. */
     public int snapshots(String pair) {
-        List<Slice> l = byPair.get(pair);
-        return l == null ? 0 : l.size();
+        Series l = byPair.get(pair);
+        return l == null ? 0 : l.n;
     }
 
     /** Отметки времени, по которым имеет смысл тикать: снимки торгуемой пары. */
@@ -145,15 +164,8 @@ public final class StandFair implements FairSource {
     }
 
     public long[] schedule(String forBase) {
-        List<Slice> own = byPair.get(forBase);
-        if (own == null) {
-            return new long[0];
-        }
-        long[] out = new long[own.size()];
-        for (int i = 0; i < own.size(); i++) {
-            out[i] = own.get(i).recvMs();
-        }
-        return out;
+        Series own = byPair.get(forBase);
+        return own == null ? new long[0] : own.recvMs.clone();
     }
 
     /**
@@ -186,7 +198,9 @@ public final class StandFair implements FairSource {
             }
         } finally {
             replaceClock(saved);
-            cursor.clear();
+            for (Series s : byPair.values()) {
+                s.cur = 0;
+            }
             // ⚠️ Вместе с курсорами пар сбрасываются курсор прямой книги и
             // состояние сглаживания: следующий вызов начнётся с начала окна, и
             // курс, «запомненный» с прошлой пары, испортил бы первые тики.
@@ -217,8 +231,8 @@ public final class StandFair implements FairSource {
                 }
             }
             for (String b : bases) {
-                List<Slice> slices = stitch(c, b, fromMs, toMs);
-                if (!slices.isEmpty()) {
+                Series slices = stitch(c, b, fromMs, toMs);
+                if (slices.n > 0) {
                     byPair.put(b, slices);
                 }
             }
@@ -227,7 +241,7 @@ public final class StandFair implements FairSource {
             }
             log.warn("справедливая цена из записи: пар {}, снимков у {} — {}; курс {}",
                     byPair.size(), base,
-                    byPair.containsKey(base) ? byPair.get(base).size() : 0,
+                    byPair.containsKey(base) ? byPair.get(base).n : 0,
                     rateSource == RateSource.MEDIAN ? "медианой по парам"
                             : rateSource == RateSource.DIRECT
                                     ? "ПРЯМОЙ книгой USDC/USD (" + directRateMid.size() + " снимков)"
@@ -283,30 +297,70 @@ public final class StandFair implements FairSource {
                 : directRateMid.get(directCursor);
     }
 
-        /** Сшить USDC- и USD-ноги одной пары по {@code snap_id}. */
-    private List<Slice> stitch(Connection c, String b, long fromMs, long toMs) {
-        Map<Long, double[]> usdc = legs(c, b + "/USDC", fromMs, toMs);
-        Map<Long, double[]> usd = legs(c, b + "/USD", fromMs, toMs);
-        List<Slice> out = new ArrayList<>();
-        for (Map.Entry<Long, double[]> e : usdc.entrySet()) {
-            double[] u = usd.get(e.getKey());
-            if (u == null) {
-                continue;                         // общего снимка нет — пара не в счёт
-            }
-            double[] q = e.getValue();
-            long skew = (long) Math.max(q[3], u[3]);
-            if (skew > maxSkewMs) {
-                continue;
-            }
-            double midQ = (q[0] + q[1]) / 2;
-            double midU = (u[0] + u[1]) / 2;
-            if (!(midQ > 0) || !(midU > 0)) {
-                continue;
-            }
-            out.add(new Slice((long) Math.max(q[4], u[4]), midQ, midU,
-                    (q[0] - q[1]) / midQ, (u[0] - u[1]) / midU, q[1], q[0], q[5], q[6], 0));
+    /**
+     * Сшить USDC- и USD-ноги одной пары по {@code snap_id}.
+     *
+     * Без карт (18.10.2026): USD-нога ложится в колонки и сортируется по {@code snap_id}, USDC-нога
+     * идёт потоком и ищет пару двоичным поиском. Карта {@code snap_id → double[]} стоила ~150 байт
+     * на строку, на ноге BTC за месяц — 0.4 ГБ. При равном времени снимки идут в порядке чтения
+     * USDC-ноги (по времени её получения), а не в порядке обхода хеш-карты, как раньше.
+     */
+    private Series stitch(Connection c, String b, long fromMs, long toMs) {
+        Leg usd = Leg.load(c, b + "/USD", fromMs, toMs);
+        int[] byId = order(usd.n, (x, y) -> Long.compare(usd.id[x], usd.id[y]));
+        long[] ids = new long[usd.n];
+        for (int k = 0; k < usd.n; k++) {
+            ids[k] = usd.id[byId[k]];
         }
-        out.sort(java.util.Comparator.comparingLong(Slice::recvMs));
+        Rows rows = new Rows();
+        String sql = "SELECT snap_id, ap1, bp1, bq1, aq1, skew_ms, t_recv_ms FROM revx_book "
+                + "WHERE symbol = ? AND t_recv_ms >= ? AND t_recv_ms <= ?";
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, b + "/USDC");
+            ps.setLong(2, fromMs);
+            ps.setLong(3, toMs);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    double qa = rs.getDouble(2);
+                    double qb = rs.getDouble(3);
+                    if (!(qa > 0) || !(qb > 0)) {
+                        continue;                 // пустой ответ книги, такое бывает
+                    }
+                    int j = java.util.Arrays.binarySearch(ids, rs.getLong(1));
+                    if (j < 0) {
+                        continue;                 // общего снимка нет — пара не в счёт
+                    }
+                    int u = byId[j];
+                    long skew = Math.max(rs.getLong(6), usd.skew[u]);
+                    if (skew > maxSkewMs) {
+                        continue;
+                    }
+                    double midQ = (qa + qb) / 2;
+                    double midU = (usd.ask[u] + usd.bid[u]) / 2;
+                    if (!(midQ > 0) || !(midU > 0)) {
+                        continue;
+                    }
+                    rows.add(Math.max(rs.getLong(7), usd.recv[u]), midQ, midU, (qa - qb) / midQ,
+                            (usd.ask[u] - usd.bid[u]) / midU, qb, qa, rs.getDouble(4), rs.getDouble(5));
+                }
+            }
+        } catch (Exception e) {
+            log.error("не прочиталась нога {}: {}", b + "/USDC", e.getMessage());
+        }
+        int[] byTime = order(rows.n, (x, y) -> Long.compare(rows.recv[x], rows.recv[y]));
+        Series s = new Series(rows.n);
+        for (int k = 0; k < rows.n; k++) {
+            int r = byTime[k];
+            s.recvMs[k] = rows.recv[r];
+            s.midUsdc[k] = rows.v[0][r];
+            s.midUsd[k] = rows.v[1][r];
+            s.spreadUsdc[k] = rows.v[2][r];
+            s.spreadUsd[k] = rows.v[3][r];
+            s.bid[k] = rows.v[4][r];
+            s.ask[k] = rows.v[5][r];
+            s.bq[k] = rows.v[6][r];
+            s.aq[k] = rows.v[7][r];
+        }
         double freezeSec = Double.parseDouble(
                 System.getProperty("revx.fair.freeze-sec", "0"));
         double smoothSec = Double.parseDouble(
@@ -316,9 +370,115 @@ public final class StandFair implements FairSource {
                     "revx.fair.freeze-sec и revx.fair.smooth-sec пишут в ОДНО поле "
                             + "альтернативной опоры: включать можно только одно");
         }
-        return freezeSec > 0
-                ? freeze(out, tradeTimes(c, b + "/USDC", fromMs, toMs), (long) (freezeSec * 1000))
-                : smooth(out);
+        if (freezeSec > 0) {
+            freeze(s, tradeTimes(c, b + "/USDC", fromMs, toMs), (long) (freezeSec * 1000));
+        } else {
+            smooth(s);
+        }
+        return s;
+    }
+
+    /** USD-нога колонками: {@code snap_id, ask, bid, skew, recv}. */
+    private static final class Leg {
+        int n;
+        long[] id = new long[1024], skew = new long[1024], recv = new long[1024];
+        double[] ask = new double[1024], bid = new double[1024];
+
+        static Leg load(Connection c, String symbol, long from, long to) {
+            Leg l = new Leg();
+            String sql = "SELECT snap_id, ap1, bp1, skew_ms, t_recv_ms FROM revx_book "
+                    + "WHERE symbol = ? AND t_recv_ms >= ? AND t_recv_ms <= ?";
+            try (PreparedStatement ps = c.prepareStatement(sql)) {
+                ps.setString(1, symbol);
+                ps.setLong(2, from);
+                ps.setLong(3, to);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        double a = rs.getDouble(2);
+                        double b = rs.getDouble(3);
+                        if (!(a > 0) || !(b > 0)) {
+                            continue;
+                        }
+                        if (l.n == l.id.length) {
+                            int cap = l.n * 2;
+                            l.id = java.util.Arrays.copyOf(l.id, cap);
+                            l.skew = java.util.Arrays.copyOf(l.skew, cap);
+                            l.recv = java.util.Arrays.copyOf(l.recv, cap);
+                            l.ask = java.util.Arrays.copyOf(l.ask, cap);
+                            l.bid = java.util.Arrays.copyOf(l.bid, cap);
+                        }
+                        l.id[l.n] = rs.getLong(1);
+                        l.ask[l.n] = a;
+                        l.bid[l.n] = b;
+                        l.skew[l.n] = rs.getLong(4);
+                        l.recv[l.n] = rs.getLong(5);
+                        l.n++;
+                    }
+                }
+            } catch (Exception e) {
+                log.error("не прочиталась нога {}: {}", symbol, e.getMessage());
+            }
+            return l;
+        }
+    }
+
+    /** Сшитые строки до сортировки по времени. */
+    private static final class Rows {
+        int n;
+        long[] recv = new long[1024];
+        double[][] v = new double[8][1024];
+
+        void add(long r, double... x) {
+            if (n == recv.length) {
+                recv = java.util.Arrays.copyOf(recv, n * 2);
+                for (int i = 0; i < v.length; i++) {
+                    v[i] = java.util.Arrays.copyOf(v[i], n * 2);
+                }
+            }
+            recv[n] = r;
+            for (int i = 0; i < v.length; i++) {
+                v[i][n] = x[i];
+            }
+            n++;
+        }
+    }
+
+    private interface IntCmp {
+        int compare(int a, int b);
+    }
+
+    /** Устойчивая сортировка индексов {@code 0..n-1} слиянием — без упаковки в объекты. */
+    private static int[] order(int n, IntCmp cmp) {
+        int[] a = new int[n];
+        for (int i = 0; i < n; i++) {
+            a[i] = i;
+        }
+        boolean sorted = true;
+        for (int i = 1; i < n && sorted; i++) {
+            sorted = cmp.compare(a[i - 1], a[i]) <= 0;
+        }
+        if (sorted) {
+            return a;                             // ноги читаются по времени — обычно уже по порядку
+        }
+        int[] b = new int[n];
+        for (int w = 1; w < n; w *= 2) {
+            for (int lo = 0; lo < n; lo += 2 * w) {
+                int mid = Math.min(lo + w, n), hi = Math.min(lo + 2 * w, n), i = lo, j = mid, k = lo;
+                while (i < mid && j < hi) {
+                    b[k++] = cmp.compare(a[j], a[i]) < 0 ? a[j++] : a[i++];
+                }
+                while (i < mid) {
+                    b[k++] = a[i++];
+                }
+                while (j < hi) {
+                    b[k++] = a[j++];
+                }
+            }
+            int[] t = a;
+            a = b;
+            b = t;
+        }
+        return a;
     }
 
     /** Отметки сделок пары: вход для замороженной опоры. */
@@ -340,6 +500,7 @@ public final class StandFair implements FairSource {
         }
         return out;
     }
+
 
     /**
      * ЗАМОРОЖЕННАЯ СЕРЕДИНА: опора не двигается {@code N} секунд после принта.
@@ -369,17 +530,16 @@ public final class StandFair implements FairSource {
      * протащила бы опору за собой по шагу, то есть вернула бы ровно ту обратную
      * связь, которую опыт убирает.
      */
-    private static List<Slice> freeze(List<Slice> in, List<Long> trades, long holdMs) {
-        if (in.isEmpty()) {
-            return in;
+    private static void freeze(Series s, List<Long> trades, long holdMs) {
+        if (s.n == 0) {
+            return;
         }
-        List<Slice> out = new ArrayList<>(in.size());
         int t = 0;
-        double held = in.get(0).midUsdc();
+        double held = s.midUsdc[0];
         long heldUntil = Long.MIN_VALUE;
-        double prevMid = in.get(0).midUsdc();
-        for (Slice s : in) {
-            while (t < trades.size() && trades.get(t) <= s.recvMs()) {
+        double prevMid = s.midUsdc[0];
+        for (int k = 0; k < s.n; k++) {
+            while (t < trades.size() && trades.get(t) <= s.recvMs[k]) {
                 long ts = trades.get(t);
                 if (ts > heldUntil) {
                     held = prevMid;               // значение ДО принта
@@ -387,39 +547,9 @@ public final class StandFair implements FairSource {
                 heldUntil = ts + holdMs;
                 t++;
             }
-            double value = s.recvMs() < heldUntil ? held : s.midUsdc();
-            out.add(new Slice(s.recvMs(), s.midUsdc(), s.midUsd(), s.spreadUsdc(),
-                    s.spreadUsd(), s.bid(), s.ask(), s.bq(), s.aq(), value));
-            prevMid = s.midUsdc();
+            s.smooth[k] = s.recvMs[k] < heldUntil ? held : s.midUsdc[k];
+            prevMid = s.midUsdc[k];
         }
-        return out;
-    }
-
-    /** {@code snap_id → [ask, bid, _, skew, recv]}. */
-    private static Map<Long, double[]> legs(Connection c, String symbol, long from, long to) {
-        Map<Long, double[]> out = new HashMap<>();
-        String sql = "SELECT snap_id, ap1, bp1, bq1, aq1, skew_ms, t_recv_ms FROM revx_book "
-                + "WHERE symbol = ? AND t_recv_ms >= ? AND t_recv_ms <= ?";
-        try (PreparedStatement ps = c.prepareStatement(sql)) {
-            ps.setString(1, symbol);
-            ps.setLong(2, from);
-            ps.setLong(3, to);
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    double ask = rs.getDouble("ap1");
-                    double bid = rs.getDouble("bp1");
-                    if (!(ask > 0) || !(bid > 0)) {
-                        continue;                 // пустой ответ книги, такое бывает
-                    }
-                    out.put(rs.getLong("snap_id"), new double[]{ask, bid, 0,
-                            rs.getLong("skew_ms"), rs.getLong("t_recv_ms"),
-                            rs.getDouble("bq1"), rs.getDouble("aq1")});
-                }
-            }
-        } catch (Exception e) {
-            log.error("не прочиталась нога {}: {}", symbol, e.getMessage());
-        }
-        return out;
     }
 
     /**
@@ -434,37 +564,33 @@ public final class StandFair implements FairSource {
      * менялась (07.09.2026 с секунды на полторы), и оконное среднее по
      * фиксированному числу точек означало бы на разных окнах разное время.
      */
-    private static List<Slice> smooth(List<Slice> in) {
+    private static void smooth(Series s) {
         double tau = Double.parseDouble(System.getProperty("revx.fair.smooth-sec", "0"));
-        if (tau <= 0 || in.isEmpty()) {
-            return in;
+        if (tau <= 0 || s.n == 0) {
+            return;                               // поле сглаживания остаётся нулём, как раньше
         }
-        List<Slice> out = new ArrayList<>(in.size());
-        double ema = in.get(0).midUsdc();
-        long prev = in.get(0).recvMs();
-        for (Slice s : in) {
-            double dt = Math.max(0, s.recvMs() - prev) / 1000.0;
+        double ema = s.midUsdc[0];
+        long prev = s.recvMs[0];
+        for (int k = 0; k < s.n; k++) {
+            double dt = Math.max(0, s.recvMs[k] - prev) / 1000.0;
             double a = 1 - Math.exp(-dt / tau);
-            ema += a * (s.midUsdc() - ema);
-            prev = s.recvMs();
-            out.add(new Slice(s.recvMs(), s.midUsdc(), s.midUsd(), s.spreadUsdc(),
-                    s.spreadUsd(), s.bid(), s.ask(), s.bq(), s.aq(), ema));
+            ema += a * (s.midUsdc[k] - ema);
+            prev = s.recvMs[k];
+            s.smooth[k] = ema;
         }
-        return out;
     }
 
-    /** Последний снимок пары не позже {@code ts}; курсор идёт только вперёд. */
-    private Slice at(String pair, long ts) {
-        List<Slice> list = byPair.get(pair);
-        if (list == null || list.isEmpty() || list.get(0).recvMs() > ts) {
-            return null;
+    /** Последний снимок пары не позже {@code ts} (индекс) или −1; курсор идёт только вперёд. */
+    private static int at(Series s, long ts) {
+        if (s.n == 0 || s.recvMs[0] > ts) {
+            return -1;
         }
-        int i = cursor.getOrDefault(pair, 0);
-        while (i + 1 < list.size() && list.get(i + 1).recvMs() <= ts) {
+        int i = s.cur;
+        while (i + 1 < s.n && s.recvMs[i + 1] <= ts) {
             i++;
         }
-        cursor.put(pair, i);
-        return list.get(i);
+        s.cur = i;
+        return i;
     }
 
     @Override
@@ -472,20 +598,23 @@ public final class StandFair implements FairSource {
         long now = clock.now();
         long since = now - lookbackMs;
         List<PairQuote> quotes = new ArrayList<>();
-        Slice own = null;
+        double ownBid = 0, ownAsk = 0;
         long asOf = 0;
-        for (String pair : byPair.keySet()) {
-            Slice s = at(pair, now);
-            if (s == null || s.recvMs() < since) {
+        for (Map.Entry<String, Series> e : byPair.entrySet()) {
+            String pair = e.getKey();
+            Series s = e.getValue();
+            int i = at(s, now);
+            if (i < 0 || s.recvMs[i] < since) {
                 continue;                         // снимок протух — пара не в счёт
             }
             if (pair.equals(askedBase)) {
-                own = s;
+                ownBid = s.bid[i];
+                ownAsk = s.ask[i];
             }
-            quotes.add(new PairQuote(pair, s.midUsdc(), s.midUsd(),
-                    s.spreadUsdc(), s.spreadUsd(), memecoins.contains(pair), s.recvMs(),
-                    s.bq(), s.aq(), s.smooth()));
-            asOf = Math.max(asOf, s.recvMs());
+            quotes.add(new PairQuote(pair, s.midUsdc[i], s.midUsd[i],
+                    s.spreadUsdc[i], s.spreadUsd[i], memecoins.contains(pair), s.recvMs[i],
+                    s.bq[i], s.aq[i], s.smooth[i]));
+            asOf = Math.max(asOf, s.recvMs[i]);
         }
         if (quotes.isEmpty()) {
             return new StandReader.Fair(0, false, "снимков нет в этом окне", 0, 0);
@@ -510,7 +639,7 @@ public final class StandFair implements FairSource {
         }
         return new StandReader.Fair(price, state.quotable(), state.pausedReason(),
                 asOf, quotes.size(),
-                own == null ? 0 : own.bid(), own == null ? 0 : own.ask(),
+                ownBid, ownAsk,
                 state.referenceSpreadPct());
     }
 }

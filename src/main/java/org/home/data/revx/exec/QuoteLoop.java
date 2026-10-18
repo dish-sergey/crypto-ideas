@@ -1278,7 +1278,689 @@ public final class QuoteLoop implements Runnable {
     private boolean startCaptured;
     private java.util.function.Consumer<String> alert = message -> { };
 
+    // ------------------------------------------------ пауза стороны после неожиданного свипа
+    /** Пауза после свипа вниз ставит аск как при полном запасе (-Drevx.exec.sweep-pause-ask-full). */
+    private static final boolean PAUSE_ASK_FULL = Boolean.getBoolean("revx.exec.sweep-pause-ask-full");
+    private SweepWatch pauseWatch;
+    private long pauseMs;
+    private double pauseSurpriseMin;
+    private boolean pauseBidOnly;
+    private long pauseSeenEndMs;
+    private double pauseSeenSurprise;
+    private long pauseLoggedEndMs;
+
+    /**
+     * Пауза стороны после НЕОЖИДАННОГО свипа (11.10.2026, идея владельца, только стенд):
+     * свип вниз — бид отводится на {@code parkDistance} от опоры, свип вверх — аск
+     * (если не {@code bidOnly}), на {@code pauseMs} с момента, когда бот увидел свип.
+     *
+     * 🔑 Отвод, а не отмена: цель уходит далеко, и котировщик переводит заявку туда
+     * ЗАМЕНОЙ, а замена суточных постановок не тратит; по окончании паузы — замена
+     * обратно. Снятие стоило бы постановку на каждом свипе.
+     *
+     * Довод владельца: при малом числе лотов одна покупка в продолжающееся падение
+     * сажает весь запас на 10–20 б.п. Разбор по ленте сказал, что таких сделок 0.4–2%
+     * и в среднем они не хуже прочих, — но среднее хвост не видит, поэтому мерить стендом.
+     */
+    public void sweepPause(SweepWatch watch, long pauseMs, double surpriseMin, boolean bidOnly) {
+        this.pauseWatch = watch;
+        this.pauseMs = pauseMs;
+        this.pauseSurpriseMin = surpriseMin;
+        this.pauseBidOnly = bidOnly;
+    }
+
+    private Quoter.Quotes sweepPause(Quoter.Quotes t, double fairPx,
+                                     java.util.function.Supplier<Double> askAsFull) {
+        if (pauseWatch == null || !(fairPx > 0)) {
+            return t;
+        }
+        long now = clock.now();
+        SweepWatch.Sweep s = pauseWatch.lastSweep(now);
+        if (s == null || now >= s.endMs() + pauseWatch.delayMs() + pauseMs) {
+            return t;
+        }
+        if (s.endMs() != pauseSeenEndMs) {
+            pauseSeenEndMs = s.endMs();
+            pauseSeenSurprise = pauseWatch.surprise(s);
+        }
+        if (!(pauseSeenSurprise >= pauseSurpriseMin)) {
+            return t;
+        }
+        double far = parkDistance > 0 ? parkDistance : 0.10;
+        Quoter.Quotes out = t;
+        if (s.side() < 0 && t.hasBid()) {
+            // 🔑 Вариант владельца: аск — как будто запас ПОЛНЫЙ, чтобы то, что есть,
+            // ушло до продолжения падения. Никогда не дальше обычного аска.
+            Double ask = t.ask();
+            if (PAUSE_ASK_FULL && ask != null) {
+                Double full = askAsFull.get();
+                if (full != null && full > 0) {
+                    ask = Math.min(ask, full);
+                }
+            }
+            out = new Quoter.Quotes(fairPx * (1 - far), ask);
+        } else if (s.side() > 0 && !pauseBidOnly && t.hasAsk()) {
+            out = new Quoter.Quotes(t.bid(), fairPx * (1 + far));
+        }
+        if (out != t && pauseLoggedEndMs != s.endMs()) {
+            pauseLoggedEndMs = s.endMs();
+            journal.event("sweep_pause", String.format(java.util.Locale.ROOT,
+                    "%s: свип %s на $%.0f, неожиданность %.1f — %s отведён на %d с", symbol,
+                    s.side() > 0 ? "вверх" : "вниз", s.notional(), pauseSeenSurprise,
+                    s.side() > 0 ? "аск" : "бид", pauseMs / 1000));
+        }
+        return out;
+    }
+
+    // ------------------------------------------------ пауза по СОВПАДЕНИЮ свипов на разных монетах
+    private java.util.List<SweepWatch> crossWatches;
+    private java.util.List<String> crossSymbols;
+    private long crossPauseMs;
+    private double crossBigUsd;
+    private long crossWindowMs;
+    private double crossProvisionalBp;
+    private long crossProvisionalMs;
+    private boolean crossBidOnly;
+    private long[] crossSeenEnd;
+    /** Свежие свипы всех монет: [монета, конец, знак, номинал]. */
+    private final java.util.ArrayDeque<double[]> crossRecent = new java.util.ArrayDeque<>();
+    private long crossPauseUntil;
+    private int crossPauseSide;
+    private long provisionalUntil;
+    private int provisionalSide;
+
+    /**
+     * Пауза по СОВПАДЕНИЮ (11.10.2026, идея владельца, только стенд). Разбор w24: крупный
+     * свип на одной монете — обычно просто покупка (ни Бинанс, ни другие монеты не идут
+     * следом), а совпавший со свипом другой монеты в ±30 с — движение рынка (BTC и ETH
+     * продолжают +8…+30 б.п. за 15 мин). Каждый бот видит ленты ВСЕХ монет:
+     * <ul>
+     *   <li>крупный свип (≥ {@code bigUsd}) на любой монете — ПРЕДВАРИТЕЛЬНЫЙ отвод стороны
+     *       на {@code provisionalBp} на {@code provisionalMs} (0 — без него);</li>
+     *   <li>два свипа одной стороны на разных монетах в пределах {@code windowMs}, хотя бы
+     *       один крупный — ПАУЗА как после свипа: бид у {@code parkDistance}, аск как при
+     *       полном запасе (если {@code sweep-pause-ask-full}), на {@code pauseMs}.</li>
+     * </ul>
+     * Подтверждение причинное: пауза ставится в момент, когда бот УВИДЕЛ второй свип.
+     */
+    public void crossPause(java.util.List<SweepWatch> watches, java.util.List<String> symbols, long pauseMs, double bigUsd,
+                           long windowMs, double provisionalBp, long provisionalMs, boolean bidOnly) {
+        this.crossWatches = watches;
+        this.crossSymbols = symbols;
+        this.crossPauseMs = pauseMs;
+        this.crossBigUsd = bigUsd;
+        this.crossWindowMs = windowMs;
+        this.crossProvisionalBp = provisionalBp;
+        this.crossProvisionalMs = provisionalMs;
+        this.crossBidOnly = bidOnly;
+        this.crossSeenEnd = new long[watches.size()];
+    }
+
+    private Quoter.Quotes crossPause(Quoter.Quotes t, double fairPx,
+                                     java.util.function.Supplier<Double> askAsFull) {
+        if (crossWatches == null || !(fairPx > 0)) {
+            return t;
+        }
+        long now = clock.now();
+        for (int i = 0; i < crossWatches.size(); i++) {
+            SweepWatch.Sweep s = crossWatches.get(i).lastSweep(now);
+            if (s == null || s.endMs() == crossSeenEnd[i]) {
+                continue;
+            }
+            crossSeenEnd[i] = s.endMs();
+            boolean big = s.notional() >= crossBigUsd;
+            if (big && crossProvisionalBp > 0) {
+                provisionalSide = s.side();
+                provisionalUntil = now + crossProvisionalMs;
+            }
+            for (double[] r : crossRecent) {
+                if ((int) r[0] != i && (int) r[2] == s.side()
+                        && Math.abs(r[1] - s.endMs()) <= crossWindowMs
+                        && (big || r[3] >= crossBigUsd)) {
+                    crossPauseSide = s.side();
+                    crossPauseUntil = now + crossPauseMs;
+                    journal.event("cross_pause", String.format(java.util.Locale.ROOT,
+                            "%s: свип %s %s $%.0f совпал с %s $%.0f (%.0f с) — пауза %d с", symbol,
+                            s.side() > 0 ? "вверх" : "вниз", crossSymbols.get(i), s.notional(),
+                            crossSymbols.get((int) r[0]), r[3], Math.abs(r[1] - s.endMs()) / 1000.0,
+                            crossPauseMs / 1000));
+                    break;
+                }
+            }
+            crossRecent.addLast(new double[]{i, s.endMs(), s.side(), s.notional()});
+        }
+        while (!crossRecent.isEmpty() && crossRecent.peekFirst()[1] < now - 2 * crossWindowMs - 10_000) {
+            crossRecent.pollFirst();
+        }
+        double far = parkDistance > 0 ? parkDistance : 0.10;
+        if (now < crossPauseUntil) {
+            if (crossPauseSide < 0 && t.hasBid()) {
+                Double ask = t.ask();
+                if (PAUSE_ASK_FULL && ask != null) {
+                    Double full = askAsFull.get();
+                    if (full != null && full > 0) {
+                        ask = Math.min(ask, full);
+                    }
+                }
+                return new Quoter.Quotes(fairPx * (1 - far), ask);
+            }
+            if (crossPauseSide > 0 && !crossBidOnly && t.hasAsk()) {
+                return new Quoter.Quotes(t.bid(), fairPx * (1 + far));
+            }
+            return t;
+        }
+        if (now < provisionalUntil) {
+            double extra = crossProvisionalBp / 1e4 * fairPx;
+            if (provisionalSide < 0 && t.hasBid()) {
+                return new Quoter.Quotes(t.bid() - extra, t.ask());
+            }
+            if (provisionalSide > 0 && !crossBidOnly && t.hasAsk()) {
+                return new Quoter.Quotes(t.bid(), t.ask() + extra);
+            }
+        }
+        return t;
+    }
+
+    // ------------------------------------------------ рывок опоры (11.10.2026, идеи владельца, стенд)
+    /**
+     * СКОРОСТНОЙ ОТСТУП: опора за окно рывка ({@code rush-window-sec}, 10 с) упала на m б.п. — бид отходит ещё на k·m (не больше
+     * {@code vel-widen-max-bp}); выросла — аск, если не {@code vel-widen-bid-only}. Отступ
+     * возвращается сам, когда рывок выходит из окна. Довод владельца: купить на рывке, если
+     * уж купят, то по лучшей цене. ⚠️ Близкие опыты (гейт по σ 15 мин/6 ч, A35; гейт по ER,
+     * док. 106) отвергнуты, но они СНИМАЛИ сторону, а не отодвигали её.
+     */
+    static final double VEL_WIDEN_K = Double.parseDouble(System.getProperty("revx.exec.vel-widen-k", "0"));
+    static final double VEL_WIDEN_MAX_BP = Double.parseDouble(System.getProperty("revx.exec.vel-widen-max-bp", "20"));
+    static final boolean VEL_WIDEN_BID_ONLY = Boolean.getBoolean("revx.exec.vel-widen-bid-only");
+    /** Скоростной отступ включается от этого хода за окно, б.п.: шум в 1–2 б.п. за 10 с не в счёт. */
+    static final double VEL_WIDEN_MIN_BP = Double.parseDouble(System.getProperty("revx.exec.vel-widen-min-bp", "3"));
+    /**
+     * ПАУЗА ПО НЕОЖИДАННОМУ ХОДУ ОПОРЫ: |ход за 60 с| ≥ z·σ минутных ходов за 6 ч и ≥
+     * {@code fair-pause-min-bp} — то же действие, что после неожиданного свипа (бид в сторону,
+     * аск как при полном запасе с {@code sweep-pause-ask-full}) на {@code fair-pause-sec}.
+     */
+    static final double FAIR_PAUSE_Z = Double.parseDouble(System.getProperty("revx.exec.fair-pause-z", "0"));
+    static final double FAIR_PAUSE_MIN_BP = Double.parseDouble(System.getProperty("revx.exec.fair-pause-min-bp", "5"));
+    static final long FAIR_PAUSE_MS = Long.getLong("revx.exec.fair-pause-sec", 180) * 1000L;
+    static final boolean FAIR_PAUSE_BID_ONLY = Boolean.getBoolean("revx.exec.fair-pause-bid-only");
+    /** Окно рывка: ход опоры за столько секунд (владелец: «5–10 с, за минуту всё кончится»). */
+    static final long RUSH_WINDOW_MS = Long.getLong("revx.exec.rush-window-sec", 10) * 1000L;
+    /** Скоростной отступ держится столько после рывка: окно короткое, а опора ещё не успокоилась. */
+    static final long VEL_WIDEN_HOLD_MS = Long.getLong("revx.exec.vel-widen-hold-sec", 30) * 1000L;
+    /**
+     * РЫВОК ПО ДВУМ EMA (владелец, 11.10.2026): быстрая и медленная EMA опоры; их разрыв в б.п.
+     * заменяет «ход за окно». Пауза — при |разрыв| ≥ {@code rush-ema-gap-bp}, скоростной отступ —
+     * k·разрыв. 0 — выключено, работает ход за окно.
+     */
+    static final double RUSH_EMA_FAST_S = Double.parseDouble(System.getProperty("revx.exec.rush-ema-fast-sec", "5"));
+    static final double RUSH_EMA_SLOW_S = Double.parseDouble(System.getProperty("revx.exec.rush-ema-slow-sec", "10"));
+    static final double RUSH_EMA_GAP_BP = Double.parseDouble(System.getProperty("revx.exec.rush-ema-gap-bp", "0"));
+    /**
+     * СНОС ПО РАЗРЫВУ EMA (владелец, 11.10.2026): обе стороны котировки сдвигаются на
+     * k·(EMA быстрая − EMA медленная), с поводком ±{@code ema-shift-max-bp}. Постоянно, без
+     * триггеров. ⚠️ Родня отвергнутым: сдвиг опоры после свипа (A86–A87), по перевесу
+     * тейкеров Бинанса (A89); отличие — смотрит на саму опору и работает всегда.
+     */
+    static final double EMA_SHIFT_K = Double.parseDouble(System.getProperty("revx.exec.ema-shift-k", "0"));
+    static final double EMA_SHIFT_MAX_BP = Double.parseDouble(System.getProperty("revx.exec.ema-shift-max-bp", "5"));
+    /** Сносить только вниз (на падении опоры): продажа и покупка для нас не симметричны. */
+    static final boolean EMA_SHIFT_DOWN_ONLY = Boolean.getBoolean("revx.exec.ema-shift-down-only");
+    private double emaGapBp;
+    private double emaFast = Double.NaN, emaSlow = Double.NaN;
+    private long emaMs;
+    private double heldExtraBp;         // удерживаемый скоростной отступ, со знаком хода
+    private long heldExtraUntil;
+    private final java.util.ArrayDeque<double[]> rushFair = new java.util.ArrayDeque<>();   // {время, опора} за 60 с
+    private final java.util.ArrayDeque<double[]> rushMin = new java.util.ArrayDeque<>();    // {время, опора} раз в минуту, 6 ч
+    private double rushMove;            // ход опоры за 60 с, б.п., со знаком
+    private long fairPauseUntil;
+    private int fairPauseSide;          // −1 падение, +1 рост
+    private long fairPauses;
+
+    public long fairPauses() {
+        return fairPauses;
+    }
+
+    /** Учёт опоры для рывка; вызывается раз в тик. */
+    private void trackRush(long now, double fairPx) {
+        if (VEL_WIDEN_K <= 0 && FAIR_PAUSE_Z <= 0 && EMA_SHIFT_K == 0 || !(fairPx > 0)) {
+            return;
+        }
+        if (EMA_SHIFT_K != 0 && RUSH_EMA_GAP_BP <= 0) {
+            if (Double.isNaN(emaFast)) {
+                emaFast = emaSlow = fairPx;
+            } else {
+                double dt = Math.max(0, (now - emaMs) / 1000.0);
+                emaFast += (1 - Math.exp(-dt / RUSH_EMA_FAST_S)) * (fairPx - emaFast);
+                emaSlow += (1 - Math.exp(-dt / RUSH_EMA_SLOW_S)) * (fairPx - emaSlow);
+            }
+            emaMs = now;
+            emaGapBp = (emaFast / emaSlow - 1) * 1e4;
+        }
+        if (RUSH_EMA_GAP_BP > 0) {
+            if (Double.isNaN(emaFast)) {
+                emaFast = emaSlow = fairPx;
+            } else {
+                double dt = Math.max(0, (now - emaMs) / 1000.0);
+                emaFast += (1 - Math.exp(-dt / RUSH_EMA_FAST_S)) * (fairPx - emaFast);
+                emaSlow += (1 - Math.exp(-dt / RUSH_EMA_SLOW_S)) * (fairPx - emaSlow);
+            }
+            emaMs = now;
+            rushMove = (emaFast / emaSlow - 1) * 1e4;
+            emaGapBp = rushMove;
+            if (Math.abs(rushMove) >= RUSH_EMA_GAP_BP && FAIR_PAUSE_Z > 0) {
+                int side = rushMove < 0 ? -1 : 1;
+                if (now >= fairPauseUntil || side != fairPauseSide) {
+                    fairPauses++;
+                    journal.event("fair_pause", String.format(java.util.Locale.ROOT,
+                            "%s: EMA %.0f/%.0f с разошлись на %+.1f б.п. — %s в сторону на %d с", symbol,
+                            RUSH_EMA_FAST_S, RUSH_EMA_SLOW_S, rushMove, side < 0 ? "бид" : "аск", FAIR_PAUSE_MS / 1000));
+                }
+                fairPauseUntil = now + FAIR_PAUSE_MS;
+                fairPauseSide = side;
+            }
+            return;
+        }
+        rushFair.addLast(new double[]{now, fairPx});
+        while (!rushFair.isEmpty() && now - (long) rushFair.peekFirst()[0] > RUSH_WINDOW_MS) {
+            rushFair.pollFirst();
+        }
+        rushMove = (fairPx / rushFair.peekFirst()[1] - 1) * 1e4;
+        if (rushMin.isEmpty() || now - (long) rushMin.peekLast()[0] >= 60_000) {
+            rushMin.addLast(new double[]{now, fairPx});
+            while (now - (long) rushMin.peekFirst()[0] > 6 * 3_600_000L) {
+                rushMin.pollFirst();
+            }
+        }
+        if (FAIR_PAUSE_Z > 0 && rushMin.size() >= 60 && Math.abs(rushMove) >= FAIR_PAUSE_MIN_BP) {
+            double s = 0, s2 = 0, prev = Double.NaN;
+            int n = 0;
+            for (double[] v : rushMin) {
+                if (!Double.isNaN(prev)) {
+                    double r = (v[1] / prev - 1) * 1e4;
+                    s += r;
+                    s2 += r * r;
+                    n++;
+                }
+                prev = v[1];
+            }
+            double sd = Math.sqrt(Math.max(0, s2 / n - (s / n) * (s / n))) * Math.sqrt(RUSH_WINDOW_MS / 60_000.0);
+            if (sd > 0 && Math.abs(rushMove) >= FAIR_PAUSE_Z * sd) {
+                int side = rushMove < 0 ? -1 : 1;
+                if (now >= fairPauseUntil || side != fairPauseSide) {
+                    fairPauses++;
+                    journal.event("fair_pause", String.format(java.util.Locale.ROOT,
+                            "%s: опора %+.1f б.п. за %d с при σ %.1f — %s в сторону на %d с", symbol,
+                            rushMove, RUSH_WINDOW_MS / 1000, sd, side < 0 ? "бид" : "аск", FAIR_PAUSE_MS / 1000));
+                }
+                fairPauseUntil = now + FAIR_PAUSE_MS;
+                fairPauseSide = side;
+            }
+        }
+    }
+
+    private Quoter.Quotes emaShift(Quoter.Quotes t, double fairPx) {
+        if (EMA_SHIFT_K == 0 || !(fairPx > 0) || emaGapBp == 0 || EMA_SHIFT_DOWN_ONLY && emaGapBp > 0) {
+            return t;
+        }
+        double bp = Math.max(-EMA_SHIFT_MAX_BP, Math.min(EMA_SHIFT_MAX_BP, EMA_SHIFT_K * emaGapBp));
+        double d = bp / 1e4 * fairPx;
+        return new Quoter.Quotes(t.hasBid() ? t.bid() + d : t.bid(), t.hasAsk() ? t.ask() + d : t.ask());
+    }
+
+    // ------------------------------------------------ раздвижка по размаху (15.10.2026, идея владельца, стенд)
+    /**
+     * РАЗДВИЖКА ПО РАЗМАХУ: пока размах опоры за {@code range-widen-sec} (300 с) не меньше
+     * {@code range-widen-bp} (40 б.п.), отступ ОБЕИХ сторон умножается на {@code range-widen-mult}
+     * (бид ниже, аск выше на (mult−1)·отступ). 0 — выключено.
+     *
+     * Из прибора качества сделки (4183 сделки шести ботов, 01–14.10): при размахе Бинанса за 5 мин
+     * 40–80 б.п. ценность сделки через 5 мин +0.9 б.п. против +8…+11 в тихие минуты, при 80–160
+     * через 15 мин −11.2. ⚠️ Отличие от отвергнутых гейтов (A35, A46, {@link #volGate}): сторона
+     * не снимается, а отодвигается — сделки в волатильность остаются, но по лучшей цене.
+     */
+    static final double RANGE_WIDEN_MULT = Double.parseDouble(System.getProperty("revx.exec.range-widen-mult", "0"));
+    static final double RANGE_WIDEN_BP = Double.parseDouble(System.getProperty("revx.exec.range-widen-bp", "40"));
+    static final long RANGE_WIDEN_MS = Long.getLong("revx.exec.range-widen-sec", 300) * 1000L;
+    private final java.util.ArrayDeque<double[]> rangeFair = new java.util.ArrayDeque<>(); // {время, опора}
+    private long rangeWidenTicks;
+
+    public long rangeWidenTicks() {
+        return rangeWidenTicks;
+    }
+
+    /**
+     * СДВИЖКА НА ТИХОМ РЫНКЕ (идея владельца 15.10.2026): размах опоры за то же окно меньше
+     * {@code range-tight-hi-bp} (10) — обе стороны ближе к опоре на {@code range-tight-step-bp},
+     * меньше {@code range-tight-lo-bp} (5) — на два шага. 0 — выключено. Из прибора качества:
+     * при размахе за минуту меньше 5 б.п. ценность сделки +11 б.п., в минусе 13% сделок.
+     */
+    static final double RANGE_TIGHT_STEP_BP = Double.parseDouble(System.getProperty("revx.exec.range-tight-step-bp", "0"));
+    static final double RANGE_TIGHT_HI_BP = Double.parseDouble(System.getProperty("revx.exec.range-tight-hi-bp", "10"));
+    static final double RANGE_TIGHT_LO_BP = Double.parseDouble(System.getProperty("revx.exec.range-tight-lo-bp", "5"));
+    private long rangeTightTicks;
+
+    public long rangeTightTicks() {
+        return rangeTightTicks;
+    }
+
+    /**
+     * ДРОБНЫЙ ЛОТ В БУРЮ (владелец 16.10.2026, {@code revx.exec.range-widen-lot}, 0 — выключено):
+     * пока действует раздвижка, лот умножается на это число ({@code range-widen-lot-side}: both или
+     * bid). У одноуровневого бота потолок 2.33 лота — одна сделка в бурю это треть-половина запаса,
+     * и итог решает удача одной покупки; пол-лота делит её цену пополам.
+     * ⚠️ Живьём смена размера идёт заменой с новым {@code base_size}; площадкой это не проверялось.
+     */
+    static final double RANGE_WIDEN_LOT = Double.parseDouble(System.getProperty("revx.exec.range-widen-lot", "0"));
+    static final String RANGE_WIDEN_LOT_SIDE = System.getProperty("revx.exec.range-widen-lot-side", "both");
+    /** Действует ли раздвижка в этом тике. */
+    private boolean rangeWidenNow;
+
+    private Quoter.Quotes rangeWiden(Quoter.Quotes t, double fairPx, long now) {
+        rangeWidenNow = false;
+        if (!(RANGE_WIDEN_MULT > 1) && !(RANGE_TIGHT_STEP_BP > 0) || !(fairPx > 0)) {
+            return t;
+        }
+        // одна точка в секунду: окно в 300 с — не больше 300 точек
+        if (rangeFair.isEmpty() || now - (long) rangeFair.peekLast()[0] >= 1000) {
+            rangeFair.addLast(new double[]{now, fairPx});
+        }
+        while (!rangeFair.isEmpty() && now - (long) rangeFair.peekFirst()[0] > RANGE_WIDEN_MS) {
+            rangeFair.pollFirst();
+        }
+        double hi = fairPx, lo = fairPx;
+        for (double[] v : rangeFair) {
+            hi = Math.max(hi, v[1]);
+            lo = Math.min(lo, v[1]);
+        }
+        double rangeBp = (hi - lo) / ((hi + lo) / 2) * 1e4;
+        if (RANGE_TIGHT_STEP_BP > 0 && rangeFair.size() >= RANGE_WIDEN_MS / 1000 / 2 && rangeBp < RANGE_TIGHT_HI_BP) {
+            // окно должно быть набрано хотя бы наполовину: после старта размах кажется нулевым
+            rangeTightTicks++;
+            double in = (rangeBp < RANGE_TIGHT_LO_BP ? 2 : 1) * RANGE_TIGHT_STEP_BP / 1e4 * fairPx;
+            return new Quoter.Quotes(t.hasBid() ? t.bid() + in : t.bid(), t.hasAsk() ? t.ask() - in : t.ask());
+        }
+        if (!(RANGE_WIDEN_MULT > 1) || rangeBp < RANGE_WIDEN_BP) {
+            return t;
+        }
+        rangeWidenTicks++;
+        rangeWidenNow = true;
+        double extra = (RANGE_WIDEN_MULT - 1) * params.offset() * fairPx;
+        boolean falling = fairPx < rangeFair.peekFirst()[1];
+        boolean widenBid = !"ask".equals(RANGE_WIDEN_SIDE)
+                && (!"danger".equals(RANGE_WIDEN_SIDE) || falling);
+        boolean widenAsk = !"bid".equals(RANGE_WIDEN_SIDE)
+                && (!"danger".equals(RANGE_WIDEN_SIDE) || !falling);
+        return new Quoter.Quotes(t.hasBid() && widenBid ? t.bid() - extra : t.bid(),
+                t.hasAsk() && widenAsk ? t.ask() + extra : t.ask());
+    }
+
+    /**
+     * Какую сторону раздвигать ({@code revx.exec.range-widen-side}, владелец 16.10.2026): {@code both}
+     * (прежнее), {@code bid}, {@code ask} или {@code danger} — ту, к которой идёт рынок: опора ниже
+     * начала окна — бид, выше — аск. Раздвижка обеих сторон на w24 выигрывала у ETH тем, что меньше
+     * покупала в падение, а продавать на отскоке переставала заодно.
+     */
+    static final String RANGE_WIDEN_SIDE = System.getProperty("revx.exec.range-widen-side", "both");
+
+    private Quoter.Quotes velWiden(Quoter.Quotes t, double fairPx) {
+        if (VEL_WIDEN_K <= 0 || !(fairPx > 0)) {
+            return t;
+        }
+        long now = clock.now();
+        double cur = Math.abs(rushMove) < VEL_WIDEN_MIN_BP ? 0
+                : Math.min(VEL_WIDEN_MAX_BP, VEL_WIDEN_K * Math.abs(rushMove)) * Math.signum(rushMove);
+        if (cur != 0 && (now >= heldExtraUntil || Math.abs(cur) >= Math.abs(heldExtraBp) || Math.signum(cur) != Math.signum(heldExtraBp))) {
+            heldExtraBp = cur;
+            heldExtraUntil = now + VEL_WIDEN_HOLD_MS;
+        }
+        if (now >= heldExtraUntil || heldExtraBp == 0) {
+            return t;
+        }
+        double move = heldExtraBp;
+        double extra = Math.abs(move) / 1e4 * fairPx;
+        if (move < 0 && t.hasBid()) {
+            return new Quoter.Quotes(t.bid() - extra, t.ask());
+        }
+        if (move > 0 && !VEL_WIDEN_BID_ONLY && t.hasAsk()) {
+            return new Quoter.Quotes(t.bid(), t.ask() + extra);
+        }
+        return t;
+    }
+
+    // ------------------------------------------------ сползание (13.10.2026, идея владельца, стенд)
+    /**
+     * ОТСТУП НА СПОЛЗАНИИ: опора за {@code slide-min} минут упала на {@code slide-bp} б.п. и больше —
+     * бид отходит ещё на {@code slide-widen-bp}, аск не трогается. Резкий провал в конце спуска
+     * ({@code flush-bp} за {@code flush-min} минут) правило СНИМАЕТ на {@code flush-hold-min}: по
+     * Бинансу за 29 дней (14.09–12.10) после часа спуска и провала за 10 мин цена в среднем отскакивает
+     * (SOL +11.9 б.п. за 30 мин, BTC +7.5), а без провала сползание продолжается. Противоположно
+     * скоростному отступу: тот отодвигает бид как раз на провале. ⚠️ Отбор признака — перебор
+     * 3 монеты × 2 признака × 5 квинтилей × 3 горизонта, t ≈ 2; это гипотеза для стенда.
+     */
+    static final double SLIDE_BP = Double.parseDouble(System.getProperty("revx.exec.slide-bp", "0"));
+    static final long SLIDE_MS = Long.getLong("revx.exec.slide-min", 60) * 60_000L;
+    static final double SLIDE_WIDEN_BP = Double.parseDouble(System.getProperty("revx.exec.slide-widen-bp", "10"));
+    static final double FLUSH_BP = Double.parseDouble(System.getProperty("revx.exec.flush-bp", "25"));
+    static final long FLUSH_MS = Long.getLong("revx.exec.flush-min", 10) * 60_000L;
+    static final long FLUSH_HOLD_MS = Long.getLong("revx.exec.flush-hold-min", 15) * 60_000L;
+    private final java.util.ArrayDeque<double[]> slideFair = new java.util.ArrayDeque<>();   // {время, опора} раз в 5 с
+    private boolean slideOn;
+    private long flushUntil;
+    private long slideEvents, flushEvents;
+
+    public long slideEvents() {
+        return slideEvents;
+    }
+
+    public long flushEvents() {
+        return flushEvents;
+    }
+
+    /**
+     * ЗЕРКАЛО НАКЛОНА (владелец, 13.10.2026: «на падении продать некому — на подъёме меньше продавать»):
+     * опора за {@code slide-min} выросла на {@code slide-up-bp} — аск дальше на {@code slide-up-widen-bp}.
+     * Довод: аск раздвижки на рывке вверх стоит +14% на w24 x100 (vw1 против vw1bid).
+     */
+    static final double SLIDE_UP_BP = Double.parseDouble(System.getProperty("revx.exec.slide-up-bp", "0"));
+    static final double SLIDE_UP_WIDEN_BP = Double.parseDouble(System.getProperty("revx.exec.slide-up-widen-bp", "10"));
+    private boolean slideUpOn;
+    private long slideUpEvents;
+
+    private Quoter.Quotes slide(Quoter.Quotes t, double fairPx) {
+        if (SLIDE_BP <= 0 && SLIDE_UP_BP <= 0 || !(fairPx > 0)) {
+            return t;
+        }
+        long now = clock.now();
+        if (slideFair.isEmpty() || now - (long) slideFair.peekLast()[0] >= 5_000) {
+            slideFair.addLast(new double[]{now, fairPx});
+        }
+        while (now - (long) slideFair.peekFirst()[0] > SLIDE_MS) {
+            slideFair.pollFirst();
+        }
+        if (now - (long) slideFair.peekFirst()[0] < SLIDE_MS * 9 / 10) {
+            return t;   // мало истории
+        }
+        double dSlide = (fairPx / slideFair.peekFirst()[1] - 1) * 1e4;
+        if (SLIDE_UP_BP > 0) {
+            boolean up = dSlide >= SLIDE_UP_BP;
+            if (up && !slideUpOn) {
+                slideUpEvents++;
+                journal.event("slide_up_on", String.format(java.util.Locale.ROOT,
+                        "%s: опора %+.1f б.п. за %d мин — аск дальше на %.0f б.п.", symbol,
+                        dSlide, SLIDE_MS / 60_000, SLIDE_UP_WIDEN_BP));
+            }
+            slideUpOn = up;
+            if (up && t.hasAsk()) {
+                t = new Quoter.Quotes(t.bid(), t.ask() + SLIDE_UP_WIDEN_BP / 1e4 * fairPx);
+            }
+        }
+        if (SLIDE_BP <= 0) {
+            return t;
+        }
+        if (FLUSH_BP > 0) {
+            double ref = Double.NaN;
+            for (double[] v : slideFair) {
+                if (now - (long) v[0] <= FLUSH_MS) {
+                    ref = v[1];
+                    break;
+                }
+            }
+            double dFlush = (fairPx / ref - 1) * 1e4;
+            if (dFlush <= -FLUSH_BP) {
+                if (now >= flushUntil) {
+                    flushEvents++;
+                    journal.event("slide_flush", String.format(java.util.Locale.ROOT,
+                            "%s: провал %+.1f б.п. за %d мин после %+.1f за %d — бид на место на %d мин", symbol,
+                            dFlush, FLUSH_MS / 60_000, dSlide, SLIDE_MS / 60_000, FLUSH_HOLD_MS / 60_000));
+                }
+                flushUntil = now + FLUSH_HOLD_MS;
+            }
+        }
+        boolean on = dSlide <= -SLIDE_BP && now >= flushUntil;
+        if (on && !slideOn) {
+            slideEvents++;
+            journal.event("slide_on", String.format(java.util.Locale.ROOT,
+                    "%s: опора %+.1f б.п. за %d мин — бид дальше на %.0f б.п.", symbol,
+                    dSlide, SLIDE_MS / 60_000, SLIDE_WIDEN_BP));
+        }
+        slideOn = on;
+        if (on && t.hasBid()) {
+            return new Quoter.Quotes(t.bid() - SLIDE_WIDEN_BP / 1e4 * fairPx, t.ask());
+        }
+        return t;
+    }
+
+    private Quoter.Quotes fairPause(Quoter.Quotes t, double fairPx,
+                                    java.util.function.Supplier<Double> askAsFull) {
+        if (FAIR_PAUSE_Z <= 0 || clock.now() >= fairPauseUntil || !(fairPx > 0)) {
+            return t;
+        }
+        double far = parkDistance > 0 ? parkDistance : 0.10;
+        if (fairPauseSide < 0 && t.hasBid()) {
+            Double ask = t.ask();
+            if (PAUSE_ASK_FULL && ask != null) {
+                Double full = askAsFull.get();
+                if (full != null && full > 0) {
+                    ask = Math.min(ask, full);
+                }
+            }
+            return new Quoter.Quotes(fairPx * (1 - far), ask);
+        }
+        if (fairPauseSide > 0 && !FAIR_PAUSE_BID_ONLY && t.hasAsk()) {
+            return new Quoter.Quotes(t.bid(), fairPx * (1 + far));
+        }
+        return t;
+    }
+
     /** Включить реакцию на свипы; {@code null} выключает. */
+    // ------------------------------------------------ тишина в покупках (18.10.2026, идея владельца)
+    /** Покупка дошла до опоры + X б.п. — значит, дошла бы и до нашего аска. */
+    static final double QUIET_X_BP = Double.parseDouble(System.getProperty("revx.exec.quiet-x-bp", "10"));
+    /** Меньше стольких дошедших покупок за окно — тихо. */
+    static final int QUIET_MIN = Integer.getInteger("revx.exec.quiet-min", 3);
+    static final long QUIET_WIN_MS = Long.getLong("revx.exec.quiet-win-sec", 3600) * 1000L;
+    /** А: в тишине при запасе ≥ цели бид отводится (заменой, постановку не тратит). */
+    static final boolean QUIET_NOBUY = Boolean.getBoolean("revx.exec.quiet-nobuy");
+    /** Б: в тишине при запасе > цели опора ниже на столько — обе стороны вместе, захват тот же. */
+    static final double QUIET_SHIFT_BP = Double.parseDouble(System.getProperty("revx.exec.quiet-shift-bp", "0"));
+    /**
+     * НЕ ПОКУПАТЬ В НИСХОДЯЩЕМ ТРЕНДЕ (18.10.2026): опора за {@code trend-win-sec} упала больше чем на
+     * {@code trend-nobid-bp} — бид отводится заменой. Модель потока по ленте 15.09–18.10 (`TapeModel`):
+     * в часах после падения > 30 б.п. продавцы, дошедшие до нашего бида, знают больше нас — ход за 5 мин
+     * против покупки за вычетом среднего хода состояния +7…+31 б.п. у BTC и +24…+96 у ETH в тишине, доход
+     * бида отрицателен на любом отступе до 30. 0 — выключено.
+     */
+    static final double TREND_NOBID_BP = Double.parseDouble(System.getProperty("revx.exec.trend-nobid-bp", "0"));
+    static final long TREND_WIN_MS = Long.getLong("revx.exec.trend-win-sec", 3600) * 1000L;
+    private boolean trendNoBidLast;
+    private BuyQuiet buyQuiet;
+    private final long[] fairHistTs = new long[8192];
+    private final double[] fairHistPx = new double[8192];
+    private int fairHistN;
+    private int fairHistHead;
+    private boolean quietLast;
+    private long quietTicks;
+    private long quietCheckedMs;                        // 0, а не MIN_VALUE: «сейчас − MIN_VALUE» переполняется
+    private int quietCount = -1;
+
+    /**
+     * ТИШИНА В ПОКУПКАХ ({@link BuyQuiet}): за скользящий час до опоры + {@code quiet-x-bp} дошло меньше
+     * {@code quiet-min} покупок-тейкеров. Тогда купленное сверх цели не продаётся (поток держится, лента
+     * 15.09–18.10: в 38–61% следующих часов не доходит ни одной), а направление цены не предсказывается —
+     * докупка только везёт запас. Два режима, по умолчанию оба выключены: {@code quiet-nobuy} (А) и
+     * {@code quiet-shift-bp} (Б).
+     */
+    public void buyQuiet(BuyQuiet watch) {
+        this.buyQuiet = watch;
+    }
+
+    private void rememberFair(long now, double f) {
+        if (!(f > 0)) {
+            return;
+        }
+        int last = (fairHistHead + fairHistN - 1) & 8191;
+        if (fairHistN > 0 && now - fairHistTs[last] < 1000) {
+            return;
+        }
+        int at = (fairHistHead + fairHistN) & 8191;
+        if (fairHistN == 8192) {
+            fairHistHead = (fairHistHead + 1) & 8191;
+            at = (fairHistHead + 8191) & 8191;
+        } else {
+            fairHistN++;
+        }
+        fairHistTs[at] = now;
+        fairHistPx[at] = f;
+    }
+
+    /** Опора на момент {@code t}: последняя записанная не позже; раньше истории — 0 (принт не засчитан). */
+    private double fairAt(long t) {
+        int lo = 0, hi = fairHistN;
+        while (lo < hi) {
+            int m = (lo + hi) >>> 1;
+            if (fairHistTs[(fairHistHead + m) & 8191] <= t) {
+                lo = m + 1;
+            } else {
+                hi = m;
+            }
+        }
+        return lo == 0 ? 0 : fairHistPx[(fairHistHead + lo - 1) & 8191];
+    }
+
+    /** Тихо ли сейчас; пересчёт не чаще раза в 5 с, переходы — в журнал. */
+    private boolean quiet(long now) {
+        if (buyQuiet == null) {
+            return false;
+        }
+        if (fairHistN == 0 || now - fairHistTs[fairHistHead] < QUIET_WIN_MS) {
+            return false;                              // истории опоры меньше окна — не судим
+        }
+        if (now - quietCheckedMs >= 5000) {
+            quietCheckedMs = now;
+            quietCount = buyQuiet.reached(now, QUIET_WIN_MS, QUIET_X_BP, this::fairAt);
+        }
+        boolean q = quietCount >= 0 && quietCount < QUIET_MIN;
+        if (q != quietLast) {
+            quietLast = q;
+            journal.event(q ? "quiet_on" : "quiet_off", String.format(java.util.Locale.ROOT,
+                    "%s: до опоры +%.0f б.п. за %d мин дошло покупок %d (порог %d), запас %s",
+                    symbol, QUIET_X_BP, QUIET_WIN_MS / 60_000, quietCount, QUIET_MIN, fmt(inventory)));
+        }
+        if (q) {
+            quietTicks++;
+        }
+        return q;
+    }
+
+    public long quietTicks() {
+        return quietTicks;
+    }
+
+    private double skewTargetInventory() {
+        return params.skewTarget() * params.inventoryCap();
+    }
+
     public void sweepWatch(SweepWatch watch) {
         this.sweeps = watch;
     }
@@ -1362,6 +2044,18 @@ public final class QuoteLoop implements Runnable {
             // Живая своя книга — для очереди перед надкушенной заявкой; в ней стоим и мы сами.
             this.bookSource = h::bookNow;
             this.bookHasOwn = true;
+            if (h.ws() != null) {
+                // Бинанс по websocket (сухой прогон SOL 15.10): тик будит ход Бинанса, как у пилота.
+                this.fast = h.ws();
+                h.onPrice(this::onFastPrice);
+            }
+        }
+        if (stand instanceof FastBnbFair fb) {
+            // Быстрая опора будит тик сама (пилот ADA): см. onFastPrice и run.
+            this.fast = fb;
+            this.bookSource = fb::bookNow;
+            this.bookHasOwn = true;
+            fb.onPrice(this::onFastPrice);
         }
         this.journal = journal;
         this.params = params;
@@ -1623,6 +2317,9 @@ public final class QuoteLoop implements Runnable {
         // ExecStopPost выполняется и после SIGKILL, так что покрытие не теряется,
         // а если Park не справится, он снимет заявки сам.
         quoting.set(false);
+        synchronized (wakeLock) {
+            wakeLock.notifyAll();         // цикл на быстрой опоре ждёт события — разбудить, чтобы вышел
+        }
     }
 
     /** Метка бота: суточный лимит постановок у каждого свой (см. {@link ExecLimits}). */
@@ -1716,6 +2413,15 @@ public final class QuoteLoop implements Runnable {
                 log.error("тик упал: {}", e.toString());
                 journal.event("tick_error", e.toString());
             }
+            if (fast != null) {
+                try {
+                    awaitWake(started);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                continue;
+            }
             long sleep = periodMs - (clock.now() - started);
             if (sleep > 0) {
                 try {
@@ -1725,6 +2431,198 @@ public final class QuoteLoop implements Runnable {
                     return;
                 }
             }
+        }
+    }
+
+    // ------------------------------------------------ быстрая опора от Бинанса (пилот ADA)
+
+    /**
+     * 🔑 ТИК ОТ СОБЫТИЯ БИНАНСА, А НЕ ПО ЧАСАМ (пилот ADA, 15.10.2026). С быстрой опорой
+     * ({@link FastBnbFair}) тик будит новая цена Бинанса, если опора ушла от цены
+     * последнего тика на {@link #WAKE_BP} и больше. Таймер {@code periodMs} остаётся
+     * страховкой. Между тиками не меньше {@link #WAKE_MIN_MS}: одна замена за тик,
+     * значит у бота не больше 1000/{@code WAKE_MIN_MS} замен в секунду при лимите
+     * площадки 10/с на весь аккаунт (шесть ботов тратят в среднем 2.3, 99% секунд — до 7).
+     *
+     * Поток котировщика один, поэтому отмена на рывке никогда не обгоняет замену той же
+     * заявки: событие ждёт конца текущего тика.
+     */
+    static final double WAKE_BP = Double.parseDouble(System.getProperty("revx.exec.wake-bp", "2"));
+    static final long WAKE_MIN_MS = Long.getLong("revx.exec.wake-min-ms", 400L);
+    private FastBnbFair fast;
+    private final Object wakeLock = new Object();
+    private boolean wakePending;
+    private volatile double tickFair;
+    private long wakeups;
+
+    private void onFastPrice(double p) {
+        double ref = tickFair;
+        if (!(ref > 0) || Math.abs(p / ref - 1) * 1e4 >= WAKE_BP) {
+            synchronized (wakeLock) {
+                wakePending = true;
+                wakeLock.notifyAll();
+            }
+        }
+    }
+
+    private void awaitWake(long started) throws InterruptedException {
+        synchronized (wakeLock) {
+            while (alive) {
+                long now = clock.now();
+                long deadline = started + periodMs;
+                long earliest = started + WAKE_MIN_MS;
+                if (now >= deadline) {
+                    break;
+                }
+                if (wakePending && now >= earliest) {
+                    wakeups++;
+                    break;
+                }
+                wakeLock.wait(Math.max(1, (wakePending ? earliest : deadline) - now));
+            }
+            wakePending = false;
+        }
+    }
+
+    public long wakeups() {
+        return wakeups;
+    }
+
+    /**
+     * 🔑 РЫВОК — ОТМЕНА, А НЕ ЗАМЕНА (пилот ADA). Опора за {@link #JUMP_WINDOW_MS} ушла
+     * против стороны на {@link #JUMP_BP} и больше — заявка этой стороны снимается
+     * {@code DELETE} (медиана 54 мс против 175 у замены, живые боты 11–14.10), и сторона
+     * не котируется, пока опора {@link #JUMP_CALM_MS} не продолжит рывок. Вернуться
+     * раньше {@code QUIET_MS} слот всё равно не даст: снятая заявка ждёт судьбы.
+     *
+     * Плохие покупки на стенде шли в пределах секунды после рывка Бинанса (−19 б.п. в
+     * среднем); у ADA рывков ≥ 20 б.п. за секунду ~9 в сутки на сторону, то есть ~18
+     * постановок на возврат. 0 — выключено.
+     */
+    static final double JUMP_BP = Double.parseDouble(System.getProperty("revx.exec.jump-bp", "0"));
+    static final long JUMP_WINDOW_MS = Long.getLong("revx.exec.jump-window-ms", 1000L);
+    static final long JUMP_CALM_MS = Long.getLong("revx.exec.jump-calm-ms", 2000L);
+    private double jumpBp = JUMP_BP;
+    private long jumpWindowMs = JUMP_WINDOW_MS;
+    private long jumpCalmMs = JUMP_CALM_MS;
+    private long bidJumpUntil;
+    private long askJumpUntil;
+    private long jumpCancels;
+
+    /** Порог рывка у этого бота (тест; живьём — системные свойства). */
+    public void jumpGuard(double bp, long windowMs, long calmMs) {
+        this.jumpBp = bp;
+        this.jumpWindowMs = windowMs;
+        this.jumpCalmMs = calmMs;
+    }
+
+    public long jumpCancels() {
+        return jumpCancels;
+    }
+
+    private Quoter.Quotes jumpGuard(Quoter.Quotes t) {
+        if (fast == null || !(jumpBp > 0)) {
+            return t;
+        }
+        long now = clock.now();
+        double[] mv = fast.moves(now, jumpWindowMs);
+        if (mv[0] >= jumpBp) {
+            bidJumpUntil = now + jumpCalmMs;
+        }
+        if (mv[1] >= jumpBp) {
+            askJumpUntil = now + jumpCalmMs;
+        }
+        Double bid = t.bid();
+        Double ask = t.ask();
+        if (now < bidJumpUntil) {
+            for (Resting r : bids) {
+                if (r.venueId != null) {
+                    jumpCancels++;
+                    cancel(Side.BUY, r, String.format(java.util.Locale.ROOT,
+                            "рывок Бинанса −%.1f б.п. за %d мс", mv[0], jumpWindowMs));
+                }
+            }
+            bid = null;
+        }
+        if (now < askJumpUntil) {
+            for (Resting r : asks) {
+                if (r.venueId != null) {
+                    jumpCancels++;
+                    cancel(Side.SELL, r, String.format(java.util.Locale.ROOT,
+                            "рывок Бинанса +%.1f б.п. за %d мс", mv[1], jumpWindowMs));
+                }
+            }
+            ask = null;
+        }
+        return bid == t.bid() && ask == t.ask() ? t : new Quoter.Quotes(bid, ask);
+    }
+
+    /**
+     * СВОЙ ОТСТУП АСКА (пилот ADA): покупка на опоре −30, продажа на опоре +20. Аск
+     * сдвигается на разность отступов, скос (если он есть) сохраняется. 0 — как у бида.
+     */
+    static final double ASK_OFFSET_BP = Double.parseDouble(System.getProperty("revx.exec.ask-offset-bp", "0"));
+
+    private double askOffsetBp = ASK_OFFSET_BP;
+
+    /** Свой отступ аска у этого бота (тест; живьём — системное свойство). */
+    public void askOffsetBp(double bp) {
+        this.askOffsetBp = bp;
+    }
+
+    private Quoter.Quotes askOffset(Quoter.Quotes t, double fairPx) {
+        if (!(askOffsetBp > 0) || t.ask() == null) {
+            return t;
+        }
+        return new Quoter.Quotes(t.bid(), t.ask() + fairPx * (askOffsetBp / 1e4 - params.offset()));
+    }
+
+    /**
+     * 🔑 СТОП ПО СУММЕ СПОТ + БУМАЖНЫЙ ХЕДЖ (пилот ADA, решение владельца 14.10.2026).
+     * Убыток спота у бота под хеджем закрыт шортом, и стоп по одному споту глушил бы его
+     * на каждом обвале (стенд SUI 12.10). Бот сам ведёт бумажный шорт: позиция = −запас,
+     * округлённый ВНИЗ до {@link #HEDGE_PAPER_STEP} (шаг контракта перпа Kraken, у ADA
+     * 1 монета), переоценка по опоре на каждом тике, пошлина {@link #HEDGE_PAPER_FEE_BP}
+     * с каждого изменения. Его итог добавляется к торговому результату в
+     * {@link #checkTradingPnl}. 0 — выключено, стоп по одному споту, как прежде.
+     */
+    static final double HEDGE_PAPER_STEP = Double.parseDouble(System.getProperty("revx.exec.hedge-paper-step", "0"));
+    static final double HEDGE_PAPER_FEE_BP = Double.parseDouble(System.getProperty("revx.exec.hedge-paper-fee-bp", "6"));
+    private double hedgePaperStep = HEDGE_PAPER_STEP;
+    private double paperShort;
+
+    /** Шаг бумажного хеджа у этого бота (тест; живьём — системное свойство). */
+    public void hedgePaperStep(double step) {
+        this.hedgePaperStep = step;
+    }
+    private double paperPx;
+    private double paperPnl;
+    private double paperFees;
+    private long paperTrades;
+
+    /** Итог бумажного хеджа с запуска процесса: переоценка шорта минус пошлина. */
+    public double paperHedgePnl() {
+        return paperPnl - paperFees;
+    }
+
+    public String paperHedgeState() {
+        return String.format(java.util.Locale.ROOT, "шорт %s, доход %+.4f, пошлина %.4f, сделок %d",
+                fmt(paperShort), paperPnl, paperFees, paperTrades);
+    }
+
+    private void paperHedgeTick(double px) {
+        if (!(hedgePaperStep > 0) || !(px > 0)) {
+            return;
+        }
+        if (paperPx > 0) {
+            paperPnl += paperShort * (px - paperPx);
+        }
+        paperPx = px;
+        double want = -Math.floor(Math.max(0, inventory) / hedgePaperStep + 1e-9) * hedgePaperStep;
+        if (Math.abs(want - paperShort) > 1e-12) {
+            paperFees += Math.abs(want - paperShort) * px * HEDGE_PAPER_FEE_BP / 1e4;
+            paperShort = want;
+            paperTrades++;
         }
     }
 
@@ -1826,9 +2724,15 @@ public final class QuoteLoop implements Runnable {
     private double reinvBuffer;
     private double reinvSeen;
 
-    private void reinvBufferStep(double capital) {
-        double d = reinvRealised - reinvSeen;
-        reinvSeen = reinvRealised;
+    /**
+     * {@code buffereq} (владелец, 11.10.2026): тот же буфер, но приросты считаются по
+     * КАПИТАЛУ С БУМАЖНЫМ — реализованное + запас по опоре против средней входа. На
+     * падении просадка запаса списывается из буфера сразу, а не когда бот продаст: в
+     * сквиз 07–08.10 бот в основном держит, и реализованный счёт его почти не видит.
+     */
+    private void reinvBufferStep(double capital, double value) {
+        double d = value - reinvSeen;
+        reinvSeen = value;
         if (d > 0) {
             double room = Math.max(0, capital * REINVEST_BUFFER_PCT / 100 - reinvBuffer);
             double toBuffer = Math.min(d * REINVEST_BUFFER_SHARE, room);
@@ -1848,10 +2752,12 @@ public final class QuoteLoop implements Runnable {
         double c0 = LOT_USD * capLots;
         if (Double.isNaN(reinvCapital) || now - reinvAtMs >= REINVEST_MS) {
             if ("buffer".equals(REINVEST) && !Double.isNaN(reinvCapital)) {
-                reinvBufferStep(reinvCapital);
+                reinvBufferStep(reinvCapital, reinvRealised);
+            } else if ("buffereq".equals(REINVEST) && !Double.isNaN(reinvCapital)) {
+                reinvBufferStep(reinvCapital, reinvRealised + reinvPos * (price - reinvAvg));
             }
             double gain = switch (REINVEST) {
-                case "buffer" -> reinvInvested;
+                case "buffer", "buffereq" -> reinvInvested;
                 case "realised" -> reinvRealised;
                 case "half" -> reinvRealised / 2;
                 case "equity" -> reinvRealised + reinvPos * (price - reinvAvg);
@@ -1958,6 +2864,10 @@ public final class QuoteLoop implements Runnable {
         rollCounters();
         StandReader.Fair fair = stand.latest(base, 30_000);
         lastFair = fair.price();
+        tickFair = fair.price();
+        if (fair.quotable()) {
+            paperHedgeTick(fair.price());
+        }
         rememberFair(fair.price());
         lossStopTick();
         if (lossStopUntil == 0) {
@@ -2096,7 +3006,12 @@ public final class QuoteLoop implements Runnable {
         // между ними 0.012–0.053 (задача A81), то есть это разные события.
         double sweepBp = sweeps == null ? 0 : sweeps.shiftBp(clock.now());
         double flowBp = flow == null ? 0 : flow.shiftBp(clock.now());
-        double quoteFair = fair.price() * (1 + (sweepBp + flowBp) / 1e4);
+        rememberFair(clock.now(), fair.price());
+        boolean quietNow = quiet(clock.now());
+        boolean overTarget = inventory > skewTargetInventory() + 1e-12;
+        // Б: опора ниже — и аск ближе, и бид дальше на те же пункты; расстояние между ними (захват) прежнее.
+        double quietBp = quietNow && overTarget && QUIET_SHIFT_BP > 0 ? -QUIET_SHIFT_BP : 0;
+        double quoteFair = fair.price() * (1 + (sweepBp + flowBp + quietBp) / 1e4);
         if (sweepBp != 0) {
             SweepWatch.Sweep sw = sweeps.lastSweep(clock.now());
             if (sweeps.isNew(sw)) {
@@ -2106,10 +3021,23 @@ public final class QuoteLoop implements Runnable {
             }
         }
         Double rampTgt = rampTarget();
+        Double volTgt = rampTgt == null ? volTarget(fair.price()) : null;
+        if (rampTgt == null && newsFlat()) {
+            volTgt = -1.0;                         // перед событием: цель запаса 0, не покупать
+        }
         Quoter.Quotes target = frozenUnwind || budgetUnwind
                 ? unwindQuoter().quotes(quoteFair, inventory, drift)
                 : rampTgt != null ? rampQuoter(rampTgt).quotes(quoteFair, inventory, drift)
+                : volTgt != null ? rampQuoter(Math.max(0, volTgt)).quotes(quoteFair, inventory, drift)
                 : policy.quotes(quoteFair, inventory, drift);
+        if (volTgt != null && volTgt < 0 && !frozenUnwind && !budgetUnwind) {
+            target = new Quoter.Quotes(null, target.ask());   // ступень «не покупать»
+        }
+        Double edgeAsk = newsEdgeAsk(fair);
+        if (edgeAsk != null && !frozenUnwind && !budgetUnwind && target.ask() != null) {
+            target = new Quoter.Quotes(null, Math.min(target.ask(), edgeAsk));   // аск к краю книги
+        }
+        target = askOffset(target, quoteFair);
         if (sellOnly) {
             target = new Quoter.Quotes(null, target.ask());   // бид снимается, аск — заменами
         }
@@ -2167,6 +3095,40 @@ public final class QuoteLoop implements Runnable {
         target = decayAsk(target, fair.price(), params.offset());
         rememberVol(fair.price());
         target = volGate(target);
+        trackRush(clock.now(), fair.price());
+        target = velWiden(target, fair.price());
+        target = rangeWiden(target, fair.price(), clock.now());
+        target = slide(target, fair.price());
+        target = emaShift(target, fair.price());
+        final double driftNow = drift;
+        target = sweepPause(target, fair.price(),
+                () -> policy.quotes(fair.price(), params.inventoryCap(), driftNow).ask());
+        target = fairPause(target, fair.price(),
+                () -> policy.quotes(fair.price(), params.inventoryCap(), driftNow).ask());
+        target = crossPause(target, fair.price(),
+                () -> policy.quotes(fair.price(), params.inventoryCap(), driftNow).ask());
+        target = jumpGuard(target);
+        if (QUIET_NOBUY && quietNow && target.hasBid()
+                && inventory >= skewTargetInventory() - 1e-12 && fair.price() > 0) {
+            // А: в тишине не покупать сверх цели. Отвод, а не снятие: замена суточных постановок не тратит.
+            double far = parkDistance > 0 ? parkDistance : 0.10;
+            target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
+        }
+        if (TREND_NOBID_BP > 0 && fair.price() > 0) {
+            double past = fairAt(clock.now() - TREND_WIN_MS);
+            boolean down = past > 0 && (fair.price() / past - 1) * 1e4 < -TREND_NOBID_BP;
+            if (down != trendNoBidLast) {
+                trendNoBidLast = down;
+                journal.event(down ? "trend_nobid" : "trend_nobid_off", String.format(java.util.Locale.ROOT,
+                        "%s: опора за %d мин %+.1f б.п. (порог −%.0f) — бид %s, запас %s", symbol,
+                        TREND_WIN_MS / 60_000, past > 0 ? (fair.price() / past - 1) * 1e4 : 0, TREND_NOBID_BP,
+                        down ? "отведён" : "вернулся", fmt(inventory)));
+            }
+            if (down && target.hasBid()) {
+                double far = parkDistance > 0 ? parkDistance : 0.10;
+                target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
+            }
+        }
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
         // потом не восстановить, а именно он и сравнивается с моделью.
         //
@@ -2259,6 +3221,9 @@ public final class QuoteLoop implements Runnable {
         // Первая реализация умела только первый вариант, и на продажах он давал
         // систематический перекос: покупки шли на всех уровнях, включая дальние
         // и выгодные, а продажи почти всегда уходили по ближней цене.
+        updateStormPark(fair.price());
+        updateFallPark(fair.price());
+        updateNews();
         chooseReplaceSlot(target, fair);
         double buyRoom = buyRoom();
         for (int k = 0; k < levels; k++) {
@@ -2271,16 +3236,316 @@ public final class QuoteLoop implements Runnable {
             Double askPrice = askLevelOff(i) ? null : onTick(Side.SELL, noCross(Side.SELL,
                     levelPrice(Side.SELL, target.ask(), fair.price(), i), fair));
 
-            double cashCap = bidPrice != null && bidPrice > 0
-                    ? buyCash / bidPrice : Double.MAX_VALUE;
-            double bought = syncSide(Side.BUY, ib, bids.get(ib), bidPrice, fair.price(),
-                    Math.min(cashCap, buyRoom));
-            buyCash = Math.max(0, buyCash - bought * (bidPrice == null ? 0 : bidPrice));
-            buyRoom = Math.max(0, buyRoom - bought);
+            if (stormParks(Side.BUY, ib)) {
+                Resting r = bids.get(ib);
+                if (!STORM_PARK_PACED || mayReplace(Side.BUY, ib)) {
+                    parkSide(Side.BUY, r, lastTrustedFair * (1 - stormParkAway(ib)), "буря");
+                }
+                if (r.venueId != null && r.price > 0) {        // отведённая держит кассу и место
+                    buyCash = Math.max(0, buyCash - r.size * r.price);
+                    buyRoom = Math.max(0, buyRoom - r.size);
+                }
+            } else {
+                double cashCap = bidPrice != null && bidPrice > 0
+                        ? buyCash / bidPrice : Double.MAX_VALUE;
+                double bought = syncSide(Side.BUY, ib, bids.get(ib), bidPrice, fair.price(),
+                        Math.min(cashCap, buyRoom));
+                buyCash = Math.max(0, buyCash - bought * (bidPrice == null ? 0 : bidPrice));
+                buyRoom = Math.max(0, buyRoom - bought);
+            }
 
-            sellPool = Math.max(0,
-                    sellPool - syncSide(Side.SELL, i, asks.get(i), askPrice, fair.price(), sellPool));
+            if (stormParks(Side.SELL, i)) {
+                Resting r = asks.get(i);
+                if (!STORM_PARK_PACED || mayReplace(Side.SELL, i)) {
+                    parkSide(Side.SELL, r, lastTrustedFair * (1 + stormParkAway(i)), "буря");
+                }
+                if (r.venueId != null) {
+                    sellPool = Math.max(0, sellPool - r.size);
+                }
+            } else {
+                sellPool = Math.max(0,
+                        sellPool - syncSide(Side.SELL, i, asks.get(i), askPrice, fair.price(), sellPool));
+            }
         }
+    }
+
+    /**
+     * ПАРКОВКА БЛИЖНИХ УРОВНЕЙ В БУРЮ (владелец 16.10.2026, {@code revx.exec.storm-park-levels}=N,
+     * 0 — выключено). Живые d/e/f за 02–16.10: ближний уровень в бурю берут на 5.5–6 б.п. от опоры
+     * при маркауте −4…−6, третий — на 9–12 при итоге +5…+12 на сделку. Пока размах опоры за
+     * {@code storm-park-sec} (300) не меньше {@code storm-park-range-bp} (40), N ближних уровней
+     * ({@code storm-park-side}: bid или both) уводятся далеко заменой и стоят, дальние торгуют как
+     * обычно. После бури держим ещё {@code storm-park-hold-sec} (60), потом заявки возвращаются
+     * обычной перестановкой. Отвод — {@code storm-park-bp} от последней доверенной цены (0 — как
+     * у гейта, {@code park-distance}), каждый уровень на свою глубину.
+     */
+    static final int STORM_PARK_LEVELS = Integer.getInteger("revx.exec.storm-park-levels", 0);
+    static final boolean STORM_PARK_BOTH =
+            "both".equals(System.getProperty("revx.exec.storm-park-side", "bid"));
+    static final double STORM_PARK_RANGE_BP =
+            Double.parseDouble(System.getProperty("revx.exec.storm-park-range-bp", "40"));
+    /**
+     * ПОРОГ БУРИ ПО УРОВНЮ (владелец 17.10.2026, {@code revx.exec.storm-park-level-bp}, например
+     * {@code 30,40}): уровень i отводится, когда размах окна не меньше i-го порога (последний — для
+     * остальных паркуемых уровней), и держится свои {@code storm-park-hold-sec}. Пусто — у всех
+     * уровней общий {@code storm-park-range-bp}.
+     */
+    static final double[] STORM_PARK_LEVEL_BP = parseLevelBp(System.getProperty("revx.exec.storm-park-level-bp", ""));
+    static final long STORM_PARK_MS = Long.getLong("revx.exec.storm-park-sec", 300L) * 1000L;
+    static final long STORM_PARK_HOLD_MS = Long.getLong("revx.exec.storm-park-hold-sec", 60L) * 1000L;
+    static final double STORM_PARK_BP =
+            Double.parseDouble(System.getProperty("revx.exec.storm-park-bp", "0"));
+    /**
+     * ПАРКОВКА В ОБЩЕМ ТЕМПЕ ЗАМЕН (владелец 16.10.2026, {@code revx.exec.storm-park-paced}): без флага
+     * вход в бурю двигает все паркуемые заявки в один тик — живьём это залп мимо «одной замены за
+     * тик» при лимите 10/с на счёт. С флагом парковка идёт через {@link #chooseReplaceSlot}
+     * ступенями: 1) опасные (по ходу рынка за окно: падение — бид, рост — аск) к парковке, ближний
+     * уровень первым; 2) опасные к обычному сдвигу; 3) остальные — безопасные сдвиги и парковка
+     * безопасной стороны. Ждущая парковки заявка стоит, где стояла.
+     */
+    static final boolean STORM_PARK_PACED = Boolean.getBoolean("revx.exec.storm-park-paced");
+    /** Опора по секундам за окно бури — для направления рынка (начало окна). */
+    private final java.util.ArrayDeque<double[]> stormPath = new java.util.ArrayDeque<>();
+
+    /** Рынок за окно бури идёт вниз (опора ниже начала окна). */
+    private boolean stormFalling(double price) {
+        return fallParking || !stormPath.isEmpty() && price < stormPath.peekFirst()[1];
+    }
+
+    /**
+     * ОТВОД БИДА, ПОКА ЦЕНА ПАДАЕТ (владелец 17.10.2026, {@code revx.exec.fall-park-sec}=N, 0 — выключено).
+     * Разбор «не покупать в бурю» у одноуровневых (окно 11–15.10): покупки на падении в бурю
+     * исполняются на 17–21 б.п. ВЫШЕ опоры, но парковка по размаху за 5 мин держит бид отведённым и
+     * после дна, и бот теряет круг «купил на дне — продал на отскоке». Здесь бид (и
+     * {@code fall-park-levels} ближних уровней) уводится, пока опора ниже максимума последних N секунд
+     * на {@code fall-park-bp} и за последние {@code fall-park-stop-sec} (10) обновляла минимум окна;
+     * нет нового минимума — падение остановилось, бид сразу возвращается.
+     */
+    static final long FALL_PARK_MS = Long.getLong("revx.exec.fall-park-sec", 0L) * 1000L;
+    static final double FALL_PARK_BP = Double.parseDouble(System.getProperty("revx.exec.fall-park-bp", "10"));
+    static final long FALL_PARK_STOP_MS = Long.getLong("revx.exec.fall-park-stop-sec", 10L) * 1000L;
+    static final int FALL_PARK_LEVELS = Integer.getInteger("revx.exec.fall-park-levels", 1);
+    private final java.util.ArrayDeque<double[]> fallMax = new java.util.ArrayDeque<>();
+    private final java.util.ArrayDeque<double[]> fallMin = new java.util.ArrayDeque<>();
+    private long fallLastSec = Long.MIN_VALUE;
+    private long fallNewLowMs = Long.MIN_VALUE / 4;
+    private boolean fallParking;
+
+    /**
+     * ЗАЩИТА ПО КАЛЕНДАРЮ (владелец 17.10.2026, {@link NewsGuard}, {@code revx.exec.news-file}): в окне
+     * [событие − {@code news-before-sec}, событие + {@code news-after-sec}] уводятся
+     * {@code news-levels} ближних уровней С ОБЕИХ сторон — скачок на статистике бывает в любую.
+     * Вход и выход пишутся событиями {@code news_park} / {@code news_clear}.
+     */
+    static final int NEWS_LEVELS = Integer.getInteger("revx.exec.news-levels", 1);
+    /**
+     * ПРИЙТИ К СОБЫТИЮ ПУСТЫМ (владелец 17.10.2026, {@code revx.exec.news-flat-sec}=N, 0 — выключено):
+     * за N секунд до события и до конца его окна бот не покупает (бид снят на всех уровнях) и
+     * котирует с целью запаса 0 — скос подтягивает аск, и набранное уходит мейкером. Тейкером не
+     * продаёт: выход по рынку стоит 16 б.п., больше, чем бережёт.
+     */
+    static final long NEWS_FLAT_MS = Long.getLong("revx.exec.news-flat-sec", 0L) * 1000L;
+    private final NewsGuard newsGuard = NewsGuard.fromProperties();
+    private NewsGuard.Event newsFlatLast;
+
+    /**
+     * АСК К КРАЮ ПЕРЕД СОБЫТИЕМ (владелец 18.10.2026, {@code revx.exec.news-edge-sec}=N, 0 — выключено).
+     * Разбор окна 11–16.10: с одной лишь целью запаса 0 бот к выходу статистики пустым не приходит —
+     * перед выходом рынок тихий, и подтянутый скосом аск не берут ($3.9 запаса за 30 мин до выхода
+     * и столько же за 30 с). Здесь за N секунд до окна события и до его начала бид снят, а аск
+     * ставится на лучшую цену книги: на тик ниже лучшего аска, но не ниже лучшего бида плюс тик —
+     * мейкером, первым в очереди. Продажа идёт около середины книги, то есть отдаёт отступ.
+     */
+    static final long NEWS_EDGE_MS = Long.getLong("revx.exec.news-edge-sec", 0L) * 1000L;
+    private NewsGuard.Event newsEdgeLast;
+
+    private Double newsEdgeAsk(StandReader.Fair fair) {
+        if (newsGuard == null || NEWS_EDGE_MS <= 0 || !(fair.bookAsk() > 0) || !(fair.bookBid() > 0)) {
+            return null;
+        }
+        long now = clock.now();
+        NewsGuard.Event e = newsGuard.within(now, NEWS_EDGE_MS);
+        if (e == null || now >= e.tsMs() - newsGuard.beforeMs()) {
+            newsEdgeLast = null;
+            return null;
+        }
+        if (e != newsEdgeLast) {
+            journal.event("news_edge", String.format(java.util.Locale.ROOT,
+                    "календарь: %s в %s UTC — бид снят, аск у края книги до %s UTC",
+                    e.title(), java.time.Instant.ofEpochMilli(e.tsMs()).toString().substring(11, 16),
+                    java.time.Instant.ofEpochMilli(e.tsMs() - newsGuard.beforeMs()).toString().substring(11, 19)));
+            newsEdgeLast = e;
+        }
+        double step = Math.max(params.quoteStep(), 1e-9);
+        return Math.max(fair.bookAsk() - step, fair.bookBid() + step);
+    }
+
+    private boolean newsFlat() {
+        if (newsGuard == null || NEWS_FLAT_MS <= 0) {
+            return false;
+        }
+        NewsGuard.Event e = newsGuard.within(clock.now(), NEWS_FLAT_MS);
+        if (e != null && e != newsFlatLast) {
+            journal.event("news_flat", String.format(java.util.Locale.ROOT,
+                    "календарь: %s %s в %s UTC — покупки стоят, сбрасываю запас (цель 0) до %s UTC",
+                    e.country(), e.title(), java.time.Instant.ofEpochMilli(e.tsMs()).toString().substring(11, 16),
+                    java.time.Instant.ofEpochMilli(e.endMs()).toString().substring(11, 16)));
+        }
+        newsFlatLast = e;
+        return e != null;
+    }
+    private NewsGuard.Event newsLast;
+    private boolean newsParking;
+
+    private void updateNews() {
+        if (newsGuard == null) {
+            return;
+        }
+        NewsGuard.Event e = newsGuard.active(clock.now());
+        newsParking = e != null;
+        if (e != newsLast) {
+            if (e != null) {
+                journal.event("news_park", String.format(java.util.Locale.ROOT,
+                        "календарь: %s %s в %s UTC — увожу %d ближн. ур. с обеих сторон",
+                        e.country(), e.title(), java.time.Instant.ofEpochMilli(e.tsMs()).toString().substring(11, 16),
+                        NEWS_LEVELS));
+            } else {
+                journal.event("news_clear", "окно статистики прошло — уровни возвращаются");
+            }
+            newsLast = e;
+        }
+        if (newsParking) {
+            stormParkTicks++;
+        }
+    }
+
+    private void updateFallPark(double price) {
+        if (FALL_PARK_MS <= 0 || !(price > 0)) {
+            return;
+        }
+        long now = clock.now();
+        long sec = now / 1000;
+        long winSec = FALL_PARK_MS / 1000;
+        if (sec != fallLastSec) {
+            if (fallLastSec != Long.MIN_VALUE && sec - fallLastSec > winSec) {
+                fallMax.clear();
+                fallMin.clear();
+            }
+            fallLastSec = sec;
+            while (!fallMax.isEmpty() && fallMax.peekFirst()[0] <= sec - winSec) {
+                fallMax.pollFirst();
+            }
+            while (!fallMin.isEmpty() && fallMin.peekFirst()[0] <= sec - winSec) {
+                fallMin.pollFirst();
+            }
+            if (!fallMin.isEmpty() && price < fallMin.peekFirst()[1]) {
+                fallNewLowMs = now;                   // новый минимум окна — падение продолжается
+            }
+            while (!fallMax.isEmpty() && fallMax.peekLast()[1] <= price) {
+                fallMax.pollLast();
+            }
+            fallMax.addLast(new double[]{sec, price});
+            while (!fallMin.isEmpty() && fallMin.peekLast()[1] >= price) {
+                fallMin.pollLast();
+            }
+            fallMin.addLast(new double[]{sec, price});
+        }
+        double hi = fallMax.peekFirst()[1];
+        fallParking = (hi - price) / hi * 1e4 >= FALL_PARK_BP && now - fallNewLowMs <= FALL_PARK_STOP_MS;
+        if (fallParking) {
+            stormParkTicks++;
+        }
+    }
+
+    private final java.util.ArrayDeque<double[]> stormMax = new java.util.ArrayDeque<>();
+    private final java.util.ArrayDeque<double[]> stormMin = new java.util.ArrayDeque<>();
+    private long stormFirstSec = Long.MIN_VALUE;
+    private long stormLastSec = Long.MIN_VALUE;
+    private long stormUntilMs;
+    private final long[] stormUntilLevelMs = new long[Math.max(1, STORM_PARK_LEVEL_BP.length)];
+    private long stormParkTicks;
+
+    /** Тиков с парковкой (стенд печатает в итоге). */
+    public long stormParkTicks() {
+        return stormParkTicks;
+    }
+
+    /** Размах опоры за окно монотонными очередями, точка в секунду; буря продлевает парковку. */
+    private void updateStormPark(double price) {
+        if (STORM_PARK_LEVELS <= 0 || !(price > 0)) {
+            return;
+        }
+        long now = clock.now();
+        long sec = now / 1000;
+        long winSec = STORM_PARK_MS / 1000;
+        if (sec != stormLastSec) {
+            if (stormLastSec != Long.MIN_VALUE && sec - stormLastSec > winSec) {
+                stormMax.clear();
+                stormMin.clear();
+                stormPath.clear();
+                stormFirstSec = Long.MIN_VALUE;
+            }
+            stormLastSec = sec;
+            if (stormFirstSec == Long.MIN_VALUE) {
+                stormFirstSec = sec;
+            }
+            while (!stormMax.isEmpty() && stormMax.peekLast()[1] <= price) {
+                stormMax.pollLast();
+            }
+            stormMax.addLast(new double[]{sec, price});
+            while (!stormMin.isEmpty() && stormMin.peekLast()[1] >= price) {
+                stormMin.pollLast();
+            }
+            stormMin.addLast(new double[]{sec, price});
+            stormPath.addLast(new double[]{sec, price});
+            while (stormPath.peekFirst()[0] <= sec - winSec) {
+                stormPath.pollFirst();
+            }
+            while (stormMax.peekFirst()[0] <= sec - winSec) {
+                stormMax.pollFirst();
+            }
+            while (stormMin.peekFirst()[0] <= sec - winSec) {
+                stormMin.pollFirst();
+            }
+        }
+        if (sec - stormFirstSec < winSec / 2) {
+            return;                                   // окно не набрано
+        }
+        double hi = stormMax.peekFirst()[1];
+        double lo = stormMin.peekFirst()[1];
+        double range = (hi - lo) / ((hi + lo) / 2) * 1e4;
+        if (STORM_PARK_LEVEL_BP.length > 0) {
+            for (int i = 0; i < STORM_PARK_LEVEL_BP.length; i++) {
+                if (range >= STORM_PARK_LEVEL_BP[i]) {
+                    stormUntilLevelMs[i] = now + STORM_PARK_HOLD_MS;
+                    stormUntilMs = Math.max(stormUntilMs, stormUntilLevelMs[i]);
+                }
+            }
+        } else if (range >= STORM_PARK_RANGE_BP) {
+            stormUntilMs = now + STORM_PARK_HOLD_MS;
+        }
+        if (now < stormUntilMs) {
+            stormParkTicks++;
+        }
+    }
+
+    /** Паркуется ли этот слот сейчас. */
+    private boolean stormParks(Side side, int level) {
+        if (fallParking && side == Side.BUY && level < FALL_PARK_LEVELS && lastTrustedFair > 0) {
+            return true;
+        }
+        if (newsParking && level < NEWS_LEVELS && lastTrustedFair > 0) {
+            return true;
+        }
+        long until = STORM_PARK_LEVEL_BP.length > 0
+                ? stormUntilLevelMs[Math.min(level, STORM_PARK_LEVEL_BP.length - 1)] : stormUntilMs;
+        return STORM_PARK_LEVELS > 0 && level < STORM_PARK_LEVELS && clock.now() < until
+                && lastTrustedFair > 0 && (side == Side.BUY || STORM_PARK_BOTH);
+    }
+
+    private double stormParkAway(int level) {
+        double base = STORM_PARK_BP > 0 ? STORM_PARK_BP / 1e4 : parkDistance > 0 ? parkDistance : 0.05;
+        return base + level * levelStep;
     }
 
     /**
@@ -2312,27 +3577,106 @@ public final class QuoteLoop implements Runnable {
     private void chooseReplaceSlot(Quoter.Quotes target, StandReader.Fair fair) {
         replaceSlotSide = null;
         replaceSlotLevel = -1;
-        double best = 0;
+        extraSlots.clear();
+        java.util.List<double[]> cand = new java.util.ArrayList<>(); // {сторона 0/1, уровень, вес, расхождение}
+        boolean falling = stormFalling(fair.price());
         for (int i = 0; i < levels; i++) {
-            best = considerSlot(Side.BUY, i, bids.get(i),
-                    onTick(Side.BUY, noCross(Side.BUY,
-                            levelPrice(Side.BUY, target.bid(), fair.price(), i), fair)),
-                    best);
-            best = considerSlot(Side.SELL, i, asks.get(i),
-                    askLevelOff(i) ? null : onTick(Side.SELL, noCross(Side.SELL,
-                            levelPrice(Side.SELL, target.ask(), fair.price(), i), fair)),
-                    best);
+            // запаркованный в бурю слот замену тика не забирает — он стоит; при storm-park-paced
+            // ещё не отведённый слот претендует на замену ради самой парковки
+            if (stormParks(Side.BUY, i)) {
+                considerPark(Side.BUY, i, bids.get(i), lastTrustedFair * (1 - stormParkAway(i)), falling, cand);
+            } else {
+                considerSlot(Side.BUY, i, bids.get(i), onTick(Side.BUY, noCross(Side.BUY,
+                        levelPrice(Side.BUY, target.bid(), fair.price(), i), fair)), cand);
+            }
+            if (stormParks(Side.SELL, i)) {
+                considerPark(Side.SELL, i, asks.get(i), lastTrustedFair * (1 + stormParkAway(i)), !falling, cand);
+            } else {
+                considerSlot(Side.SELL, i, asks.get(i),
+                        askLevelOff(i) ? null : onTick(Side.SELL, noCross(Side.SELL,
+                                levelPrice(Side.SELL, target.ask(), fair.price(), i), fair)),
+                        cand);
+            }
+        }
+        markStarving(cand);
+        if (cand.isEmpty()) {
+            return;
+        }
+        if (DANGER_LEVEL_BP.length > 0) {
+            // опасные — первыми, среди них ближний уровень первым; безопасные — по расхождению
+            cand.sort((x, y) -> x[4] != y[4] ? Double.compare(y[4], x[4])
+                    : x[4] > 0 && x[1] != y[1] ? Double.compare(x[1], y[1])
+                    : Double.compare(y[3], x[3]));
+        } else {
+            cand.sort((x, y) -> Double.compare(y[2], x[2]));
+        }
+        if (STARVE_MS > 0 || STARVE_BP > 0) {
+            // голодающая безопасная обгоняет всех (устойчивая сортировка: среди голодающих — прежний порядок)
+            cand.sort((x, y) -> Double.compare(y[5], x[5]));
+        }
+        if (STORM_PARK_PACED) {
+            // ступени: опасная к парковке (ближний уровень первым) → опасная к сдвигу → остальные
+            cand.sort((x, y) -> {
+                int tx = parkTier(x);
+                int ty = parkTier(y);
+                if (tx != ty) {
+                    return Integer.compare(ty, tx);
+                }
+                return tx == 3 ? Double.compare(x[1], y[1]) : 0;
+            });
+        }
+        replaceSlotSide = cand.get(0)[0] == 0 ? Side.BUY : Side.SELL;
+        replaceSlotLevel = (int) cand.get(0)[1];
+        if (STARVE_MS > 0 || STARVE_BP > 0) {
+            waitSinceMs.put(slotKey(replaceSlotSide, replaceSlotLevel), clock.now());
+        }
+        if (EXTRA_REPLACE_CAP <= 0) {
+            return;
+        }
+        long now = clock.now();
+        if (extraRefillMs == 0) {
+            extraRefillMs = now;
+        }
+        long steps = (now - extraRefillMs) / EXTRA_REPLACE_MS;
+        if (steps > 0) {
+            extraTokens = Math.min(EXTRA_REPLACE_CAP, extraTokens + steps);
+            extraRefillMs += steps * EXTRA_REPLACE_MS;
+        }
+        for (int k = 1; k < cand.size() && extraTokens >= 1; k++) {
+            if (DANGER_LEVEL_BP.length > 0) {
+                // из ведра — только опасные, с порогом своего уровня
+                int lv = (int) cand.get(k)[1];
+                double thr = DANGER_LEVEL_BP[Math.min(lv, DANGER_LEVEL_BP.length - 1)];
+                if (cand.get(k)[4] == 0 || cand.get(k)[3] * 1e4 < thr) {
+                    continue;
+                }
+            } else if (cand.get(k)[3] * 1e4 < EXTRA_REPLACE_MIN_BP) {
+                continue;
+            }
+            int key = slotKey(cand.get(k)[0] == 0 ? Side.BUY : Side.SELL, (int) cand.get(k)[1]);
+            extraSlots.add(key);
+            waitSinceMs.computeIfPresent(key, (kk, v) -> now);
+            extraTokens--;
+            extraReplaces++;
         }
     }
 
-    /** Претендент на замену: годится ли и насколько он разошёлся с целью. */
-    private double considerSlot(Side side, int level, Resting resting, Double targetPrice,
-                                double best) {
+    /**
+     * Претендент на замену: годится ли и насколько он разошёлся с целью.
+     *
+     * ПРИОРИТЕТ ОПАСНОЙ СТОРОНЫ (идея владельца 15.10.2026, {@code revx.exec.replace-danger-first}):
+     * первой двигается заявка, к которой рынок идёт, — бид выше цели, аск ниже цели. Её
+     * исполнят первой и по худшей цене; заявка, от которой рынок ушёл, теряет только
+     * исполнение. Прибор качества сделки показал, что у трёхуровневых d/e/f заявка в момент
+     * исполнения стоит на 1.6–2.2 б.п. ближе к рынку, чем их собственная цель.
+     */
+    private void considerSlot(Side side, int level, Resting resting, Double targetPrice,
+                              java.util.List<double[]> cand) {
         if (resting.venueId == null || targetPrice == null || !(resting.price > 0)) {
-            return best;                 // нечего заменять: заявки нет
+            return;                      // нечего заменять: заявки нет
         }
         if (clock.now() < resting.blockedUntilMs || !quoter.shouldRequote(resting.price, targetPrice)) {
-            return best;                 // под наказанием или цена и так годная
+            return;                      // под наказанием или цена и так годная
         }
         if (resting.partial()) {
             // ⚠️ Право на замену НЕЛЬЗЯ отдавать частично исполненной заявке:
@@ -2340,20 +3684,114 @@ public final class QuoteLoop implements Runnable {
             // бота одно на тик — и достанется оно самому отставшему слоту, то
             // есть как раз тому, кого только что задело исполнение. Остальные
             // слоты при этом стояли бы с устаревшей ценой не по разу, а подряд.
-            return best;
+            return;
         }
         double divergence = Math.abs(targetPrice - resting.price) / resting.price;
-        if (divergence <= best) {
-            return best;
-        }
-        replaceSlotSide = side;
-        replaceSlotLevel = level;
-        return divergence;
+        boolean danger = side == Side.BUY ? resting.price > targetPrice : resting.price < targetPrice;
+        double weight = REPLACE_DANGER_FIRST && danger ? 1 + divergence : divergence;
+        cand.add(new double[]{side == Side.BUY ? 0 : 1, level, weight, divergence, danger ? 1 : 0, 0, 0});
     }
+
+    /** Претендент на замену ради парковки в бурю (только при storm-park-paced; уже отведённый — нет). */
+    private void considerPark(Side side, int level, Resting resting, double parkPrice, boolean danger,
+                              java.util.List<double[]> cand) {
+        if (!STORM_PARK_PACED || alreadyParked(side, resting, parkPrice)) {
+            return;
+        }
+        int before = cand.size();
+        considerSlot(side, level, resting, parkPrice, cand);
+        if (cand.size() > before) {
+            double[] c = cand.get(cand.size() - 1);
+            c[4] = danger ? 1 : 0;           // опасность — по ходу рынка, а не по цели
+            c[6] = 1;
+        }
+    }
+
+    /** Ступень претендента: 3 — опасная к парковке, 2 — опасная к сдвигу, 1 — остальные. */
+    private static int parkTier(double[] c) {
+        boolean park = c[6] > 0;
+        boolean danger = c[4] > 0;
+        return park && danger ? 3 : !park && danger ? 2 : 1;
+    }
+
+    /**
+     * ЗАЩИТА ОТ ГОЛОДОВКИ (владелец 16.10.2026, {@code revx.exec.replace-starve-sec} и
+     * {@code -starve-bp}; 0 — выключено). При приоритете опасной стороны безопасная заявка на
+     * тренде не двигается вовсе: на росте бид стоит далеко внизу, и бот теряет покупки на отскоке
+     * (стенд 11–15.10, ETH L3: 237 → 206 покупок). Безопасная, ждущая замены дольше N секунд
+     * подряд или отставшая на X б.п., получает основную замену тика раньше опасных; после замены
+     * её ожидание начинается заново, так что опасная сторона теряет не больше тика за N секунд.
+     */
+    private void markStarving(java.util.List<double[]> cand) {
+        if (STARVE_MS <= 0 && STARVE_BP <= 0) {
+            return;
+        }
+        long now = clock.now();
+        java.util.Set<Integer> seen = new java.util.HashSet<>();
+        for (double[] c : cand) {
+            int key = slotKey(c[0] == 0 ? Side.BUY : Side.SELL, (int) c[1]);
+            seen.add(key);
+            long since = waitSinceMs.computeIfAbsent(key, k -> now);
+            boolean starving = c[4] == 0 && (STARVE_MS > 0 && now - since >= STARVE_MS
+                    || STARVE_BP > 0 && c[3] * 1e4 >= STARVE_BP);
+            c[5] = starving ? 1 : 0;
+        }
+        waitSinceMs.keySet().retainAll(seen);
+    }
+
+    static final long STARVE_MS = Long.getLong("revx.exec.replace-starve-sec", 0L) * 1000L;
+    static final double STARVE_BP =
+            Double.parseDouble(System.getProperty("revx.exec.replace-starve-bp", "0"));
+    /** С какого момента слот подряд ждёт замены (сбрасывается, когда цена годная). */
+    private final java.util.Map<Integer, Long> waitSinceMs = new java.util.HashMap<>();
 
     /** Досталось ли этой заявке право на замену в текущем тике. */
     private boolean mayReplace(Side side, int level) {
-        return replaceSlotSide == side && replaceSlotLevel == level;
+        return replaceSlotSide == side && replaceSlotLevel == level || extraSlots.contains(slotKey(side, level));
+    }
+
+    private static int slotKey(Side side, int level) {
+        return (side == Side.BUY ? 0 : 100) + level;
+    }
+
+    static final boolean REPLACE_DANGER_FIRST = Boolean.getBoolean("revx.exec.replace-danger-first");
+
+    /**
+     * СПАСАТЬ ОПАСНЫЕ ПО УРОВНЯМ (идея владельца 16.10.2026, {@code revx.exec.replace-danger-level-bp},
+     * например {@code 0.5,1,2}; пусто — выключено). Основная замена тика — опасной заявке БЛИЖНЕГО
+     * уровня (а не самой отставшей), дальше по уровням; безопасные — только когда опасных нет.
+     * Из ведра ({@code extra-replace-cap}/{@code -ms}) сверх основной спасаются только опасные
+     * заявки, приблизившиеся к рынку не меньше порога своего уровня (уровень 0, 1, 2…; последний
+     * порог — для всех дальше). Порог ведра {@code extra-replace-min-bp} при этом не действует.
+     */
+    static final double[] DANGER_LEVEL_BP = parseLevelBp(
+            System.getProperty("revx.exec.replace-danger-level-bp", ""));
+
+    static double[] parseLevelBp(String s) {
+        return s.isBlank() ? new double[0]
+                : java.util.Arrays.stream(s.split(",")).mapToDouble(Double::parseDouble).toArray();
+    }
+
+    /**
+     * ДОПОЛНИТЕЛЬНЫЕ ЗАМЕНЫ ИЗ ВЕДРА (идея владельца 15.10.2026, по умолчанию выключено).
+     * Сверх одной замены за тик бот может сдвинуть ещё заявки, разошедшиеся с целью не
+     * меньше чем на {@code extra-replace-min-bp}, — по жетону из ведра ёмкостью
+     * {@code extra-replace-cap}, жетон каждые {@code extra-replace-ms}.
+     * ⚠️ Живьём ведро должно быть ОБЩИМ на шесть ботов (лимит замен 10/с на счёт), на стенде
+     * один бот — ведро его, и темп пополнения надо брать как долю бота в общем.
+     */
+    static final int EXTRA_REPLACE_CAP = Integer.getInteger("revx.exec.extra-replace-cap", 0);
+    static final long EXTRA_REPLACE_MS = Long.getLong("revx.exec.extra-replace-ms", 500L);
+    static final double EXTRA_REPLACE_MIN_BP =
+            Double.parseDouble(System.getProperty("revx.exec.extra-replace-min-bp", "5"));
+    private final java.util.Set<Integer> extraSlots = new java.util.HashSet<>();
+    private double extraTokens = EXTRA_REPLACE_CAP;
+    private long extraRefillMs;
+    private long extraReplaces;
+
+    /** Сколько дополнительных замен выдано из ведра (стенд печатает в итоге). */
+    public long extraReplaces() {
+        return extraReplaces;
     }
 
     /**
@@ -2436,8 +3874,60 @@ public final class QuoteLoop implements Runnable {
         return behindShifts;
     }
 
+    /**
+     * Книга без НАШИХ заявок. В живой книге стоим и мы, и без вычета правило «встать за
+     * лучшей чужой» прилипало бы к собственной цене: наш аск — лучший, «встаём за ним»,
+     * и он больше не опускается к опоре +20, даже когда чужие ушли.
+     */
+    private java.util.List<org.home.data.revx.sim.BookView.Level> otherOrders(
+            java.util.List<org.home.data.revx.sim.BookView.Level> levels, java.util.List<Resting> own) {
+        if (!bookHasOwn) {
+            return levels;
+        }
+        java.util.List<double[]> mine = new java.util.ArrayList<>();
+        for (Resting r : own) {
+            if (r.venueId != null && r.price > 0) {
+                mine.add(new double[]{r.price, Math.max(0, r.size - r.partialFilled)});
+            }
+        }
+        return withoutOwn(levels, mine);
+    }
+
+    /** Вычесть свои объёмы {цена, остаток} из уровней книги; опустевшие уровни выпадают. */
+    static java.util.List<org.home.data.revx.sim.BookView.Level> withoutOwn(
+            java.util.List<org.home.data.revx.sim.BookView.Level> levels, java.util.List<double[]> mine) {
+        if (mine.isEmpty()) {
+            return levels;
+        }
+        java.util.List<org.home.data.revx.sim.BookView.Level> out = new java.util.ArrayList<>(levels.size());
+        for (org.home.data.revx.sim.BookView.Level l : levels) {
+            double q = l.qty();
+            for (double[] m : mine) {
+                if (Math.abs(m[0] - l.price()) <= 1e-12 * Math.max(1, l.price())) {
+                    q -= m[1];
+                }
+            }
+            // Допуск на округление количества площадкой: остаток в сотую долю нашего
+            // объёма — это мы сами, а не чужая заявка.
+            if (q > 1e-9 && q > 0.01 * Math.max(0, l.qty() - q)) {
+                out.add(new org.home.data.revx.sim.BookView.Level(l.price(), q));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Какие стороны встают за чужой ({@code revx.exec.behind-sides} = both | bid | ask).
+     * Пилот ADA: только аск — max(опора +20; лучший чужой аск); бид стоит на своей цене,
+     * за $250 чужого маркет-мейкера на лучшем биде он терял бы 20% объёма.
+     */
+    static final String BEHIND_SIDES = System.getProperty("revx.exec.behind-sides", "both").trim();
+
     private double behindBest(Side side, double base, double fair) {
         if (BEHIND_MODE.isBlank() || bookSource == null) {
+            return base;
+        }
+        if (side == Side.BUY ? "ask".equalsIgnoreCase(BEHIND_SIDES) : "bid".equalsIgnoreCase(BEHIND_SIDES)) {
             return base;
         }
         org.home.data.revx.sim.BookView book = bookSource.apply(clock.now());
@@ -2445,7 +3935,7 @@ public final class QuoteLoop implements Runnable {
             return base;
         }
         java.util.List<org.home.data.revx.sim.BookView.Level> levels =
-                side == Side.BUY ? book.bids() : book.asks();
+                otherOrders(side == Side.BUY ? book.bids() : book.asks(), side == Side.BUY ? bids : asks);
         if (levels.isEmpty()) {
             return base;
         }
@@ -2775,6 +4265,70 @@ public final class QuoteLoop implements Runnable {
         rampStart = 0;
         journal.event("target_ramp_end", symbol + ": цель запаса снова обычная");
         return null;
+    }
+
+    /**
+     * ЦЕЛЬ ЗАПАСА ПО ВОЛАТИЛЬНОСТИ (владелец 17.10.2026, {@code revx.exec.vol-target}, пусто — выключено).
+     * Лестница «порог размаха → цель скоса, доля потолка», например {@code 20=0.2,25=0.1,30=0,40=-1}:
+     * размах опоры за {@code vol-target-sec} (300) ≥ 20 б.п. — цель 20%, ≥ 25 — 10%, ≥ 30 — 0, ≥ 40 —
+     * цель 0 и бид снят (−1). Ниже первого порога — обычная цель. Одноуровневый бот держит запас ради
+     * быстрой перепродажи, а в сквиз она не успевает: чем резче рынок, тем меньше монеты на руках.
+     */
+    static final double[][] VOL_TARGET = parseVolTarget(System.getProperty("revx.exec.vol-target", ""));
+    static final long VOL_TARGET_MS = Long.getLong("revx.exec.vol-target-sec", 300L) * 1000L;
+    private final java.util.ArrayDeque<double[]> volPath = new java.util.ArrayDeque<>();
+    private long volTargetTicks;
+
+    public long volTargetTicks() {
+        return volTargetTicks;
+    }
+
+    static double[][] parseVolTarget(String s) {
+        if (s.isBlank()) {
+            return new double[0][];
+        }
+        return java.util.Arrays.stream(s.split(","))
+                .map(p -> p.split("="))
+                .map(p -> new double[]{Double.parseDouble(p[0].trim()), Double.parseDouble(p[1].trim())})
+                .sorted((x, y) -> Double.compare(x[0], y[0]))
+                .toArray(double[][]::new);
+    }
+
+    /** Цель скоса по размаху опоры за окно; null — обычная. Точка в секунду, окно набрано наполовину. */
+    private Double volTarget(double price) {
+        if (VOL_TARGET.length == 0 || !(price > 0)) {
+            return null;
+        }
+        long now = clock.now();
+        if (volPath.isEmpty() || now - (long) volPath.peekLast()[0] >= 1000) {
+            if (!volPath.isEmpty() && now - (long) volPath.peekLast()[0] > VOL_TARGET_MS) {
+                volPath.clear();                  // дыра длиннее окна — набираем заново
+            }
+            volPath.addLast(new double[]{now, price});
+        }
+        while (now - (long) volPath.peekFirst()[0] > VOL_TARGET_MS) {
+            volPath.pollFirst();
+        }
+        if (now - (long) volPath.peekFirst()[0] < VOL_TARGET_MS / 2) {
+            return null;
+        }
+        double hi = price;
+        double lo = price;
+        for (double[] v : volPath) {
+            hi = Math.max(hi, v[1]);
+            lo = Math.min(lo, v[1]);
+        }
+        double rangeBp = (hi - lo) / ((hi + lo) / 2) * 1e4;
+        Double out = null;
+        for (double[] step : VOL_TARGET) {
+            if (rangeBp >= step[0]) {
+                out = step[1];
+            }
+        }
+        if (out != null) {
+            volTargetTicks++;
+        }
+        return out;
     }
 
     private Quoter rampQuoter(double target) {
@@ -3490,6 +5044,10 @@ public final class QuoteLoop implements Runnable {
         // params.sizeFor учитывает асимметрию набора: покупаем медленнее, чем
         // разгружаемся (док. 98 §6). При симметричной настройке это прежний size().
         double want = params.sizeFor(side, inventory);
+        if (rangeWidenNow && RANGE_WIDEN_LOT > 0 && RANGE_WIDEN_LOT < 1
+                && (side == Side.BUY || !"bid".equals(RANGE_WIDEN_LOT_SIDE))) {
+            want *= RANGE_WIDEN_LOT;          // в бурю — дробный лот (владелец 16.10.2026)
+        }
         if (side == Side.SELL && panicSizing) {
             want = Double.MAX_VALUE;          // экстренная продажа: весь запас одной заявкой
         } else if (side == Side.SELL && ASK_LOT_MULT != 1.0) {
@@ -4455,8 +6013,23 @@ public final class QuoteLoop implements Runnable {
             }
             return null;
         }
-        unknownFate.remove(venueId);
-        return book(side, venueId, order.body());
+        UnknownFate was = unknownFate.remove(venueId);
+        String status = book(side, venueId, order.body());
+        resolvedFate(was, venueId, status, "проверка исчезнувшей");
+        return status;
+    }
+
+    /**
+     * Запись о выясненной судьбе, если заявка была под вопросом. Без неё вопрос, снятый
+     * попутным ответом 200, пропадал из журнала молча (16.10.2026: 76 из 149 за 11–15.10).
+     */
+    private void resolvedFate(UnknownFate was, String venueId, String status, String how) {
+        if (was == null) {
+            return;
+        }
+        journal.event("fate_resolved", String.format(java.util.Locale.ROOT,
+                "%s %s: судьба выяснена через %d с — %s (%s)",
+                was.side, venueId, (clock.now() - was.sinceMs) / 1000, status, how));
     }
 
     /**
@@ -5300,10 +6873,16 @@ public final class QuoteLoop implements Runnable {
         double pnl = ownPosition
                 ? tradingPnl(ownCash, seedCash, inventory, seedPosition, lastFair)
                 : tradingPnl(quoteTotal, startQuote, inventory, startInventory, lastFair);
-        if (pnl < -maxTradingLoss) {
-            String message = ("ОСТАНОВКА: торговый убыток %s USDC против buy & hold превысил "
-                    + "предел %s. Котирование выключено, заявки сняты.")
-                    .formatted(fmt(pnl), fmt(-maxTradingLoss));
+        // Под бумажным хеджем стоп смотрит на СУММУ: убыток спота закрыт шортом.
+        double hedge = hedgePaperStep > 0 ? paperHedgePnl() : 0;
+        if (pnl + hedge < -maxTradingLoss) {
+            String message = (hedgePaperStep > 0
+                    ? "ОСТАНОВКА: спот %s + бумажный хедж %s = %s USDC, предел %s (%s). "
+                            .formatted(fmt(pnl), fmt(hedge), fmt(pnl + hedge), fmt(-maxTradingLoss),
+                                    paperHedgeState())
+                    : "ОСТАНОВКА: торговый убыток %s USDC против buy & hold превысил предел %s. "
+                            .formatted(fmt(pnl), fmt(-maxTradingLoss)))
+                    + "Котирование выключено, заявки сняты.";
             log.error(message);
             journal.event("loss_stop", message);
             alert.accept(message);
@@ -7417,8 +8996,9 @@ public final class QuoteLoop implements Runnable {
         String id = r.questioned;
         Venue.Response resp = client.order(id);
         if (resp.ok() && resp.body() != null) {
-            unknownFate.remove(id);
+            UnknownFate was = unknownFate.remove(id);
             String status = book(r.qSide, id, resp.body());      // исполнение — разницей
+            resolvedFate(was, id, status, "слот под вопросом");
             if (status != null && !terminal(status)) {
                 // Жива после нашей отмены (404 на живую, 204 «на словах»): снимаем снова.
                 if (now - r.qRecancelMs >= QUESTION_RECANCEL_MS) {

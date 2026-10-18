@@ -231,7 +231,21 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
     /** В затыке каждая N-я замена — призрак, остальные — гонка (живьём 02.10: 3–4 призрака в сутки на бота). */
     static final int GHOST_EVERY = Integer.getInteger("revx.sim.ghost-every", 3);
     static final long FRESH_MS = Long.getLong("revx.sim.fresh404-ms", 6_000L);
+    /**
+     * Невидимой делается лишь каждая N-я свежая заявка затыка (17.10.2026). При N = 1 (прежнее)
+     * каждый затык рождал заявку с неизвестной судьбой: стенд w1116 — 1.2–1.4 на затык, 373–679
+     * за шесть суток, и бот минуту держал по старой цене бид, который тем временем исполнялся на
+     * −20…−90 б.п. Живые шесть ботов за те же 11–16.10: 0.08–0.16 на затык (11–37 за шесть суток),
+     * у одноуровневых ни одна не исполнилась. Отсюда N ≈ 10.
+     */
+    static final int FRESH_EVERY = Math.max(1, Integer.getInteger("revx.sim.fresh404-every", 1));
+    private long freshEligible;
     private final Map<String, Long> freshUntil = new LinkedHashMap<>();
+
+    /** Свежая заявка затыка: становится ли невидимой (каждая {@link #FRESH_EVERY}-я). */
+    private boolean makeFresh() {
+        return inVolStall() && effect("fresh404") && freshEligible++ % FRESH_EVERY == 0;
+    }
 
     private static double[] parseVolStall(String s) {
         if (s == null || s.isBlank()) {
@@ -641,7 +655,7 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
             }
         }
         live.put(o.id, o);
-        if (inVolStall() && effect("fresh404")) {
+        if (makeFresh()) {
             freshUntil.put(o.id, clock.now() + FRESH_MS);
         }
         model.placed(new FillModel.Resting(o.id, o.buy, o.price, o.size, o.createdMs));
@@ -739,9 +753,13 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         }
         // Гонка: в затык по ходу цены две замены из трёх «медленные» (старая заявка
         // живёт ещё RACE_MS и может исполниться), третья — призрак, как живьём 02.10.
-        boolean stallRace = live.containsKey(id) && inVolStall() && effect("race");
+        // {@code slow} (16.10.2026) — то же, что race, но предок снимается сразу: живьём за 11–15.10
+        // площадка 267 раз назвала предка живым после замены, и ни один из них не исполнился.
+        boolean slowOnly = !effect("race") && effect("slow");
+        boolean stallRace = live.containsKey(id) && inVolStall() && (effect("race") || slowOnly);
         boolean race = stallRace
                 && !(stallEffects.contains("ghost") && stallReplaces % GHOST_EVERY == GHOST_EVERY - 1);
+        boolean keepOld = race && !slowOnly;
         if (stallRace) {
             stallReplaces++;          // счёт ВСЕХ замен в затыке, а не только гонок
         }
@@ -759,7 +777,7 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
                     GHOST_LATENCY_MS);
         }
         Order old;
-        if (race) {
+        if (keepOld) {
             // Старая остаётся в книге (исполнима) и уходит сама через RACE_MS.
             old = live.get(id);
             hiddenUntil.put(id, clock.now() + RACE_MS);
@@ -768,7 +786,7 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         } else {
             old = live.remove(id);
             if (old != null) {
-                gone.put(id, "заменой");
+                gone.put(id, race ? "заменой (медленной)" : "заменой");
             }
         }
         if (old == null) {
@@ -778,12 +796,12 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
             return new Response(422,
                     "{\"message\":\"Cannot replace an order that is not in the 'NEW' state\"}", 0);
         }
-        if (!race) {
+        if (!keepOld) {
             model.cancelled(id);
         }
         JsonNode n = read(json);
         if (n == null) {
-            if (!race) {
+            if (!keepOld) {
                 live.put(id, old);
             }
             return new Response(400, "{\"message\":\"bad body\"}", 0);
@@ -803,7 +821,7 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         live.put(o.id, o);
         model.placed(new FillModel.Resting(o.id, o.buy, o.price, o.size, o.createdMs));
         replaces++;
-        if (inVolStall() && effect("fresh404")) {
+        if (makeFresh()) {
             freshUntil.put(o.id, clock.now() + FRESH_MS);
         }
         return new Response(200, String.format(

@@ -34,7 +34,8 @@ JOURNALS=${JOURNALS:-"/home/ubuntu/revx-exec/state/exec.db
 /home/ubuntu/revx-exec-c/state/exec-c-xrp.db
 /home/ubuntu/revx-exec-d/state/exec-d-xrp.db
 /home/ubuntu/revx-exec-e/state/exec-e-btc.db
-/home/ubuntu/revx-exec-f/state/exec-f-sol.db"}
+/home/ubuntu/revx-exec-f/state/exec-f-sol.db
+/home/ubuntu/revx-exec-g/state/exec-g-ada.db"}
 
 mkdir -p "$ARCH"
 now=$(date -u +%s)

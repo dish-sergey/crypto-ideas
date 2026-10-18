@@ -156,6 +156,11 @@ final class HybridFair {
                             + "глубины не хватило на %d, поводок к Бинансу ±%.1f б.п. держал %.2f%% тиков",
                     symbol, LEVEL_MIX, DEPTH_K, TAU_MS / 1000, done,
                     ticks.size(), gate, core.depthShort(), core.clampBp(), 100 * core.clampedShare()));
+            if (core.stormClampBp() > 0) {
+                log.warn(String.format(Locale.ROOT, "ПОВОДОК БУРИ %s: ±%.2f б.п. при размахе Бинанса ≥ %.0f б.п. — "
+                        + "%.2f%% тиков", symbol, core.stormClampBp(), core.stormRangeBp(),
+                        done == 0 ? 0 : 100.0 * core.stormSteps() / done));
+            }
             return out;
         }
         List<ReplayFair.Tick> out = new ArrayList<>(ticks.size());
@@ -264,13 +269,37 @@ final class HybridFair {
         return out;
     }
 
-    /** Закрытия секундных свечей Бинанса по открытию секунды (мс). */
+    /**
+     * Какую пару Бинанса брать: {@code USDC} — {@code <монета>USDC}, как живые боты;
+     * {@code USDT} — {@code <монета>USDT ÷ USDCUSDT} (опыт 15.10.2026: USDT в разы
+     * ликвиднее и ведёт USDC, как у пилота ADA). Файлы обеих пар — в том же каталоге.
+     */
+    static final String BNB_QUOTE = System.getProperty("revx.fair.hybrid-bnb-quote", "USDC").toUpperCase(Locale.ROOT);
+
+    /** Закрытия секундных свечей Бинанса по открытию секунды (мс), в USDC. */
     private static TreeMap<Long, Double> load(String base, long fromMs, long toMs) {
+        if (!"USDT".equals(BNB_QUOTE)) {
+            return loadSym(base + "USDC", fromMs, toMs);
+        }
+        TreeMap<Long, Double> px = loadSym(base + "USDT", fromMs, toMs);
+        TreeMap<Long, Double> rate = loadSym("USDCUSDT", fromMs, toMs);
+        TreeMap<Long, Double> m = new TreeMap<>();
+        for (var e : px.entrySet()) {
+            var r = rate.floorEntry(e.getKey());
+            if (r != null && r.getValue() > 0) {
+                m.put(e.getKey(), e.getValue() / r.getValue());
+            }
+        }
+        log.warn("ГИБРИД {}: Бинанс {}USDT ÷ USDCUSDT, секунд {}", base, base, m.size());
+        return m;
+    }
+
+    private static TreeMap<Long, Double> loadSym(String sym, long fromMs, long toMs) {
         TreeMap<Long, Double> m = new TreeMap<>();
         LocalDate d = Instant.ofEpochMilli(fromMs).atZone(ZoneOffset.UTC).toLocalDate();
         LocalDate last = Instant.ofEpochMilli(toMs).atZone(ZoneOffset.UTC).toLocalDate();
         for (; !d.isAfter(last); d = d.plusDays(1)) {
-            Path f = Path.of(DIR, base + "USDC-1s-" + d + ".zip");
+            Path f = Path.of(DIR, sym + "-1s-" + d + ".zip");
             if (!Files.exists(f)) {
                 log.warn("ГИБРИД: нет файла {}", f);
                 continue;

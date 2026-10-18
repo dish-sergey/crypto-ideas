@@ -310,6 +310,52 @@ public final class SweepWatch implements AutoCloseable {
         return best;
     }
 
+    /** Окно «обычного» потока для неожиданности свипа. */
+    public static final long SURPRISE_BASE_MS = 6 * 3_600_000L;
+    /** Окно «всплеска» для неожиданности свипа. */
+    public static final long SURPRISE_BURST_MS = 60_000L;
+
+    /**
+     * НЕОЖИДАННОСТЬ свипа: объём ЕГО стороны за минуту до конца свипа, делённый на
+     * средний объём минуты (обе стороны) за прошлые 6 часов.
+     *
+     * 🔑 Разбор 11.10.2026 (w24 и 05–11.10): чем неожиданнее свип, тем сильнее
+     * короткое продолжение — верхняя треть +2…+7 б.п. за 10–60 с, нижняя около нуля,
+     * на обоих окнах и трёх парах. Пороги терций: BTC ~5 / ~20, ETH и SOL ~10 / ~40–50.
+     * ⚠️ Считается по ленте В ПАМЯТИ (стенд); живого режима у меры нет —
+     * {@code NaN}, и пауза по нему не срабатывает.
+     */
+    public double surprise(Sweep s) {
+        if (tapeTs == null || s == null) {
+            return Double.NaN;
+        }
+        double burst = 0;
+        for (int i = lowerBound(s.endMs() - SURPRISE_BURST_MS); i < tapeTs.length && tapeTs[i] <= s.endMs(); i++) {
+            if (tapeSide[i] == s.side()) {
+                burst += tapeNotional[i];
+            }
+        }
+        double base = 0;
+        for (int i = lowerBound(s.endMs() - SURPRISE_BASE_MS); i < tapeTs.length && tapeTs[i] < s.endMs() - SURPRISE_BURST_MS; i++) {
+            base += tapeNotional[i];
+        }
+        double perMinute = base / ((SURPRISE_BASE_MS - SURPRISE_BURST_MS) / 60_000.0);
+        return burst / Math.max(perMinute, 1.0);
+    }
+
+    /** Задержка узнавания ленты, мс. */
+    public long delayMs() {
+        return delayMs;
+    }
+
+    /** Лента в память с запасом назад на окно неожиданности — для паузы после свипа. */
+    public static SweepWatch preloadedForPause(String dbPath, String symbol, double minNotional,
+                                               long chainMs, long delayMs, long fromMs, long toMs) {
+        SweepWatch w = new SweepWatch(dbPath, symbol, minNotional, chainMs, 0, 0, delayMs);
+        w.preload(fromMs - SURPRISE_BASE_MS - LOOKBACK_MS, toMs);
+        return w;
+    }
+
     /** Свип: начало, конец, знак (+1 покупатель), номинал в долларах. */
     public record Sweep(long startMs, long endMs, int side, double notional) {
     }

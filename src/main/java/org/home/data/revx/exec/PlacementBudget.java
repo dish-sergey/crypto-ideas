@@ -87,7 +87,7 @@ public final class PlacementBudget implements AutoCloseable {
      * в карте, получает {@link #FLOOR_PER_DAY}.
      */
     static final java.util.Map<String, Integer> FLOORS = parseFloors(
-            System.getProperty("revx.budget.floors", "a:80,b:80,c:80,d:160,e:160,f:160"));
+            System.getProperty("revx.budget.floors", "a:80,b:80,c:80,d:160,e:160,f:160,g:40"));
 
     static java.util.Map<String, Integer> parseFloors(String spec) {
         java.util.Map<String, Integer> m = new java.util.TreeMap<>();

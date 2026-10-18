@@ -39,7 +39,8 @@ public final class ExecLimits {
      * учёта: инвентарь общего счёта делится реестром, и ошибка в знаменателе
      * реестра, незаметная при одном боте, стала постоянной — см. задачу A42.
      */
-    public static final int BOTS_SHARING_ACCOUNT = 6;
+    // 15.10.2026 — седьмой: бот g, пилот ADA под хеджем (docs/pairs/ПИЛОТ-ADA.md).
+    public static final int BOTS_SHARING_ACCOUNT = 7;
 
     /**
      * Потолок одной заявки. Прогноз исполнений почти не зависит от размера в
@@ -195,15 +196,21 @@ public final class ExecLimits {
      * При исчерпании лимита бот не пропускает постановку, а ВЫКЛЮЧАЕТСЯ совсем —
      * упереться в него нельзя.
      */
-    public static final int PLACEMENTS_SINGLE_LEVEL = 100;
+    // 15.10.2026: 100 → 95, трёхуровневым 250 → 235 — 60 отдано пилоту g (решение владельца),
+    // сумма прежняя: 95·3 + 235·3 + 60 = 1050.
+    public static final int PLACEMENTS_SINGLE_LEVEL = 95;
 
     /** Трёхуровневому нужно втрое больше: постановка идёт на каждый слот. */
-    public static final int PLACEMENTS_THREE_LEVEL = 250;
+    public static final int PLACEMENTS_THREE_LEVEL = 235;
+
+    /** Пилот ADA под хеджем (бот g): ~15 на укусы и исполнения + ~18 на возврат после рывков. */
+    public static final int PLACEMENTS_PILOT = 60;
 
     private static final java.util.Map<String, Integer> PLACEMENTS_BY_BOT =
             java.util.Map.of("a", PLACEMENTS_SINGLE_LEVEL, "b", PLACEMENTS_SINGLE_LEVEL,
                     "c", PLACEMENTS_SINGLE_LEVEL, "d", PLACEMENTS_THREE_LEVEL,
-                    "e", PLACEMENTS_THREE_LEVEL, "f", PLACEMENTS_THREE_LEVEL);
+                    "e", PLACEMENTS_THREE_LEVEL, "f", PLACEMENTS_THREE_LEVEL,
+                    "g", PLACEMENTS_PILOT);
 
     /**
      * Сколько постановок в сутки положено этому боту.

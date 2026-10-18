@@ -6,6 +6,9 @@ import org.home.data.revx.sim.Side;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -34,21 +37,26 @@ public final class MarketData {
      * 🔑 КНИГА ПЛОТНЫМИ МАССИВАМИ (09.10.2026). Прежде каждый снимок жил списками
      * объектов {@code Level}: ~2 млн снимков × ~100 уровней за 24 дня — 200 млн мелких
      * объектов, 8–9 ГБ кучи, и два прогона длинного окна в 32 ГБ не помещались.
-     * Теперь цены и объёмы лежат в двух {@code double[]} подряд, снимок собирается в
-     * {@link BookView} только при обращении (с кэшем последнего). Значения те же до
-     * бита — {@code double}, как и были.
      * Снимок {@code i}: биды в {@code [bidOff[i], askOff[i])}, аски в
      * {@code [askOff[i], bidOff[i+1])}.
+     *
+     * 🔑 УРОВНИ ВНЕ КУЧИ (18.10.2026). Даже плотно уровни окна 15.09–17.10 — 4.5–5 ГБ на
+     * прогон (16 байт × ~300 млн), с пиком роста массивов в полтора раза, и прогоны SOL/BTC
+     * не влезли в 8 ГБ. Теперь уровни — пары {@code (цена, объём)} подряд в {@link #lv}: с
+     * кэшем это файл, отображённый в память (страницы держит ОС, читаются по курсору
+     * вперёд, прогоны одной монеты делят одни и те же страницы); без кэша — массив в
+     * куче, как раньше. Значения те же до бита — {@code double}, как и были.
      */
     private final int[] bidOff;
     private final int[] askOff;
-    private final double[] px;
-    private final double[] qty;
+    private final MemorySegment lv;
     private int tradeCursor;
     private int bookCursor;
     private int afterCursor;
     private int cachedIdx = -1;
     private BookView cached;
+
+    private static final ValueLayout.OfDouble D = ValueLayout.JAVA_DOUBLE_UNALIGNED;
 
     /**
      * Рынок из готовых рядов — для тестов.
@@ -58,40 +66,73 @@ public final class MarketData {
      * подобраны под проверку, а не на тех, где всё и так сходится.
      */
     public static MarketData of(List<MarketTrade> trades, long[] bookTs, List<BookView> books) {
-        Packer p = new Packer();
+        Packer p = new Packer(null);
         for (BookView b : books) {
             p.add(b.bids(), b.asks());
         }
-        return new MarketData(trades, bookTs, p.bidOff(), p.askOff(), p.px(), p.qty());
+        return new MarketData(trades, bookTs, p.bidOff(), p.askOff(), p.heapLevels());
     }
 
     private MarketData(List<MarketTrade> trades, long[] bookTs, int[] bidOff, int[] askOff,
-                       double[] px, double[] qty) {
+                       MemorySegment lv) {
         this.trades = trades;
         this.bookTs = bookTs;
         this.bidOff = bidOff;
         this.askOff = askOff;
-        this.px = px;
-        this.qty = qty;
+        this.lv = lv;
     }
 
-    /** Накопитель плотной книги: растущие массивы без промежуточных объектов. */
+    /**
+     * Накопитель плотной книги. Смещения снимков — растущие массивы в куче (их мало:
+     * 8 байт на снимок), уровни — либо растущий {@code double[]} пар, либо поток в файл
+     * ({@code sink}), чтобы разбор длинного окна не держал их в куче вовсе.
+     */
     private static final class Packer {
         private int n;
         private int m;
         private int[] bo = new int[1024];
         private int[] ao = new int[1024];
-        private double[] p = new double[16384];
-        private double[] q = new double[16384];
+        private double[] p;
+        private final java.nio.channels.FileChannel sink;
+        private final java.nio.ByteBuffer buf;
+
+        Packer(java.nio.channels.FileChannel sink) {
+            this.sink = sink;
+            this.p = sink == null ? new double[32768] : null;
+            this.buf = sink == null ? null
+                    : java.nio.ByteBuffer.allocateDirect(1 << 23).order(java.nio.ByteOrder.nativeOrder());
+        }
 
         void level(double price, double size) {
-            if (m == p.length) {
-                p = java.util.Arrays.copyOf(p, p.length + (p.length >> 1));
-                q = java.util.Arrays.copyOf(q, q.length + (q.length >> 1));
+            if (m == Integer.MAX_VALUE) {
+                throw new IllegalStateException("уровней книги больше 2^31 — окно слишком длинное для int-смещений");
             }
-            p[m] = price;
-            q[m] = size;
+            if (sink == null) {
+                if (2L * m + 2 > p.length) {
+                    p = java.util.Arrays.copyOf(p, Math.toIntExact(Math.min(Integer.MAX_VALUE - 8,
+                            (long) p.length + (p.length >> 1))));
+                }
+                p[2 * m] = price;
+                p[2 * m + 1] = size;
+            } else {
+                if (buf.remaining() < 16) {
+                    flush();
+                }
+                buf.putDouble(price).putDouble(size);
+            }
             m++;
+        }
+
+        void flush() {
+            buf.flip();
+            try {
+                while (buf.hasRemaining()) {
+                    sink.write(buf);
+                }
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+            buf.clear();
         }
 
         void startBids() {
@@ -133,13 +174,18 @@ public final class MarketData {
             return java.util.Arrays.copyOf(ao, n);
         }
 
-        double[] px() {
-            return p;                    // без обрезки: копия на пике удвоила бы память
+        /** Уровни в куче — без обрезки: копия на пике удвоила бы память. */
+        MemorySegment heapLevels() {
+            return MemorySegment.ofArray(p);
         }
+    }
 
-        double[] qty() {
-            return q;
-        }
+    private double px(int k) {
+        return lv.getAtIndex(D, 2L * k);
+    }
+
+    private double qty(int k) {
+        return lv.getAtIndex(D, 2L * k + 1);
     }
 
     /** Снимок {@code i} как {@link BookView}; последний собранный держится в кэше. */
@@ -149,11 +195,11 @@ public final class MarketData {
         }
         List<BookView.Level> bids = new ArrayList<>(askOff[i] - bidOff[i]);
         for (int k = bidOff[i]; k < askOff[i]; k++) {
-            bids.add(new BookView.Level(px[k], qty[k]));
+            bids.add(new BookView.Level(px(k), qty(k)));
         }
         List<BookView.Level> asks = new ArrayList<>(bidOff[i + 1] - askOff[i]);
         for (int k = askOff[i]; k < bidOff[i + 1]; k++) {
-            asks.add(new BookView.Level(px[k], qty[k]));
+            asks.add(new BookView.Level(px(k), qty(k)));
         }
         cached = new BookView(bids, asks);
         cachedIdx = i;
@@ -168,7 +214,7 @@ public final class MarketData {
      * пару по нескольким отступам и двум моделям, поэтому копия обязательна.
      */
     public MarketData fresh() {
-        return new MarketData(trades, bookTs, bidOff, askOff, px, qty);
+        return new MarketData(trades, bookTs, bidOff, askOff, lv);
     }
 
     public int tradeCount() {
@@ -287,10 +333,198 @@ public final class MarketData {
      * исполнения не вызывает (ТЗ §4.3): трактовать неизвестное в свою пользу
      * нельзя, а в чужую — можно и нужно.
      */
+    /** Принты мельче этого номинала стенд не видит ({@code -Drevx.sim.min-print-usd}, 0 — все). */
+    static final double MIN_PRINT_USD = Double.parseDouble(System.getProperty("revx.sim.min-print-usd", "0"));
+
+
+    /**
+     * КЭШ РЫНКА (17.10.2026, {@code -Drevx.forecast.cache-dir}): разбор книги окна w24 — 7 минут
+     * на каждый прогон (текст глубины в числа), а результат у всех прогонов окна одинаков.
+     * Ключ: база (путь, размер, время изменения), пара, окно, порог мелких принтов.
+     *
+     * Два файла (18.10.2026, формат 2): {@code .bin} — лента и смещения снимков, читается в
+     * кучу; {@code .bin.lv} — уровни книги парами {@code (цена, объём)} в порядке байт машины,
+     * отображается в память и в кучу не грузится. Первый прогон пишет уровни сразу в файл,
+     * по ходу разбора базы, так что и он не держит книгу в куче. {@code .bin} пишется
+     * последним — его наличие значит, что {@code .lv} целый.
+     */
     public static MarketData load(String standDbPath, String symbol, long fromMs, long toMs) {
+        String dir = System.getProperty("revx.forecast.cache-dir", "");
+        if (dir.isBlank()) {
+            return loadDb(standDbPath, symbol, fromMs, toMs, null);
+        }
+        java.nio.file.Path file;
+        try {
+            java.nio.file.Path db = java.nio.file.Path.of(standDbPath);
+            String key = "v2|" + db.toAbsolutePath().normalize() + "|" + java.nio.file.Files.size(db) + "|"
+                    + java.nio.file.Files.getLastModifiedTime(db).toMillis() + "|" + symbol + "|" + fromMs + "|"
+                    + toMs + "|" + MIN_PRINT_USD;
+            byte[] h = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(key.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            file = java.nio.file.Path.of(dir, "market-" + symbol.replace('/', '-') + "-"
+                    + java.util.HexFormat.of().formatHex(h, 0, 8) + ".bin");
+        } catch (Exception e) {
+            log.warn("кэш рынка: ключ не посчитан ({}) — читаю базу", e.getMessage());
+            return loadDb(standDbPath, symbol, fromMs, toMs, null);
+        }
+        if (java.nio.file.Files.exists(file) && java.nio.file.Files.exists(levelsPath(file))) {
+            try {
+                MarketData m = readCache(file);
+                log.warn("кэш рынка {}: сделок {}, снимков книги {}", symbol, m.trades.size(), m.bookTs.length);
+                return m;
+            } catch (Exception e) {
+                log.warn("кэш рынка {} не прочитан ({}) — читаю базу", file.getFileName(), e.getMessage());
+            }
+        }
+        try {
+            java.nio.file.Files.createDirectories(file.getParent());
+            java.nio.file.Path tmpLv = java.nio.file.Files.createTempFile(file.getParent(),
+                    file.getFileName().toString() + ".lv", ".tmp");
+            MarketData m;
+            try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(tmpLv,
+                    java.nio.file.StandardOpenOption.WRITE, java.nio.file.StandardOpenOption.TRUNCATE_EXISTING)) {
+                m = loadDb(standDbPath, symbol, fromMs, toMs, ch);
+            }
+            java.nio.file.Files.move(tmpLv, levelsPath(file), java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            java.nio.file.Path tmp = java.nio.file.Files.createTempFile(file.getParent(),
+                    file.getFileName().toString(), ".tmp");
+            m.writeBin(tmp);
+            java.nio.file.Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            log.warn("кэш рынка записан: {}", file.getFileName());
+            return readCache(file);
+        } catch (Exception e) {
+            log.warn("кэш рынка не записан ({}) — читаю базу в кучу", e.toString());
+            return loadDb(standDbPath, symbol, fromMs, toMs, null);
+        }
+    }
+
+    private static final int CACHE_MAGIC = 0x4D4B5432;   // "MKT2"
+
+    static java.nio.file.Path levelsPath(java.nio.file.Path bin) {
+        return bin.resolveSibling(bin.getFileName().toString() + ".lv");
+    }
+
+    /** Кэш целиком: {@code file} (лента, смещения) и {@code file.lv} (уровни). */
+    void writeCache(java.nio.file.Path file) throws java.io.IOException {
+        int m = bookTs.length == 0 ? 0 : bidOff[bookTs.length];
+        try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(levelsPath(file),
+                java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE,
+                java.nio.file.StandardOpenOption.TRUNCATE_EXISTING)) {
+            java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(1 << 20).order(java.nio.ByteOrder.nativeOrder());
+            for (int k = 0; k < m; k++) {
+                if (b.remaining() < 16) {
+                    b.flip();
+                    while (b.hasRemaining()) {
+                        ch.write(b);
+                    }
+                    b.clear();
+                }
+                b.putDouble(px(k)).putDouble(qty(k));
+            }
+            b.flip();
+            while (b.hasRemaining()) {
+                ch.write(b);
+            }
+        }
+        writeBin(file);
+    }
+
+    private void writeBin(java.nio.file.Path file) throws java.io.IOException {
+        int n = bookTs.length;
+        int m = n == 0 ? 0 : bidOff[n];
+        try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(file,
+                java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.WRITE,
+                java.nio.file.StandardOpenOption.TRUNCATE_EXISTING)) {
+            java.nio.ByteBuffer head = java.nio.ByteBuffer.allocate(16 + trades.size() * 25);
+            head.putInt(CACHE_MAGIC).putInt(trades.size()).putInt(n).putInt(m);
+            for (MarketTrade t : trades) {
+                head.putLong(t.tsMs()).putDouble(t.price()).putDouble(t.qty())
+                        .put((byte) (t.aggressor() == null ? 0 : t.aggressor() == Side.BUY ? 1 : 2));
+            }
+            head.flip();
+            while (head.hasRemaining()) {
+                ch.write(head);
+            }
+            writeLongs(ch, bookTs, n);
+            writeInts(ch, bidOff, n + 1);
+            writeInts(ch, askOff, n);
+        }
+    }
+
+    static MarketData readCache(java.nio.file.Path file) throws java.io.IOException {
+        try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(file,
+                java.nio.file.StandardOpenOption.READ)) {
+            java.nio.ByteBuffer h = read(ch, 16);
+            if (h.getInt() != CACHE_MAGIC) {
+                throw new java.io.IOException("не тот формат");
+            }
+            int nt = h.getInt();
+            int n = h.getInt();
+            int m = h.getInt();
+            java.nio.ByteBuffer tb = read(ch, nt * 25L);
+            List<MarketTrade> trades = new ArrayList<>(nt);
+            for (int i = 0; i < nt; i++) {
+                long ts = tb.getLong();
+                double p = tb.getDouble();
+                double q = tb.getDouble();
+                byte s = tb.get();
+                trades.add(new MarketTrade(ts, p, q, s == 0 ? null : s == 1 ? Side.BUY : Side.SELL));
+            }
+            long[] bookTs = new long[n];
+            read(ch, n * 8L).asLongBuffer().get(bookTs);
+            int[] bo = new int[n + 1];
+            read(ch, (n + 1) * 4L).asIntBuffer().get(bo);
+            int[] ao = new int[n];
+            read(ch, n * 4L).asIntBuffer().get(ao);
+            MemorySegment lv;
+            try (java.nio.channels.FileChannel lc = java.nio.channels.FileChannel.open(levelsPath(file),
+                    java.nio.file.StandardOpenOption.READ)) {
+                if (lc.size() != m * 16L) {
+                    throw new java.io.IOException("уровни: " + lc.size() + " байт вместо " + m * 16L);
+                }
+                // Отображение живёт, пока жив сегмент (Arena.ofAuto): закрытие канала его не снимает.
+                lv = m == 0 ? MemorySegment.ofArray(new double[0])
+                        : lc.map(java.nio.channels.FileChannel.MapMode.READ_ONLY, 0, lc.size(), Arena.ofAuto());
+            }
+            return new MarketData(trades, bookTs, bo, ao, lv);
+        }
+    }
+
+    private static java.nio.ByteBuffer read(java.nio.channels.FileChannel ch, long bytes) throws java.io.IOException {
+        java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(Math.toIntExact(bytes));
+        while (b.hasRemaining()) {
+            if (ch.read(b) < 0) {
+                throw new java.io.EOFException("кэш рынка обрезан");
+            }
+        }
+        return b.flip();
+    }
+
+    private static void writeLongs(java.nio.channels.FileChannel ch, long[] a, int len) throws java.io.IOException {
+        java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(len * 8);
+        b.asLongBuffer().put(a, 0, len);
+        while (b.hasRemaining()) {
+            ch.write(b);
+        }
+    }
+
+    private static void writeInts(java.nio.channels.FileChannel ch, int[] a, int len) throws java.io.IOException {
+        java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(len * 4);
+        b.asIntBuffer().put(a, 0, len);
+        while (b.hasRemaining()) {
+            ch.write(b);
+        }
+    }
+
+    /** Разбор базы; {@code sink != null} — уровни идут потоком в файл, а не в кучу. */
+    private static MarketData loadDb(String standDbPath, String symbol, long fromMs, long toMs,
+                                     java.nio.channels.FileChannel sink) {
         List<MarketTrade> trades = new ArrayList<>();
-        List<Long> ts = new ArrayList<>();
-        Packer books = new Packer();
+        long[] ts = new long[1024];
+        int nts = 0;
+        Packer books = new Packer(sink);
         try (Connection c = StandDb.open(standDbPath);
              Statement st = c.createStatement()) {
             try (ResultSet rs = st.executeQuery(
@@ -298,6 +532,10 @@ public final class MarketData {
                             + "' AND ts_ms >= " + fromMs + " AND ts_ms <= " + toMs
                             + " ORDER BY ts_ms")) {
                 while (rs.next()) {
+                    // Опыт владельца 13.10.2026: мелкий бот (с 08.10, ~$0.10) — 40–60% принтов ленты.
+                    if (MIN_PRINT_USD > 0 && rs.getDouble(2) * rs.getDouble(3) < MIN_PRINT_USD) {
+                        continue;
+                    }
                     String side = rs.getString(4);
                     Side aggressor = side == null ? null
                             : ("buy".equalsIgnoreCase(side) ? Side.BUY : Side.SELL);
@@ -341,18 +579,25 @@ public final class MarketData {
                     // повреждение, и старые базы обязаны читаться по-прежнему.
                     appendDeep(bids, rs.getString(22));
                     appendDeep(asks, rs.getString(23));
-                    ts.add(rs.getLong(1));
+                    if (nts == ts.length) {
+                        ts = java.util.Arrays.copyOf(ts, ts.length * 2);
+                    }
+                    ts[nts++] = rs.getLong(1);
                     books.add(bids, asks);      // временные списки уходят в GC сразу
                 }
             }
+            if (sink != null) {
+                books.flush();
+            }
         } catch (Exception e) {
             log.error("не прочитался рынок из {}: {}", standDbPath, e.toString());
+            if (sink != null) {
+                throw new IllegalStateException("рынок не прочитан в кэш", e);
+            }
         }
-        long[] arr = new long[ts.size()];
-        for (int i = 0; i < arr.length; i++) {
-            arr[i] = ts.get(i);
-        }
+        long[] arr = java.util.Arrays.copyOf(ts, nts);
         log.warn("рынок {}: сделок {}, снимков книги {}", symbol, trades.size(), arr.length);
-        return new MarketData(trades, arr, books.bidOff(), books.askOff(), books.px(), books.qty());
+        return new MarketData(trades, arr, books.bidOff(), books.askOff(),
+                sink == null ? books.heapLevels() : null);
     }
 }

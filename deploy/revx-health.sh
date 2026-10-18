@@ -5,10 +5,11 @@ H=${1:-6}
 NOW=$(date +%s%3N); FROM=$((NOW - H*3600*1000))
 echo "== $(date -u '+%F %T') UTC, окно $H ч"
 declare -A J=( [a]=revx-exec/state/exec.db [b]=revx-exec-b/state/exec-b-sol.db [c]=revx-exec-c/state/exec-c-eth2.db
-               [d]=revx-exec-d/state/exec-d-eth2.db [e]=revx-exec-e/state/exec-e-btc.db [f]=revx-exec-f/state/exec-f-sol.db )
-declare -A U=( [a]=revx-exec [b]=revx-exec-b [c]=revx-exec-c [d]=revx-exec-d [e]=revx-exec-e [f]=revx-exec-f )
+               [d]=revx-exec-d/state/exec-d-eth2.db [e]=revx-exec-e/state/exec-e-btc.db [f]=revx-exec-f/state/exec-f-sol.db
+               [g]=revx-exec-g/state/exec-g-ada.db )
+declare -A U=( [a]=revx-exec [b]=revx-exec-b [c]=revx-exec-c [d]=revx-exec-d [e]=revx-exec-e [f]=revx-exec-f [g]=revx-exec-g )
 printf "%-2s %-7s %-4s %7s %6s %5s %9s %5s %5s  %s\n" бот служба поток тик_с котир сдел позиция книга пропущ события
-for b in a b c d e f; do
+for b in a b c d e f g; do
   db=~/${J[$b]}; u=${U[$b]}
   pid=$(systemctl show -p MainPID --value $u); st=$(systemctl is-active $u)
   thr=$(grep -l revx-quote-loop /proc/$pid/task/*/comm 2>/dev/null | wc -l)

@@ -323,6 +323,9 @@ public final class Forecast {
         SimClock clock = new SimClock(start);
         clock.followSchedule(ticks.stream().mapToLong(ReplayFair.Tick::tsMs).toArray());
         ReplayFair fair = new ReplayFair(ticks, clock);
+        if (Boolean.getBoolean("revx.sim.fair-book") && model instanceof MarketFillModel mfb) {
+            fair.withBook(mfb.market().fresh());   // лучшие цены книги котировщику: край аска, зажим по книге
+        }
 
         // Счёт ОБЩИЙ: боты делят и книгу, и деньги. Денег даём столько, чтобы
         // каждому хватило на полный потолок, иначе меряли бы не настройку, а
@@ -371,6 +374,7 @@ public final class Forecast {
                 ExecJournal journal = new ExecJournal(
                         dir.resolve("bot-" + spec.botId() + ".db").toString());
                 journal.clock(clock);
+                journal.batched();
                 // Котировки в базу не пишем: единственное, ради чего они писались,
                 // теперь считается в памяти. Живому боту так делать НЕЛЬЗЯ —
                 // у него по ним восстанавливаются захват и markout.
@@ -437,6 +441,12 @@ public final class Forecast {
                 // млн отказов «экспозиция превысила предел» и ровные нули дохода
                 // при живом рынке (06.09.2026). Меряли предохранитель, не пару.
                 loop.scaleLimitsForLot(spec.size() * refPrice);
+                // Бот под хеджем: убыток спота закрыт шортом, и стоп по споту глушил бы его на каждом
+                // обвале (SUI 12.10 −9%). Предел задаётся явно, как в юните (revx.exec.max-loss).
+                double simMaxLoss = Double.parseDouble(System.getProperty("revx.sim.max-loss", "0"));
+                if (simMaxLoss > 0) {
+                    loop.maxTradingLoss(simMaxLoss);
+                }
                 if (spec.dynOffsetK() > 0) {
                     // Потолок 1% — выше опора считается сломанной (замер
                     // 19.08.2026: 1.18% у ETH на движении 18%).
@@ -481,6 +491,47 @@ public final class Forecast {
                     loop.flowWatch(fw);
                 }
 
+                // Пауза стороны после неожиданного свипа (11.10.2026): ключи -D, по
+                // умолчанию выключена. Порог свипа $1000 — p90 события у BTC/ETH/SOL.
+                long pauseSec = Long.getLong("revx.exec.sweep-pause-sec", 0);
+                if (pauseSec > 0 && standDbPath != null) {
+                    var pw = org.home.data.revx.exec.SweepWatch.preloadedForPause(standDbPath,
+                            base.symbol(),
+                            Double.parseDouble(System.getProperty("revx.exec.sweep-pause-min-usd", "1000")),
+                            cfg.execSweepChainMs(), Long.getLong("revx.exec.sweep-pause-delay-ms", 2000),
+                            start, end);
+                    watches.add(pw);
+                    loop.sweepPause(pw, pauseSec * 1000,
+                            Double.parseDouble(System.getProperty("revx.exec.sweep-pause-surprise", "20")),
+                            Boolean.parseBoolean(System.getProperty("revx.exec.sweep-pause-bid-only", "false")));
+                }
+                long crossSec = Long.getLong("revx.exec.cross-pause-sec", 0);
+                if (crossSec > 0 && standDbPath != null) {
+                    // ленты всех монет: своя первой, затем остальные
+                    List<org.home.data.revx.exec.SweepWatch> cw = new ArrayList<>();
+                    List<String> syms = new ArrayList<>();
+                    syms.add(base.symbol());
+                    for (String s : System.getProperty("revx.exec.cross-symbols", "BTC/USDC,ETH/USDC,SOL/USDC").split(",")) {
+                        if (!s.isBlank() && !s.trim().equals(base.symbol())) {
+                            syms.add(s.trim());
+                        }
+                    }
+                    for (String s : syms) {
+                        var w = org.home.data.revx.exec.SweepWatch.preloaded(standDbPath, s,
+                                Double.parseDouble(System.getProperty("revx.exec.cross-confirm-usd", "1000")),
+                                cfg.execSweepChainMs(), 0, 0, Long.getLong("revx.exec.sweep-pause-delay-ms", 2000),
+                                start, end);
+                        watches.add(w);
+                        cw.add(w);
+                    }
+                    loop.crossPause(cw, syms, crossSec * 1000,
+                            Double.parseDouble(System.getProperty("revx.exec.cross-big-usd", "10000")),
+                            Long.getLong("revx.exec.cross-window-sec", 30) * 1000,
+                            Double.parseDouble(System.getProperty("revx.exec.cross-provisional-bp", "0")),
+                            Long.getLong("revx.exec.cross-provisional-sec", 30) * 1000,
+                            Boolean.parseBoolean(System.getProperty("revx.exec.cross-bid-only", "true")));
+                }
+
                 if (spec.sweepCoef() != 0) {
                     if (standDbPath == null) {
                         throw new IllegalStateException("реакция на свип просит базу стенда: "
@@ -496,6 +547,16 @@ public final class Forecast {
                             start, end);
                     watches.add(watch);
                     loop.sweepWatch(watch, spec.sweepSide());
+                }
+                // Тишина в покупках (18.10.2026): -Drevx.exec.quiet-nobuy / quiet-shift-bp, по умолчанию выключено.
+                if ((Boolean.getBoolean("revx.exec.quiet-nobuy")
+                        || Double.parseDouble(System.getProperty("revx.exec.quiet-shift-bp", "0")) > 0)) {
+                    if (standDbPath == null) {
+                        throw new IllegalStateException("тишина в покупках просит базу стенда: ленту брать неоткуда");
+                    }
+                    long win = Long.getLong("revx.exec.quiet-win-sec", 3600) * 1000L;
+                    loop.buyQuiet(org.home.data.revx.exec.BuyQuiet.preloaded(standDbPath, base.symbol(),
+                            Long.getLong("revx.exec.quiet-delay-ms", 2000), start - win - 60_000, end));
                 }
                 if (model instanceof MarketFillModel mfm) {
                     loop.bookSource(mfm.market().fresh()::bookAt);

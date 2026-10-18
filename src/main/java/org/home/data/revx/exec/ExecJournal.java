@@ -343,6 +343,7 @@ public final class ExecJournal implements AutoCloseable {
     /** Запрос записывается ВСЕГДА — и удавшийся, и упавший. */
     public synchronized void request(String method, String path, String body,
                                      Integer status, String response, long latencyMs, String error) {
+        batchTick();
         try (PreparedStatement ps = connection.prepareStatement(
                 "INSERT INTO exec_request(ts_ms, method, path, body, status, response, latency_ms, error)"
                         + " VALUES (?,?,?,?,?,?,?,?)")) {
@@ -384,6 +385,39 @@ public final class ExecJournal implements AutoCloseable {
      * ⚠️ У ЖИВОГО бота выключать это нельзя: захват и markout восстанавливаются
      * только по справедливой цене в момент котировки, а её больше взять неоткуда.
      */
+    /**
+     * ЗАПИСЬ ПАЧКАМИ — ТОЛЬКО ДЛЯ СТЕНДА (17.10.2026). Каждая вставка в обычном режиме — своя
+     * транзакция, и прогон окна 11–16.10 (SOL, один уровень) записал на диск 14.7 ГБ при журнале
+     * в 85 МБ, а симуляция треть времени ждала диска. Здесь всё идёт в одной транзакции,
+     * фиксация — каждые {@link #BATCH_ROWS} записей и при закрытии; синхронизации с диском нет.
+     * Свои же чтения видят незафиксированное (соединение одно). ⚠️ Живому боту НЕЛЬЗЯ: упавший
+     * процесс потерял бы до тысяч строк, включая исполнения.
+     */
+    public synchronized void batched() {
+        try (Statement st = connection.createStatement()) {
+            st.execute("PRAGMA synchronous=OFF");
+            connection.setAutoCommit(false);
+            batched = true;
+        } catch (Exception e) {
+            log.warn("журнал пачками не включился: {}", e.getMessage());
+        }
+    }
+
+    static final int BATCH_ROWS = 20_000;
+    private boolean batched;
+    private int batchPending;
+
+    private void batchTick() {
+        if (batched && ++batchPending >= BATCH_ROWS) {
+            try {
+                connection.commit();
+            } catch (Exception e) {
+                log.warn("фиксация пачки журнала: {}", e.getMessage());
+            }
+            batchPending = 0;
+        }
+    }
+
     public void quotesOff() {
         this.quotesOff = true;
     }
@@ -404,6 +438,7 @@ public final class ExecJournal implements AutoCloseable {
      */
     public synchronized void quote(double fair, Double bid, Double ask, double inventory,
                                    boolean quotable, String reason, double pressure) {
+        batchTick();
         if (quotesOff) {
             return;
         }
@@ -774,6 +809,7 @@ public final class ExecJournal implements AutoCloseable {
 
     /** События уровня решений: запуск, остановка, паника, срабатывание лимита. */
     public synchronized void event(String kind, String detail) {
+        batchTick();
         try (PreparedStatement ps = connection.prepareStatement(
                 "INSERT INTO exec_event(ts_ms, kind, detail) VALUES (?,?,?)")) {
             ps.setLong(1, clock.now());
@@ -988,6 +1024,12 @@ public final class ExecJournal implements AutoCloseable {
     @Override
     public void close() {
         try {
+            if (connection.isClosed()) {
+                return;
+            }
+            if (batched) {
+                connection.commit();
+            }
             connection.close();
         } catch (Exception e) {
             log.warn("журнал закрылся с ошибкой: {}", e.getMessage());

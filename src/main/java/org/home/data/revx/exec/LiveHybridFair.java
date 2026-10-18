@@ -41,6 +41,24 @@ public final class LiveHybridFair implements FairSource {
     public static final boolean ENABLED = Boolean.getBoolean("revx.fair.live-hybrid");
     static final long MAX_AGE_MS = Long.getLong("revx.fair.hybrid-max-age-ms", 15_000L);
 
+    /**
+     * 🔑 БИНАНС ПО WEBSOCKET ВМЕСТО {@code bnb.db} (сухой прогон SOL, 15.10.2026). Служба
+     * {@code revx-bnb-feed} опрашивает REST раз в секунду, и опора узнаёт о ходе Бинанса
+     * на 0.5–1.5 с позже. Задним числом 27.09–14.10: сделки шести ботов после хода
+     * Бинанса ≥ 5 б.п. против нас за 3 с — 13% сделок и −$3.31 при итоге +$5.15.
+     * С флагом цена берётся из {@code bookTicker} (правила свежести {@link FastBnbFair}),
+     * и каждое её изменение будит тик котировщика ({@link #onPrice}). Пара —
+     * {@code revx.fair.hybrid-ws-pair} (по умолчанию {@code <монета>USDC}, как у службы),
+     * делитель — {@code revx.fair.hybrid-ws-rate} (пусто — не делить).
+     */
+    public static final boolean WS = Boolean.getBoolean("revx.fair.hybrid-ws");
+
+    private final FastBnbFair ws;
+    private volatile java.util.function.DoubleConsumer onPrice = p -> { };
+    /** Опора и цена Бинанса последнего шага: ход Бинанса переводится в ход опоры. */
+    private volatile double lastOutFair = Double.NaN;
+    private volatile double lastStepBnb = Double.NaN;
+
     private final FairSource inner;
     private final String standDbPath;
     private final String bnbDbPath;
@@ -79,6 +97,23 @@ public final class LiveHybridFair implements FairSource {
         this.bnbSymbol = symbol.substring(0, symbol.indexOf('/')) + "USDC";
         this.lotQty = lotQty;
         this.journal = journal;
+        if (WS) {
+            String pair = System.getProperty("revx.fair.hybrid-ws-pair", bnbSymbol);
+            String rate = System.getProperty("revx.fair.hybrid-ws-rate", "");
+            BnbStream s = rate.isBlank() ? new BnbStream(pair) : new BnbStream(pair, rate);
+            this.ws = new FastBnbFair(s, symbol, pair, rate, standDbPath);
+            // Ход Бинанса с прошлого шага, перенесённый на опору: fair = уровень × bnb / среднее bnb.
+            ws.onPrice(p -> {
+                double f0 = lastOutFair;
+                double b0 = lastStepBnb;
+                if (f0 > 0 && b0 > 0) {
+                    onPrice.accept(f0 * p / b0);
+                }
+            });
+            s.start();
+        } else {
+            this.ws = null;
+        }
         this.core = new HybridCore(
                 Double.parseDouble(System.getProperty("revx.fair.hybrid-mix", "0.25")),
                 Double.parseDouble(System.getProperty("revx.fair.hybrid-depth-k", "10")),
@@ -88,7 +123,18 @@ public final class LiveHybridFair implements FairSource {
                         + "Бинанс {} из {}", symbol, System.getProperty("revx.fair.hybrid-mix", "0.25"),
                 System.getProperty("revx.fair.hybrid-depth-k", "10"),
                 Double.parseDouble(System.getProperty("revx.fair.hybrid-depth-k", "10")) * lotQty,
-                System.getProperty("revx.fair.hybrid-tau-sec", "180"), bnbSymbol, bnbDbPath);
+                System.getProperty("revx.fair.hybrid-tau-sec", "180"), bnbSymbol,
+                ws != null ? "websocket " + ws.describe() : bnbDbPath);
+    }
+
+    /** Бинанс по websocket; null — цена из {@code bnb.db}. */
+    public FastBnbFair ws() {
+        return ws;
+    }
+
+    /** Котировщик подписывается на ход опоры по websocket — будить тик (только с {@link #WS}). */
+    public void onPrice(java.util.function.DoubleConsumer c) {
+        this.onPrice = c == null ? p -> { } : c;
     }
 
     /**
@@ -165,6 +211,8 @@ public final class LiveHybridFair implements FairSource {
                                 + "уровень по своей книге, движение по Бинансу, торгую как обычно");
                     }
                     healthy(now);
+                    lastStepBnb = mid;
+                    lastOutFair = o.fair();
                     return new StandReader.Fair(o.fair(), o.quotable(), o.quotable() ? null : pauseWhy(o, f),
                             f.asOfMs(), f.pairsUsed(), b.bestBid(), b.bestAsk(), f.referenceSpreadPct());
                 }
@@ -309,6 +357,21 @@ public final class LiveHybridFair implements FairSource {
         if (book == null) {
             book = DriverManager.getConnection("jdbc:sqlite:file:" + standDbPath + "?mode=ro");
         }
+        long[] seen = new long[1];
+        BookView v = readBook(book, symbol, now, MAX_AGE_MS, seen);
+        if (seen[0] > 0) {
+            lastBookMs = seen[0];
+        }
+        return v;
+    }
+
+    /**
+     * Последний снимок книги {@code symbol} из базы сборщика: пять верхних уровней и
+     * глубина. {@code null} — снимка нет или он старше {@code maxAgeMs}; момент снимка
+     * (любой давности) кладётся в {@code seenMs[0]}. Общий для этой опоры и {@link FastBnbFair}.
+     */
+    static BookView readBook(Connection book, String symbol, long now, long maxAgeMs, long[] seenMs)
+            throws Exception {
         try (PreparedStatement ps = book.prepareStatement(
                 "SELECT t_recv_ms, bp1,bq1,bp2,bq2,bp3,bq3,bp4,bq4,bp5,bq5,"
                         + "ap1,aq1,ap2,aq2,ap3,aq3,ap4,aq4,ap5,aq5, deep_bids, deep_asks"
@@ -318,8 +381,8 @@ public final class LiveHybridFair implements FairSource {
                 if (!rs.next()) {
                     return null;
                 }
-                lastBookMs = rs.getLong(1);
-                if (now - lastBookMs > MAX_AGE_MS) {
+                seenMs[0] = rs.getLong(1);
+                if (now - seenMs[0] > maxAgeMs) {
                     return null;
                 }
                 List<BookView.Level> bids = new ArrayList<>();
@@ -344,6 +407,13 @@ public final class LiveHybridFair implements FairSource {
     }
 
     private double bnbMid(long now) throws Exception {
+        if (ws != null) {
+            // Тот же срок, что у bnb.db: сессия молчит дольше MAX_AGE_MS — Бинанса нет.
+            // Строже (3 с пилота) нельзя: сбой опоры здесь — распродажа и пауза на 2 мин.
+            double p = ws.price();
+            lastBnbMs = ws.stream().lastMsgMs();
+            return p > 0 && now - lastBnbMs <= MAX_AGE_MS ? p : Double.NaN;
+        }
         if (bnb == null) {
             bnb = DriverManager.getConnection("jdbc:sqlite:file:" + bnbDbPath + "?mode=ro");
         }
@@ -366,6 +436,9 @@ public final class LiveHybridFair implements FairSource {
     /** Закрыть соединения с базами (тест, прибор проверки). */
     public void close() {
         closeQuietly();
+        if (ws != null) {
+            ws.close();
+        }
     }
 
     private void closeQuietly() {

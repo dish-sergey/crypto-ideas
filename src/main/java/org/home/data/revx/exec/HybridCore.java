@@ -40,6 +40,22 @@ public final class HybridCore {
      * выше рынка. 0 — поводка нет (как было до 06.10).
      */
     private final double clampBp;
+    /**
+     * ПОВОДОК ПО ВОЛАТИЛЬНОСТИ (16.10.2026, идея владельца): когда размах Бинанса за
+     * {@code stormSec} не меньше {@code stormRangeBp}, поводок — {@code stormClampBp}
+     * вместо {@code clampBp}. Повод — стенд w24: в тихом рынке свободный поводок (7 и
+     * больше) даёт сделки лучше, в бурю (размах ≥ 80 б.п. за 5 мин) лучше тугой
+     * (SOL +0.20 ¢/ч при 0.25 против −1.20 при 5). 0 — выключено.
+     */
+    private final double stormClampBp;
+    private final double stormRangeBp;
+    private final long stormMs;
+    /** Монотонные очереди по секундным точкам Бинанса: {сек, цена}. */
+    private final java.util.ArrayDeque<double[]> rangeMax = new java.util.ArrayDeque<>();
+    private final java.util.ArrayDeque<double[]> rangeMin = new java.util.ArrayDeque<>();
+    private long rangeFirstSec = Long.MIN_VALUE;
+    private long rangeLastSec = Long.MIN_VALUE;
+    private long stormSteps;
     private final double basisTauMs;
     private double emaM = Double.NaN;
     private double emaB = Double.NaN;
@@ -63,6 +79,61 @@ public final class HybridCore {
         this.maxSpreadBp = maxSpreadBp;
         this.clampBp = Double.parseDouble(System.getProperty("revx.fair.hybrid-clamp-bp", "0"));
         this.basisTauMs = Double.parseDouble(System.getProperty("revx.fair.hybrid-basis-tau-sec", "1800")) * 1000;
+        this.stormClampBp = Double.parseDouble(System.getProperty("revx.fair.hybrid-clamp-storm-bp", "0"));
+        this.stormRangeBp = Double.parseDouble(System.getProperty("revx.fair.hybrid-clamp-storm-range-bp", "80"));
+        this.stormMs = Long.getLong("revx.fair.hybrid-clamp-storm-sec", 300L) * 1000;
+    }
+
+    /** Шагов, на которых действовал поводок бури. */
+    public long stormSteps() {
+        return stormSteps;
+    }
+
+    public double stormClampBp() {
+        return stormClampBp;
+    }
+
+    public double stormRangeBp() {
+        return stormRangeBp;
+    }
+
+    /**
+     * Размах Бинанса за {@link #stormMs}, б.п.; NaN — окно набрано меньше чем наполовину.
+     * Одна точка в секунду (первая цена секунды), очереди монотонные — шаг O(1).
+     */
+    double bnbRangeBp(long tsMs, double bnb) {
+        long sec = Math.floorDiv(tsMs, 1000);
+        if (sec != rangeLastSec) {
+            if (rangeLastSec != Long.MIN_VALUE && sec - rangeLastSec > stormMs / 1000) {
+                rangeMax.clear();           // дыра длиннее окна — набираем заново
+                rangeMin.clear();
+                rangeFirstSec = Long.MIN_VALUE;
+            }
+            rangeLastSec = sec;
+            if (rangeFirstSec == Long.MIN_VALUE) {
+                rangeFirstSec = sec;
+            }
+            while (!rangeMax.isEmpty() && rangeMax.peekLast()[1] <= bnb) {
+                rangeMax.pollLast();
+            }
+            rangeMax.addLast(new double[]{sec, bnb});
+            while (!rangeMin.isEmpty() && rangeMin.peekLast()[1] >= bnb) {
+                rangeMin.pollLast();
+            }
+            rangeMin.addLast(new double[]{sec, bnb});
+        }
+        long from = sec - stormMs / 1000;
+        while (!rangeMax.isEmpty() && rangeMax.peekFirst()[0] <= from) {
+            rangeMax.pollFirst();
+        }
+        while (!rangeMin.isEmpty() && rangeMin.peekFirst()[0] <= from) {
+            rangeMin.pollFirst();
+        }
+        if (rangeMax.isEmpty() || sec - rangeFirstSec < stormMs / 2000) {
+            return Double.NaN;
+        }
+        double hi = rangeMax.peekFirst()[1], lo = rangeMin.peekFirst()[1];
+        return (hi - lo) / ((hi + lo) / 2) * 1e4;
     }
 
     /** Шагов с поводком (счётчик растёт, только если поводок задан). */
@@ -188,18 +259,30 @@ public final class HybridCore {
             emaB += a * (bnb - emaB);
         }
         double fair = emaM * bnb / emaB;
-        if (clampBp > 0) {
+        double clampNow = clampBp;
+        if (stormClampBp > 0) {
+            double r = bnbRangeBp(tsMs, bnb);
+            if (r >= stormRangeBp) {
+                clampNow = stormClampBp;
+                stormSteps++;
+            }
+        }
+        if (clampBp > 0 || stormClampBp > 0) {
+            // Базис набирается всегда, когда поводок вообще возможен: поводку бури
+            // при выключенном обычном нужен базис, накопленный в тихом рынке.
             double x = Math.log(level / bnb) * 1e4;
             if (Double.isNaN(basisBp)) {
                 basisBp = x;
             } else {
                 basisBp += (1 - Math.exp(-(tsMs - prev) / basisTauMs)) * (x - basisBp);
             }
+        }
+        if (clampNow > 0) {
             double dev = Math.log(fair / bnb) * 1e4 - basisBp;
             steps++;
-            if (Math.abs(dev) > clampBp) {
+            if (Math.abs(dev) > clampNow) {
                 clamped++;
-                fair = bnb * Math.exp((basisBp + Math.signum(dev) * clampBp) / 1e4);
+                fair = bnb * Math.exp((basisBp + Math.signum(dev) * clampNow) / 1e4);
             }
         }
         prev = tsMs;
