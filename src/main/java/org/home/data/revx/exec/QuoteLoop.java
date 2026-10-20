@@ -1170,6 +1170,10 @@ public final class QuoteLoop implements Runnable {
      * Задаётся юнитом (`--revx.exec.max-loss=`), по умолчанию прежняя единица:
      * у боевых ботов ничего не меняется, пока значение не передано явно.
      */
+    public double maxTradingLoss() {
+        return maxTradingLoss;
+    }
+
     public void maxTradingLoss(double usdc) {
         if (usdc > 0) {
             this.maxTradingLoss = usdc;
@@ -2122,6 +2126,14 @@ public final class QuoteLoop implements Runnable {
             return null;
         }
         long now = clock.now();
+        if (!"pool".equals(REINVEST) && alloc.poolOf(tag.id()) != null) {
+            // Участник пула: касса = капитал − запас по входу, сводится с буфером пула
+            // (или с ничейным, если капитал только что задан владельцем).
+            livePoolAtMs = 0;
+            livePoolTick(now);
+            String s = poolSettle(now);
+            return s != null ? s : livePoolLine();
+        }
         refreshBalances();
         double need = Math.max(0, (params.inventoryCap() - inventory) * price);
         double have = alloc.own(tag.id(), quote);
@@ -2364,6 +2376,71 @@ public final class QuoteLoop implements Runnable {
                 "Период опроса %d мс, отвод заявок %s%n", periodMs,
                 parkDistance > 0 ? String.format(java.util.Locale.ROOT, "%.0f%%",
                         parkDistance * 100) : "выключен"));
+        sb.append(protections());
+        return sb.toString();
+    }
+
+    /**
+     * ЗАЩИТЫ И РЕЖИМЫ, ВКЛЮЧЁННЫЕ ЮНИТОМ (владелец 20.10.2026: «при старте не видно, с чем
+     * бот запустился»). Половина настроек приходит системными свойствами, и ни профиль, ни
+     * машинная часть {@code boot} их не показывали — отличить бота с календарём и парковкой
+     * от голого можно было только по командной строке процесса.
+     */
+    String protections() {
+        try {
+            return protectionsText();
+        } catch (RuntimeException e) {
+            // строка для человека не должна ронять стартовое сообщение и поток Telegram
+            return "— защиты — не удалось показать: " + e + "\n";
+        }
+    }
+
+    private String protectionsText() {
+        java.util.Locale r = java.util.Locale.ROOT;
+        StringBuilder sb = new StringBuilder("— защиты —\n");
+        if (newsGuard == null) {
+            sb.append("Календарь: выключен\n");
+        } else {
+            NewsGuard.Event e = newsGuard.next(clock.now());
+            sb.append(String.format(r, "Календарь: окно −%d с…+событие, уводит %d ближн. ур.; %s%n",
+                    newsGuard.beforeMs() / 1000, NEWS_LEVELS,
+                    e == null ? "событий впереди нет"
+                            : "ближайшее " + java.time.Instant.ofEpochMilli(e.tsMs()).toString()
+                                    .substring(5, 16).replace('T', ' ') + " UTC " + e.title()
+                                    + " (+" + e.afterMs() / 1000 + " с)"));
+        }
+        sb.append(STORM_PARK_LEVELS > 0
+                ? String.format(r, "Парковка в бурю: размах ≥ %.0f б.п. за %d с, ближних %d, %s%s%n",
+                        STORM_PARK_RANGE_BP, STORM_PARK_MS / 1000, STORM_PARK_LEVELS,
+                        STORM_PARK_BOTH ? "обе стороны" : "опасная сторона",
+                        STORM_PARK_PACED ? ", по очереди замен (опасная первой)" : "")
+                : "Парковка в бурю: выключена\n");
+        sb.append("Приоритет замен (опасная сторона первой): ")
+                .append(REPLACE_DANGER_FIRST || (STORM_PARK_LEVELS > 0 && STORM_PARK_PACED) ? "ВКЛ" : "выкл")
+                .append('\n');
+        if (Boolean.getBoolean("revx.fair.live-hybrid")) {
+            sb.append(String.format(r, "Опора: смесь %s, глубина %s лота, Бинанс τ %s с, поводок ±%s б.п.%n",
+                    System.getProperty("revx.fair.hybrid-mix", "?"),
+                    System.getProperty("revx.fair.hybrid-depth-k", "?"),
+                    System.getProperty("revx.fair.hybrid-tau-sec", "?"),
+                    System.getProperty("revx.fair.hybrid-clamp-bp", "—")));
+        }
+        sb.append(String.format(r, "Затыки: минута %s, заморозка %s с, надкушенную снимать за %s б.п.%n",
+                System.getProperty("revx.exec.quiet-minute", "выкл"),
+                System.getProperty("revx.exec.stall-freeze-sec", "0"),
+                PARTIAL_STALE_BP > 0 ? fmt(PARTIAL_STALE_BP) : "—"));
+        sb.append(String.format(r, "Стоп по убытку %.2f %s, заявка ≤ %.0f, экспозиция ≤ %.0f%n",
+                maxTradingLoss, quote, ExecLimits.MAX_ORDER_NOTIONAL_USDC, ExecLimits.MAX_TOTAL_EXPOSURE_USDC));
+        AllocRegistry.PoolMember pm = null;
+        try {
+            pm = alloc == null ? null : alloc.poolOf(tag.id());
+        } catch (Exception ignored) {
+            // реестр занят — строку пула просто не покажем точно
+        }
+        sb.append(pm != null
+                ? String.format(r, "Пул %s: капитал %.2f %s (старт %.2f), лот = капитал / %.2f лота%n",
+                        pm.pool(), pm.capital(), quote, pm.capital0(), params.inventoryCap() / params.size())
+                : "Пул: не участник\n");
         return sb.toString();
     }
 
@@ -2398,6 +2475,7 @@ public final class QuoteLoop implements Runnable {
     @Override
     public void run() {
         restorePosition();
+        restoreReinv();                       // до сверки пропущенных: они идут в учёт пула
         recoverMissedFills();
         refreshBalances();
         // Стартуем остановленными, значит и книга должна быть пуста: заявки
@@ -2696,6 +2774,9 @@ public final class QuoteLoop implements Runnable {
 
     /** Средняя цена входа и реализованное — своим счётом, независимо от режима позиции. */
     private void reinvTrack(Side side, double qty, double price) {
+        if (Double.isNaN(reinvAvg)) {
+            reinvAvg = price;                 // живой пул: средняя входа ещё не задана
+        }
         if (side == Side.BUY) {
             reinvAvg = reinvPos + qty > 0 ? (reinvAvg * reinvPos + qty * price) / (reinvPos + qty) : price;
             reinvPos += qty;
@@ -2745,7 +2826,287 @@ public final class QuoteLoop implements Runnable {
         }
     }
 
+    /**
+     * {@code pool} (владелец, 19.10.2026): ОБЩИЙ буфер семейства — {@link ReinvestPool}.
+     * Буфер {@code reinvest-buffer-pct}% суммы капиталов резервируется при старте, весь
+     * реализованный доход и убыток каждого участника идёт в него, раз в
+     * {@code reinvest-min} минут излишек сверх цели делится ПОРОВНУ в капиталы,
+     * недостача (при {@code pool-shrink}) — поровну из капиталов. Границы капитала —
+     * ½ и {@code reinvest-max} стартового. На стенде участники — отдельные процессы,
+     * сходятся через каталог {@code pool-dir} ({@link PoolExchange}); {@code pool-member}
+     * — своё имя, {@code pool-members} — все через запятую.
+     */
+    static final String POOL_DIR = System.getProperty("revx.exec.pool-dir", "");
+    static final String POOL_ME = System.getProperty("revx.exec.pool-member", "");
+    static final java.util.List<String> POOL_MEMBERS = java.util.Arrays.stream(
+            System.getProperty("revx.exec.pool-members", "").split(","))
+            .map(String::trim).filter(s -> !s.isEmpty()).sorted().toList();
+    static final boolean POOL_SHRINK = !"false".equals(System.getProperty("revx.exec.pool-shrink", "true"));
+    private PoolExchange poolX;
+    private ReinvestPool pool;
+    private long poolHour = -1;
+    private double poolSeen;
+    private boolean poolDirty;
+
+    /** Шаг общего буфера на границе часа. Зовётся с каждого тика, от котирования не зависит. */
+    private void poolTick(long now) {
+        if (!"pool".equals(REINVEST) || LOT_USD <= 0) {
+            return;
+        }
+        if (Double.isNaN(capLots)) {
+            capLots = params.size() > 0 ? params.inventoryCap() / params.size() : 0;
+        }
+        double c0 = LOT_USD * capLots;
+        long h = now / REINVEST_MS;
+        if (poolHour < 0) {
+            poolHour = h;
+            poolSeen = reinvRealised;
+            poolX = new PoolExchange(POOL_DIR, POOL_ME, POOL_MEMBERS, h + 1, c0);
+            return;
+        }
+        while (poolHour < h) {
+            poolHour++;
+            double d = poolHour == h ? reinvRealised - poolSeen : 0;
+            if (poolHour == h) {
+                poolSeen = reinvRealised;
+            }
+            var all = poolX.exchange(poolHour, d, c0);
+            if (pool == null) {
+                java.util.Map<String, Double> caps = new java.util.TreeMap<>();
+                all.forEach((k, e) -> caps.put(k, e.capital0()));
+                pool = new ReinvestPool(caps, REINVEST_BUFFER_PCT, 0.5, REINVEST_MAX, POOL_SHRINK);
+            }
+            double before = pool.capital(POOL_ME);
+            java.util.Map<String, Double> deltas = new java.util.TreeMap<>();
+            all.forEach((k, e) -> deltas.put(k, e.delta()));
+            pool.step(deltas);
+            if (Math.abs(pool.capital(POOL_ME) - before) > 1e-9) {
+                poolDirty = true;
+                journal.event("reinvest", String.format(java.util.Locale.ROOT,
+                        "пул, шаг %d: капитал %.4f → %.4f USDC; %s", poolHour, before,
+                        pool.capital(POOL_ME), pool.describe()));
+            }
+        }
+    }
+
+    /**
+     * ЖИВОЙ ПУЛ (20.10.2026). Членство и капитал лежат в {@code alloc.db}
+     * ({@link AllocRegistry#poolOf}), часовой шаг делает сводный бот. Бот раз в минуту:
+     * <ol>
+     *   <li>докладывает реализованное с прошлого доклада (по средней цене входа);</li>
+     *   <li>берёт свой капитал: лот = капитал / лотов в потолке (лотов — из юнита);</li>
+     *   <li>сводит кассу: {@code касса = капитал − запас по цене входа}. Разница идёт
+     *       через буфер пула ({@code pool:<имя>}): прибыль уходит в буфер, убыток и
+     *       реинвест приходят из него. Так претензия буфера в реестре и есть буфер.</li>
+     * </ol>
+     * Капитал, заданный владельцем ({@code /pool add}, {@code /pool set}), сводится с
+     * НИЧЕЙНЫМ, а не с буфером. Деньги двигаются только пока бот котирует: остановленный
+     * после {@code /release} иначе забрал бы весь капитал из буфера обратно.
+     *
+     * Средняя входа и реализованное переживают перезапуск в журнале (пока бот в пуле);
+     * при вступлении отсчёт начинается заново: запас по текущей цене.
+     */
+    private static final String STATE_REINV_POS = "reinv_pos";
+    private static final String STATE_REINV_AVG = "reinv_avg";
+    private static final String STATE_REINV_REAL = "reinv_realised";
+    private static final String STATE_REINV_REPORTED = "reinv_reported";
+    private static final long LIVE_POOL_MS = 60_000;
+    /** Стенд живого пула: капитал бота в USDC; 0 — выключено. */
+    static final double POOL_STAND = Double.parseDouble(System.getProperty("revx.exec.pool-stand", "0"));
+    private boolean poolStandInit;
+    private AllocRegistry.PoolMember livePool;
+    private double livePoolCapital;
+    private double reinvReported;
+    private long livePoolAtMs;
+    private double unitSize = Double.NaN;
+    private double unitCap = Double.NaN;
+
+    private void livePoolTick(long now) {
+        if (alloc == null || !ownPosition || "pool".equals(REINVEST) || now - livePoolAtMs < LIVE_POOL_MS) {
+            return;
+        }
+        livePoolAtMs = now;
+        if (Double.isNaN(unitSize)) {
+            unitSize = params.size();
+            unitCap = params.inventoryCap();
+        }
+        if (POOL_STAND > 0 && !poolStandInit) {
+            // СТЕНД живого пула: свой реестр прогона, пул «stand» из одного бота,
+            // шаг делает сам бот (живьём — сводка). Проверка проводки, а не дохода.
+            poolStandInit = true;
+            refreshBalances();
+            // Стенд кладёт всю кассу счёта за ботом (запас cash-mult) — ничейного ноль, и
+            // буфер взять неоткуда. Лишнее сверх капитала возвращаем в ничейное, как
+            // живьём: там за ботом его доля, остальное — ничьё.
+            double extra = alloc.own(tag.id(), quote) - POOL_STAND;
+            if (extra > 0) {
+                double gave = alloc.releasePart(tag.id(), quote, extra, 1, now);
+                ownCash -= gave;
+                seedCash -= gave;
+            }
+            alloc.poolCreate("stand", REINVEST_BUFFER_PCT, 0.5, REINVEST_MAX, POOL_SHRINK, now);
+            String err = alloc.poolAdd("stand", tag.id(), POOL_STAND, quoteTotal, now);
+            journal.event("pool", err == null ? "стенд: бот в пуле stand, капитал " + POOL_STAND : "стенд: " + err);
+        }
+        if (POOL_STAND > 0) {
+            String step = alloc.poolStep("stand", now);
+            if (step != null) {
+                journal.event("pool_step", step);
+            }
+        }
+        AllocRegistry.PoolMember m = alloc.poolOf(tag.id());
+        if (m == null) {
+            if (livePool != null) {
+                livePool = null;
+                livePoolCapital = 0;
+                journal.event("pool", "бот выведен из пула — лот и потолок из юнита");
+                restoreUnitLot();
+            }
+            return;
+        }
+        if (livePool == null && !m.funded()) {
+            // Вступление: отсчёт реализованного и средней входа — с этой минуты.
+            reinvPos = inventory;
+            reinvAvg = Double.NaN;
+            reinvReported = reinvRealised;
+        }
+        livePool = m;
+        double d = reinvRealised - reinvReported;
+        if (Math.abs(d) > 1e-9) {
+            alloc.poolReport(tag.id(), d, now);
+            reinvReported = reinvRealised;
+        }
+        saveReinv();
+        if (Math.abs(m.capital() - livePoolCapital) > 1e-9) {
+            journal.event("pool", String.format(java.util.Locale.ROOT,
+                    "пул %s: капитал %.4f → %.4f USDC", m.pool(), livePoolCapital, m.capital()));
+            livePoolCapital = m.capital();
+            poolDirty = true;
+        }
+        if (!m.funded() || quoting.get()) {
+            String s = poolSettle(now);
+            if (s != null) {
+                log.warn("пул: {}", s);
+            }
+        }
+    }
+
+    /** Свести кассу с капиталом пула. @return что сделано, либо null */
+    private String poolSettle(long now) {
+        AllocRegistry.PoolMember m = livePool;
+        double price = lastTrustedFair > 0 ? lastTrustedFair : lastFair;
+        if (m == null || !(price > 0)) {
+            return null;
+        }
+        if (Double.isNaN(reinvAvg)) {
+            reinvAvg = price;
+        }
+        if (Math.abs(reinvPos - inventory) > Math.max(dust, 1e-15)) {
+            // Монеты пришли или ушли передачей (/claim, /release): в цене входа —
+            // по текущей, капитал от этого не меняется, меняется его раскладка.
+            double q = inventory - reinvPos;
+            if (q > 0) {
+                reinvAvg = (reinvAvg * Math.max(0, reinvPos) + q * price) / (Math.max(0, reinvPos) + q);
+            }
+            reinvPos = inventory;
+            saveReinv();
+        }
+        double target = m.capital() - Math.max(0, reinvPos) * reinvAvg;
+        double have = alloc.own(tag.id(), quote);
+        double diff = target - have;
+        double moved;
+        String how;
+        if (!m.funded()) {
+            refreshBalances();
+            moved = Math.abs(diff) < 0.01 ? 0 : alloc.poolFundFree(tag.id(), quote, diff, quoteTotal, now);
+            alloc.poolFunded(tag.id());
+            how = "с ничейным";
+        } else {
+            if (Math.abs(diff) < Math.max(minNotional, 0.05)) {
+                return null;
+            }
+            moved = alloc.poolTransfer(tag.id(), quote, diff, now);
+            how = "с буфером пула";
+        }
+        if (moved == 0) {
+            return null;
+        }
+        ownCash += moved;
+        seedCash += moved;            // передача, а не торговый результат
+        journal.putState(STATE_CASH, ownCash);
+        journal.putState(STATE_SEED_CASH, seedCash);
+        String detail = String.format(java.util.Locale.ROOT,
+                "касса сведена %s: %+.4f %s (капитал %.2f, запас по входу %.2f, было %.2f, нужно %.2f)",
+                how, moved, quote, m.capital(), Math.max(0, reinvPos) * reinvAvg, have, target);
+        journal.event("pool_cash", detail);
+        return detail;
+    }
+
+    private void saveReinv() {
+        if (livePool == null) {
+            return;
+        }
+        journal.putState(STATE_REINV_POS, reinvPos);
+        journal.putState(STATE_REINV_AVG, Double.isNaN(reinvAvg) ? -1 : reinvAvg);
+        journal.putState(STATE_REINV_REAL, reinvRealised);
+        journal.putState(STATE_REINV_REPORTED, reinvReported);
+    }
+
+    private void restoreReinv() {
+        Double pos = journal.getState(STATE_REINV_POS);
+        if (pos == null || alloc == null || alloc.poolOf(tag.id()) == null) {
+            return;
+        }
+        Double avg = journal.getState(STATE_REINV_AVG);
+        Double real = journal.getState(STATE_REINV_REAL);
+        Double rep = journal.getState(STATE_REINV_REPORTED);
+        reinvPos = pos;
+        reinvAvg = avg == null || avg <= 0 ? Double.NaN : avg;
+        reinvRealised = real == null ? 0 : real;
+        reinvReported = rep == null ? reinvRealised : rep;
+        log.warn("пул: учёт восстановлен — запас {} по {}, реализовано {}, доложено {}",
+                fmt(reinvPos), fmt(reinvAvg), fmt(reinvRealised), fmt(reinvReported));
+    }
+
+    private void restoreUnitLot() {
+        if (Double.isNaN(unitSize) || !(policy instanceof Quoter)
+                || Math.abs(unitSize - params.size()) <= Math.max(1e-15, baseStep / 2)) {
+            return;
+        }
+        params = params.withSize(unitSize, unitCap);
+        quoter = new Quoter(params);
+        policy = quoter;
+        if (stand instanceof LiveHybridFair h) {
+            h.setLotQty(unitSize);
+        }
+        sizingChecked = false;
+        journal.event("lot_resize", "лот и потолок возвращены к юниту: " + fmt(unitSize) + " / " + fmt(unitCap));
+    }
+
+    /** Строка о пуле для чата бота; null — не в пуле. */
+    public String livePoolLine() {
+        AllocRegistry.PoolMember m = livePool;
+        if (m == null) {
+            return null;
+        }
+        return String.format(java.util.Locale.ROOT,
+                "пул %s: капитал %.2f (старт %.2f), принёс %+.2f, ждёт шага %+.2f",
+                m.pool(), m.capital(), m.capital0(), m.contributed(), m.pending());
+    }
+
+    /** Состояние общего буфера для отчёта прогона; null — пула нет. */
+    public String poolSummary() {
+        return pool == null ? null : pool.describe();
+    }
+
     private double lotUsdNow(double price, long now) {
+        if (livePoolCapital > 0 && capLots > 0) {
+            return livePoolCapital / capLots;
+        }
+        if ("pool".equals(REINVEST)) {
+            return pool == null || Double.isNaN(capLots) || capLots <= 0
+                    ? LOT_USD : pool.capital(POOL_ME) / capLots;
+        }
         if ("off".equals(REINVEST) || Double.isNaN(capLots) || capLots <= 0) {
             return LOT_USD;
         }
@@ -2778,13 +3139,14 @@ public final class QuoteLoop implements Runnable {
     private boolean lotRefused;
 
     private void lotFromUsd(double price) {
-        if (LOT_USD <= 0 || !(price > 0)) {
+        if ((LOT_USD <= 0 && livePoolCapital <= 0) || !(price > 0)) {
             return;
         }
         long now = clock.now();
-        if (lotResizedMs > 0 && (LOT_RESIZE_MS <= 0 || now - lotResizedMs < LOT_RESIZE_MS)) {
+        if (!poolDirty && lotResizedMs > 0 && (LOT_RESIZE_MS <= 0 || now - lotResizedMs < LOT_RESIZE_MS)) {
             return;
         }
+        poolDirty = false;
         lotResizedMs = now;
         if (Double.isNaN(capLots)) {
             capLots = params.size() > 0 ? params.inventoryCap() / params.size() : 0;
@@ -2836,8 +3198,10 @@ public final class QuoteLoop implements Runnable {
         double capUsd = params.inventoryCap() * price;
         double lots = params.size() > 0 ? params.inventoryCap() / params.size() : 0;
         String detail = String.format(java.util.Locale.ROOT,
-                "лот %.2f USDC, потолок %.2f USDC, лотов в потолке %.2f, предел заявки %.2f",
-                lotUsd, capUsd, lots, maxOrderNotional);
+                "лот %.2f USDC, потолок %.2f USDC, лотов в потолке %.2f, предел заявки %.2f"
+                        + ", предел экспозиции %.2f; лот_монет=%s потолок_монет=%s",
+                lotUsd, capUsd, lots, maxOrderNotional, maxExposure,
+                fmt(params.size()), fmt(params.inventoryCap()));
         log.warn("размеры: {}", detail);
         journal.event("sizing", detail);
 
@@ -2869,6 +3233,8 @@ public final class QuoteLoop implements Runnable {
             paperHedgeTick(fair.price());
         }
         rememberFair(fair.price());
+        poolTick(clock.now());
+        livePoolTick(clock.now());
         lossStopTick();
         if (lossStopUntil == 0) {
             panicWatch(fair.price());
@@ -5361,7 +5727,7 @@ public final class QuoteLoop implements Runnable {
                  "order_configuration":{"limit":{"base_size":"%s","price":"%s",
                  "execution_instructions":["post_only"]}}}"""
                 .formatted(tag.newClientOrderId(), symbol.replace('/', '-'),
-                        side == Side.BUY ? "buy" : "sell", fmtSize(size), fmt(price))
+                        side == Side.BUY ? "buy" : "sell", fmtSize(size), fmtPrice(price))
                 .replaceAll("\\s*\\n\\s*", "");
         if (takerNext) {
             // Тейкерская продажа экстренного режима: без post_only, пересекает книгу.
@@ -5435,7 +5801,7 @@ public final class QuoteLoop implements Runnable {
         String body = """
                 {"client_order_id":"%s","base_size":"%s","price":"%s",
                  "execution_instructions":["post_only"]}"""
-                .formatted(heirClientId, fmtSize(size), fmt(price))
+                .formatted(heirClientId, fmtSize(size), fmtPrice(price))
                 .replaceAll("\\s*\\n\\s*", "");
         Venue.Response response = client.replace(resting.venueId, body);
         replaces++;
@@ -7226,6 +7592,7 @@ public final class QuoteLoop implements Runnable {
      */
     private void applyFill(Side side, double qty, double price) {
         reinvTrack(side, qty, price);
+        saveReinv();
         noteRebuy(side, price);
         lossWatch(side, qty, price);
         freqFill(side);
@@ -9163,6 +9530,23 @@ public final class QuoteLoop implements Runnable {
                 .divide(step, 0, java.math.RoundingMode.DOWN)
                 .multiply(step);
         return q.stripTrailingZeros().toPlainString();
+    }
+
+    /**
+     * ЦЕНА ЗАЯВКИ — К ШАГУ ЦЕНЫ ПАРЫ (20.10.2026). Цена уже стоит на тике, но двоичная
+     * арифметика печатает её как 82275.90000000001, и площадка отвечает
+     * `400 price precision must not exceed 2 decimal places`. Живьём это 1–5 тыс. отказов
+     * в сутки на бота: замена тратит жетон секундного ведра, постановка уходит в паузу
+     * 5–10 с. Округление к ближайшему шагу: цена на тике, сдвигается только шум.
+     */
+    private String fmtPrice(double price) {
+        double step = params.quoteStep();
+        if (!(step > 0)) {
+            return fmt(price);
+        }
+        java.math.BigDecimal s = java.math.BigDecimal.valueOf(step);
+        return java.math.BigDecimal.valueOf(price).divide(s, 0, java.math.RoundingMode.HALF_UP)
+                .multiply(s).stripTrailingZeros().toPlainString();
     }
 
     private static String fmt(double value) {

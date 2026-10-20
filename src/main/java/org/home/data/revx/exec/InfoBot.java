@@ -311,6 +311,45 @@ public final class InfoBot implements Runnable {
     }
 
     /**
+     * Размеры из последнего {@code sizing} (19.10.2026, владелец: видеть лот и пределы):
+     * «лот 12.51 USDC, потолок 29.15 (2.33 лота), пределы: заявка 100, экспозиция 250».
+     * Лот и потолок переводятся в доллары по ТЕКУЩЕЙ цене, если событие несёт их в
+     * монетах; старое событие (до 19.10) — как записано. null — события нет.
+     */
+    String sizeOf(String botId, double fair) {
+        Watched w = watched.stream().filter(x -> x.botId().equalsIgnoreCase(botId)).findFirst().orElse(null);
+        if (w == null) {
+            return null;
+        }
+        try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
+            String[] e = j.lastEventOf("sizing");
+            if (e == null || e[1] == null) {
+                return null;
+            }
+            String d = e[1];
+            java.util.function.Function<String, Double> num = re -> {
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile(re).matcher(d);
+                return m.find() ? Double.parseDouble(m.group(1)) : Double.NaN;
+            };
+            double lot = num.apply("лот ([0-9.]+) USDC");
+            double cap = num.apply("потолок ([0-9.]+) USDC");
+            double lotQ = num.apply("лот_монет=([0-9.eE-]+)");
+            double capQ = num.apply("потолок_монет=([0-9.eE-]+)");
+            if (fair > 0 && lotQ > 0 && capQ > 0) {
+                lot = lotQ * fair;
+                cap = capQ * fair;
+            }
+            double lots = num.apply("лотов в потолке ([0-9.]+)");
+            double order = num.apply("предел заявки ([0-9.]+)");
+            double exp = num.apply("предел экспозиции ([0-9.]+)");
+            return String.format(Locale.ROOT, "лот %.2f USDC, потолок %.2f (%.2f лота), пределы: заявка %.0f%s",
+                    lot, cap, lots, order, Double.isNaN(exp) ? "" : String.format(Locale.ROOT, ", экспозиция %.0f", exp));
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    /**
      * Доля поводка к Бинансу из последнего {@code hybrid_clamp}: «поводок 2.4% за 60 мин»;
      * null — события нет или оно старше двух часов (после перезапуска первое — через час).
      */
@@ -500,6 +539,7 @@ public final class InfoBot implements Runnable {
                 watchHybrid();
                 watchVenue();
                 watchDisk();
+                poolSteps();
                 for (JsonNode update : JSON.readTree(body).path("result")) {
                     offset = update.path("update_id").asLong() + 1;
                     String text = update.path("message").path("text").asText("").trim();
@@ -532,10 +572,12 @@ public final class InfoBot implements Runnable {
             case "/all", "/status", "/start" -> send(all());
             case "/pnl" -> send(pnl());
             case "/alloc", "/claims" -> send(alloc());
+            case "/pool" -> send(poolCommand(args));
             case "/hide" -> send(visibility(args, true));
             case "/show" -> send(visibility(args, false));
             case "/help" -> send("""
-                    Сводка по всем исполнителям. Только смотрит, ничего не меняет.
+                    Сводка по всем исполнителям. Только смотрит — кроме общего буфера
+                    реинвеста: /pool help.
 
                     /all — котирование, форма сетки, инвентарь, сделки и доход
                     /pnl — доход сегодня (с 00:00) и за 7 суток, плюс нереализованное
@@ -565,6 +607,160 @@ public final class InfoBot implements Runnable {
                     снять заявки можно только в его собственном чате. Это
                     намеренно — команда, отданная не тому боту, дороже всего.""");
             default -> { }                      // чужие команды не наши
+        }
+    }
+
+    // --- общий буфер реинвестирования (20.10.2026) ----------------------------
+    //
+    // Сводка — координатор пула: часовой шаг и команды владельца. Деньги она не
+    // двигает (кроме резерва буфера при /pool add — из ничейного в pool:<имя>);
+    // кассу с капиталом сводит каждый бот сам. Ключа у сводки по-прежнему нет.
+
+    private AllocRegistry registry;
+
+    private AllocRegistry registry() {
+        if (registry == null) {
+            registry = new AllocRegistry(allocPath);
+        }
+        return registry;
+    }
+
+    private void poolSteps() {
+        try {
+            long now = System.currentTimeMillis();
+            for (AllocRegistry.Pool p : registry().pools()) {
+                String d = registry().poolStep(p.name(), now);
+                if (d != null) {
+                    log.info("пул {}: {}", p.name(), d);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("пул: шаг — {}", e.toString());
+        }
+    }
+
+    String poolCommand(String[] args) {
+        long now = System.currentTimeMillis();
+        AllocRegistry r = registry();
+        String sub = args.length == 0 ? "" : args[0].toLowerCase(Locale.ROOT);
+        try {
+            switch (sub) {
+                case "" -> {
+                    String s = poolLines();
+                    return s.isBlank() ? "Пулов нет. /pool help — как завести." : s.trim();
+                }
+                case "new" -> {
+                    if (args.length < 3) {
+                        return "Формат: /pool new <имя> <буфер %>, например /pool new mm 5";
+                    }
+                    String err = r.poolCreate(args[1], Double.parseDouble(args[2]), 0.5, 3, true, now);
+                    return err != null ? "Не создан: " + err
+                            : "Пул " + args[1] + " создан: буфер " + args[2]
+                            + "%, капитал участника от ½ до 3× стартового, недостача режет капиталы поровну.";
+                }
+                case "add" -> {
+                    if (args.length < 3) {
+                        return "Формат: /pool add <бот> <капитал USDC> [пул], например /pool add a 30";
+                    }
+                    String name = poolName(args.length > 3 ? args[3] : null);
+                    if (name == null) {
+                        return "Какой пул? Их несколько — укажите имя последним.";
+                    }
+                    Balance usdc = venueBalances().byCurrency().get(AllocRegistry.POOL_CURRENCY);
+                    if (usdc == null) {
+                        return "Нет остатка USDC ни в одном журнале — резерв буфера посчитать не из чего.";
+                    }
+                    String bot = args[1].toLowerCase(Locale.ROOT);
+                    String err = r.poolAdd(name, bot, Double.parseDouble(args[2]), usdc.total(), now);
+                    return err != null ? "Не принят: " + err
+                            : "Бот " + bot + " в пуле " + name + ", капитал " + args[2]
+                            + " USDC. Касса сведётся с ничейным при его /start (или через минуту, если он котирует), "
+                            + "лот станет капитал / лотов в потолке.";
+                }
+                case "set" -> {
+                    if (args.length < 3) {
+                        return "Формат: /pool set <бот> <капитал USDC>";
+                    }
+                    String err = r.poolSet(args[1].toLowerCase(Locale.ROOT), Double.parseDouble(args[2]), now);
+                    return err != null ? "Не задан: " + err
+                            : "Капитал " + args[1] + " = " + args[2] + " USDC (он же новый стартовый). "
+                            + "Разницу бот сведёт с ничейным.";
+                }
+                case "remove" -> {
+                    if (args.length < 2) {
+                        return "Формат: /pool remove <бот>";
+                    }
+                    String err = r.poolRemove(args[1].toLowerCase(Locale.ROOT), now);
+                    return err != null ? "Не выведен: " + err
+                            : "Бот " + args[1] + " выведен из пула: лот и потолок вернутся к юниту, "
+                            + "касса осталась за ним, буфер — пулу.";
+                }
+                default -> {
+                    return """
+                            Общий буфер реинвестирования.
+                            /pool — состояние
+                            /pool new mm 5 — завести пул с буфером 5%
+                            /pool add a 30 — бот a в пул с капиталом 30 USDC (буфер 5% от него берётся из ничейного)
+                            /pool set a 35 — задать капитал руками (разница — с ничейным)
+                            /pool remove a — вывести
+
+                            Весь реализованный доход и убыток участников идёт в буфер. Раз в час излишек
+                            сверх цели (5% суммы капиталов) делится ПОРОВНУ в капиталы, недостача — поровну
+                            из капиталов. Лот = капитал / лотов в потолке.""";
+                }
+            }
+        } catch (NumberFormatException e) {
+            return "Не число: " + e.getMessage();
+        }
+    }
+
+    private String poolName(String given) {
+        if (given != null) {
+            return given;
+        }
+        java.util.List<AllocRegistry.Pool> ps = registry().pools();
+        return ps.size() == 1 ? ps.get(0).name() : null;
+    }
+
+    /** Строки пулов для /all и /pool; пусто — пулов нет. */
+    String poolLines() {
+        try {
+            AllocRegistry r = registry();
+            StringBuilder sb = new StringBuilder();
+            long now = System.currentTimeMillis();
+            for (AllocRegistry.Pool p : r.pools()) {
+                java.util.List<AllocRegistry.PoolMember> ms = r.poolMembers(p.name());
+                double sum = 0;
+                double pending = 0;
+                for (AllocRegistry.PoolMember m : ms) {
+                    sum += m.capital();
+                    pending += m.pending();
+                }
+                double cash = r.own(AllocRegistry.POOL_PREFIX + p.name(), AllocRegistry.POOL_CURRENCY);
+                double target = sum * p.pct() / 100;
+                sb.append(String.format(Locale.ROOT,
+                        "%n💰 ПУЛ %s: буфер %.2f (цель %.2f, на счёте %.2f), ждёт шага %+.2f; "
+                                + "шагов %d, в капиталы %.2f, срезано %.2f%n",
+                        p.name(), p.buffer(), target, cash, pending, p.steps(), p.reinvested(), p.cut()));
+                for (AllocRegistry.PoolMember m : ms) {
+                    boolean quiet = m.reportedMs() > 0 && now - m.reportedMs() > 10 * 60_000L;
+                    sb.append(String.format(Locale.ROOT,
+                            "  %s: капитал %.2f (старт %.2f), принёс %+.2f%s%s%n",
+                            m.botId(), m.capital(), m.capital0(), m.contributed(),
+                            m.funded() ? "" : " · касса не сведена",
+                            m.reportedMs() == 0 ? " · ещё не докладывал"
+                                    : quiet ? " · не докладывал " + ago(now - m.reportedMs()) : ""));
+                }
+                if (cash < -1e-9 || Math.abs(cash - p.buffer()) > Math.max(1, target * 0.2)) {
+                    sb.append(String.format(Locale.ROOT,
+                            "  ⚠️ на счёте буфера %.2f при учётных %.2f — сведётся, когда участники котируют%n",
+                            cash, p.buffer()));
+                }
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            log.warn("пул: строка — {}", e.toString());
+            return "";
         }
     }
 
@@ -910,13 +1106,15 @@ public final class InfoBot implements Runnable {
                 what = what + " · " + mode;
             }
             String clamp = s.quoting() ? clampOf(s.botId(), now) : null;
+            String size = sizeOf(s.botId(), s.fair());
             sb.append(String.format(Locale.ROOT,
-                    "%s %s  %s%s — %s%n  закрытых пар сегодня %d, доход %+.4f USDC%n"
+                    "%s %s  %s%s — %s%n%s  закрытых пар сегодня %d, доход %+.4f USDC%n"
                             + "  инвентарь %.2f USDC%s, постановок за 24ч %d из %d (%d%%)%n"
                             + "  оборот сегодня %.2f USDC, доход %+.1f б.п. оборота%n"
                             + "  отводов за час %d, тик %s%s%s%n%n",
                     mark, s.botId().toUpperCase(Locale.ROOT), s.symbol(),
                     s.form() == null || s.form().isEmpty() ? "" : " · " + s.form(), what,
+                    size == null ? "" : "  " + size + "\n",
                     s.fills24(), s.realised24(), s.position() * s.fair(),
                     stale ? " — СНИМОК на момент остановки, НЕ ПРОВЕРЕНО" : "",
                     s.placements24(), s.cap(), pct,
@@ -934,6 +1132,7 @@ public final class InfoBot implements Runnable {
         // строками выше, а это худший вид неправды в отчёте.
         sb.append(budgetLine(now));
         sb.append(hiddenNote());
+        sb.append(poolLines());
         sb.append(bufferLine());
         sb.append(newsLine(now));
         sb.append(unownedNote());
@@ -1374,7 +1573,8 @@ public final class InfoBot implements Runnable {
                 claimed += qty;
                 // ⚠️ Мёртвый бот продолжает держать резервацию, пока её не
                 // распустят. Отметка времени показывает, жив ли он.
-                String stale = now - beat > 10 * 60_000L
+                // Буфер пула (pool:<имя>) процесса не имеет и не молчит.
+                String stale = now - beat > 10 * 60_000L && !bot.getKey().startsWith(AllocRegistry.POOL_PREFIX)
                         ? "  ⚠️ молчит " + ago(now - beat) : "";
                 // ⚠️ НУЛЕВЫЕ ПРЯЧЕМ, НО НЕ МОЛЧАЩИЕ (задача A64). После массового
                 // `/release` 16.09.2026 у всех пяти мёртвых ботов претензия по
@@ -1665,6 +1865,7 @@ public final class InfoBot implements Runnable {
                     [{"command":"all","description":"состояние всех исполнителей"},
                      {"command":"pnl","description":"доход сегодня и за 7 суток"},
                      {"command":"alloc","description":"кто что держит и сколько ничейного"},
+                     {"command":"pool","description":"общий буфер реинвеста: /pool, /pool help"},
                      {"command":"hide","description":"убрать ботов из сводок: /hide d e f"},
                      {"command":"show","description":"вернуть: /show d или /show all"},
                      {"command":"help","description":"что тут есть"}]"""

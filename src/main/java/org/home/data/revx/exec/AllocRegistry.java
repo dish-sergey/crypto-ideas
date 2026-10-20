@@ -79,7 +79,46 @@ public final class AllocRegistry implements AutoCloseable {
                 detail   TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_claim_event_bot ON claim_event(bot_id, ts_ms);
+            CREATE TABLE IF NOT EXISTS pool (
+                name        TEXT    PRIMARY KEY,
+                pct         REAL    NOT NULL,
+                floor       REAL    NOT NULL,
+                ceil        REAL    NOT NULL,
+                shrink      INTEGER NOT NULL,
+                buffer      REAL    NOT NULL,
+                step_hour   INTEGER NOT NULL,
+                steps       INTEGER NOT NULL DEFAULT 0,
+                reinvested  REAL    NOT NULL DEFAULT 0,
+                cut         REAL    NOT NULL DEFAULT 0,
+                created_ms  INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pool_member (
+                pool        TEXT    NOT NULL,
+                bot_id      TEXT    NOT NULL PRIMARY KEY,
+                capital0    REAL    NOT NULL,
+                capital     REAL    NOT NULL,
+                pending     REAL    NOT NULL DEFAULT 0,
+                contributed REAL    NOT NULL DEFAULT 0,
+                funded      INTEGER NOT NULL DEFAULT 0,
+                joined_ms   INTEGER NOT NULL,
+                reported_ms INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS pool_event (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ms   INTEGER NOT NULL,
+                pool    TEXT    NOT NULL,
+                kind    TEXT    NOT NULL,
+                detail  TEXT
+            );
             """;
+
+    /**
+     * Претензия ОБЩЕГО БУФЕРА пула — {@code pool:<имя>} в валюте котировки. Процесса у
+     * неё нет, сердцебиения тоже: она жива всегда, иначе через пять минут её распустил
+     * бы первый же захват как бесхозную.
+     */
+    public static final String POOL_PREFIX = "pool:";
+    public static final String POOL_CURRENCY = "USDC";
 
     /** Строка реестра. {@code live} — жива ли аренда на момент чтения. */
     public record Claim(String botId, String currency, double qty,
@@ -121,8 +160,9 @@ public final class AllocRegistry implements AutoCloseable {
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     long hb = rs.getLong(4);
-                    out.add(new Claim(rs.getString(1), currency, rs.getDouble(2),
-                            rs.getLong(3), hb, nowMs - hb < LEASE_MS));
+                    String bot = rs.getString(1);
+                    out.add(new Claim(bot, currency, rs.getDouble(2),
+                            rs.getLong(3), hb, nowMs - hb < LEASE_MS || bot.startsWith(POOL_PREFIX)));
                 }
             }
         } catch (Exception e) {
@@ -361,6 +401,395 @@ public final class AllocRegistry implements AutoCloseable {
                     f.claimedLive(), venueTotal, f.claimedLive() - venueTotal);
         }
         return null;
+    }
+
+    // --- общий буфер реинвестирования (20.10.2026) ----------------------------
+    //
+    // Учёт пула — ReinvestPool, его состояние живёт здесь. Шаг делает сводный бот
+    // (revx-info) раз в час; деньги двигает САМ бот-участник между своей претензией
+    // и претензией pool:<имя>, чтобы касса в его журнале и в реестре шла вместе.
+
+    public record Pool(String name, double pct, double floor, double ceil, boolean shrink,
+                       double buffer, long stepHour, long steps, double reinvested, double cut,
+                       long createdMs) {
+    }
+
+    /**
+     * @param funded своими деньгами (из ничейного) капитал уже обеспечен; false — после
+     *               {@code /pool add} и {@code /pool set}, бот сводит разницу с ничейным
+     */
+    public record PoolMember(String pool, String botId, double capital0, double capital,
+                             double pending, double contributed, boolean funded, long joinedMs,
+                             long reportedMs) {
+    }
+
+    public synchronized List<Pool> pools() {
+        List<Pool> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT name, pct, floor, ceil, shrink, buffer, step_hour, steps, reinvested, cut, "
+                        + "created_ms FROM pool ORDER BY name");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                out.add(new Pool(rs.getString(1), rs.getDouble(2), rs.getDouble(3), rs.getDouble(4),
+                        rs.getInt(5) != 0, rs.getDouble(6), rs.getLong(7), rs.getLong(8),
+                        rs.getDouble(9), rs.getDouble(10), rs.getLong(11)));
+            }
+        } catch (Exception e) {
+            log.error("не прочитать пулы: {}", e.getMessage());
+        }
+        return out;
+    }
+
+    public synchronized Pool pool(String name) {
+        for (Pool p : pools()) {
+            if (p.name().equals(name)) {
+                return p;
+            }
+        }
+        return null;
+    }
+
+    public synchronized List<PoolMember> poolMembers(String name) {
+        List<PoolMember> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT pool, bot_id, capital0, capital, pending, contributed, funded, joined_ms, "
+                        + "COALESCE(reported_ms, 0) FROM pool_member WHERE pool = ? ORDER BY bot_id")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(member(rs));
+                }
+            }
+        } catch (Exception e) {
+            log.error("не прочитать участников пула: {}", e.getMessage());
+        }
+        return out;
+    }
+
+    /** Членство бота; null — бот ни в каком пуле. */
+    public synchronized PoolMember poolOf(String botId) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT pool, bot_id, capital0, capital, pending, contributed, funded, joined_ms, "
+                        + "COALESCE(reported_ms, 0) FROM pool_member WHERE bot_id = ?")) {
+            ps.setString(1, botId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? member(rs) : null;
+            }
+        } catch (Exception e) {
+            log.error("не прочитать членство в пуле: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private static PoolMember member(ResultSet rs) throws java.sql.SQLException {
+        return new PoolMember(rs.getString(1), rs.getString(2), rs.getDouble(3), rs.getDouble(4),
+                rs.getDouble(5), rs.getDouble(6), rs.getInt(7) != 0, rs.getLong(8), rs.getLong(9));
+    }
+
+    /** Создать пул. @return null при успехе, иначе причина */
+    public synchronized String poolCreate(String name, double pct, double floor, double ceil,
+                                          boolean shrink, long nowMs) {
+        if (pool(name) != null) {
+            return "пул " + name + " уже есть";
+        }
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT INTO pool(name, pct, floor, ceil, shrink, buffer, step_hour, created_ms) "
+                        + "VALUES(?,?,?,?,?,0,?,?)")) {
+            ps.setString(1, name);
+            ps.setDouble(2, pct);
+            ps.setDouble(3, floor);
+            ps.setDouble(4, ceil);
+            ps.setInt(5, shrink ? 1 : 0);
+            ps.setLong(6, nowMs / HOUR_MS);
+            ps.setLong(7, nowMs);
+            ps.executeUpdate();
+            poolEvent(name, "create", String.format(java.util.Locale.ROOT,
+                    "буфер %.1f%%, капитал от %.2f до %.2f стартового, недостача %s", pct, floor, ceil,
+                    shrink ? "режет капиталы" : "ждёт дохода"));
+            return null;
+        } catch (Exception e) {
+            return "не создать пул: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Принять бота в пул со стартовым капиталом {@code capital} USDC. Буфер — {@code pct}%
+     * капитала — резервируется сразу из НИЧЕЙНЫХ денег (претензия {@code pool:<имя>}).
+     * Свою кассу под капитал бот сведёт с ничейным сам, при ближайшем {@code /start} или
+     * через минуту, если уже котирует.
+     *
+     * @param venueTotal остаток USDC на счёте (total)
+     * @return null при успехе, иначе причина
+     */
+    public synchronized String poolAdd(String name, String botId, double capital, double venueTotal,
+                                       long nowMs) {
+        Pool p = pool(name);
+        if (p == null) {
+            return "пула " + name + " нет";
+        }
+        PoolMember was = poolOf(botId);
+        if (was != null) {
+            return "бот " + botId + " уже в пуле " + was.pool();
+        }
+        if (!(capital > 0)) {
+            return "капитал должен быть больше нуля";
+        }
+        double reserve = capital * p.pct() / 100;
+        double free = free(POOL_CURRENCY, venueTotal, nowMs).free();
+        if (reserve > free + 1e-9) {
+            return String.format(java.util.Locale.ROOT,
+                    "под буфер нужно %.2f %s, ничейного %.2f", reserve, POOL_CURRENCY, free);
+        }
+        try {
+            connection.setAutoCommit(false);
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "INSERT INTO pool_member(pool, bot_id, capital0, capital, joined_ms) VALUES(?,?,?,?,?)")) {
+                ps.setString(1, name);
+                ps.setString(2, botId);
+                ps.setDouble(3, capital);
+                ps.setDouble(4, capital);
+                ps.setLong(5, nowMs);
+                ps.executeUpdate();
+            }
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "UPDATE pool SET buffer = buffer + ? WHERE name = ?")) {
+                ps.setDouble(1, reserve);
+                ps.setString(2, name);
+                ps.executeUpdate();
+            }
+            String id = POOL_PREFIX + name;
+            setQty(id, POOL_CURRENCY, own(id, POOL_CURRENCY) + reserve, nowMs,
+                    sinceOf(id, POOL_CURRENCY, nowMs));
+            event(id, POOL_CURRENCY, reserve, "pool_reserve", 1, "буфер под " + botId);
+            poolEvent(name, "add", String.format(java.util.Locale.ROOT,
+                    "%s: капитал %.2f, в буфер из ничейного %.2f", botId, capital, reserve));
+            connection.commit();
+            return null;
+        } catch (Exception e) {
+            rollback();
+            return "не принять в пул: " + e.getMessage();
+        } finally {
+            autoCommit();
+        }
+    }
+
+    /**
+     * Задать капитал участника руками (и он же новый стартовый: границы ½…3× от него).
+     * Разницу бот сведёт с НИЧЕЙНЫМ, а не с буфером: это решение владельца, а не доход.
+     */
+    public synchronized String poolSet(String botId, double capital, long nowMs) {
+        PoolMember m = poolOf(botId);
+        if (m == null) {
+            return "бот " + botId + " ни в каком пуле";
+        }
+        if (!(capital > 0)) {
+            return "капитал должен быть больше нуля";
+        }
+        try (PreparedStatement ps = connection.prepareStatement(
+                "UPDATE pool_member SET capital0 = ?, capital = ?, funded = 0 WHERE bot_id = ?")) {
+            ps.setDouble(1, capital);
+            ps.setDouble(2, capital);
+            ps.setString(3, botId);
+            ps.executeUpdate();
+            poolEvent(m.pool(), "set", String.format(java.util.Locale.ROOT,
+                    "%s: капитал %.2f → %.2f руками", botId, m.capital(), capital));
+            return null;
+        } catch (Exception e) {
+            return "не задать капитал: " + e.getMessage();
+        }
+    }
+
+    /** Вывести бота из пула. Буфер остаётся пулу; касса бота — за ботом. */
+    public synchronized String poolRemove(String botId, long nowMs) {
+        PoolMember m = poolOf(botId);
+        if (m == null) {
+            return "бот " + botId + " ни в каком пуле";
+        }
+        try (PreparedStatement ps = connection.prepareStatement(
+                "DELETE FROM pool_member WHERE bot_id = ?")) {
+            ps.setString(1, botId);
+            ps.executeUpdate();
+            poolEvent(m.pool(), "remove", String.format(java.util.Locale.ROOT,
+                    "%s: капитал был %.2f, не учтено в шаге %+.4f", botId, m.capital(), m.pending()));
+            return null;
+        } catch (Exception e) {
+            return "не вывести из пула: " + e.getMessage();
+        }
+    }
+
+    /** Бот докладывает реализованное с прошлого доклада. */
+    public synchronized void poolReport(String botId, double delta, long nowMs) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "UPDATE pool_member SET pending = pending + ?, reported_ms = ? WHERE bot_id = ?")) {
+            ps.setDouble(1, delta);
+            ps.setLong(2, nowMs);
+            ps.setString(3, botId);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.error("не доложить пулу: {}", e.getMessage());
+        }
+    }
+
+    public synchronized void poolFunded(String botId) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "UPDATE pool_member SET funded = 1 WHERE bot_id = ?")) {
+            ps.setString(1, botId);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.error("не отметить обеспечение капитала: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Передача денег между ботом и буфером его пула. {@code amount} &gt; 0 — из буфера
+     * боту (не больше, чем в буфере), &lt; 0 — от бота в буфер (не больше его претензии).
+     * @return сколько передано, со знаком
+     */
+    public synchronized double poolTransfer(String botId, String currency, double amount, long nowMs) {
+        PoolMember m = poolOf(botId);
+        if (m == null || amount == 0 || !Double.isFinite(amount)) {
+            return 0;
+        }
+        String id = POOL_PREFIX + m.pool();
+        double inPool = own(id, currency);
+        double mine = own(botId, currency);
+        double move = amount > 0 ? Math.min(amount, Math.max(0, inPool)) : -Math.min(-amount, Math.max(0, mine));
+        if (move == 0) {
+            return 0;
+        }
+        try {
+            connection.setAutoCommit(false);
+            setQty(id, currency, inPool - move, nowMs, sinceOf(id, currency, nowMs));
+            setQty(botId, currency, mine + move, nowMs, sinceOf(botId, currency, nowMs));
+            event(botId, currency, move, move > 0 ? "pool_in" : "pool_out", 1,
+                    (move > 0 ? "из буфера " : "в буфер ") + m.pool());
+            connection.commit();
+            return move;
+        } catch (Exception e) {
+            rollback();
+            log.error("не выполнить передачу с пулом: {}", e.getMessage());
+            return 0;
+        } finally {
+            autoCommit();
+        }
+    }
+
+    /**
+     * Свести кассу бота с НИЧЕЙНЫМ (решение владельца: {@code /pool add}, {@code /pool set}).
+     * {@code amount} &gt; 0 — взять из ничейного (сколько есть), &lt; 0 — вернуть.
+     * @return сколько передано, со знаком
+     */
+    public synchronized double poolFundFree(String botId, String currency, double amount,
+                                            double venueTotal, long nowMs) {
+        if (amount == 0 || !Double.isFinite(amount)) {
+            return 0;
+        }
+        double mine = own(botId, currency);
+        double move = amount > 0
+                ? Math.min(amount, free(currency, venueTotal, nowMs).free())
+                : -Math.min(-amount, Math.max(0, mine));
+        if (move == 0) {
+            return 0;
+        }
+        try {
+            connection.setAutoCommit(false);
+            setQty(botId, currency, mine + move, nowMs, sinceOf(botId, currency, nowMs));
+            event(botId, currency, move, "pool_fund", 1,
+                    move > 0 ? "капитал пула: взято из ничейного" : "капитал пула: возвращено в ничейное");
+            connection.commit();
+            return move;
+        } catch (Exception e) {
+            rollback();
+            log.error("не свести кассу с ничейным: {}", e.getMessage());
+            return 0;
+        } finally {
+            autoCommit();
+        }
+    }
+
+    public static final long HOUR_MS = 3_600_000L;
+
+    /**
+     * Часовой шаг пула. Делается, если с прошлого шага сменился час; пропущенные часы
+     * (сводка лежала) схлопываются в один шаг — накопленное всё равно лежит в pending.
+     * @return строка о шаге, если капиталы сдвинулись; иначе null
+     */
+    public synchronized String poolStep(String name, long nowMs) {
+        Pool p = pool(name);
+        long hour = nowMs / HOUR_MS;
+        if (p == null || hour <= p.stepHour()) {
+            return null;
+        }
+        List<PoolMember> ms = poolMembers(name);
+        try {
+            connection.setAutoCommit(false);
+            if (ms.isEmpty()) {
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "UPDATE pool SET step_hour = ? WHERE name = ?")) {
+                    ps.setLong(1, hour);
+                    ps.setString(2, name);
+                    ps.executeUpdate();
+                }
+                connection.commit();
+                return null;
+            }
+            java.util.Map<String, double[]> state = new java.util.TreeMap<>();
+            java.util.Map<String, Double> deltas = new java.util.TreeMap<>();
+            for (PoolMember m : ms) {
+                state.put(m.botId(), new double[]{m.capital0(), m.capital(), m.contributed()});
+                deltas.put(m.botId(), m.pending());
+            }
+            ReinvestPool rp = ReinvestPool.restore(p.pct(), p.floor(), p.ceil(), p.shrink(), p.buffer(), state);
+            rp.step(deltas);
+            boolean moved = false;
+            for (PoolMember m : ms) {
+                ReinvestPool.Member after = rp.members().get(m.botId());
+                moved |= Math.abs(after.capital - m.capital()) > 1e-9;
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "UPDATE pool_member SET capital = ?, contributed = ?, pending = pending - ? "
+                                + "WHERE bot_id = ?")) {
+                    ps.setDouble(1, after.capital);
+                    ps.setDouble(2, after.contributed);
+                    ps.setDouble(3, m.pending());
+                    ps.setString(4, m.botId());
+                    ps.executeUpdate();
+                }
+            }
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "UPDATE pool SET buffer = ?, step_hour = ?, steps = steps + 1, "
+                            + "reinvested = reinvested + ?, cut = cut + ? WHERE name = ?")) {
+                ps.setDouble(1, rp.buffer());
+                ps.setLong(2, hour);
+                ps.setDouble(3, rp.reinvested());
+                ps.setDouble(4, rp.cut());
+                ps.setString(5, name);
+                ps.executeUpdate();
+            }
+            String d = String.format(java.util.Locale.ROOT, "шаг: принесено %+.4f; %s",
+                    deltas.values().stream().mapToDouble(Double::doubleValue).sum(), rp.describe());
+            poolEvent(name, moved ? "step" : "step_hold", d);
+            connection.commit();
+            return moved ? d : null;
+        } catch (Exception e) {
+            rollback();
+            log.error("пул {}: шаг не сделан — {}", name, e.getMessage());
+            return null;
+        } finally {
+            autoCommit();
+        }
+    }
+
+    private void poolEvent(String pool, String kind, String detail) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT INTO pool_event(ts_ms, pool, kind, detail) VALUES(?,?,?,?)")) {
+            ps.setLong(1, System.currentTimeMillis());
+            ps.setString(2, pool);
+            ps.setString(3, kind);
+            ps.setString(4, detail);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            log.error("не записать событие пула: {}", e.getMessage());
+        }
     }
 
     // --- внутреннее -----------------------------------------------------------

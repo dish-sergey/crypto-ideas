@@ -1057,8 +1057,10 @@ public class Executor {
             double lot = ps.baseStep() > 0
                     ? Math.max(ps.baseStep(), Math.round(lotUsd / price / ps.baseStep()) * ps.baseStep())
                     : lotUsd / price;
+            // Цель скоса прогноза пары: 0.3, как у живых a–f; -Drevx.sim.pair-skew-target — ось опыта (19.10.2026).
+            double pairSkewTarget = Double.parseDouble(System.getProperty("revx.sim.pair-skew-target", "0.3"));
             var bp = new org.home.data.revx.replay.BootParams(pairSymbol, "a", lot, lot * capLots,
-                    0.0007, cfg.simSkewK(), 0.3, 1000, ps.minNotional(), ps.baseStep(),
+                    0.0007, cfg.simSkewK(), pairSkewTarget, 1000, ps.minNotional(), ps.baseStep(),
                     ps.quoteStep(), 0.10, -1, -1, 0, 0.02, 0.5, true,
                     levels, levelStepBp / 10_000, innerFirst);
 
@@ -1075,7 +1077,7 @@ public class Executor {
             for (int i = 0; i < parts.length; i++) {
                 bots.add(new org.home.data.revx.replay.Forecast.BotSpec(
                         String.valueOf((char) ('a' + i)),
-                        Double.parseDouble(parts[i].trim()) / 10_000, 0.3,
+                        Double.parseDouble(parts[i].trim()) / 10_000, pairSkewTarget,
                         bp.inventoryCap() / parts.length, levels,
                         levelStepBp / 10_000, lot, innerFirst));
             }

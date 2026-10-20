@@ -76,7 +76,7 @@ public final class ExecBot implements Runnable {
         registerCommands();
         dropBacklog();
         send("Исполнитель запущен. Котирование ВЫКЛЮЧЕНО — включить: /start\n\n"
-                + loop.profile() + "\n" + ExecLimits.describe(loop.botId()));
+                + loop.profile() + "\n" + ExecLimits.describe(loop.botId(), loop.maxTradingLoss()));
         while (alive) {
             try {
                 String body = call("getUpdates?timeout=25&offset=" + offset, null);
@@ -154,7 +154,8 @@ public final class ExecBot implements Runnable {
                 } else {
                     loop.startQuoting();
                     send("Котирование ВКЛЮЧЕНО."
-                            + (taken == null ? "" : "\n" + taken) + "\n" + status());
+                            + (taken == null ? "" : "\n" + taken) + "\n" + status()
+                            + "\n" + loop.protections());
                 }
             }
             case "/stop" -> {
@@ -168,7 +169,7 @@ public final class ExecBot implements Runnable {
             }
             case "/status" -> send(status());
             case "/stats" -> send(stats());
-            case "/limits" -> send(ExecLimits.describe(loop.botId()));
+            case "/limits" -> send(ExecLimits.describe(loop.botId(), loop.maxTradingLoss()));
             case "/free" -> send(loop.describeFree());
             case "/claim" -> {
                 String[] parts = text.split("\s+");

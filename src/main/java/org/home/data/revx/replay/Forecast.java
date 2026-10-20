@@ -346,8 +346,10 @@ public final class Forecast {
             throw new IllegalStateException("нет ни одного тика со справедливой ценой для "
                     + base.symbol());
         }
+        // Реинвестирование растит потолок до reinvest-max стартового: денег на счёте
+        // должно хватать и на выросший, иначе мерили бы нехватку кассы.
         double quoteStart = bots.stream().mapToDouble(BotSpec::inventoryCap).sum()
-                * refPrice * 1.2;
+                * refPrice * Double.parseDouble(System.getProperty("revx.sim.cash-mult", "1.2"));
         double startBase = startInventory(ticks, bots);
         // Ничейный буфер на счёте (лотов первого бота): монета, которую никто не
         // затравил и не купил, — ею бот покрывает своё запертое призраком (§3.6).
@@ -626,6 +628,11 @@ public final class Forecast {
                         + crashes.size() + ", первый — " + crashes.get(0), crashes.get(0));
             }
 
+            for (QuoteLoop l : loops) {
+                if (l.poolSummary() != null) {
+                    log.warn("ОБЩИЙ БУФЕР {}: {}", l.botId(), l.poolSummary());
+                }
+            }
             log.warn("площадка исполнила заявок: {} (это НЕ то же, что заметил бот)",
                     venue.appliedFills());
             log.warn("объём: {}", venue.fillDiag());

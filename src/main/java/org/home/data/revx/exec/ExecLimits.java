@@ -50,8 +50,12 @@ public final class ExecLimits {
      * С 10.10.2026 — 25 вместо 10: лот удвоен второй раз (решение владельца), у
      * a/b/c он ~$12.5 и в прежние $10 не влезал. 25 держит лот на половине
      * предела, ниже порога предупреждения в 60% ({@code QuoteLoop} sizing_warn).
+     *
+     * С 19.10.2026 — 100 (решение владельца): реинвестирование общим буфером растит
+     * лот до трёх стартовых, у a/b/c это ~$37.5, и прежние 25 молча остановили бы
+     * постановки. Лот и предел каждого бота видны в {@code /all}.
      */
-    public static final double MAX_ORDER_NOTIONAL_USDC = 25.0;
+    public static final double MAX_ORDER_NOTIONAL_USDC = 100.0;
 
     /**
      * Потолок суммарной экспозиции ОДНОГО бота: стоящие заявки плюс инвентарь.
@@ -69,8 +73,11 @@ public final class ExecLimits {
      *
      * С 10.10.2026 — 80: потолок запаса удвоен до ~$29 на бота, и с
      * заявкой $12.5 сверху прежние 40 стали бы рабочим пределом, а не аварийным.
+     *
+     * С 19.10.2026 — 250: при росте капитала в три раза запас доходит до ~$87, а с
+     * заявками трёх уровней сверху до ~$125 — прежние 80 стали бы рабочим пределом.
      */
-    public static final double MAX_TOTAL_EXPOSURE_USDC = 80.0;
+    public static final double MAX_TOTAL_EXPOSURE_USDC = 250.0;
 
     /**
      * ⚠️ <b>С 07.09.2026 это АВАРИЙНЫЙ потолок, а не рабочая доля.</b> Бюджет
@@ -269,6 +276,11 @@ public final class ExecLimits {
     }
 
     public static String describe(String botId) {
+        return describe(botId, MAX_TRADING_LOSS_USDC);
+    }
+
+    /** @param maxLoss действующий предел бота: юнит (`--revx.exec.max-loss=`) перекрывает константу. */
+    public static String describe(String botId, double maxLoss) {
         return """
                 Жёсткие пределы (в коде, менять только пересборкой):
                   заявка не больше       %.2f USDC
@@ -279,6 +291,6 @@ public final class ExecLimits {
                   торговый убыток        %.2f USDC — иначе стоп (против buy and hold)""".formatted(
                 MAX_ORDER_NOTIONAL_USDC, MAX_TOTAL_EXPOSURE_USDC,
                 maxPlacementsPerDay(botId), MAX_REPLACES_PER_MINUTE,
-                MAX_FEE_USDC, MAX_TRADING_LOSS_USDC);
+                MAX_FEE_USDC, maxLoss);
     }
 }
