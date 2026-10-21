@@ -738,22 +738,53 @@ public final class InfoBot implements Runnable {
                 }
                 double cash = r.own(AllocRegistry.POOL_PREFIX + p.name(), AllocRegistry.POOL_CURRENCY);
                 double target = sum * p.pct() / 100;
+                // Буфер и капиталы — УЧЁТ: шаг двигает их числами, деньги остаются у ботов.
+                // Бот сводит свою кассу с капиталом сам, когда расхождение больше $0.10
+                // (QuoteLoop, порог — минимум заявки), поэтому отложенное под буфер на
+                // счёте отстаёт от учёта на сумму несведённого у ботов.
                 sb.append(String.format(Locale.ROOT,
-                        "%n💰 ПУЛ %s: буфер %.2f (цель %.2f, на счёте %.2f), ждёт шага %+.2f; "
+                        "%n💰 ПУЛ %s: буфер %.2f (цель %.2f), отложено %.2f%s; ждёт шага %+.2f; "
                                 + "шагов %d, в капиталы %.2f, срезано %.2f%n",
-                        p.name(), p.buffer(), target, cash, pending, p.steps(), p.reinvested(), p.cut()));
-                for (AllocRegistry.PoolMember m : ms) {
+                        p.name(), p.buffer(), target, cash,
+                        Math.abs(cash - p.buffer()) >= 0.005
+                                ? String.format(Locale.ROOT, " (%+.2f не сведено с ботами)", cash - p.buffer()) : "",
+                        pending, p.steps(), p.reinvested(), p.cut()));
+                // Сколько бот ещё возьмёт из буфера (+) или сдаст в него (−): прибавка
+                // капитала минус принесённое минус уже переданное. В сумме с «ждёт шага» это
+                // ровно «отложено − буфер»; после /pool set (старт переписан) или /pool remove
+                // тождество рвётся — тогда по ботам не показываем, чтобы не врать.
+                double[] open = new double[ms.size()];
+                double openSum = 0;
+                for (int i = 0; i < ms.size(); i++) {
+                    AllocRegistry.PoolMember m = ms.get(i);
+                    open[i] = (m.capital() - m.capital0()) - (m.contributed() + m.pending())
+                            - r.poolTransferred(m.botId(), AllocRegistry.POOL_CURRENCY);
+                    openSum += open[i];
+                }
+                boolean openTrusted = Math.abs(openSum + pending - (cash - p.buffer())) < 0.05;
+                boolean anyOpen = false;
+                for (int i = 0; i < ms.size(); i++) {
+                    AllocRegistry.PoolMember m = ms.get(i);
                     boolean quiet = m.reportedMs() > 0 && now - m.reportedMs() > 10 * 60_000L;
+                    String openText = "";
+                    if (openTrusted && m.funded() && Math.abs(open[i]) >= 0.005) {
+                        anyOpen = true;
+                        openText = String.format(Locale.ROOT, ", не сведено %+.2f", open[i]);
+                    }
                     sb.append(String.format(Locale.ROOT,
-                            "  %s: капитал %.2f (старт %.2f), принёс %+.2f%s%s%n",
-                            m.botId(), m.capital(), m.capital0(), m.contributed(),
+                            "  %s: капитал %.2f (старт %.2f), принёс %+.2f%s%s%s%n",
+                            m.botId(), m.capital(), m.capital0(), m.contributed(), openText,
                             m.funded() ? "" : " · касса не сведена",
-                            m.reportedMs() == 0 ? " · ещё не докладывал"
-                                    : quiet ? " · не докладывал " + ago(now - m.reportedMs()) : ""));
+                            m.reportedMs() == 0 ? " · продаж ещё не было"
+                                    : quiet ? " · продаж не было " + ago(now - m.reportedMs()) : ""));
+                }
+                if (anyOpen) {
+                    sb.append("  не сведено: + бот ещё возьмёт из буфера, − ещё сдаст; сводит сам, "
+                            + "когда больше $0.10 и бот котирует\n");
                 }
                 if (cash < -1e-9 || Math.abs(cash - p.buffer()) > Math.max(1, target * 0.2)) {
                     sb.append(String.format(Locale.ROOT,
-                            "  ⚠️ на счёте буфера %.2f при учётных %.2f — сведётся, когда участники котируют%n",
+                            "  ⚠️ отложено под буфер %.2f при учётных %.2f — сведётся, когда участники котируют%n",
                             cash, p.buffer()));
                 }
             }

@@ -630,6 +630,22 @@ public final class AllocRegistry implements AutoCloseable {
         }
     }
 
+    /** Сумма передач бота с буфером пула ({@code pool_in} +, {@code pool_out} −) за всё время. */
+    public synchronized double poolTransferred(String botId, String currency) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT COALESCE(SUM(qty), 0) FROM claim_event "
+                        + "WHERE bot_id = ? AND currency = ? AND kind IN ('pool_in', 'pool_out')")) {
+            ps.setString(1, botId);
+            ps.setString(2, currency);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getDouble(1) : 0;
+            }
+        } catch (Exception e) {
+            log.error("не прочитать передачи с пулом: {}", e.getMessage());
+            return 0;
+        }
+    }
+
     public synchronized void poolFunded(String botId) {
         try (PreparedStatement ps = connection.prepareStatement(
                 "UPDATE pool_member SET funded = 1 WHERE bot_id = ?")) {
