@@ -1936,13 +1936,52 @@ public final class InfoBot implements Runnable {
         }
     }
 
+    /**
+     * Telegram не принимает сообщение длиннее 4096 символов (400 «message is too long») —
+     * сводка /all на шести ботах с пулом к этому пределу подошла (21.10.2026: ответов не было
+     * вовсе, а отказ проглатывался молча). Режем по строкам на части до {@link #TG_CHUNK}.
+     */
+    static final int TG_CHUNK = 4000;
+
     public void send(String text) {
-        try {
-            call("sendMessage", "chat_id=" + chatId + "&text="
-                    + URLEncoder.encode(text, StandardCharsets.UTF_8));
-        } catch (Exception e) {
-            log.warn("не отправилось сообщение: {}", e.toString());
+        for (String part : chunks(text, TG_CHUNK)) {
+            try {
+                if (call("sendMessage", "chat_id=" + chatId + "&text="
+                        + URLEncoder.encode(part, StandardCharsets.UTF_8)) == null) {
+                    log.warn("Telegram не принял сообщение ({} символов)", part.length());
+                }
+            } catch (Exception e) {
+                log.warn("не отправилось сообщение: {}", e.toString());
+            }
         }
+    }
+
+    /** Части не длиннее {@code max}, разрез по концу строки; строка длиннее предела режется как есть. */
+    static java.util.List<String> chunks(String text, int max) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        for (String line : text.split("\n", -1)) {
+            while (line.length() > max) {
+                if (!cur.isEmpty()) {
+                    out.add(cur.toString());
+                    cur.setLength(0);
+                }
+                out.add(line.substring(0, max));
+                line = line.substring(max);
+            }
+            if (cur.length() + line.length() + (cur.isEmpty() ? 0 : 1) > max) {
+                out.add(cur.toString());
+                cur.setLength(0);
+            }
+            if (!cur.isEmpty()) {
+                cur.append('\n');
+            }
+            cur.append(line);
+        }
+        if (!cur.toString().isBlank()) {
+            out.add(cur.toString());
+        }
+        return out;
     }
 
     private String call(String method, String form) throws Exception {
@@ -1956,6 +1995,12 @@ public final class InfoBot implements Runnable {
                     .POST(HttpRequest.BodyPublishers.ofString(form));
         }
         HttpResponse<String> r = http.send(b.build(), HttpResponse.BodyHandlers.ofString());
-        return r.statusCode() / 100 == 2 ? r.body() : null;
+        if (r.statusCode() / 100 != 2) {
+            String body = r.body() == null ? "" : r.body();
+            log.warn("Telegram {}: HTTP {} {}", method.replaceAll("\\?.*", ""), r.statusCode(),
+                    body.substring(0, Math.min(300, body.length())));
+            return null;
+        }
+        return r.body();
     }
 }
