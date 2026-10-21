@@ -2418,6 +2418,10 @@ public final class QuoteLoop implements Runnable {
         sb.append("Приоритет замен (опасная сторона первой): ")
                 .append(REPLACE_DANGER_FIRST || (STORM_PARK_LEVELS > 0 && STORM_PARK_PACED) ? "ВКЛ" : "выкл")
                 .append('\n');
+        if (QUEUE_ADAPT) {
+            sb.append(String.format(r, "Отступ от очереди: впереди > $%.0f — до %.1f б.п. ближе, никого (≤ $%.0f) — до %.1f б.п. дальше%n",
+                    QA_AHEAD_USD, QA_IN_BP, QA_EMPTY_USD, QA_OUT_BP)).append(QA_FIRST_ONLY ? "  (ходит только ближний уровень)\n" : "");
+        }
         if (Boolean.getBoolean("revx.fair.live-hybrid")) {
             sb.append(String.format(r, "Опора: смесь %s, глубина %s лота, Бинанс τ %s с, поводок ±%s б.п.%n",
                     System.getProperty("revx.fair.hybrid-mix", "?"),
@@ -4180,6 +4184,16 @@ public final class QuoteLoop implements Runnable {
         if (base != null) {
             base = behindBest(side, base, fair);
         }
+        if (base != null && (level == 0 || !QA_FIRST_ONLY)) {
+            double raw = base;
+            base = queueAdapt(side, base, fair);
+            if (QA_FIRST_ONLY && levels > 1 && levelStep > 0) {
+                // Только ближний уровень ходит, дальние стоят на местах: ближний не заходит за второй.
+                double second = levelStep * fair;
+                double step = Math.max(params.quoteStep(), 1e-12);
+                base = side == Side.BUY ? Math.max(base, raw - second + step) : Math.min(base, raw + second - step);
+            }
+        }
         if (side == Side.BUY && base != null) {
             base = rebuyCap(base);
         }
@@ -4340,6 +4354,114 @@ public final class QuoteLoop implements Runnable {
         }
         behindShifts++;
         return target;
+    }
+
+    /**
+     * ОТСТУП ОТ ОЧЕРЕДИ (20.10.2026, идея владельца). Цена уровня не прибита к отступу, а ходит
+     * в полосе [база − in; база + out] б.п. от опоры по тому, сколько чужого стоит впереди:
+     * <ul>
+     *   <li>впереди (по лучшим ценам и на нашей) больше {@code queue-adapt-ahead-usd} — подходим к
+     *       рынку: встаём на шаг перед тем уровнем книги, за которым впереди останется не больше
+     *       порога, но не ближе {@code in} б.п. к рынку от базы;</li>
+     *   <li>впереди никого (не больше {@code queue-adapt-empty-usd} — пыль и соседние боты) —
+     *       отходим от рынка до шага перед следующей чужой заявкой, но не дальше {@code out}.</li>
+     * </ul>
+     * {@code revx.exec.queue-adapt=true} включает; по умолчанию выключено.
+     */
+    static final boolean QUEUE_ADAPT = Boolean.getBoolean("revx.exec.queue-adapt");
+    static final double QA_AHEAD_USD = Double.parseDouble(System.getProperty("revx.exec.queue-adapt-ahead-usd", "1000"));
+    static final double QA_EMPTY_USD = Double.parseDouble(System.getProperty("revx.exec.queue-adapt-empty-usd", "25"));
+    static final double QA_IN_BP = Double.parseDouble(System.getProperty("revx.exec.queue-adapt-in-bp", "2"));
+    static final double QA_OUT_BP = Double.parseDouble(System.getProperty("revx.exec.queue-adapt-out-bp", "5"));
+    /** {@code queue-adapt-first-only=true}: ходит только ближний уровень, дальние на своих ценах. */
+    static final boolean QA_FIRST_ONLY = Boolean.getBoolean("revx.exec.queue-adapt-first-only");
+    /** Насколько ближе к рынку может подойти ПОКУПКА (по умолчанию как {@code in}); 0 — покупка только отходит. */
+    static final double QA_BID_IN_BP = Double.parseDouble(System.getProperty("revx.exec.queue-adapt-bid-in-bp", String.valueOf(QA_IN_BP)));
+    /** {@code queue-adapt-storm-no-in=true}: в бурю (окно парковки, {@code storm-park-*}) к рынку не подходим вовсе. */
+    static final boolean QA_STORM_NO_IN = Boolean.getBoolean("revx.exec.queue-adapt-storm-no-in");
+    private long qaStormTicks;
+    private long qaTicks;
+    private long qaIn;
+    private long qaOut;
+    private double qaShiftBpSum;
+
+    /** Для стенда: сколько тиков уровень подходил к рынку, отходил и средний сдвиг. */
+    public String queueAdaptStats() {
+        return String.format(java.util.Locale.ROOT,
+                "отступ от очереди: тиков %d, ближе к рынку %d (%.1f%%), дальше %d (%.1f%%), средний сдвиг %+.2f б.п. (+ = дальше)",
+                qaTicks, qaIn, qaTicks > 0 ? 100.0 * qaIn / qaTicks : 0, qaOut,
+                qaTicks > 0 ? 100.0 * qaOut / qaTicks : 0, qaTicks > 0 ? qaShiftBpSum / qaTicks : 0)
+                + (QA_STORM_NO_IN ? ", в бурю без подхода " + qaStormTicks + " тиков" : "");
+    }
+
+    private double queueAdapt(Side side, double base, double fair) {
+        if (!QUEUE_ADAPT || bookSource == null || !(fair > 0)) {
+            return base;
+        }
+        org.home.data.revx.sim.BookView book = bookSource.apply(clock.now());
+        if (book == null) {
+            return base;
+        }
+        java.util.List<org.home.data.revx.sim.BookView.Level> levels =
+                otherOrders(side == Side.BUY ? book.bids() : book.asks(), side == Side.BUY ? bids : asks);
+        double inBp = side == Side.BUY ? QA_BID_IN_BP : QA_IN_BP;
+        if (QA_STORM_NO_IN && STORM_PARK_LEVELS > 0 && clock.now() < stormUntilMs) {
+            inBp = 0;
+            qaStormTicks++;
+        }
+        double p = queueAdaptPrice(side == Side.BUY, base, levels, Math.max(params.quoteStep(), 1e-12),
+                fair * inBp / 10_000, fair * QA_OUT_BP / 10_000, QA_AHEAD_USD, QA_EMPTY_USD);
+        qaTicks++;
+        double shiftBp = (side == Side.BUY ? base - p : p - base) / fair * 10_000;
+        if (shiftBp > 1e-9) {
+            qaOut++;
+        } else if (shiftBp < -1e-9) {
+            qaIn++;
+        }
+        qaShiftBpSum += shiftBp;
+        return p;
+    }
+
+    /**
+     * Чистая часть правила (для теста). Уровни — лучшие первыми, только чужие. {@code in}/{@code out}
+     * — в цене. Впереди цены p — всё по p и лучше.
+     */
+    static double queueAdaptPrice(boolean buy, double base,
+                                  java.util.List<org.home.data.revx.sim.BookView.Level> levels,
+                                  double step, double in, double out, double aheadUsd, double emptyUsd) {
+        double ahead = 0;
+        for (org.home.data.revx.sim.BookView.Level l : levels) {
+            if (buy ? l.price() >= base - 1e-12 : l.price() <= base + 1e-12) {
+                ahead += l.qty() * l.price();
+            }
+        }
+        if (ahead > aheadUsd) {
+            // Ближе к рынку: шаг перед первым уровнем, на котором накопленное впереди превысит порог.
+            double cum = 0;
+            for (org.home.data.revx.sim.BookView.Level l : levels) {
+                cum += l.qty() * l.price();
+                if (cum > aheadUsd) {
+                    double front = buy ? l.price() + step : l.price() - step;
+                    return buy ? Math.min(front, base + in) : Math.max(front, base - in);
+                }
+            }
+            return base;
+        }
+        if (ahead <= emptyUsd) {
+            // Дальше от рынка: шаг перед первой чужой заявкой крупнее пыли.
+            double cum = 0;
+            for (org.home.data.revx.sim.BookView.Level l : levels) {
+                cum += l.qty() * l.price();
+                if (cum > emptyUsd) {
+                    double front = buy ? l.price() + step : l.price() - step;
+                    double p = buy ? Math.max(front, base - out) : Math.min(front, base + out);
+                    // Не ближе к рынку, чем база: отход, а не подход.
+                    return buy ? Math.min(p, base) : Math.max(p, base);
+                }
+            }
+            return buy ? base - out : base + out;
+        }
+        return base;
     }
 
     /**

@@ -657,6 +657,7 @@ public final class Forecast {
                 log.warn("по уровням, бот {}:%n{}", l.botId(), l.levelPresence());
                 log.warn("бот {}: {}", l.botId(), l.effectiveOffset());
                 log.warn("бот {}: не стоять первым — сдвигов {}", l.botId(), l.behindShifts());
+                log.warn("бот {}: {}", l.botId(), l.queueAdaptStats());
             }
             if (sharedBudget != null) {
                 // Ради чего всё и затевалось: сколько ведра осталось и кто
