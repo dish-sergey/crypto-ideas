@@ -679,12 +679,70 @@ public final class InfoBot implements Runnable {
                 }
                 case "set" -> {
                     if (args.length < 3) {
-                        return "Формат: /pool set <бот> <капитал USDC>";
+                        return "Формат: /pool set <бот> <капитал USDC> или /pool set all <капитал USDC>";
                     }
-                    String err = r.poolSet(args[1].toLowerCase(Locale.ROOT), Double.parseDouble(args[2]), now);
+                    String who = args[1].toLowerCase(Locale.ROOT);
+                    if (who.equals("all") || who.equals("все")) {
+                        String name = poolName(args.length > 3 ? args[3] : null);
+                        if (name == null) {
+                            return "Какой пул? Их несколько — укажите имя последним.";
+                        }
+                        double cap = Double.parseDouble(args[2]);
+                        StringBuilder sb = new StringBuilder();
+                        int ok = 0;
+                        for (AllocRegistry.PoolMember m : r.poolMembers(name)) {
+                            String e = r.poolSet(m.botId(), cap, now);
+                            if (e == null) {
+                                ok++;
+                                sb.append(String.format(Locale.ROOT, "%n  %s: %.2f → %.2f", m.botId(), m.capital(), cap));
+                            } else {
+                                sb.append(String.format(Locale.ROOT, "%n  %s: не задан — %s", m.botId(), e));
+                            }
+                        }
+                        if (ok == 0 && sb.length() == 0) {
+                            return "В пуле " + name + " нет участников.";
+                        }
+                        double target = cap * ok * r.pool(name).pct() / 100;
+                        return String.format(Locale.ROOT,
+                                "Капитал %s USDC задан %d ботам пула %s (он же новый стартовый):%s%n"
+                                        + "Разницу каждый бот сведёт с ничейным. Буфер %.2f при цели %.2f — "
+                                        + "долить из ничейного: /pool fill",
+                                args[2], ok, name, sb, r.pool(name).buffer(), target);
+                    }
+                    String err = r.poolSet(who, Double.parseDouble(args[2]), now);
                     return err != null ? "Не задан: " + err
                             : "Капитал " + args[1] + " = " + args[2] + " USDC (он же новый стартовый). "
                             + "Разницу бот сведёт с ничейным.";
+                }
+                case "fill" -> {
+                    // /pool fill — до цели; /pool fill 3 — ровно на 3 USDC; имя пула последним, если их несколько
+                    double amount = Double.NaN;
+                    String given = null;
+                    for (int i = 1; i < args.length; i++) {
+                        try {
+                            amount = Double.parseDouble(args[i]);
+                        } catch (NumberFormatException e) {
+                            given = args[i];
+                        }
+                    }
+                    String name = poolName(given);
+                    if (name == null) {
+                        return "Какой пул? Их несколько — укажите имя.";
+                    }
+                    Balance usdc = venueBalances().byCurrency().get(AllocRegistry.POOL_CURRENCY);
+                    if (usdc == null) {
+                        return "Нет остатка USDC ни в одном журнале — ничейное посчитать не из чего.";
+                    }
+                    AllocRegistry.PoolFill f = r.poolFill(name, amount, usdc.total(), now);
+                    if (f.err() != null) {
+                        return "Не долит: " + f.err();
+                    }
+                    return String.format(Locale.ROOT, "Буфер %s долит из ничейного на %.2f USDC: теперь %.2f при цели %.2f.%s",
+                            name, f.moved(), f.buffer(), f.target(),
+                            f.buffer() > f.target() + 0.005
+                                    ? String.format(Locale.ROOT, "%nИзлишек %.2f ближайший часовой шаг поровну разнесёт в капиталы.",
+                                    f.buffer() - f.target())
+                                    : f.buffer() < f.target() - 0.005 ? "\nДо цели не хватило ничейного." : "");
                 }
                 case "remove" -> {
                     if (args.length < 2) {
@@ -702,6 +760,8 @@ public final class InfoBot implements Runnable {
                             /pool new mm 5 — завести пул с буфером 5%
                             /pool add a 30 — бот a в пул с капиталом 30 USDC (буфер 5% от него берётся из ничейного)
                             /pool set a 35 — задать капитал руками (разница — с ничейным)
+                            /pool set all 40 — всем участникам сразу
+                            /pool fill — долить буфер из ничейного до цели; /pool fill 3 — ровно на 3 USDC
                             /pool remove a — вывести
 
                             Весь реализованный доход и убыток участников идёт в буфер. Раз в час излишек
@@ -1228,7 +1288,23 @@ public final class InfoBot implements Runnable {
      */
     private String bufferLine() {
         java.util.Map<String, Double> caps = new java.util.TreeMap<>();
+        // Бот в пуле: потолок = капитал (лот = капитал / лотов в потолке), в монетах по
+        // текущей цене. Юнит его больше не задаёт — после /pool set он устарел бы (22.10.2026).
+        java.util.Set<String> bases = new java.util.TreeSet<>();
+        watched.forEach(w -> bases.add(w.base()));
+        java.util.Map<String, Double> px = prices(bases);
         for (Watched w : watched) {
+            AllocRegistry.PoolMember pm = null;
+            try {
+                pm = registry().poolOf(w.botId());
+            } catch (Exception ignore) {
+                // реестр недоступен — потолок из юнита
+            }
+            Double price = px.get(w.base());
+            if (pm != null && price != null && price > 0) {
+                caps.merge(w.base(), pm.capital() / price, Double::sum);
+                continue;
+            }
             try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
                 ExecJournal.Boot boot = j.lastBoot();
                 org.home.data.revx.replay.BootParams p = boot == null ? null
@@ -1263,7 +1339,7 @@ public final class InfoBot implements Runnable {
         for (var e : bal.byCurrency().entrySet()) {
             free.put(e.getKey(), e.getValue().total() - claimed.getOrDefault(e.getKey(), 0.0));
         }
-        return bufferText(caps, free, prices(caps.keySet()));
+        return bufferText(caps, free, px);
     }
 
     /**

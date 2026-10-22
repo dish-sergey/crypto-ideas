@@ -114,4 +114,29 @@ class AllocPoolTest {
             assertEquals(1.5, r.own("pool:mm", U), 1e-12, "буфер остался пулу");
         }
     }
+
+    @Test
+    void fillTopsBufferUpToTargetFromUnowned(@TempDir Path dir) {
+        try (AllocRegistry r = open(dir)) {
+            r.poolCreate("mm", 5, 0.5, 3, true, T0);
+            r.poolAdd("mm", "a", 30, 200, T0);
+            r.poolAdd("mm", "b", 30, 200, T0);
+            r.poolSet("a", 50, T0);
+            r.poolSet("b", 50, T0);
+            assertEquals(3.0, r.pool("mm").buffer(), 1e-12, "set буфер не трогает");
+
+            AllocRegistry.PoolFill f = r.poolFill("mm", Double.NaN, 200, T0 + 1);
+            assertNull(f.err());
+            assertEquals(2.0, f.moved(), 1e-12, "до цели 5% от 100");
+            assertEquals(5.0, r.pool("mm").buffer(), 1e-12);
+            assertEquals(5.0, r.own("pool:mm", U), 1e-12, "отложено растёт вместе с учётом");
+            assertNotNull(r.poolFill("mm", Double.NaN, 200, T0 + 2).err(), "уже в цели");
+
+            AllocRegistry.PoolFill g = r.poolFill("mm", 1000, 200, T0 + 3);
+            assertNull(g.err());
+            assertEquals(195.0, g.moved(), 1e-9, "не больше ничейного");
+            assertEquals(0, r.free(U, 200, T0 + 3).free(), 1e-9);
+            assertNotNull(r.poolFill("mm", 1, 200, T0 + 4).err(), "ничейного нет");
+        }
+    }
 }

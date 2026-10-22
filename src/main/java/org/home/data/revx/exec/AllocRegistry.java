@@ -599,6 +599,57 @@ public final class AllocRegistry implements AutoCloseable {
         }
     }
 
+    /** Итог {@link #poolFill}: сколько долито и цель буфера; {@code err} — почему не долито. */
+    public record PoolFill(double moved, double buffer, double target, String err) {
+    }
+
+    /**
+     * Долить буфер пула из НИЧЕЙНОГО USDC (22.10.2026, владелец: после {@code /pool set}
+     * капиталы выросли, а буфер остался прежним). {@code amount} NaN — до цели (pct% суммы
+     * капиталов); иначе ровно столько, сколько сказано, но не больше ничейного. Излишек
+     * сверх цели ближайший часовой шаг поровну разнесёт в капиталы.
+     */
+    public synchronized PoolFill poolFill(String name, double amount, double venueTotal, long nowMs) {
+        Pool p = pool(name);
+        if (p == null) {
+            return new PoolFill(0, 0, 0, "пула " + name + " нет");
+        }
+        double target = poolMembers(name).stream().mapToDouble(PoolMember::capital).sum() * p.pct() / 100;
+        double want = Double.isNaN(amount) ? target - p.buffer() : amount;
+        if (!(want > 0.005)) {
+            return new PoolFill(0, p.buffer(), target, Double.isNaN(amount)
+                    ? String.format(java.util.Locale.ROOT, "буфер %.2f уже не ниже цели %.2f", p.buffer(), target)
+                    : "сумма должна быть больше нуля");
+        }
+        double free = free(POOL_CURRENCY, venueTotal, nowMs).free();
+        double move = Math.min(want, free);
+        if (!(move > 0.005)) {
+            return new PoolFill(0, p.buffer(), target, String.format(java.util.Locale.ROOT,
+                    "ничейного %s %.2f — доливать нечем", POOL_CURRENCY, free));
+        }
+        try {
+            connection.setAutoCommit(false);
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "UPDATE pool SET buffer = buffer + ? WHERE name = ?")) {
+                ps.setDouble(1, move);
+                ps.setString(2, name);
+                ps.executeUpdate();
+            }
+            String id = POOL_PREFIX + name;
+            setQty(id, POOL_CURRENCY, own(id, POOL_CURRENCY) + move, nowMs, sinceOf(id, POOL_CURRENCY, nowMs));
+            event(id, POOL_CURRENCY, move, "pool_reserve", 1, "буфер долит из ничейного");
+            poolEvent(name, "fill", String.format(java.util.Locale.ROOT,
+                    "из ничейного %.2f, буфер %.2f → %.2f (цель %.2f)", move, p.buffer(), p.buffer() + move, target));
+            connection.commit();
+            return new PoolFill(move, p.buffer() + move, target, null);
+        } catch (Exception e) {
+            rollback();
+            return new PoolFill(0, p.buffer(), target, "не долить буфер: " + e.getMessage());
+        } finally {
+            autoCommit();
+        }
+    }
+
     /** Вывести бота из пула. Буфер остаётся пулу; касса бота — за ботом. */
     public synchronized String poolRemove(String botId, long nowMs) {
         PoolMember m = poolOf(botId);
