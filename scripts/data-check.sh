@@ -25,7 +25,7 @@ age_file() { f=$(ls -t $1 2>/dev/null | head -1); [ -n "$f" ] && echo $(( now - 
 Q() { timeout 300 nice -n 19 ionice -c3 sqlite3 -readonly "$@" 2>/dev/null; }'
 
 MICRO_CHECK='
-svc crypto-data litestream bnb-book kr-book s5-live
+svc crypto-data litestream bnb-book kr-book bnb-deriv s5-live
 D=~/crypto-data/data/crypto.db
 for ex in binance bybit okx; do fresh "ликвидации $ex" $(age_ms $(Q $D "select max(ts) from liquidations where exchange=\"$ex\"")) 3600; done
 fresh "свечи" $(age_ms $(Q $D "select max(open_time) from candles")) 7200
@@ -37,6 +37,7 @@ fresh "календарь (загрузка)" $(age_ms $(Q $D "select max(availa
 d=$(Q $D "select max(day) from onchain_daily"); [ -n "$d" ] && fresh "ончейн" $(( now - $(date -d "$d" +%s) )) 259200 || echo "FAIL;ончейн;нет данных"
 fresh "захват книги Бинанса" $(age_file "$HOME/binance-book/book-*") 600
 fresh "захват книги Kraken" $(age_file "$HOME/kraken-book/book-*") 600
+for d in perp perpbook spot oi; do fresh "запись Бинанса: $d" $(age_file "$HOME/binance-deriv/$d/book-*") 600; done
 fresh "инкремент стенда (revx-backup)" $(age_file "$HOME/revx-backups/revx-inc-*.db.gz") 93600
 s=$(stat -c %s $(ls -t ~/revx-backups/revx-inc-*.db.gz | head -1)); [ $s -gt 20000000 ] && echo "OK;размер инкремента;$((s/1000000)) МБ" || echo "FAIL;размер инкремента;$((s/1000000)) МБ — подозрительно мало"
 e=$(sudo journalctl -u litestream --since "-24h" --no-pager 2>/dev/null | grep -ciE "error|fail"); [ "${e:-0}" -lt 20 ] && echo "OK;litestream за сутки;ошибок $e" || echo "WARN;litestream за сутки;ошибок $e"
@@ -77,7 +78,7 @@ if [ -z "$lp" ]; then echo "local;FAIL;забор на диск;ни одног�
 elif [ $(( $(date +%s) - $(stat -c %Y "$lp") )) -gt 129600 ]; then echo "local;FAIL;забор на диск;последний $(basename "$lp")"
 elif grep -q 'ОШИБКА' "$lp"; then echo "local;FAIL;забор на диск;$(grep -c 'ОШИБКА' "$lp") ошибок в $(basename "$lp")"
 else echo "local;OK;забор на диск;$(basename "$lp") без ошибок"; fi
-for d in revx-inc revx-sim-inc binance-book kraken-book journal-archive; do
+for d in revx-inc revx-sim-inc binance-book kraken-book journal-archive binance-deriv/perp binance-deriv/perpbook binance-deriv/spot binance-deriv/oi; do
   f=$(ls -t "$ROOT/$d" 2>/dev/null | grep -v sha256 | head -1)
   if [ -z "$f" ]; then echo "local;FAIL;копия $d;пусто"; else a=$(( ($(date +%s) - $(stat -c %Y "$ROOT/$d/$f")) / 3600 )); [ $a -le 50 ] && echo "local;OK;копия $d;свежий файл $a ч назад" || echo "local;FAIL;копия $d;свежий файл $a ч назад"; fi
 done

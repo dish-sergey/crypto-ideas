@@ -22,6 +22,7 @@
 | ончейн, макро, новости, календарь, вселенная | там же | `crypto-data` (cron) | сутки / неделя | бессрочно | B2 + снимок | новости и календарь — да | ончейн 3 сут, новости 12 ч, календарь 2 сут |
 | **захват книги Бинанса** (`bookTicker`, 3 пары) | micro, `~/binance-book/book-YYYY-MM-DD.jsonl[.gz]` | `bnb-book` | поток | **45 суток** | **локально** `C:\data-archive\binance-book` (с 25.10) | **да** — единственный источник чужой середины | 10 мин |
 | **захват книги Kraken** | micro, `~/kraken-book/` | `kr-book` | поток | **45 суток** | **локально** `C:\data-archive\kraken-book` (с 25.10) | **да** | 10 мин |
+| **запись деривативов и спота Бинанса** (шаг Б док. 197, с 25.10.2026): сделки перпа и марк-цена (`perp`), верх книги перпа 5 уровней раз в 0.5 с (`perpbook`), сделки спота USDT и USDC (`spot`), открытый интерес раз в 15 с (`oi`); BTC, ETH, SOL | micro, `~/binance-deriv/<поток>/book-YYYY-MM-DD.jsonl[.gz]`, строка «мс приёма + JSON» | `bnb-deriv` (`deploy/bnb-deriv-collect.sh`) | поток | **45 суток** (`bnb-prune.sh` в 04:27) | **локально** `C:\data-archive\binance-deriv\<поток>` | марк-цена, книга перпа и открытый интерес чаще 5 мин — **да**; сделки — нет (архив Бинанса) | 10 мин на каждый поток; на micro свой сторож раз в 15 мин (`bnb-rate-check.sh`) |
 | **книга и лента Revolut X** (23 пары, 50 уровней у торгуемых) | bot-arm, `~/revx/data/revx.db` | `revx-collect` | 1 с / 15 с | **14 суток** | инкремент на micro `~/revx-backups` (60 сут) → локально `C:\data-archive\revx-inc` | **да** | книга 5 мин, лента 30 мин; инкремент — раз в сутки, ≥ 20 МБ |
 | **книга симуляции 5 альтов** (XRP, LINK, ADA, SUI, DOGE) | micro2, `~/revx/data/revx-sim.db` | `revx-sim` | 1 с, 50 уровней | 14 суток | инкремент на micro2 `~/revx-sim-backups` (**3 суток**!) → локально `C:\data-archive\revx-sim-inc` (sha256) | **да** | книга 5 мин; инкремент — раз в сутки |
 | журналы ботов: запросы и котировки | bot-arm, `~/revx-exec*/state/exec-*.db` | боты | поток | 14 суток, старше — в `~/revx-journal-archive` | архив → локально `C:\data-archive\journal-archive` (с 25.10) | **да** | архив — раз в сутки |
@@ -36,7 +37,7 @@
 ## 2. Что проверяется каждый день (`scripts/data-check.sh`)
 
 - **Службы:**
-  - на micro: `crypto-data`, `litestream`, `bnb-book`, `kr-book`, `s5-live`;
+  - на micro: `crypto-data`, `litestream`, `bnb-book`, `kr-book`, `bnb-deriv`, `s5-live`;
   - на bot-arm: `revx-collect`, `revx-venue`, `revx-bnb-feed`, `revx-info`;
   - на micro2: `revx-sim`.
 - **Свежесть последней записи** по каждому потоку из §1, с порогами из колонки «порог тревоги». Ликвидации — по каждой бирже отдельно.
@@ -52,6 +53,7 @@
 |---|---|
 | ликвидации одной биржи молчат | `sudo journalctl -u crypto-data | grep liq-<биржа>`; с 25.10 сторож тишины сам переподключает через 15–30 мин. Если не помог — перезапуск `crypto-data` (дыра секунды во всех потоках) |
 | захват книги Бинанса или Kraken стоит | `sudo systemctl restart bnb-book` или `kr-book` |
+| запись деривативов Бинанса (`bnb-deriv`) стоит | `sudo systemctl restart bnb-deriv`; поток пишется в свой каталог, по `ls -la ~/binance-deriv/*/` видно, какой молчит |
 | книга Revolut X стоит | `deploy/SERVERS.md`, раздел `revx-collect`; темп сторожит и `revx-rate-check` на micro |
 | инкремент стенда не сделался | `tail ~/revx-backup.log` на micro. ⚠️ Чистка на bot-arm курсор не обгоняет, но хранение там 14 суток |
 | инкремент симуляции не сделался | `tail ~/revx-sim-backup.log` на micro2 — **срочно**, на сервере всего 3 суток |

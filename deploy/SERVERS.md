@@ -65,6 +65,20 @@
 - **Список снапшотов:** `sudo bash -c 'set -a; . /etc/litestream.env; litestream snapshots -config /etc/litestream.yml <ПУТЬ_К_БД>'` (crypto.db или `~/s5/state/s5.db`).
 - **Восстановить БД:** `sudo bash -c 'set -a; . /etc/litestream.env; litestream restore -config /etc/litestream.yml -o /tmp/restored.db <ПУТЬ_К_БД>'` — проверять под sudo (restore пишет root-owned файл): `sudo sqlite3 /tmp/restored.db "PRAGMA integrity_check;"`. Восстановление s5.db проверено 2026-08-22 (integrity ok).
 
+### 2-бис. Захват потоков Бинанса и Kraken (websocat, файлы `book-YYYY-MM-DD.jsonl`)
+
+| служба | что пишет | каталог | скрипт |
+|---|---|---|---|
+| `bnb-book` | `bookTicker` спота Бинанса BTC/ETH/SOL/XRP к USDC | `~/binance-book` | `deploy/bnb-collect.sh` |
+| `kr-book` | книга Kraken | `~/kraken-book` | `deploy/kr-collect.sh` |
+| `bnb-deriv` (с 25.10.2026, шаг Б док. 197) | сделки перпа и марк-цена (`perp`), верх книги перпа (`perpbook`), сделки спота USDT/USDC (`spot`), открытый интерес раз в 15 с (`oi`) | `~/binance-deriv/<поток>` | `deploy/bnb-deriv-collect.sh` |
+
+- **Строка файла** — «мс приёма JSON». Сегодняшний файл открыт, вчерашний жмёт `~/bin/bnb-prune.sh` (крон 04:17 / 04:37 / 04:27, `DIR=…`), старше 45 суток удаляется.
+- **Сторож тишины** `~/bnb-rate-check.sh` (крон каждые 15 мин, на каждый каталог свой `STATE`) шлёт тревогу ботом S5, если последняя строка старше 5 минут.
+- **Забирает на локальный диск** `scripts/data-pull.sh` (`deploy/DATA-INVENTORY.md`).
+- **Юниты:** `deploy/bnb-book.service`, `deploy/kr-book.service`, `deploy/bnb-deriv.service` → `/etc/systemd/system/`. Перезапуск — `sudo systemctl restart <служба>`.
+- ⚠️ **Книга перпа берётся с адреса `/public/stream`**: на `/market/stream` подписка на `depth` молчит. Сделки, марк-цена и ликвидации идут по `/market/stream`.
+
 ### 3. `arm-catch` — ловушка ARM
 - **Что:** `~/arm_catch.sh` в цикле пытается запустить бесплатный A1.Flex по 3 зонам Frankfurt через OCI instance principal. Поймает — `exit 0`, сервис встаёт сам.
 - **Исходник в git:** `deploy/arm_catch.sh` (на micro лежит копия; старая версия — `~/arm_catch.sh.bak-v1`).

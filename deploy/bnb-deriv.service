@@ -1,0 +1,13 @@
+[Unit]
+Description=Binance perp+spot trades, mark price, perp top-of-book, OI (BTC/ETH/SOL) — doc 197 step B
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/home/ubuntu/bin/bnb-deriv-collect.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

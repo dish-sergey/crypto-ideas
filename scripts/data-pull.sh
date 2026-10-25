@@ -13,7 +13,7 @@ set -u
 ROOT=${DATA_ARCHIVE:-/c/data-archive}
 KEYDIR=${KEYDIR:-$HOME/.ssh/data-keys}
 LOG=$ROOT/checks/pull-$(date +%Y%m%d).log
-mkdir -p "$ROOT"/{revx-inc,revx-sim-inc,binance-book,kraken-book,journal-archive,crypto-db,checks} "$KEYDIR"
+mkdir -p "$ROOT"/{revx-inc,revx-sim-inc,binance-book,kraken-book,journal-archive,crypto-db,checks} "$ROOT"/binance-deriv/{perp,perpbook,spot,oi} "$KEYDIR"
 exec > >(tee -a "$LOG") 2>&1
 
 # Ключи: ssh под Windows не берёт файл с широкими правами, поэтому — копия без CR с chmod 600.
@@ -35,7 +35,7 @@ note() { echo "$(date +%H:%M:%S) $*"; }
 pull() {
   local k=$1 h=$2 rdir=$3 mask=$4 ldir=$5 how=$6 n=0 bad=0
   local list
-  list=$(ssh -i "$k" "${SSH_OPTS[@]}" "$h" "cd $rdir 2>/dev/null && stat -c '%s %n' $mask 2>/dev/null") || { note "ОШИБКА: $h:$rdir не читается"; FAIL=1; return; }
+  list=$(ssh -i "$k" "${SSH_OPTS[@]}" "$h" "cd $rdir 2>/dev/null || exit 3; stat -c '%s %n' $mask 2>/dev/null; exit 0") || { note "ОШИБКА: $h:$rdir не читается"; FAIL=1; return; }
   while read -r size name; do
     [ -n "$name" ] || continue
     local f=$ldir/$name
@@ -59,6 +59,10 @@ pull "$KMICRO2" $MICRO2 '~/revx-sim-backups'      'revx-sim-inc-*.db.gz'    "$RO
 pull "$KMICRO"  $MICRO  '~/binance-book'          'book-*.jsonl.gz'         "$ROOT/binance-book"    gz
 pull "$KMICRO"  $MICRO  '~/kraken-book'           'book-*.jsonl.gz'         "$ROOT/kraken-book"     gz
 pull "$KARM"    $ARM    '~/revx-journal-archive'  '*.db.gz'                 "$ROOT/journal-archive" gz
+# Запись деривативов и спота Бинанса (шаг Б док. 197, с 25.10.2026): на micro хранится 45 суток.
+for d in perp perpbook spot oi; do
+  pull "$KMICRO" $MICRO "~/binance-deriv/$d" 'book-*.jsonl.gz' "$ROOT/binance-deriv/$d" gz
+done
 
 # Раз в неделю — снимок базы слоя данных (её копирует и Litestream в B2; локальная — на случай,
 # если пропадёт и бакет). VACUUM INTO берёт согласованный срез без перезапусков, как у .backup.
