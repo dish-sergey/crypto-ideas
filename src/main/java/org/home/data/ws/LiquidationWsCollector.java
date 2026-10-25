@@ -48,6 +48,18 @@ public class LiquidationWsCollector {
     // Bybit: allLiquidation.<symbol> пер-символьный, wildcard'а нет. Тянем весь список
     // инструментов и подписываемся батчами; реконнект раз в 6ч подхватывает новые листинги.
     private static final long BYBIT_SESSION_MS = 6 * 3600_000L;
+    /**
+     * СТОРОЖ ТИШИНЫ (25.10.2026). Бинанс молчал с 01.08.2026 17:56 почти три месяца: Bybit и OKX
+     * писались, а у Бинанса ни строки, при живом процессе. Соединение повисло полуоткрытым —
+     * Бинанс рвёт сессию раз в сутки, закрытие до нас не дошло, а сессия ждала только его
+     * (app-ping у Бинанса нет, его ping-фреймы шлёт сервер). Теперь сессия без сообщений дольше
+     * порога переподключается, а у Бинанса ещё и обрывается сама каждые 12 ч, не дожидаясь его
+     * суточного разрыва. Поток всего рынка даёт ликвидации каждые несколько секунд, 15 минут
+     * тишины — это обрыв, а не спокойный рынок.
+     */
+    private static final long BINANCE_SESSION_MS = 12 * 3600_000L;
+    private static final long IDLE_BINANCE_MS = 15 * 60_000L;
+    private static final long IDLE_OTHER_MS = 30 * 60_000L;
     private static final int BYBIT_BATCH = 100;
     private static final long RECONNECT_DELAY_MS = 5000;
 
@@ -85,12 +97,13 @@ public class LiquidationWsCollector {
         running = true;
         if (binanceEnabled) {
             // Binance сам шлёт ping-фреймы, JDK отвечает pong — app-ping не нужен (null).
-            startLoop("liq-binance", () -> connect(BINANCE_URL, List.of(BINANCE_SUBSCRIBE), null, 0, this::handleBinance));
+            startLoop("liq-binance", () -> connect(BINANCE_URL, List.of(BINANCE_SUBSCRIBE), null, BINANCE_SESSION_MS,
+                    IDLE_BINANCE_MS, this::handleBinance));
         }
         // Bybit: список символов пересобирается на каждом коннекте (свежие листинги).
-        startLoop("liq-bybit", () -> connect(BYBIT_URL, bybitSubscribes(), "{\"op\":\"ping\"}", BYBIT_SESSION_MS, this::handleBybit));
+        startLoop("liq-bybit", () -> connect(BYBIT_URL, bybitSubscribes(), "{\"op\":\"ping\"}", BYBIT_SESSION_MS, IDLE_OTHER_MS, this::handleBybit));
         // OKX закрывает соединение без активности ~30с — шлём его raw-ping "ping".
-        startLoop("liq-okx", () -> connect(OKX_URL, List.of(OKX_SUBSCRIBE), "ping", 0, this::handleOkx));
+        startLoop("liq-okx", () -> connect(OKX_URL, List.of(OKX_SUBSCRIBE), "ping", 0, IDLE_OTHER_MS, this::handleOkx));
     }
 
     private void startLoop(String threadName, Runnable session) {
@@ -122,13 +135,15 @@ public class LiquidationWsCollector {
      * sessionMaxMs>0 — завершить сессию через это время (форс-реконнект для обновления подписок).
      */
     private void connect(String url, List<String> subscribeMessages, String pingMessage,
-                         long sessionMaxMs, MessageHandler handler) {
+                         long sessionMaxMs, long idleMaxMs, MessageHandler handler) {
         CountDownLatch closed = new CountDownLatch(1);
+        long[] lastMessageMs = {System.currentTimeMillis()};
         StringBuilder buffer = new StringBuilder();
         WebSocket.Listener listener = new WebSocket.Listener() {
             @Override
             public CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) {
                 buffer.append(data);
+                lastMessageMs[0] = System.currentTimeMillis();
                 if (last) {
                     String message = buffer.toString();
                     buffer.setLength(0);
@@ -167,6 +182,11 @@ public class LiquidationWsCollector {
             // Bybit/OKX требуют app-ping каждые ~20с; у Binance pingMessage=null (пингует сам).
             while (closed.getCount() > 0 && running && System.currentTimeMillis() < deadline) {
                 if (closed.await(20, TimeUnit.SECONDS)) {
+                    break;
+                }
+                long idle = System.currentTimeMillis() - lastMessageMs[0];
+                if (idleMaxMs > 0 && idle > idleMaxMs) {
+                    log.warn("{}: {} мин без сообщений — переподключаюсь", url, idle / 60_000);
                     break;
                 }
                 if (pingMessage != null) {
