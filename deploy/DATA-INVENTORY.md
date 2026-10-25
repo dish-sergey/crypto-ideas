@@ -75,3 +75,4 @@
 | секундные свечи спота Бинанса `BTC/ETH/SOL USDT` с объёмом тейкеров (док. 208) | `C:\data-archive\bnb-spot-1s` (11 ГБ), скрипт `fetch.sh` рядом | data.binance.vision, `spot/monthly|daily/klines/<пара>/1s` | 01.2022–24.10.2026 |
 | минутные свечи перпов Бинанса USDT | `C:\data-archive\bnb-hist-1m\um`, `bnb-um-1m` | data.binance.vision | 01.2022–24.10.2026 |
 | секундные свечи спота Бинанса USDC | `D:\revx-data\bnb1s` | data.binance.vision | 14.09–24.10.2026 |
+| глубина книги перпов Бинанса `BTC/ETH/SOL USDT` (`bookDepth`: снимок ~30 с, накопленная глубина ±0.2…5% от середины; док. 212) | `C:\data-archive\bnb-um-bookdepth` (1.9 ГБ), `fetch.sh` рядом | data.binance.vision, `futures/um/daily/bookDepth` | 01.2023–24.10.2026 |
