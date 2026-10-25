@@ -1878,6 +1878,40 @@ public final class QuoteLoop implements Runnable {
     static final double TREND_NOBID_BP = Double.parseDouble(System.getProperty("revx.exec.trend-nobid-bp", "0"));
     static final long TREND_WIN_MS = Long.getLong("revx.exec.trend-win-sec", 3600) * 1000L;
     private boolean trendNoBidLast;
+    /**
+     * ТЕНЕВЫЕ ПРАВИЛА (док. 193 шаг 7, 25.10.2026): бот считает, что сделали бы правила против падений,
+     * и пишет это к каждому своему исполнению событием {@code shadow_fill}, но котировку не трогает.
+     * Правила: {@code tn20/tn30/tn50} — опора за час упала больше порога (как {@code trend-nobid-bp});
+     * {@code qA} — тишина в покупках при запасе ≥ цели (как {@code quiet-nobuy}); {@code knife} — опора
+     * ниже максимума последних {@code knife-win-sec} (600) на {@code knife-bp} (30) и
+     * держится, пока нет нового минимума {@code knife-stop-sec} (300) или нет отскока от минимума
+     * на {@code knife-rebound-bp} (15). Сравнение «заблокировал бы / пропустил бы» — по маркауту
+     * 15 и 60 мин. По умолчанию выключено.
+     */
+    public static final boolean SHADOW_RULES = Boolean.getBoolean("revx.exec.shadow-rules");
+    static final double[] SHADOW_TREND_BP = {20, 30, 50};
+    static final double KNIFE_BP = Double.parseDouble(System.getProperty("revx.exec.knife-bp", "30"));
+    static final long KNIFE_WIN_MS = Long.getLong("revx.exec.knife-win-sec", 600) * 1000L;
+    static final long KNIFE_STOP_MS = Long.getLong("revx.exec.knife-stop-sec", 300) * 1000L;
+    static final double KNIFE_REBOUND_BP = Double.parseDouble(System.getProperty("revx.exec.knife-rebound-bp", "15"));
+    /**
+     * ПОТОЛОК ОТ ПОТОКА (док. 193 шаг 5.1): запас не больше, чем продаётся за {@code flow-cap-hours}
+     * часов — по числу покупок-тейкеров, дошедших до опоры + {@code quiet-x-bp}, по лоту на каждую
+     * (не меньше лота). Выше — бид отводится. 0 — выключено.
+     */
+    public static final double FLOW_CAP_H = Double.parseDouble(System.getProperty("revx.exec.flow-cap-hours", "0"));
+    private long flowCapCheckedMs;
+    private int flowCapCount = -1;
+    /** БЕЗ ЖАДНОСТИ НИЖЕ ЦЕЛИ (док. 193 шаг 5.3): в тишине скос не подтягивает бид ближе отступа. */
+    public static final boolean NO_GREED = Boolean.getBoolean("revx.exec.no-greed");
+    /** «Не ловить нож» в бою (док. 193 шаг 4.1): пока нож включён, бид отводится заменой. */
+    static final boolean KNIFE = Boolean.getBoolean("revx.exec.knife");
+    private boolean knifeLast;
+    private String shadowState = "";
+    private boolean knifeOn;
+    private double knifeLow;
+    private long knifeLowMs;
+    private long knifeOffMs;                           // после снятия ножа максимум окна считается заново
     private BuyQuiet buyQuiet;
     private final long[] fairHistTs = new long[8192];
     private final double[] fairHistPx = new double[8192];
@@ -1899,7 +1933,7 @@ public final class QuoteLoop implements Runnable {
         this.buyQuiet = watch;
     }
 
-    private void rememberFair(long now, double f) {
+    void rememberFair(long now, double f) {
         if (!(f > 0)) {
             return;
         }
@@ -1959,6 +1993,49 @@ public final class QuoteLoop implements Runnable {
 
     public long quietTicks() {
         return quietTicks;
+    }
+
+    /** Теневые правила на этот тик: строка сработавших через пробел, пусто — ни одно. */
+    String shadowRules(long now, double f, boolean quietNow) {
+        if (!(f > 0)) {
+            return shadowState;
+        }
+        StringBuilder sb = new StringBuilder();
+        double past = fairAt(now - TREND_WIN_MS);
+        for (double bp : SHADOW_TREND_BP) {
+            if (past > 0 && (f / past - 1) * 1e4 < -bp) {
+                sb.append("tn").append((int) bp).append(' ');
+            }
+        }
+        if (quietNow && inventory >= skewTargetInventory() - 1e-12) {
+            sb.append("qA ");
+        }
+        double hi = 0;
+        for (int i = fairHistN - 1; i >= 0; i--) {
+            int at = (fairHistHead + i) & 8191;
+            if (now - fairHistTs[at] > KNIFE_WIN_MS || fairHistTs[at] < knifeOffMs) {
+                break;
+            }
+            hi = Math.max(hi, fairHistPx[at]);
+        }
+        if (!knifeOn && hi > 0 && (hi - f) / hi * 1e4 >= KNIFE_BP) {
+            knifeOn = true;
+            knifeLow = f;
+            knifeLowMs = now;
+        } else if (knifeOn) {
+            if (f < knifeLow) {
+                knifeLow = f;
+                knifeLowMs = now;
+            } else if (now - knifeLowMs >= KNIFE_STOP_MS || (f / knifeLow - 1) * 1e4 >= KNIFE_REBOUND_BP) {
+                knifeOn = false;
+                knifeOffMs = now;
+            }
+        }
+        if (knifeOn) {
+            sb.append("knife ");
+        }
+        shadowState = sb.toString().trim();
+        return shadowState;
     }
 
     private double skewTargetInventory() {
@@ -3306,6 +3383,15 @@ public final class QuoteLoop implements Runnable {
                     // которая УЖЕ в пути, и отмена после первого медленного ответа его
                     // не спасает. Поэтому STALL_FREEZE_MS никаких запросов записи — ни
                     // замен, ни отмен — и продолжаем с теми же заявками.
+                    if (STALL_CANCEL_BID) {
+                        // Док. 193 шаг 4.4: замена в затык висит секундами, а отмена проходит
+                        // за ~50 мс (живые журналы 20–25.10) — бид снимается отменой, аск стоит.
+                        for (Resting r : bids) {
+                            if (r.venueId != null) {
+                                cancel(Side.BUY, r, pausedReason);
+                            }
+                        }
+                    }
                     return;
                 }
                 if (STALL_FREEZE_OUTER && levels > 1) {
@@ -3378,6 +3464,9 @@ public final class QuoteLoop implements Runnable {
         double flowBp = flow == null ? 0 : flow.shiftBp(clock.now());
         rememberFair(clock.now(), fair.price());
         boolean quietNow = quiet(clock.now());
+        if (SHADOW_RULES || KNIFE) {
+            shadowRules(clock.now(), fair.price(), quietNow);
+        }
         boolean overTarget = inventory > skewTargetInventory() + 1e-12;
         // Б: опора ниже — и аск ближе, и бид дальше на те же пункты; расстояние между ними (захват) прежнее.
         double quietBp = quietNow && overTarget && QUIET_SHIFT_BP > 0 ? -QUIET_SHIFT_BP : 0;
@@ -3495,6 +3584,34 @@ public final class QuoteLoop implements Runnable {
                         down ? "отведён" : "вернулся", fmt(inventory)));
             }
             if (down && target.hasBid()) {
+                double far = parkDistance > 0 ? parkDistance : 0.10;
+                target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
+            }
+        }
+        if (FLOW_CAP_H > 0 && buyQuiet != null && fair.price() > 0 && target.hasBid()) {
+            long win = (long) (FLOW_CAP_H * 3_600_000L);
+            if (fairHistN > 0 && clock.now() - fairHistTs[fairHistHead] >= win) {
+                if (clock.now() - flowCapCheckedMs >= 5000) {
+                    flowCapCheckedMs = clock.now();
+                    flowCapCount = buyQuiet.reached(clock.now(), win, QUIET_X_BP, this::fairAt);
+                }
+                if (flowCapCount >= 0 && inventory >= Math.max(1, flowCapCount) * params.size() - 1e-12) {
+                    double far = parkDistance > 0 ? parkDistance : 0.10;
+                    target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
+                }
+            }
+        }
+        if (NO_GREED && quietNow && inventory < skewTargetInventory() && target.hasBid() && fair.price() > 0) {
+            target = new Quoter.Quotes(Math.min(target.bid(), fair.price() * (1 - params.offset())), target.ask());
+        }
+        if (KNIFE && fair.price() > 0) {
+            if (knifeOn != knifeLast) {
+                knifeLast = knifeOn;
+                journal.event(knifeOn ? "knife_on" : "knife_off", String.format(java.util.Locale.ROOT,
+                        "%s: опора %s, минимум %s — бид %s, запас %s", symbol, fmtPrice(fair.price()),
+                        fmtPrice(knifeLow), knifeOn ? "отведён" : "вернулся", fmt(inventory)));
+            }
+            if (knifeOn && target.hasBid()) {
                 double far = parkDistance > 0 ? parkDistance : 0.10;
                 target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
             }
@@ -7290,6 +7407,10 @@ public final class QuoteLoop implements Runnable {
             totalFilledNotional += filled * price;
             journal.fill(venueId, side.name(), filled, price, lastFair, fee, feeCurrency, status,
                     levelOf(venueId));
+            if (SHADOW_RULES) {
+                journal.event("shadow_fill", String.format(java.util.Locale.ROOT, "%s %s %s по %s: %s",
+                        venueId, side.name(), fmt(filled), fmtPrice(price), shadowState.isEmpty() ? "-" : shadowState));
+            }
             // Своя позиция и касса меняются ЗДЕСЬ, а не по остаткам аккаунта:
             // при двух ботах остатки содержат чужие сделки.
             applyFill(side, filled, price);
@@ -9116,6 +9237,9 @@ public final class QuoteLoop implements Runnable {
     /** На затыке замереть на столько секунд вместо минуты с отменой ({@code revx.exec.stall-freeze-sec}). */
     static final long STALL_FREEZE_MS = Long.getLong("revx.exec.stall-freeze-sec", 0L) * 1000L;
 
+    /** На затыке при заморозке снимать покупки отменой ({@code revx.exec.stall-cancel-bid}, док. 193). */
+    static final boolean STALL_CANCEL_BID = Boolean.getBoolean("revx.exec.stall-cancel-bid");
+
     /** На затыке снимать только ближний уровень ({@code revx.exec.stall-freeze-outer}). */
     static final boolean STALL_FREEZE_OUTER =
             Boolean.parseBoolean(System.getProperty("revx.exec.stall-freeze-outer", "false"));
@@ -9162,7 +9286,10 @@ public final class QuoteLoop implements Runnable {
         // меньше лота. Порог в целый лот 30.09.2026 оставил боту a треть лота
         // (0.0000228 BTC ≈ $2): её можно продать заменой той же заявки.
         double px = lastFair > 0 ? lastFair : 0;
-        if (!sellOnly || px <= 0 || inventory * px >= minNotional) {
+        // ⚠️ Порог тот же, что у постановки продажи (×DUST_PLACE_MULT минимума). С порогом в один
+        // минимум остаток между 1 и 1.5 минимума не продавался и не выпускал из распродажи: стенд
+        // ETH L3 (док. 193) 19.09 остался с $0.12 и молчал четыре недели — тики шли, запросов ноль.
+        if (!sellOnly || px <= 0 || inventory * px >= minNotional * DUST_PLACE_MULT) {
             return;
         }
         sellOnly = false;

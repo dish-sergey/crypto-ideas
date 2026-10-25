@@ -200,9 +200,9 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
     public synchronized String stallDiag() {
         return String.format(Locale.ROOT, "призраков %d, 204-с-жизнью %d, 404-на-живой %d, "
                         + "404-о-судьбе %d, исполнено после «отмены» %d; затыков по ходу цены %d, "
-                        + "гонок замены %d, невидимых свежих %d",
+                        + "гонок замены %d, невидимых свежих %d, поздних замен %d (исполнено по старой цене %d)",
                 ghostsMade, late204Made, live404Made, staleMade, fillsAfterCancel,
-                volStalls, raceMade, fresh404Made);
+                volStalls, raceMade, fresh404Made, lagMade, lagFills);
     }
 
     private boolean effect(String name) {
@@ -241,6 +241,98 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
     static final int FRESH_EVERY = Math.max(1, Integer.getInteger("revx.sim.fresh404-every", 1));
     private long freshEligible;
     private final Map<String, Long> freshUntil = new LinkedHashMap<>();
+
+    /**
+     * ЗАМЕНА В ЗАТЫК ДОХОДИТ ПОЗДНО (эффект {@code lag}, док. 193 шаг 2, 25.10.2026). Живьём, пока
+     * площадка не отвечает, замена висит, а заявка стоит по СТАРОЙ цене и исполняется принтами —
+     * так бот «ловит первый удар». Прежде стенд переставлял заявку мгновенно и только сообщал боту
+     * долгую задержку. Теперь в окне затыка замена вступает в силу в конце окна (не раньше
+     * {@code lag-min-ms} и не позже {@code lag-max-ms}), до этого в книге стоит предок со своим
+     * местом в очереди. Бот получает новый идентификатор сразу; всё, что исполнилось у предка,
+     * числится за ним, а отмена и следующая замена той же заявки ждут конца окна, как ждал бы
+     * занятый поток живого бота. Выключено, пока {@code lag} не назван в {@code stall-effects}.
+     */
+    static final long LAG_MIN_MS = Long.getLong("revx.sim.lag-min-ms", 1_000L);
+    static final long LAG_MAX_MS = Long.getLong("revx.sim.lag-max-ms", 20_000L);
+
+    private static final class Pending {
+        String oldId;
+        String clientId;
+        double price;
+        double size;
+        long applyAt;
+        boolean cancel;
+    }
+
+    /** Новый идентификатор → отложенная замена его предка. */
+    private final Map<String, Pending> pending = new LinkedHashMap<>();
+    private long lagMade;
+    private long lagFills;
+
+    /** Конец окна затыка, в котором лежит {@code now} (по расписанию или по ходу цены). */
+    private long stallEnd(long now) {
+        long end = now < volStallUntil ? volStallUntil : now;
+        if (schedule != null) {
+            for (long[] w : schedule) {
+                if (w[0] <= now && now <= w[1]) {
+                    end = Math.max(end, w[1]);
+                }
+                if (w[0] > now) {
+                    break;
+                }
+            }
+        }
+        return Math.min(now + LAG_MAX_MS, Math.max(now + LAG_MIN_MS, end));
+    }
+
+    /** Отложенные замены, чьё время пришло: предок уходит, наследник встаёт (если есть что ставить). */
+    private void resolvePending(long now) {
+        var it = pending.entrySet().iterator();
+        while (it.hasNext()) {
+            var e = it.next();
+            Pending p = e.getValue();
+            if (p.applyAt > now) {
+                continue;
+            }
+            it.remove();
+            String newId = e.getKey();
+            double[] acc = done.remove(p.oldId);
+            if (acc != null) {
+                done.put(newId, acc);           // исполненное у предка бот увидит у наследника
+            }
+            Order old = live.remove(p.oldId);
+            gone.put(p.oldId, "заменой (поздно)");
+            if (old == null) {
+                gone.put(newId, "исполнением");   // предок исполнился до конца, ставить нечего
+                continue;
+            }
+            model.cancelled(p.oldId);
+            if (p.cancel) {
+                gone.put(newId, "отменой");
+                continue;
+            }
+            Order o = new Order();
+            o.id = newId;
+            o.clientId = p.clientId;
+            o.symbol = old.symbol;
+            o.buy = old.buy;
+            o.price = p.price;
+            o.size = Math.min(p.size, old.size);
+            o.createdMs = now;
+            live.put(o.id, o);
+            model.placed(new FillModel.Resting(o.id, o.buy, o.price, o.size, o.createdMs));
+        }
+    }
+
+    /** Идентификатор, под которым бот знает заявку из книги (наследник отложенной замены). */
+    private String shownId(String id) {
+        for (var e : pending.entrySet()) {
+            if (e.getValue().oldId.equals(id)) {
+                return e.getKey();
+            }
+        }
+        return id;
+    }
 
     /** Свежая заявка затыка: становится ли невидимой (каждая {@link #FRESH_EVERY}-я). */
     private boolean makeFresh() {
@@ -460,7 +552,13 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
             if (hiddenUntil.containsKey(f.orderId()) && live.containsKey(f.orderId())) {
                 fillsAfterCancel++;
             }
+            if (!pending.isEmpty() && !shownId(f.orderId()).equals(f.orderId())) {
+                lagFills++;                    // исполнилась по старой цене, пока замена висела
+            }
             apply(f);
+        }
+        if (!pending.isEmpty()) {
+            resolvePending(clock.now());
         }
         // Срок «отменённых на словах» вышел — площадка их действительно сняла.
         long now = clock.now();
@@ -564,7 +662,7 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
                             + "\"side\":\"%s\",\"type\":\"limit\",\"quantity\":\"%s\","
                             + "\"filled_quantity\":\"%s\",\"leaves_quantity\":\"%s\","
                             + "\"price\":\"%s\",\"status\":\"%s\",\"created_date\":%d}",
-                    o.id, o.clientId, o.symbol, o.buy ? "buy" : "sell",
+                    pending.isEmpty() ? o.id : shownId(o.id), o.clientId, o.symbol, o.buy ? "buy" : "sell",
                     plain(o.size + filled), plain(filled), plain(o.size), plain(o.price),
                     filled > 1e-12 ? "partially_filled" : "new", o.createdMs));
         }
@@ -610,17 +708,19 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
             fresh404Made++;
             return new Response(404, "{\"message\":\"Order not found\"}", 50);
         }
-        if ((!live.containsKey(id) || hiddenUntil.containsKey(id)) && effect("stale")) {
+        // наследник отложенной замены — пока это предок в книге
+        String real = pending.containsKey(id) ? pending.get(id).oldId : id;
+        if ((!live.containsKey(real) || hiddenUntil.containsKey(real)) && effect("stale")) {
             staleMade++;              // в затык судьба ушедшей заявки ещё не видна
             return new Response(404, "{\"message\":\"Order not found\"}", 50);
         }
-        double[] acc = done.get(id);
+        double[] acc = done.get(real);
         if (acc != null) {
             inspected.add(id);
         }
         double filled = acc == null ? 0 : acc[0];
         double avg = filled > 0 ? acc[1] / filled : 0;
-        Order o = live.get(id);
+        Order o = live.get(real);
         String status = o != null
                 ? (filled > 1e-12 ? "partially_filled" : "new")
                 : (filled > 0 ? "filled" : "cancelled");
@@ -755,6 +855,43 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         // живёт ещё RACE_MS и может исполниться), третья — призрак, как живьём 02.10.
         // {@code slow} (16.10.2026) — то же, что race, но предок снимается сразу: живьём за 11–15.10
         // площадка 267 раз назвала предка живым после замены, и ни один из них не исполнился.
+        if (pending.containsKey(id)) {
+            // Следующая замена той же заявки, пока первая висит: ждёт того же конца окна.
+            Pending p = pending.remove(id);
+            JsonNode n = read(json);
+            if (n != null) {
+                p.price = n.path("price").asDouble(p.price);
+                p.size = n.path("base_size").asDouble(p.size);
+                p.clientId = n.path("client_order_id").asText(p.clientId);
+            }
+            String next = UUID.randomUUID().toString();
+            pending.put(next, p);
+            gone.put(id, "заменой");
+            replaces++;
+            return new Response(200, String.format(
+                    "{\"data\":{\"venue_order_id\":\"%s\",\"client_order_id\":\"%s\",\"state\":\"new\"}}",
+                    next, p.clientId), Math.max(0, p.applyAt - clock.now()));
+        }
+        if (effect("lag") && live.containsKey(id) && !hiddenUntil.containsKey(id)) {
+            JsonNode n = read(json);
+            if (n == null) {
+                return new Response(400, "{\"message\":\"bad body\"}", 0);
+            }
+            Order old = live.get(id);
+            Pending p = new Pending();
+            p.oldId = id;
+            p.clientId = n.path("client_order_id").asText(old.clientId);
+            p.price = n.path("price").asDouble(old.price);
+            p.size = n.path("base_size").asDouble(old.size);
+            p.applyAt = stallEnd(clock.now());
+            String next = UUID.randomUUID().toString();
+            pending.put(next, p);
+            lagMade++;
+            replaces++;
+            return new Response(200, String.format(
+                    "{\"data\":{\"venue_order_id\":\"%s\",\"client_order_id\":\"%s\",\"state\":\"new\"}}",
+                    next, p.clientId), p.applyAt - clock.now());
+        }
         boolean slowOnly = !effect("race") && effect("slow");
         boolean stallRace = live.containsKey(id) && inVolStall() && (effect("race") || slowOnly);
         boolean race = stallRace
@@ -833,6 +970,11 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
     public synchronized Response cancel(String id) {
         advance();
         cancels++;
+        Pending lagged = pending.get(id);
+        if (lagged != null) {
+            lagged.cancel = true;             // снимется в конце окна, до того может исполниться
+            return new Response(204, "", Math.max(0, lagged.applyAt - clock.now()));
+        }
         if (fresh(id)) {
             fresh404Made++;
             return new Response(404, "{\"message\":\"Order not found\"}", 60);   // свежая: снять нельзя

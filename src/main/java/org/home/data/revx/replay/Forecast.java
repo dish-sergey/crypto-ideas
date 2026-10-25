@@ -551,12 +551,12 @@ public final class Forecast {
                     loop.sweepWatch(watch, spec.sweepSide());
                 }
                 // Тишина в покупках (18.10.2026): -Drevx.exec.quiet-nobuy / quiet-shift-bp, по умолчанию выключено.
-                if ((Boolean.getBoolean("revx.exec.quiet-nobuy")
+                if ((Boolean.getBoolean("revx.exec.quiet-nobuy") || QuoteLoop.SHADOW_RULES || QuoteLoop.FLOW_CAP_H > 0 || QuoteLoop.NO_GREED
                         || Double.parseDouble(System.getProperty("revx.exec.quiet-shift-bp", "0")) > 0)) {
                     if (standDbPath == null) {
                         throw new IllegalStateException("тишина в покупках просит базу стенда: ленту брать неоткуда");
                     }
-                    long win = Long.getLong("revx.exec.quiet-win-sec", 3600) * 1000L;
+                    long win = Math.max(Long.getLong("revx.exec.quiet-win-sec", 3600) * 1000L, (long) (QuoteLoop.FLOW_CAP_H * 3_600_000L));
                     loop.buyQuiet(org.home.data.revx.exec.BuyQuiet.preloaded(standDbPath, base.symbol(),
                             Long.getLong("revx.exec.quiet-delay-ms", 2000), start - win - 60_000, end));
                 }

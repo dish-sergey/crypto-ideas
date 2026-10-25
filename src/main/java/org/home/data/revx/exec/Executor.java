@@ -220,7 +220,8 @@ public class Executor {
                     sweepChainMs, sweepCoef, sweepMaxBp));
         }
         // Тишина в покупках (18.10.2026): только явной настройкой, живьём не включалась.
-        if (Boolean.getBoolean("revx.exec.quiet-nobuy")
+        // Теневые правила (док. 193) тоже смотрят на тишину — сторож нужен и им.
+        if (Boolean.getBoolean("revx.exec.quiet-nobuy") || QuoteLoop.SHADOW_RULES || QuoteLoop.FLOW_CAP_H > 0 || QuoteLoop.NO_GREED
                 || Double.parseDouble(System.getProperty("revx.exec.quiet-shift-bp", "0")) > 0) {
             loop.buyQuiet(BuyQuiet.live(standDbPath, symbol, Long.getLong("revx.exec.quiet-delay-ms", 2000)));
         }
