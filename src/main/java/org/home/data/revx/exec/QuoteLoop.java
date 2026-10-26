@@ -633,7 +633,8 @@ public final class QuoteLoop implements Runnable {
         }
         double[] head = lotAges.peekFirst();
         boolean old = ASK_FIRST_AFTER > 0 && clock.now() - head[0] >= ASK_FIRST_AFTER * 60_000;
-        double riseBp = head.length > 2 && head[2] > 0 ? (fair / head[2] - 1) * 1e4 : 0;
+        double ref = riseRef();
+        double riseBp = ref > 0 ? (fair / ref - 1) * 1e4 : 0;
         int k = ASK_RISE_BP > 0 && riseBp > 0 ? (int) Math.floor(riseBp / ASK_RISE_BP) : 0;
         if (!old && k == 0) {
             return target;
@@ -654,6 +655,28 @@ public final class QuoteLoop implements Runnable {
             }
         }
         return ask >= target.ask() ? target : new Quoter.Quotes(target.bid(), ask);
+    }
+
+    /**
+     * От какой цены покупки считать рост ({@code revx.sim.ask-rise-ref}): {@code oldest} — самый старый
+     * лот (его и продаёт ближний аск при учёте FIFO), {@code avg} — средняя по всем лотам запаса,
+     * {@code last} — последний купленный. У L3 лоты куплены в разное время по разным ценам (владелец, 26.10).
+     */
+    static final String ASK_RISE_REF = System.getProperty("revx.sim.ask-rise-ref", "oldest").trim();
+
+    private double riseRef() {
+        if ("avg".equalsIgnoreCase(ASK_RISE_REF)) {
+            double q = 0, v = 0;
+            for (double[] l : lotAges) {
+                if (l.length > 2 && l[2] > 0) {
+                    q += l[1];
+                    v += l[1] * l[2];
+                }
+            }
+            return q > 0 ? v / q : Double.NaN;
+        }
+        double[] l = "last".equalsIgnoreCase(ASK_RISE_REF) ? lotAges.peekLast() : lotAges.peekFirst();
+        return l != null && l.length > 2 ? l[2] : Double.NaN;
     }
 
     /** Цена «первым в книге»: лучший чужой аск минус {@link #ASK_FIRST_GAP} шагов; NaN — книги нет. */
