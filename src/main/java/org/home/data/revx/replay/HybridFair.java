@@ -111,6 +111,13 @@ final class HybridFair {
     private HybridFair() {
     }
 
+    /**
+     * «Дальняя из двух» последнего {@link #apply} (26.10.2026): {меньшая, большая} из «своей книги без
+     * поводка» и «Бинанса × базис» по тикам результата; null — общий расчёт не шёл. Прогон стенда —
+     * одна пара в процессе, поэтому статическое поле, а не смена подписи.
+     */
+    static double[][] sides;
+
     static boolean enabled() {
         return !DIR.isBlank();
     }
@@ -118,6 +125,7 @@ final class HybridFair {
     /** Пересчитывает ряд тиков; без данных Бинанса или книги тик остаётся прежним. */
     static List<ReplayFair.Tick> apply(List<ReplayFair.Tick> ticks, String symbol, MarketData market,
                                        double lotQty) {
+        sides = null;
         if (ticks.isEmpty() || market == null) {
             return ticks;
         }
@@ -136,6 +144,7 @@ final class HybridFair {
             List<ReplayFair.Tick> out = new ArrayList<>(ticks.size());
             long done = 0;
             long gate = 0;
+            double[][] sd = new double[2][ticks.size()];
             for (ReplayFair.Tick t : ticks) {
                 var e = bnb.floorEntry(t.tsMs() - LAG_MS - 1000);
                 var o = core.step(t.tsMs(), t.fair(), t.quotable(), market.bookAt(t.tsMs()), lotQty,
@@ -143,6 +152,11 @@ final class HybridFair {
                 if (o == null) {
                     out.add(t);
                     continue;
+                }
+                double[] r = core.sideRefs();
+                if (r != null) {
+                    sd[0][out.size()] = r[0];
+                    sd[1][out.size()] = r[1];
                 }
                 done++;
                 if (o.ownGate()) {
@@ -161,6 +175,7 @@ final class HybridFair {
                         + "%.2f%% тиков", symbol, core.stormClampBp(), core.stormRangeBp(),
                         done == 0 ? 0 : 100.0 * core.stormSteps() / done));
             }
+            sides = sd;
             return out;
         }
         List<ReplayFair.Tick> out = new ArrayList<>(ticks.size());

@@ -96,7 +96,10 @@ if [ "${NOTIFY:-1}" = 1 ]; then
   if [ "$bad" = 0 ]; then msg="✅ Данные: всё в порядке ($(grep -c ';OK;' "$OUT") проверок)."
   else msg="⚠️ Данные: сломано $bad
 $(grep -E ';(FAIL|WARN);' "$OUT" | awk -F';' '{printf "• %s · %s: %s\n", $1, $3, $4}')"; fi
+  # текст через файл: под заданием Windows локали нет, и кириллица в аргументе curl превращается в «?»
+  mf=$(mktemp); printf '%s' "$msg" > "$mf"
   [ -n "$tok" ] && curl -s -o /dev/null --max-time 20 "https://api.telegram.org/bot$tok/sendMessage" \
-     --data-urlencode "chat_id=$chat" --data-urlencode "text=$msg" || echo "Telegram: не отправлено"
+     --data-urlencode "chat_id=$chat" --data-urlencode "text@$mf" || echo "Telegram: не отправлено"
+  rm -f "$mf"
 fi
 exit 0

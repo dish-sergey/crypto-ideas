@@ -67,6 +67,22 @@ public final class HybridCore {
     private long clamped;
     private long noOldSteps;
 
+    /** Опора последнего шага ДО поводка (своя книга без ограничения) и «Бинанс × обычный базис»; NaN — нет. */
+    private double rawFair = Double.NaN;
+    private double anchor = Double.NaN;
+
+    /**
+     * ДАЛЬНЯЯ ИЗ ДВУХ (идея владельца 26.10.2026): цены, от которых ставить бид и аск, если брать
+     * дальнюю от рынка из «своей книги без поводка» и «Бинанса × базис»: {меньшая, большая}.
+     * null — базиса ещё нет (он набирается, только когда задан поводок).
+     */
+    public double[] sideRefs() {
+        if (!(rawFair > 0) || !(anchor > 0)) {
+            return null;
+        }
+        return new double[]{Math.min(rawFair, anchor), Math.max(rawFair, anchor)};
+    }
+
     /** Шагов без прежней опоры (уровень целиком по своей книге). */
     public long noOldSteps() {
         return noOldSteps;
@@ -277,6 +293,8 @@ public final class HybridCore {
                 basisBp += (1 - Math.exp(-(tsMs - prev) / basisTauMs)) * (x - basisBp);
             }
         }
+        rawFair = fair;
+        anchor = Double.isNaN(basisBp) ? Double.NaN : bnb * Math.exp(basisBp / 1e4);
         if (clampNow > 0) {
             double dev = Math.log(fair / bnb) * 1e4 - basisBp;
             steps++;

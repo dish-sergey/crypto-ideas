@@ -22,4 +22,12 @@ public interface FairSource {
      * @param lookbackMs насколько старую цену ещё принимать
      */
     StandReader.Fair latest(String base, long lookbackMs);
+
+    /**
+     * Цены для бида и аска по правилу «дальняя из двух» ({@link HybridCore#sideRefs()}) на текущий
+     * тик: {меньшая, большая}. null — источник их не знает.
+     */
+    default double[] sideRefs() {
+        return null;
+    }
 }

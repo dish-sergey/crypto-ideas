@@ -323,6 +323,9 @@ public final class Forecast {
         SimClock clock = new SimClock(start);
         clock.followSchedule(ticks.stream().mapToLong(ReplayFair.Tick::tsMs).toArray());
         ReplayFair fair = new ReplayFair(ticks, clock);
+        if (HybridFair.sides != null && HybridFair.sides[0].length == ticks.size()) {
+            fair.withSides(HybridFair.sides);
+        }
         if (Boolean.getBoolean("revx.sim.fair-book") && model instanceof MarketFillModel mfb) {
             fair.withBook(mfb.market().fresh());   // лучшие цены книги котировщику: край аска, зажим по книге
         }
@@ -658,6 +661,9 @@ public final class Forecast {
                 log.warn("бот {}: {}", l.botId(), l.effectiveOffset());
                 log.warn("бот {}: не стоять первым — сдвигов {}", l.botId(), l.behindShifts());
                 log.warn("бот {}: {}", l.botId(), l.queueAdaptStats());
+                if (l.farSideSummary() != null) {
+                    log.warn("бот {}: {}", l.botId(), l.farSideSummary());
+                }
             }
             if (sharedBudget != null) {
                 // Ради чего всё и затевалось: сколько ведра осталось и кто

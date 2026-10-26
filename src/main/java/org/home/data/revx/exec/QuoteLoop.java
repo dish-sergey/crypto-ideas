@@ -1609,7 +1609,7 @@ public final class QuoteLoop implements Runnable {
         }
         double bp = Math.max(-EMA_SHIFT_MAX_BP, Math.min(EMA_SHIFT_MAX_BP, EMA_SHIFT_K * emaGapBp));
         double d = bp / 1e4 * fairPx;
-        return new Quoter.Quotes(t.hasBid() ? t.bid() + d : t.bid(), t.hasAsk() ? t.ask() + d : t.ask());
+        return new Quoter.Quotes(plus(t.bid(), d), plus(t.ask(), d));
     }
 
     // ------------------------------------------------ раздвижка по размаху (15.10.2026, идея владельца, стенд)
@@ -1660,6 +1660,54 @@ public final class QuoteLoop implements Runnable {
     /** Действует ли раздвижка в этом тике. */
     private boolean rangeWidenNow;
 
+    /**
+     * ДАЛЬНЯЯ ИЗ ДВУХ (идея владельца 26.10.2026, {@code revx.exec.far-side=true}): бид ставится от
+     * меньшей, аск — от большей из двух цен: «своя книга без поводка» и «Бинанс × обычный базис»
+     * ({@link FairSource#sideRefs()}). Повод — Revolut догоняет Бинанс минутами (на падении на 20 б.п.
+     * за минуту отстаёт на 7–11 б.п.), и заявка, поставленная по своей книге, стоит по цене, которую
+     * Бинанс уже прошёл. Сдвиг только наружу: сторона, где опора и так дальняя, не трогается.
+     */
+    static final boolean FAR_SIDE = Boolean.getBoolean("revx.exec.far-side");
+    /** Какую сторону двигать: {@code both} или {@code bid} (аск от обычной опоры — продажи и так идут хуже). */
+    static final boolean FAR_SIDE_ASK = !"bid".equals(System.getProperty("revx.exec.far-side-side", "both"));
+    private long farSideTicks;
+    private double farSideSumBp;
+
+    /** Тиков, где «дальняя из двух» сдвинула хотя бы одну сторону, и средний сдвиг на них, б.п. */
+    public String farSideSummary() {
+        return FAR_SIDE ? String.format(java.util.Locale.ROOT, "дальняя из двух: тиков со сдвигом %d, средний сдвиг %.2f б.п.",
+                farSideTicks, farSideTicks == 0 ? 0 : farSideSumBp / farSideTicks) : null;
+    }
+
+    private Quoter.Quotes farSide(Quoter.Quotes t, double fairPx) {
+        if (!FAR_SIDE || !(fairPx > 0)) {
+            return t;
+        }
+        double[] r = stand.sideRefs();
+        if (r == null) {
+            return t;
+        }
+        double down = Math.min(1, r[0] / fairPx), up = FAR_SIDE_ASK ? Math.max(1, r[1] / fairPx) : 1;
+        if (down >= 1 && up <= 1) {
+            return t;
+        }
+        farSideTicks++;
+        farSideSumBp += Math.max(1 - down, up - 1) * 1e4;
+        return new Quoter.Quotes(t.hasBid() ? Double.valueOf(t.bid() * down) : null,
+                t.hasAsk() ? Double.valueOf(t.ask() * up) : null);
+    }
+
+    /**
+     * Сдвиг цены стороны; пустая сторона (null) остаётся пустой.
+     * ⚠️ 26.10.2026: запись {@code t.hasBid() ? t.bid() + d : t.bid()} — смешанный тернарный оператор
+     * типа double, он распаковывает null в NPE, и тик падал всякий раз, когда у бота нет одной из сторон
+     * (пустой запас — нет аска, потолок — нет бида). Так были написаны сдвиг по EMA, сужение в тишине,
+     * раздвижка в бурю и по частоте; ни один из этих флагов живым не включался.
+     */
+    static Double plus(Double p, double d) {
+        return p == null ? null : p + d;
+    }
+
     private Quoter.Quotes rangeWiden(Quoter.Quotes t, double fairPx, long now) {
         rangeWidenNow = false;
         if (!(RANGE_WIDEN_MULT > 1) && !(RANGE_TIGHT_STEP_BP > 0) || !(fairPx > 0)) {
@@ -1682,7 +1730,7 @@ public final class QuoteLoop implements Runnable {
             // окно должно быть набрано хотя бы наполовину: после старта размах кажется нулевым
             rangeTightTicks++;
             double in = (rangeBp < RANGE_TIGHT_LO_BP ? 2 : 1) * RANGE_TIGHT_STEP_BP / 1e4 * fairPx;
-            return new Quoter.Quotes(t.hasBid() ? t.bid() + in : t.bid(), t.hasAsk() ? t.ask() - in : t.ask());
+            return new Quoter.Quotes(plus(t.bid(), in), plus(t.ask(), -in));
         }
         if (!(RANGE_WIDEN_MULT > 1) || rangeBp < RANGE_WIDEN_BP) {
             return t;
@@ -1695,8 +1743,8 @@ public final class QuoteLoop implements Runnable {
                 && (!"danger".equals(RANGE_WIDEN_SIDE) || falling);
         boolean widenAsk = !"bid".equals(RANGE_WIDEN_SIDE)
                 && (!"danger".equals(RANGE_WIDEN_SIDE) || !falling);
-        return new Quoter.Quotes(t.hasBid() && widenBid ? t.bid() - extra : t.bid(),
-                t.hasAsk() && widenAsk ? t.ask() + extra : t.ask());
+        return new Quoter.Quotes(widenBid ? plus(t.bid(), -extra) : t.bid(),
+                widenAsk ? plus(t.ask(), extra) : t.ask());
     }
 
     /**
@@ -3557,6 +3605,7 @@ public final class QuoteLoop implements Runnable {
         trackRush(clock.now(), fair.price());
         target = velWiden(target, fair.price());
         target = rangeWiden(target, fair.price(), clock.now());
+        target = farSide(target, fair.price());
         target = slide(target, fair.price());
         target = emaShift(target, fair.price());
         final double driftNow = drift;
@@ -5181,8 +5230,8 @@ public final class QuoteLoop implements Runnable {
             return q;
         }
         double d = fair * pts / 1e4;
-        Double bid = q.hasBid() ? q.bid() - d : q.bid();
-        Double ask = FREQ_BOTH && q.hasAsk() ? q.ask() + d : q.ask();
+        Double bid = plus(q.bid(), -d);
+        Double ask = FREQ_BOTH ? plus(q.ask(), d) : q.ask();
         return new Quoter.Quotes(bid, ask);
     }
 
