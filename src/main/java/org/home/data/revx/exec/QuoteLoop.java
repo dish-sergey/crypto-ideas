@@ -599,6 +599,84 @@ public final class QuoteLoop implements Runnable {
      */
     private final Deque<double[]> lotAges = new ArrayDeque<>();
 
+    /**
+     * АСК ПЕРВЫМ В КНИГЕ ДЛЯ ЗАЛЕЖАВШЕГОСЯ ИЛИ ПОДОРОЖАВШЕГО ЛОТА (идея владельца 26.10.2026: «купил и
+     * таскает вверх-вниз, а продаёт в случайном месте»). Два правила, оба по САМОМУ СТАРОМУ лоту
+     * ({@link #lotAges}: отметка, остаток, цена покупки):
+     * <ul>
+     *   <li>{@code revx.sim.ask-first-after=N} (мин) — лот лежит дольше N минут: аск встаёт на шаг перед
+     *   лучшим ЧУЖИМ аском ({@code ask-first-gap-steps}, 0 — рядом с ним, на его цене);</li>
+     *   <li>{@code revx.sim.ask-rise-bp=X} — опора выросла над ценой покупки на k·X б.п.: аск подходит к
+     *   опоре на k б.п., но не ближе места «первым в книге». На падении — прежняя логика.</li>
+     * </ul>
+     * Аск только приближается, дальше обычного не уходит, и не опускается ниже опоры +
+     * {@code ask-first-min-bp} (1 б.п.). Нет книги — граница только по опоре.
+     */
+    static final double ASK_FIRST_AFTER = Double.parseDouble(System.getProperty("revx.sim.ask-first-after", "0"));
+    static final double ASK_RISE_BP = Double.parseDouble(System.getProperty("revx.sim.ask-rise-bp", "0"));
+    static final int ASK_FIRST_GAP = Integer.getInteger("revx.sim.ask-first-gap-steps", 1);
+    static final double ASK_FIRST_MIN_BP = Double.parseDouble(System.getProperty("revx.sim.ask-first-min-bp", "1"));
+    private long askFirstTicks;
+    private long askRiseTicks;
+
+    /** Тиков, где аск подвинуло правило «первым» по возрасту и по росту. */
+    public String firstAskStats() {
+        return ASK_FIRST_AFTER > 0 || ASK_RISE_BP > 0
+                ? String.format(java.util.Locale.ROOT, "аск по старому лоту: первым по возрасту %d тиков, по росту %d тиков",
+                askFirstTicks, askRiseTicks) : null;
+    }
+
+    private Quoter.Quotes firstAsk(Quoter.Quotes target, double fair) {
+        if ((ASK_FIRST_AFTER <= 0 && ASK_RISE_BP <= 0) || lotAges.isEmpty()
+                || !target.hasAsk() || !(target.ask() > 0) || !(fair > 0)) {
+            return target;
+        }
+        double[] head = lotAges.peekFirst();
+        boolean old = ASK_FIRST_AFTER > 0 && clock.now() - head[0] >= ASK_FIRST_AFTER * 60_000;
+        double riseBp = head.length > 2 && head[2] > 0 ? (fair / head[2] - 1) * 1e4 : 0;
+        int k = ASK_RISE_BP > 0 && riseBp > 0 ? (int) Math.floor(riseBp / ASK_RISE_BP) : 0;
+        if (!old && k == 0) {
+            return target;
+        }
+        double floor = fair * (1 + ASK_FIRST_MIN_BP / 1e4);
+        double first = firstAskPrice(fair);
+        double bound = Math.max(floor, Double.isNaN(first) ? floor : first);
+        double ask = target.ask();
+        if (old) {
+            ask = Math.min(ask, bound);
+            askFirstTicks++;
+        }
+        if (k > 0) {
+            double shifted = Math.max(target.ask() - fair * k / 1e4, bound);
+            if (shifted < ask) {
+                ask = shifted;
+                askRiseTicks++;
+            }
+        }
+        return ask >= target.ask() ? target : new Quoter.Quotes(target.bid(), ask);
+    }
+
+    /** Цена «первым в книге»: лучший чужой аск минус {@link #ASK_FIRST_GAP} шагов; NaN — книги нет. */
+    private double firstAskPrice(double fair) {
+        if (bookSource == null) {
+            return Double.NaN;
+        }
+        org.home.data.revx.sim.BookView book = bookSource.apply(clock.now());
+        if (book == null) {
+            return Double.NaN;
+        }
+        java.util.List<org.home.data.revx.sim.BookView.Level> other = otherOrders(book.asks(), asks);
+        if (other.isEmpty() || !(other.get(0).price() > 0)) {
+            return Double.NaN;
+        }
+        return firstAskPrice(other.get(0).price(), Math.max(params.quoteStep(), 1e-12), ASK_FIRST_GAP);
+    }
+
+    /** Чистая часть (тест): шаг перед лучшим чужим аском. */
+    static double firstAskPrice(double bestOtherAsk, double step, int gapSteps) {
+        return bestOtherAsk - gapSteps * step;
+    }
+
 
     /**
      * ГЕЙТ ПО РЕЖИМУ РЫНКА: не котировать, пока волатильность выше обычной.
@@ -3600,6 +3678,7 @@ public final class QuoteLoop implements Runnable {
         target = new Quoter.Quotes(bidSlew(target.bid()), askSlew(target.ask()));
         target = pullFirstLot(target, fair.price());
         target = decayAsk(target, fair.price(), params.offset());
+        target = firstAsk(target, fair.price());
         rememberVol(fair.price());
         target = volGate(target);
         trackRush(clock.now(), fair.price());
@@ -7909,7 +7988,7 @@ public final class QuoteLoop implements Runnable {
         // головы, и головная отметка и есть возраст того, что мы держим дольше
         // всего.
         if (side == Side.BUY) {
-            lotAges.addLast(new double[]{clock.now(), qty});
+            lotAges.addLast(new double[]{clock.now(), qty, price});
         } else {
             double left = qty;
             while (left > 1e-15 && !lotAges.isEmpty()) {

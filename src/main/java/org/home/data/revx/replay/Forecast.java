@@ -661,6 +661,9 @@ public final class Forecast {
                 log.warn("бот {}: {}", l.botId(), l.effectiveOffset());
                 log.warn("бот {}: не стоять первым — сдвигов {}", l.botId(), l.behindShifts());
                 log.warn("бот {}: {}", l.botId(), l.queueAdaptStats());
+                if (l.firstAskStats() != null) {
+                    log.warn("бот {}: {}", l.botId(), l.firstAskStats());
+                }
                 if (l.farSideSummary() != null) {
                     log.warn("бот {}: {}", l.botId(), l.farSideSummary());
                 }
