@@ -184,8 +184,16 @@ public final class BnbStream implements AutoCloseable {
                 closed.countDown();
             }
         };
-        WebSocket ws = http.newWebSocketBuilder().connectTimeout(Duration.ofSeconds(3))
-                .buildAsync(URI.create(url), listener).get(5, TimeUnit.SECONDS);
+        var pending = http.newWebSocketBuilder().connectTimeout(Duration.ofSeconds(3))
+                .buildAsync(URI.create(url), listener);
+        WebSocket ws;
+        try {
+            ws = pending.get(5, TimeUnit.SECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            // Опоздавшее соединение не бросать живым: иначе рядом с новой сессией шла бы вторая.
+            pending.thenAccept(WebSocket::abort);
+            throw e;
+        }
         lastMsgMs = System.currentTimeMillis();
         long lastPing = 0;
         try {

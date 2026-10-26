@@ -126,4 +126,63 @@ class LiveHybridFairTest {
         assertEquals("своя книга SOL/USDC шире 50 б.п. (85 б.п.) и курс ненадёжен: разброс implied 0.114% "
                 + "выше порога 0.1%", LiveHybridFair.pauseWhy(o, f, 50, "SOL/USDC"));
     }
+
+    /**
+     * Веб-сокет основной, {@code bnb.db} запасной и сверочный (26.10.2026): молчит веб-сокет —
+     * цена из базы без аварии; оба свежи, но расходятся дольше порога — тоже база.
+     */
+    @Test
+    void вебСокетПадаетНаБазуИСверяетсяСНей() throws Exception {
+        String standDb = dir.resolve("stand.db").toString();
+        String bnbDb = dir.resolve("bnb.db").toString();
+        System.setProperty("revx.bnb.db", bnbDb);
+        System.setProperty("revx.fair.hybrid-ws-diverge-ms", "0");
+        FairSource old = (base, lb) -> new StandReader.Fair(1.5000, true, null, System.currentTimeMillis(), 8);
+        ExecJournal j = new ExecJournal(dir.resolve("j.db").toString());
+        long now = System.currentTimeMillis();
+        book(standDb, now);
+        bnb(bnbDb, now, 1.5000);
+
+        // 1) веб-сокет свеж и сходится с базой — источник он, событий нет
+        BnbStream s1 = new BnbStream("XRPUSDC");
+        s1.inject("XRPUSDC", 1.5001, 1.5003, now);
+        LiveHybridFair h1 = new LiveHybridFair(old, standDb, "XRP/USDC", 50, j,
+                new FastBnbFair(s1, "XRP/USDC", "XRPUSDC", "", standDb));
+        h1.latest("XRP", 30_000);
+        assertFalse(h1.degraded());
+        assertEquals(0, h1.wsFallbackTicks());
+        assertTrue(j.lastEventOf("bnb_source") == null);
+
+        // 2) веб-сокет молчит 8 с — цена из базы, аварии нет; ожил — снова веб-сокет
+        BnbStream s2 = new BnbStream("XRPUSDC");
+        s2.inject("XRPUSDC", 1.4999, 1.5001, now - 8_000);
+        LiveHybridFair h2 = new LiveHybridFair(old, standDb, "XRP/USDC", 50, j,
+                new FastBnbFair(s2, "XRP/USDC", "XRPUSDC", "", standDb));
+        h2.latest("XRP", 30_000);
+        assertFalse(h2.degraded(), "база свежа — аварии быть не должно");
+        assertEquals(1, h2.wsFallbackTicks());
+        assertTrue(j.lastEventOf("bnb_source")[1].contains("веб-сокет молчит"), j.lastEventOf("bnb_source")[1]);
+        Thread.sleep(5);
+        s2.inject("XRPUSDC", 1.4999, 1.5001, System.currentTimeMillis());
+        h2.latest("XRP", 30_000);
+        assertEquals(1, h2.wsFallbackTicks());
+        assertTrue(j.lastEventOf("bnb_source")[1].contains("снова по веб-сокету"));
+
+        // 3) оба свежи, расходятся на ~66 б.п. — веры веб-сокету нет, берём базу
+        Thread.sleep(5);
+        BnbStream s3 = new BnbStream("XRPUSDC");
+        s3.inject("XRPUSDC", 1.5099, 1.5101, System.currentTimeMillis());
+        LiveHybridFair h3 = new LiveHybridFair(old, standDb, "XRP/USDC", 50, j,
+                new FastBnbFair(s3, "XRP/USDC", "XRPUSDC", "", standDb));
+        h3.latest("XRP", 30_000);
+        assertFalse(h3.degraded());
+        assertEquals(1, h3.wsFallbackTicks());
+        assertTrue(j.lastEventOf("bnb_source")[1].contains("расходятся"), j.lastEventOf("bnb_source")[1]);
+
+        h1.close();
+        h2.close();
+        h3.close();
+        System.clearProperty("revx.fair.hybrid-ws-diverge-ms");
+        j.close();
+    }
 }

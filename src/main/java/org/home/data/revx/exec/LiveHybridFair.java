@@ -90,6 +90,23 @@ public final class LiveHybridFair implements FairSource {
 
     public LiveHybridFair(FairSource inner, String standDbPath, String symbol, double lotQty,
                           ExecJournal journal) {
+        this(inner, standDbPath, symbol, lotQty, journal, WS ? startWs(symbol, standDbPath) : null);
+    }
+
+    /** Поток Бинанса для опоры: пара {@code <монета>USDC} (или {@code hybrid-ws-pair}), запущен. */
+    private static FastBnbFair startWs(String symbol, String standDbPath) {
+        String bnbSymbol = symbol.substring(0, symbol.indexOf('/')) + "USDC";
+        String pair = System.getProperty("revx.fair.hybrid-ws-pair", bnbSymbol);
+        String rate = System.getProperty("revx.fair.hybrid-ws-rate", "");
+        BnbStream s = rate.isBlank() ? new BnbStream(pair) : new BnbStream(pair, rate);
+        FastBnbFair f = new FastBnbFair(s, symbol, pair, rate, standDbPath);
+        s.start();
+        return f;
+    }
+
+    /** @param ws Бинанс по веб-сокету (тест передаёт незапущенный поток); null — только {@code bnb.db} */
+    LiveHybridFair(FairSource inner, String standDbPath, String symbol, double lotQty,
+                   ExecJournal journal, FastBnbFair ws) {
         this.inner = inner;
         this.standDbPath = standDbPath;
         this.bnbDbPath = System.getProperty("revx.bnb.db", "/home/ubuntu/revx-shared/bnb.db");
@@ -97,11 +114,8 @@ public final class LiveHybridFair implements FairSource {
         this.bnbSymbol = symbol.substring(0, symbol.indexOf('/')) + "USDC";
         this.lotQty = lotQty;
         this.journal = journal;
-        if (WS) {
-            String pair = System.getProperty("revx.fair.hybrid-ws-pair", bnbSymbol);
-            String rate = System.getProperty("revx.fair.hybrid-ws-rate", "");
-            BnbStream s = rate.isBlank() ? new BnbStream(pair) : new BnbStream(pair, rate);
-            this.ws = new FastBnbFair(s, symbol, pair, rate, standDbPath);
+        this.ws = ws;
+        if (ws != null) {
             // Ход Бинанса с прошлого шага, перенесённый на опору: fair = уровень × bnb / среднее bnb.
             ws.onPrice(p -> {
                 double f0 = lastOutFair;
@@ -110,9 +124,17 @@ public final class LiveHybridFair implements FairSource {
                     onPrice.accept(f0 * p / b0);
                 }
             });
-            s.start();
-        } else {
-            this.ws = null;
+            // Первая цена приходит через 1–2 с после старта; без ожидания первый тик видел
+            // «Бинанс молчит» и ставил аварию с паузой на 2 мин (e, 26.10.2026).
+            long until = System.currentTimeMillis() + 10_000;
+            while (!(ws.price() > 0) && System.currentTimeMillis() < until) {
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
         }
         this.core = new HybridCore(
                 Double.parseDouble(System.getProperty("revx.fair.hybrid-mix", "0.25")),
@@ -124,7 +146,7 @@ public final class LiveHybridFair implements FairSource {
                 System.getProperty("revx.fair.hybrid-depth-k", "10"),
                 Double.parseDouble(System.getProperty("revx.fair.hybrid-depth-k", "10")) * lotQty,
                 System.getProperty("revx.fair.hybrid-tau-sec", "180"), bnbSymbol,
-                ws != null ? "websocket " + ws.describe() : bnbDbPath);
+                ws != null ? "websocket " + ws.describe() + ", запасной и сверочный " + bnbDbPath : bnbDbPath);
     }
 
     /** Бинанс по websocket; null — цена из {@code bnb.db}. */
@@ -411,14 +433,87 @@ public final class LiveHybridFair implements FairSource {
         }
     }
 
+    /**
+     * 🔑 ВЕБ-СОКЕТ ОСНОВНОЙ, {@code bnb.db} ЗАПАСНОЙ И СВЕРОЧНЫЙ (владелец, 26.10.2026). Служба
+     * {@code revx-bnb-feed} пишет ту же пару раз в секунду и с веб-сокетом не связана, поэтому:
+     * <ul>
+     *   <li>веб-сокет несвеж (сессия молчит дольше {@link #WS_MAX_AGE_MS} или по самой паре нет
+     *   сообщений дольше {@link FastBnbFair#LEG_MAX_AGE_MS} — сессию держат живой и ответы на
+     *   пинг) — цена из {@code bnb.db}, как без флага; аварии нет, пока свеж хотя бы один;</li>
+     *   <li>оба свежи, но расходятся больше {@link #WS_DIVERGE_BP} дольше {@link #WS_DIVERGE_MS} —
+     *   где-то ошибка; берём {@code bnb.db} (проверенный путь, своя метка времени у каждой
+     *   строки) до схождения. Короткое расхождение — норма: опрос отстаёт до секунды.</li>
+     * </ul>
+     * Смена источника пишется событием {@code bnb_source}.
+     */
+    private final long WS_MAX_AGE_MS = Long.getLong("revx.fair.hybrid-ws-max-age-ms", 5_000L);
+    private final double WS_DIVERGE_BP = Double.parseDouble(System.getProperty("revx.fair.hybrid-ws-diverge-bp", "20"));
+    private final long WS_DIVERGE_MS = Long.getLong("revx.fair.hybrid-ws-diverge-ms", 10_000L);
+    private boolean wsInUse = true;
+    private long divergeSince;
+    private long wsFallbackTicks;
+
+    /** Тиков, на которых цена Бинанса взята из {@code bnb.db} при включённом веб-сокете. */
+    public long wsFallbackTicks() {
+        return wsFallbackTicks;
+    }
+
     private double bnbMid(long now) throws Exception {
-        if (ws != null) {
-            // Тот же срок, что у bnb.db: сессия молчит дольше MAX_AGE_MS — Бинанса нет.
-            // Строже (3 с пилота) нельзя: сбой опоры здесь — распродажа и пауза на 2 мин.
-            double p = ws.price();
-            lastBnbMs = ws.stream().lastMsgMs();
-            return p > 0 && now - lastBnbMs <= MAX_AGE_MS ? p : Double.NaN;
+        if (ws == null) {
+            return dbMid(now);
         }
+        double p = ws.price();
+        long wsMsg = ws.stream().lastMsgMs();
+        String bad = null;
+        if (!(p > 0)) {
+            bad = "цены по веб-сокету ещё нет";
+        } else if (now - wsMsg > WS_MAX_AGE_MS) {
+            bad = String.format(java.util.Locale.ROOT, "веб-сокет молчит %.1f с", (now - wsMsg) / 1000.0);
+        } else if (ws.ageMs(now) > FastBnbFair.LEG_MAX_AGE_MS) {
+            bad = String.format(java.util.Locale.ROOT, "по %s нет сообщений %.0f с", bnbSymbol, ws.ageMs(now) / 1000.0);
+        }
+        double db = dbMid(now);
+        long dbMs = lastBnbMs;
+        if (bad == null && db > 0 && rateFree()) {
+            double gap = Math.abs(Math.log(p / db)) * 1e4;
+            if (gap > WS_DIVERGE_BP) {
+                if (divergeSince == 0) {
+                    divergeSince = now;
+                }
+                if (now - divergeSince >= WS_DIVERGE_MS) {
+                    bad = String.format(java.util.Locale.ROOT, "веб-сокет %.2f и bnb.db %.2f расходятся на %.0f б.п. %d с",
+                            p, db, gap, (now - divergeSince) / 1000);
+                }
+            } else {
+                divergeSince = 0;
+            }
+        }
+        if (bad == null) {
+            if (!wsInUse) {
+                wsInUse = true;
+                journal.event("bnb_source", symbol + ": Бинанс снова по веб-сокету");
+            }
+            lastBnbMs = wsMsg;
+            return p;
+        }
+        if (wsInUse) {
+            wsInUse = false;
+            journal.event("bnb_source", symbol + ": Бинанс из bnb.db — " + bad
+                    + (db > 0 ? "" : "; bnb.db тоже несвеж"));
+            log.warn("{}: Бинанс из bnb.db — {}", symbol, bad);
+        }
+        wsFallbackTicks++;
+        lastBnbMs = dbMs;
+        return db;
+    }
+
+    /** Цена веб-сокета без делителя — сравнима со строкой {@code bnb.db} той же пары. */
+    private boolean rateFree() {
+        return System.getProperty("revx.fair.hybrid-ws-rate", "").isBlank()
+                && System.getProperty("revx.fair.hybrid-ws-pair", bnbSymbol).equalsIgnoreCase(bnbSymbol);
+    }
+
+    private double dbMid(long now) throws Exception {
         if (bnb == null) {
             bnb = DriverManager.getConnection("jdbc:sqlite:file:" + bnbDbPath + "?mode=ro");
         }
