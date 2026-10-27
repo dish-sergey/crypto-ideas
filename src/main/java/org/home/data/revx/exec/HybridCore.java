@@ -83,6 +83,17 @@ public final class HybridCore {
         return new double[]{Math.min(rawFair, anchor), Math.max(rawFair, anchor)};
     }
 
+    /**
+     * Обе опоры как есть: {своя книга без поводка, Бинанс × обычный базис} (27.10.2026, док. 216 — пишутся в
+     * журнал, чтобы «дальнюю из двух» и поводок можно было разбирать по журналу). null — базиса ещё нет.
+     */
+    public double[] rawRefs() {
+        if (!(rawFair > 0) || !(anchor > 0)) {
+            return null;
+        }
+        return new double[]{rawFair, anchor};
+    }
+
     /** Шагов без прежней опоры (уровень целиком по своей книге). */
     public long noOldSteps() {
         return noOldSteps;

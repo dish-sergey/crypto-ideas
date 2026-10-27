@@ -30,4 +30,12 @@ public interface FairSource {
     default double[] sideRefs() {
         return null;
     }
+
+    /**
+     * Обе опоры тика как есть: {своя книга без поводка, Бинанс × базис} ({@link HybridCore#rawRefs()}).
+     * Пишутся в {@code exec_quote.ref_own / ref_bnb}. null — источник их не знает.
+     */
+    default double[] rawRefs() {
+        return null;
+    }
 }

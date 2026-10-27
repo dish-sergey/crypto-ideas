@@ -57,7 +57,9 @@ public final class ExecJournal implements AutoCloseable {
                 inventory REAL,
                 quotable  INTEGER NOT NULL,
                 reason    TEXT,
-                pressure  REAL
+                pressure  REAL,
+                ref_own   REAL,
+                ref_bnb   REAL
             );
             CREATE INDEX IF NOT EXISTS idx_exec_quote_ts ON exec_quote(ts_ms);
             CREATE TABLE IF NOT EXISTS exec_fill (
@@ -173,6 +175,17 @@ public final class ExecJournal implements AutoCloseable {
                             + "(раздвижение отступа от дефицита постановок)");
                 } catch (Exception already) {
                     log.debug("колонка pressure уже есть: {}", already.getMessage());
+                }
+                // Обе опоры тика (27.10.2026, док. 216): «своя книга без поводка» и «Бинанс × базис».
+                // Опора в fair — их смесь с поводком, и разобрать «дальнюю из двух» или поводок
+                // задним числом без них нельзя.
+                for (String col : new String[]{"ref_own", "ref_bnb"}) {
+                    try {
+                        st.execute("ALTER TABLE exec_quote ADD COLUMN " + col + " REAL");
+                        log.warn("в exec_quote добавлена колонка {}", col);
+                    } catch (Exception already) {
+                        log.debug("колонка {} уже есть: {}", col, already.getMessage());
+                    }
                 }
                 // Уровень сетки, на котором стояла исполнившаяся заявка. Нужен,
                 // чтобы понять, зарабатывают ли дальние уровни или числятся:
@@ -438,13 +451,22 @@ public final class ExecJournal implements AutoCloseable {
      */
     public synchronized void quote(double fair, Double bid, Double ask, double inventory,
                                    boolean quotable, String reason, double pressure) {
+        quote(fair, bid, ask, inventory, quotable, reason, pressure, null);
+    }
+
+    /**
+     * @param refs обе опоры тика {своя книга без поводка, Бинанс × базис} ({@link FairSource#rawRefs()});
+     *             null — источник их не знает, колонки остаются пустыми.
+     */
+    public synchronized void quote(double fair, Double bid, Double ask, double inventory,
+                                   boolean quotable, String reason, double pressure, double[] refs) {
         batchTick();
         if (quotesOff) {
             return;
         }
         try (PreparedStatement ps = connection.prepareStatement(
                 "INSERT INTO exec_quote(ts_ms, fair, bid, ask, inventory, quotable, reason,"
-                        + " pressure) VALUES (?,?,?,?,?,?,?,?)")) {
+                        + " pressure, ref_own, ref_bnb) VALUES (?,?,?,?,?,?,?,?,?,?)")) {
             ps.setLong(1, clock.now());
             ps.setDouble(2, fair);
             if (bid == null) ps.setNull(3, java.sql.Types.REAL); else ps.setDouble(3, bid);
@@ -453,6 +475,8 @@ public final class ExecJournal implements AutoCloseable {
             ps.setInt(6, quotable ? 1 : 0);
             ps.setString(7, reason);
             ps.setDouble(8, pressure);
+            if (refs == null || !(refs[0] > 0)) ps.setNull(9, java.sql.Types.REAL); else ps.setDouble(9, refs[0]);
+            if (refs == null || !(refs[1] > 0)) ps.setNull(10, java.sql.Types.REAL); else ps.setDouble(10, refs[1]);
             ps.executeUpdate();
         } catch (Exception e) {
             log.error("не записалась котировка: {}", e.getMessage());

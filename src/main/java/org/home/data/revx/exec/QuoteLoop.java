@@ -3504,7 +3504,7 @@ public final class QuoteLoop implements Runnable {
             pausedReason = String.format(java.util.Locale.ROOT,
                     "минута затыков :%02d — заявки разведены", quietMinute);
             countTick();
-            journal.quote(fair.price(), null, null, inventory, false, pausedReason);
+            journal.quote(fair.price(), null, null, inventory, false, pausedReason, 0, stand.rawRefs());
             if (parkDistance > 0 && lastTrustedFair > 0) {
                 standAside(pausedReason);
             }
@@ -3514,7 +3514,7 @@ public final class QuoteLoop implements Runnable {
         if (venuePause != null) {
             pausedReason = venuePause;
             countTick();
-            journal.quote(fair.price(), null, null, inventory, false, pausedReason);
+            journal.quote(fair.price(), null, null, inventory, false, pausedReason, 0, stand.rawRefs());
             // ⚠️ НА ЗАТЫКЕ — СНИМАТЬ, А НЕ ОТВОДИТЬ, и это не мелочь.
             //
             // {@link #standAside} уводит заявку далеко от рынка ЗАМЕНОЙ, то есть
@@ -3578,7 +3578,7 @@ public final class QuoteLoop implements Runnable {
             // Гейт ТЗ §4.1: опора сломана — уводим котировки из зоны исполнения.
             pausedReason = fair.pausedReason() == null ? "курс ненадёжен" : fair.pausedReason();
             countTick();
-            journal.quote(fair.price(), null, null, inventory, false, pausedReason);
+            journal.quote(fair.price(), null, null, inventory, false, pausedReason, 0, stand.rawRefs());
             standAside(pausedReason);
             return;
         }
@@ -3657,7 +3657,7 @@ public final class QuoteLoop implements Runnable {
             } else {
                 pausedReason = "опора нарушена (" + h.degradedWhy() + ") — пауза до нормы";
                 countTick();
-                journal.quote(fair.price(), null, null, inventory, false, pausedReason);
+                journal.quote(fair.price(), null, null, inventory, false, pausedReason, 0, stand.rawRefs());
                 cancelAll(pausedReason);
                 return;
             }
@@ -3801,7 +3801,7 @@ public final class QuoteLoop implements Runnable {
             }
         }
         journal.quote(fair.price(), target.bid(), target.ask(), inventory, true, null,
-                pressure);
+                pressure, stand.rawRefs());
         if (panicOn) {
             panicTick(fair);
             return;

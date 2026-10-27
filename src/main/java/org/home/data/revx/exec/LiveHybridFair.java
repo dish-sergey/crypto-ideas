@@ -212,6 +212,11 @@ public final class LiveHybridFair implements FairSource {
     }
 
     @Override
+    public double[] rawRefs() {
+        return core.rawRefs();
+    }
+
+    @Override
     public StandReader.Fair latest(String base, long lookbackMs) {
         StandReader.Fair f = inner.latest(base, lookbackMs);
         long now = System.currentTimeMillis();

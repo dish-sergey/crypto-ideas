@@ -44,7 +44,7 @@ public final class ReplayFair implements FairSource {
         return this;
     }
 
-    /** «Дальняя из двух» по тикам (26.10.2026, {@link HybridFair#sides}); null — нет. */
+    /** Обе опоры по тикам: {своя книга, Бинанс × базис} ({@link HybridFair#sides}); null — нет. */
     private double[][] sides;
 
     public ReplayFair withSides(double[][] sides) {
@@ -54,6 +54,14 @@ public final class ReplayFair implements FairSource {
 
     @Override
     public synchronized double[] sideRefs() {
+        if (sides == null || current() == null || !(sides[0][cursor] > 0)) {
+            return null;
+        }
+        return new double[]{Math.min(sides[0][cursor], sides[1][cursor]), Math.max(sides[0][cursor], sides[1][cursor])};
+    }
+
+    @Override
+    public synchronized double[] rawRefs() {
         if (sides == null || current() == null || !(sides[0][cursor] > 0)) {
             return null;
         }
