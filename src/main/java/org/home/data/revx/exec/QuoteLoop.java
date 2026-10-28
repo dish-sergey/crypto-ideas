@@ -3454,8 +3454,102 @@ public final class QuoteLoop implements Runnable {
         }
     }
 
+    /**
+     * ОТСТУП ПО РАСПИСАНИЮ (док. 217, только стенд): файл строк «ts_ms;отступ_бп», по возрастанию времени. С каждой
+     * отметки котировщик берёт её отступ (уровни L3 едут вместе с базой); до первой отметки — настройка запуска.
+     * Расписание одно на процесс — стенд гоняет по боту на процесс. Смена пишется событием {@code offset_schedule}.
+     */
+    static final java.util.NavigableMap<Long, Double> OFFSET_SCHEDULE = loadOffsetSchedule(System.getProperty("revx.sim.offset-schedule"));
+    private double scheduledOffset = Double.NaN;
+
+    static java.util.NavigableMap<Long, Double> loadOffsetSchedule(String path) {
+        java.util.TreeMap<Long, Double> m = new java.util.TreeMap<>();
+        if (path == null || path.isBlank()) {
+            return m;
+        }
+        try {
+            for (String l : java.nio.file.Files.readAllLines(java.nio.file.Path.of(path))) {
+                String[] p = l.trim().split("[;,]");
+                if (p.length < 2 || p[0].isEmpty() || !Character.isDigit(p[0].charAt(0))) {
+                    continue;
+                }
+                m.put(Long.parseLong(p[0].trim()), Double.parseDouble(p[1].trim()));
+            }
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("расписание отступа не читается: " + path, e);
+        }
+        if (m.isEmpty()) {
+            throw new IllegalStateException("расписание отступа пустое: " + path);
+        }
+        return m;
+    }
+
+    private void offsetScheduleTick(long now) {
+        if (OFFSET_SCHEDULE.isEmpty()) {
+            return;
+        }
+        var e = OFFSET_SCHEDULE.floorEntry(now);
+        if (e == null || e.getValue().equals(scheduledOffset)) {
+            return;
+        }
+        if (!(policy instanceof Quoter)) {   // надстройка держит параметры в себе — подменить отступ нельзя
+            throw new IllegalStateException("расписание отступа несовместимо с политикой " + policy.getClass().getSimpleName());
+        }
+        double was = params.offset() * 1e4;
+        scheduledOffset = e.getValue();
+        params = params.withOffset(scheduledOffset / 1e4);
+        quoter = new Quoter(params);
+        policy = quoter;
+        journal.event("offset_schedule", String.format(java.util.Locale.ROOT, "отступ %.2f → %.2f б.п.", was, scheduledOffset));
+    }
+
+    /**
+     * ОТСТУП ОТ ТЕМПА ПОСТАНОВОК (идея владельца 27.10.2026, док. 218). Отступ = настройка запуска + k × (доля предела,
+     * израсходованная за скользящие сутки, − цель), в пределах ±{@code offset-tempo-max-bp}, шаг 1 б.п., пересчёт раз в
+     * минуту: постановок в запасе много — ближе к рынку, расход быстрее нужного — шире заранее, до упора в предел.
+     * Флаги {@code revx.exec.offset-tempo-k} (б.п. на всю долю; 0 — выключено), {@code revx.exec.offset-tempo-target}
+     * (по умолчанию 0.75), {@code revx.exec.offset-tempo-max-bp} (4). Смена пишется событием {@code offset_tempo}.
+     */
+    static final double OFFSET_TEMPO_K = Double.parseDouble(System.getProperty("revx.exec.offset-tempo-k", "0"));
+    static final double OFFSET_TEMPO_TARGET = Double.parseDouble(System.getProperty("revx.exec.offset-tempo-target", "0.75"));
+    static final double OFFSET_TEMPO_MAX = Double.parseDouble(System.getProperty("revx.exec.offset-tempo-max-bp", "4"));
+    private double tempoBase = Double.NaN;
+    private long tempoCheckedMs;
+
+    /** Отступ (б.п.) при доле расхода {@code share}: база + k·(доля − цель), к целому, в пределах ±max. */
+    static double tempoOffset(double baseBp, double share, double k, double target, double max) {
+        double d = Math.max(-max, Math.min(max, k * (share - target)));
+        return baseBp + Math.round(d);
+    }
+
+    private void offsetTempoTick(long now) {
+        if (OFFSET_TEMPO_K == 0 || now - tempoCheckedMs < 60_000) {
+            return;
+        }
+        tempoCheckedMs = now;
+        if (Double.isNaN(tempoBase)) {
+            if (!(policy instanceof Quoter)) {
+                throw new IllegalStateException("отступ от темпа несовместим с политикой " + policy.getClass().getSimpleName());
+            }
+            tempoBase = params.offset() * 1e4;
+        }
+        int cap = LIVE_CAP > 0 ? LIVE_CAP : placementCap();
+        double share = (double) placementsLastDay() / Math.max(1, cap);
+        double next = tempoOffset(tempoBase, share, OFFSET_TEMPO_K, OFFSET_TEMPO_TARGET, OFFSET_TEMPO_MAX);
+        double was = params.offset() * 1e4;
+        if (Math.abs(next - was) < 1e-9) {
+            return;
+        }
+        params = params.withOffset(next / 1e4);
+        quoter = new Quoter(params);
+        policy = quoter;
+        journal.event("offset_tempo", String.format(java.util.Locale.ROOT, "доля %.2f — отступ %.0f → %.0f б.п.", share, was, next));
+    }
+
     private void tick() {
         rollCounters();
+        offsetScheduleTick(clock.now());
+        offsetTempoTick(clock.now());
         StandReader.Fair fair = stand.latest(base, 30_000);
         lastFair = fair.price();
         tickFair = fair.price();
@@ -6035,6 +6129,41 @@ public final class QuoteLoop implements Runnable {
     /** Моменты своих постановок за сутки — только для стенда. */
     private final java.util.ArrayDeque<Long> placedAt = new java.util.ArrayDeque<>();
 
+    /**
+     * ПРЕВЫШЕНИЕ ЖИВОГО ПРЕДЕЛА (док. 217, только стенд, решение владельца 27.10.2026): настройки сравниваются с
+     * пределом 1000 на бота, чтобы остановки не вмешивались, а этот сторож отмечает, где живой бот упёрся бы.
+     * {@code revx.sim.live-cap=N}: расход за скользящие сутки дошёл до N — событие {@code live_cap_exceed} (снова
+     * взводится, когда расход опустится до 80% N); пик за каждые сутки UTC — событие {@code placements_day}.
+     */
+    static final int LIVE_CAP = Integer.getInteger("revx.sim.live-cap", 0);
+    private boolean liveCapArmed = true;
+    private long liveCapDay = -1;
+    private int liveCapDayPeak;
+
+    private void liveCapWatch() {
+        if (LIVE_CAP <= 0) {
+            return;
+        }
+        long now = clock.now();
+        int used = (int) placementsLastDay();
+        long day = now / 86_400_000L;
+        if (day != liveCapDay) {
+            if (liveCapDay >= 0) {
+                journal.event("placements_day", java.time.LocalDate.ofEpochDay(liveCapDay) + " пик за скользящие сутки "
+                        + liveCapDayPeak + " при живом пределе " + LIVE_CAP);
+            }
+            liveCapDay = day;
+            liveCapDayPeak = 0;
+        }
+        liveCapDayPeak = Math.max(liveCapDayPeak, used);
+        if (liveCapArmed && used >= LIVE_CAP) {
+            liveCapArmed = false;
+            journal.event("live_cap_exceed", "постановок за скользящие сутки " + used + " — живой бот упёрся бы в предел " + LIVE_CAP);
+        } else if (!liveCapArmed && used <= LIVE_CAP * BUDGET_UNWIND_OFF) {
+            liveCapArmed = true;
+        }
+    }
+
     private void place(Side side, Resting resting, double price, double size) {
         trace("PLACE", side, resting, price, size);
         // 🔑 НЕ СТАВИТЬ ПОКУПКУ, ПОКА НЕ ЗНАЕМ СУДЬБУ ПРЕЖНЕЙ (владелец, 07.10.2026).
@@ -6126,6 +6255,7 @@ public final class QuoteLoop implements Runnable {
         Venue.Response response = client.place(body);
         placements++;
         placedAt.addLast(clock.now());
+        liveCapWatch();
         if (response.ok()) {
             resting.venueId = extract(response.body());
             rememberLevel(side, resting);
