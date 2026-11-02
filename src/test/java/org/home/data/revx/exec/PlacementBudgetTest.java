@@ -170,4 +170,24 @@ class PlacementBudgetTest {
         assertEquals(1.0, budget.state("a", T0).pressure(), 0.001,
                 "сломанное ведро обязано выглядеть как полный дефицит");
     }
+
+    @Test
+    void скользящееОкноВозвращаетМестоЧерезСутки(@TempDir Path dir) {
+        long day = 86_400_000L;
+        try (PlacementBudget budget = open(dir, 1).window(true)) {
+            int cap = (int) PlacementBudget.CAPACITY;
+            for (int i = 0; i < cap; i++) {
+                assertTrue(budget.tryAcquire("a", T0 + i * 1000L));
+            }
+            // капающее ведро за 12 ч вернуло бы половину — окно не возвращает ничего
+            assertFalse(budget.tryAcquire("a", T0 + day / 2), "место вернулось раньше суток");
+            assertEquals(0, budget.state("a", T0 + day / 2).tokens(), 1e-9);
+            // через сутки после первых двух постановок свободны ровно два места
+            long t = T0 + day + 1500;
+            assertEquals(2, budget.state("a", t).tokens(), 1e-9);
+            assertTrue(budget.tryAcquire("a", t));
+            assertTrue(budget.tryAcquire("a", t));
+            assertFalse(budget.tryAcquire("a", t));
+        }
+    }
 }

@@ -563,6 +563,13 @@ public final class Forecast {
                     loop.buyQuiet(org.home.data.revx.exec.BuyQuiet.preloaded(standDbPath, base.symbol(),
                             Long.getLong("revx.exec.quiet-delay-ms", 2000), start - win - 60_000, end));
                 }
+                if (QuoteLoop.WALL_FLOW_MIN > 0 || QuoteLoop.FUNC_FILE != null) {
+                    if (standDbPath == null) {
+                        throw new IllegalStateException("стена от потока и отступ из функции просят базу стенда: ленту брать неоткуда");
+                    }
+                    loop.takerFlow(org.home.data.revx.exec.TakerFlow.preloaded(standDbPath, base.symbol(),
+                            Long.getLong("revx.exec.wall-flow-delay-ms", 2000), start - 3_600_000L - 60_000, end));
+                }
                 if (model instanceof MarketFillModel mfm) {
                     loop.bookSource(mfm.market().fresh()::bookAt);
                 }
@@ -661,6 +668,12 @@ public final class Forecast {
                 log.warn("бот {}: {}", l.botId(), l.effectiveOffset());
                 log.warn("бот {}: не стоять первым — сдвигов {}", l.botId(), l.behindShifts());
                 log.warn("бот {}: {}", l.botId(), l.queueAdaptStats());
+                if (!l.funcStats().isEmpty()) {
+                    log.warn("бот {}: {}", l.botId(), l.funcStats());
+                }
+                if (!l.wallStats().isEmpty()) {
+                    log.warn("бот {}: {}", l.botId(), l.wallStats());
+                }
                 if (l.firstAskStats() != null) {
                     log.warn("бот {}: {}", l.botId(), l.firstAskStats());
                 }

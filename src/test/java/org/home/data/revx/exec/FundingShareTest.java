@@ -3,6 +3,8 @@ package org.home.data.revx.exec;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -57,5 +59,25 @@ class FundingShareTest {
     void inventoryAtCapNeedsNoCash() {
         // Покупать не на что: потолок уже выбран монетами.
         assertTrue(allowed(0, 0));
+    }
+
+    @Test
+    void partialLastLotUnderwaterStarts() {
+        // e 02.11.2026: лот 61.92, до потолка 11.39, касса 11.36 (запас в минусе на центы) — пускаем.
+        assertNull(QuoteLoop.fundingGap(11.36, 11.39, 61.92, 0.1, "USDC"));
+    }
+
+    @Test
+    void partialLastLotBelowShareIsRefused() {
+        assertNotNull(QuoteLoop.fundingGap(5.0, 11.39, 61.92, 0.1, "USDC"));
+    }
+
+    @Test
+    void fullLotStillNeedsFullLotOfCash() {
+        // Бот c 16.09.2026: до потолка 0.96 при лоте 2.90 и кассе 0.97 — пускаем.
+        assertNull(QuoteLoop.fundingGap(0.97, 0.96, 2.90, 0.1, "USDC"));
+        // До потолка больше лота — заявку целиком покрыть обязан.
+        assertNotNull(QuoteLoop.fundingGap(2.50, 10.0, 2.90, 0.1, "USDC"));
+        assertNull(QuoteLoop.fundingGap(8.50, 10.0, 2.90, 0.1, "USDC"));
     }
 }

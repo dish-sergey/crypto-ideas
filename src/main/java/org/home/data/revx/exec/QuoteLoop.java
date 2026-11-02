@@ -1072,11 +1072,13 @@ public final class QuoteLoop implements Runnable {
             log.error("заявка {} на {} USDC превышает предел {} — не ставлю",
                     side, notional, maxOrderNotional);
             journal.event("limit_blocked", side + " нотионал " + notional);
+            refused("заявка " + side + " на " + fmt(notional) + " USDC выше предела " + fmt(maxOrderNotional));
             return 0;
         }
         if (exposure() + notional > maxExposure) {
             log.error("экспозиция превысила бы предел {} — не ставлю", maxExposure);
             journal.event("limit_blocked", "экспозиция");
+            refused("экспозиция превысила бы предел " + fmt(maxExposure));
             return 0;
         }
         if (slot.questioned != null) {
@@ -2443,6 +2445,22 @@ public final class QuoteLoop implements Runnable {
         }
         double have = alloc.own(tag.id(), quote);
         double oneLot = params.size() * price;
+        double need = Math.max(0, (params.inventoryCap() - inventory) * price);
+        return fundingGap(have, need, oneLot, minNotional, quote);
+    }
+
+    /**
+     * Хватает ли кассы на старт; null — хватает, иначе причина отказа.
+     *
+     * 🔑 Полной заявки требуем, только если до потолка не меньше лота (02.11.2026). Иначе
+     * следующая покупка и так неполная, и решает порог покрытия {@link #MIN_FUNDING_SHARE}.
+     * Найдено на e при выкладке «пара на монету»: лот $61.92, потолок 1.2 лота, запас 1 лот,
+     * до потолка $11.39 при кассе $11.36. У участника пула касса = капитал − запас ПО ЦЕНЕ
+     * ВХОДА, а «до потолка» считается по нынешней, поэтому с запасом в минусе на центы
+     * старое правило «покрыть остаток целиком» не пускало бота НИКОГДА — и не дало бы
+     * включиться самому после остановки по пределу.
+     */
+    static String fundingGap(double have, double need, double oneLot, double minNotional, String quote) {
         // ⚠️ СНАЧАЛА «СКОЛЬКО ВООБЩЕ НУЖНО», И ТОЛЬКО ПОТОМ «ХВАТАЕТ ЛИ».
         //
         // Порядок был обратный, и 16.09.2026 это не пустило бота `c`: потолок у
@@ -2453,11 +2471,10 @@ public final class QuoteLoop implements Runnable {
         // Цена ошибки больше, чем кажется: не пустив бота, мы лишаем его
         // возможности ПРОДАВАТЬ, хотя у потолка это ровно то, что ему нужно.
         // Касса нужна под покупки, а покупок у него почти не осталось.
-        double need = Math.max(0, (params.inventoryCap() - inventory) * price);
         if (need <= 0) {
             return null;                  // инвентарь уже у потолка, покупать не на что
         }
-        double required = Math.min(Math.max(oneLot, minNotional), need);
+        double required = need >= oneLot ? Math.max(oneLot, minNotional) : 0;
         if (have + 1e-9 < required) {
             return String.format(java.util.Locale.ROOT,
                     "Не хватает своей кассы: за ботом числится %.2f %s, а до потолка "
@@ -2509,6 +2526,77 @@ public final class QuoteLoop implements Runnable {
             reconcile("остановка");
             log.warn("котирование выключено");
         }
+    }
+
+    /**
+     * СТОРОЖ «НИ ОДНОЙ ЗАЯВКИ» (02.11.2026, владелец). Котирование включено, а в книге {@code no-orders-alert-min}
+     * (10) минут нет ни одной своей заявки — одна тревога с причиной; заявки вернулись — одно сообщение. Повторная
+     * тревога не раньше чем через час после прошлой, чтобы мигающее состояние не спамило. Ловит то, чего не видит
+     * сторож молчания сводки (тики идут, а заявок нет): предел заявки или экспозиции, нехватку денег или монет,
+     * паузы. Остановки (по убытку, по пределу постановок, командой) сообщают о себе сами — при выключенном
+     * котировании сторож молчит.
+     */
+    static final long NO_ORDERS_ALERT_MS = Long.getLong("revx.exec.no-orders-alert-min", 10) * 60_000L;
+    static final long NO_ORDERS_REPEAT_MS = 3_600_000L;
+    private long noOrdersSinceMs;
+    private boolean noOrdersAlerted;
+    private long noOrdersAlertMs = Long.MIN_VALUE / 2;
+    private volatile String lastRefusal;
+    private volatile long lastRefusalMs;
+
+    private void refused(String why) {
+        lastRefusal = why;
+        lastRefusalMs = clock.now();
+    }
+
+    private static boolean anyLive(java.util.List<Resting> side) {
+        for (Resting r : side) {
+            if (r != null && r.venueId != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void noOrdersWatch(long now) {
+        if (NO_ORDERS_ALERT_MS <= 0) {
+            return;
+        }
+        if (!quoting.get()) {
+            noOrdersSinceMs = 0;
+            noOrdersAlerted = false;
+            return;
+        }
+        if (anyLive(bids) || anyLive(asks)) {
+            if (noOrdersAlerted) {
+                String msg = "✅ " + tag.id() + " " + symbol + ": заявки снова в книге (не было "
+                        + (now - noOrdersSinceMs) / 60_000 + " мин)";
+                journal.event("orders_back", msg);
+                alert.accept(msg);
+            }
+            noOrdersSinceMs = 0;
+            noOrdersAlerted = false;
+            return;
+        }
+        if (noOrdersSinceMs == 0) {
+            noOrdersSinceMs = now;
+            return;
+        }
+        if (noOrdersAlerted || now - noOrdersSinceMs < NO_ORDERS_ALERT_MS || now - noOrdersAlertMs < NO_ORDERS_REPEAT_MS) {
+            return;
+        }
+        noOrdersAlerted = true;
+        noOrdersAlertMs = now;
+        String why = pausedReason != null ? "пауза: " + pausedReason
+                : lastRefusal != null && lastRefusalMs >= noOrdersSinceMs - 60_000 ? lastRefusal
+                : sellOnly ? "режим распродажи, а продавать нечего" : "причина не записана — смотреть журнал";
+        String msg = String.format(java.util.Locale.ROOT,
+                "⚠️ %s %s: %d мин ни одной заявки в книге, котирование включено. %s. Запас %.2f лота",
+                tag.id(), symbol, (now - noOrdersSinceMs) / 60_000, why,
+                params.size() > 0 ? inventory / params.size() : 0);
+        journal.event("no_orders", msg);
+        log.warn(msg);
+        alert.accept(msg);
     }
 
     /** Куда сообщать о срабатывании предохранителей. Ставится исполнителем. */
@@ -3072,6 +3160,17 @@ public final class QuoteLoop implements Runnable {
             System.getProperty("revx.exec.pool-members", "").split(","))
             .map(String::trim).filter(s -> !s.isEmpty()).sorted().toList();
     static final boolean POOL_SHRINK = !"false".equals(System.getProperty("revx.exec.pool-shrink", "true"));
+    /** стартовый капитал участника в USDC (как у живого пула: лот = капитал / лотов в потолке); 0 — lot-usd × лотов */
+    static final double POOL_CAPITAL = Double.parseDouble(System.getProperty("revx.exec.pool-capital", "0"));
+
+    /** имя в пуле: pool-member, а если не задан — метка бота (два бота одной пары в одном процессе стенда, 02.11.2026) */
+    private String poolMe() {
+        return POOL_ME.isEmpty() ? tag.id() : POOL_ME;
+    }
+
+    private double poolCapital0() {
+        return POOL_CAPITAL > 0 ? POOL_CAPITAL : LOT_USD * capLots;
+    }
     private PoolExchange poolX;
     private ReinvestPool pool;
     private long poolHour = -1;
@@ -3080,19 +3179,25 @@ public final class QuoteLoop implements Runnable {
 
     /** Шаг общего буфера на границе часа. Зовётся с каждого тика, от котирования не зависит. */
     private void poolTick(long now) {
-        if (!"pool".equals(REINVEST) || LOT_USD <= 0) {
+        if (!"pool".equals(REINVEST) || (LOT_USD <= 0 && POOL_CAPITAL <= 0)) {
             return;
         }
         if (Double.isNaN(capLots)) {
             capLots = params.size() > 0 ? params.inventoryCap() / params.size() : 0;
         }
-        double c0 = LOT_USD * capLots;
+        double c0 = poolCapital0();
         long h = now / REINVEST_MS;
         if (poolHour < 0) {
             poolHour = h;
             poolSeen = reinvRealised;
-            poolX = new PoolExchange(POOL_DIR, POOL_ME, POOL_MEMBERS, h + 1, c0);
+            poolX = new PoolExchange(POOL_DIR, poolMe(), POOL_MEMBERS, h + 1, c0);
             return;
+        }
+        // Две фазы (02.11.2026): отчёт за шаг кладётся на его границе, а забирается и применяется на СЛЕДУЮЩЕМ тике —
+        // сосед по процессу ходит после нас и до своего хода отчитаться не может (см. PoolExchange.post).
+        while (!poolPosted.isEmpty()) {
+            long step = poolPosted.pollFirst();
+            poolApply(step, poolX.collect(step));
         }
         while (poolHour < h) {
             poolHour++;
@@ -3100,21 +3205,29 @@ public final class QuoteLoop implements Runnable {
             if (poolHour == h) {
                 poolSeen = reinvRealised;
             }
-            var all = poolX.exchange(poolHour, d, c0);
+            poolX.post(poolHour, d, c0);
+            poolPosted.addLast(poolHour);
+        }
+    }
+
+    private final java.util.ArrayDeque<Long> poolPosted = new java.util.ArrayDeque<>();
+
+    private void poolApply(long step, java.util.Map<String, PoolExchange.Entry> all) {
+        {
             if (pool == null) {
                 java.util.Map<String, Double> caps = new java.util.TreeMap<>();
                 all.forEach((k, e) -> caps.put(k, e.capital0()));
                 pool = new ReinvestPool(caps, REINVEST_BUFFER_PCT, 0.5, REINVEST_MAX, POOL_SHRINK);
             }
-            double before = pool.capital(POOL_ME);
+            double before = pool.capital(poolMe());
             java.util.Map<String, Double> deltas = new java.util.TreeMap<>();
             all.forEach((k, e) -> deltas.put(k, e.delta()));
             pool.step(deltas);
-            if (Math.abs(pool.capital(POOL_ME) - before) > 1e-9) {
+            if (Math.abs(pool.capital(poolMe()) - before) > 1e-9) {
                 poolDirty = true;
                 journal.event("reinvest", String.format(java.util.Locale.ROOT,
-                        "пул, шаг %d: капитал %.4f → %.4f USDC; %s", poolHour, before,
-                        pool.capital(POOL_ME), pool.describe()));
+                        "пул, шаг %d: капитал %.4f → %.4f USDC; %s", step, before,
+                        pool.capital(poolMe()), pool.describe()));
             }
         }
     }
@@ -3335,7 +3448,7 @@ public final class QuoteLoop implements Runnable {
         }
         if ("pool".equals(REINVEST)) {
             return pool == null || Double.isNaN(capLots) || capLots <= 0
-                    ? LOT_USD : pool.capital(POOL_ME) / capLots;
+                    ? poolCapital0() / capLots : pool.capital(poolMe()) / capLots;
         }
         if ("off".equals(REINVEST) || Double.isNaN(capLots) || capLots <= 0) {
             return LOT_USD;
@@ -3369,7 +3482,7 @@ public final class QuoteLoop implements Runnable {
     private boolean lotRefused;
 
     private void lotFromUsd(double price) {
-        if ((LOT_USD <= 0 && livePoolCapital <= 0) || !(price > 0)) {
+        if ((LOT_USD <= 0 && livePoolCapital <= 0 && !("pool".equals(REINVEST) && POOL_CAPITAL > 0)) || !(price > 0)) {
             return;
         }
         long now = clock.now();
@@ -3558,6 +3671,7 @@ public final class QuoteLoop implements Runnable {
         }
         rememberFair(fair.price());
         poolTick(clock.now());
+        noOrdersWatch(clock.now());
         livePoolTick(clock.now());
         lossStopTick();
         if (lossStopUntil == 0) {
@@ -3574,13 +3688,13 @@ public final class QuoteLoop implements Runnable {
         if (!quoting.get()) {
             pausedReason = "не запущен";
             if (LIMIT_AUTO_RESUME && limitStoppedMs > 0 && AUTO_RESUME_MS <= 0
-                    && placementsLastDay() <= placementCap() * BUDGET_UNWIND_OFF) {
+                    && placementsLastDay() <= placementCap() * LIMIT_RESUME_FRAC) {
                 autoResume();
                 return;
             }
             if (AUTO_RESUME_MS > 0 && limitStoppedMs > 0
                     && clock.now() - limitStoppedMs >= AUTO_RESUME_MS
-                    && placementsLastDay() < placementCap() * BUDGET_UNWIND_OFF) {
+                    && placementsLastDay() < placementCap() * LIMIT_RESUME_FRAC) {
                 limitStoppedMs = 0;
                 journal.event("auto_resume", "стенд: оператор включил бота после остановки по пределу");
                 startQuoting();
@@ -3956,6 +4070,9 @@ public final class QuoteLoop implements Runnable {
         updateStormPark(fair.price());
         updateFallPark(fair.price());
         updateNews();
+        // ворота ближних — до выбора слота: закрытый ближний замену тика не забирает
+        nearBuyWhy = nearGateClosed(0);
+        nearAskWhy = NEAR_ASK ? nearAskClosed() : null;
         chooseReplaceSlot(target, fair);
         double buyRoom = buyRoom();
         for (int k = 0; k < levels; k++) {
@@ -3977,11 +4094,19 @@ public final class QuoteLoop implements Runnable {
                     buyCash = Math.max(0, buyCash - r.size * r.price);
                     buyRoom = Math.max(0, buyRoom - r.size);
                 }
+            } else if (ib == 0 && nearBuyWhy != null) {
+                Resting r = bids.get(ib);                     // ближний закрыт: отвести заменой, не снимать
+                parkSide(Side.BUY, r, lastTrustedFair * (1 - NEAR_PARK_BP / 1e4), "ближний закрыт", true);
+                if (r.venueId != null && r.price > 0) {
+                    buyCash = Math.max(0, buyCash - r.size * r.price);
+                    buyRoom = Math.max(0, buyRoom - r.size);
+                }
             } else {
                 double cashCap = bidPrice != null && bidPrice > 0
                         ? buyCash / bidPrice : Double.MAX_VALUE;
                 double bought = syncSide(Side.BUY, ib, bids.get(ib), bidPrice, fair.price(),
-                        Math.min(cashCap, buyRoom));
+                        LEVEL_WEIGHTS.length == 0 ? Math.min(cashCap, buyRoom)
+                                : Math.min(Math.min(cashCap, buyRoom), buyWeight(ib) * params.size()));
                 buyCash = Math.max(0, buyCash - bought * (bidPrice == null ? 0 : bidPrice));
                 buyRoom = Math.max(0, buyRoom - bought);
             }
@@ -3994,9 +4119,17 @@ public final class QuoteLoop implements Runnable {
                 if (r.venueId != null) {
                     sellPool = Math.max(0, sellPool - r.size);
                 }
+            } else if (NEAR_ASK && i == 0 && nearAskWhy != null) {
+                Resting r = asks.get(i);                      // ближний аск закрыт: отвести заменой
+                parkSide(Side.SELL, r, lastTrustedFair * (1 + NEAR_PARK_BP / 1e4), "ближний аск закрыт", true);
+                if (r.venueId != null) {
+                    sellPool = Math.max(0, sellPool - r.size);
+                }
             } else {
+                double pool = NEAR_ASK && nearAskWhy == null && LEVEL_WEIGHTS.length > 0
+                        ? Math.min(sellPool, levelWeight(i) * params.size()) : sellPool;
                 sellPool = Math.max(0,
-                        sellPool - syncSide(Side.SELL, i, asks.get(i), askPrice, fair.price(), sellPool));
+                        sellPool - syncSide(Side.SELL, i, asks.get(i), askPrice, fair.price(), pool));
             }
         }
     }
@@ -4317,12 +4450,18 @@ public final class QuoteLoop implements Runnable {
             // ещё не отведённый слот претендует на замену ради самой парковки
             if (stormParks(Side.BUY, i)) {
                 considerPark(Side.BUY, i, bids.get(i), lastTrustedFair * (1 - stormParkAway(i)), falling, cand);
+            } else if (i == 0 && nearBuyWhy != null) {
+                // закрытый ближний отводится сам (parkSide) и стоит; иначе он, в 300 б.п. от цели, забирал
+                // замену КАЖДЫЙ тик, и остальные слоты не двигались вовсе (стенд 28.10: аск после отвода
+                // по календарю простоял 30 суток)
             } else {
                 considerSlot(Side.BUY, i, bids.get(i), onTick(Side.BUY, noCross(Side.BUY,
                         levelPrice(Side.BUY, target.bid(), fair.price(), i), fair)), cand);
             }
             if (stormParks(Side.SELL, i)) {
                 considerPark(Side.SELL, i, asks.get(i), lastTrustedFair * (1 + stormParkAway(i)), !falling, cand);
+            } else if (NEAR_ASK && i == 0 && nearAskWhy != null) {
+                // то же для закрытого ближнего аска
             } else {
                 considerSlot(Side.SELL, i, asks.get(i),
                         askLevelOff(i) ? null : onTick(Side.SELL, noCross(Side.SELL,
@@ -4546,7 +4685,7 @@ public final class QuoteLoop implements Runnable {
         if (base != null) {
             base = behindBest(side, base, fair);
         }
-        if (base != null && (level == 0 || !QA_FIRST_ONLY)) {
+        if (base != null && QA_ON == null && (level == 0 || !QA_FIRST_ONLY)) {
             double raw = base;
             base = queueAdapt(side, base, fair);
             if (QA_FIRST_ONLY && levels > 1 && levelStep > 0) {
@@ -4556,11 +4695,20 @@ public final class QuoteLoop implements Runnable {
                 base = side == Side.BUY ? Math.max(base, raw - second + step) : Math.min(base, raw + second - step);
             }
         }
+        if (base != null && WALL_SIDE != null && level == 0) {
+            base = wallPrice(side, base, fair);
+        }
+        if (base != null && FUNC_FILE != null && level == 0) {
+            base = funcPrice(side, base, fair);
+        }
         if (side == Side.BUY && base != null) {
             base = rebuyCap(base);
         }
         if (base == null || level == 0 || levelStep <= 0) {
-            return base;
+            if (base == null || QA_ON == null) {
+                return base;                  // ⚠️ не тернарником: он распаковал бы null в double
+            }
+            return queueAdaptKind(side, base, fair, level, base);
         }
         // ⚠️ ГЕОМЕТРИЧЕСКИЙ ШАГ, если задан множитель.
         //
@@ -4586,7 +4734,46 @@ public final class QuoteLoop implements Runnable {
         } else {
             shift = level * levelStep * fair;
         }
-        return side == Side.BUY ? base - shift : base + shift;
+        double p = side == Side.BUY ? base - shift : base + shift;
+        if (QA_ON == null) {
+            return p;
+        }
+        // внутренний сосед (уровень level−1) без отступа от очереди: уровень за него не заходит
+        double innerShift = growth > 1.0
+                ? levelStep * fair * (Math.pow(growth, level - 1) - 1) / (growth - 1)
+                : (level - 1) * levelStep * fair;
+        return queueAdaptKind(side, p, fair, level, side == Side.BUY ? base - innerShift : base + innerShift);
+    }
+
+    /**
+     * ОТСТУП ОТ ОЧЕРЕДИ ПО ВИДУ ЗАЯВКИ (владелец 28.10.2026, {@code revx.exec.queue-adapt-on}): {@code main} —
+     * ходит только основная заявка, {@code near} — только ближняя (откусанная), пусто — как было (ход считается
+     * для базовой цены и переносится на все уровни). Ближняя — покупка уровня 0 при {@code level-weights} и
+     * продажа уровня 0 при {@code near-ask}; остальное — основные. Ходит каждая по СВОЕЙ очереди и не заходит
+     * за внутреннего соседа.
+     */
+    static final String QA_ON = blankToNull(System.getProperty("revx.exec.queue-adapt-on", ""));
+
+    private static String blankToNull(String s) {
+        return s == null || s.isBlank() ? null : s.trim();
+    }
+
+    /** Ближняя ли (откусанная) это заявка. */
+    private boolean nearKind(Side side, int level) {
+        return level == 0 && levels > 1 && LEVEL_WEIGHTS.length > 0 && (side == Side.BUY || NEAR_ASK);
+    }
+
+    private double queueAdaptKind(Side side, double p, double fair, int level, double inner) {
+        boolean near = nearKind(side, level);
+        if (!("near".equals(QA_ON) ? near : !near)) {
+            return p;
+        }
+        double q = queueAdapt(side, p, fair);
+        if (level > 0) {
+            double step = Math.max(params.quoteStep(), 1e-12);
+            q = side == Side.BUY ? Math.min(q, inner - step) : Math.max(q, inner + step);
+        }
+        return q;
     }
 
     /**
@@ -4785,6 +4972,554 @@ public final class QuoteLoop implements Runnable {
     }
 
     /**
+     * ПЕРЕД СТЕНОЙ (док. 221, 29.10.2026). Заявка встаёт на шаг перед первой чужой стеной — уровнем книги, на котором
+     * накопленное от лучшей цены $ своей стороны достигает {@code revx.exec.wall-usd}. По ленте 15.09–18.10 лучший
+     * отступ аска почти всегда на шаг перед стеной: до неё цена доходит, за неё — вдвое реже.
+     * <ul>
+     *   <li>{@code wall-side} = ask | bid | both; пусто — выключено;</li>
+     *   <li>стена ближе {@code wall-min-bp} к опоре — стоим на обычной цене; дальше {@code wall-max-bp} или стены в книге
+     *       нет — стоим на {@code wall-max-bp};</li>
+     *   <li>{@code wall-bid-empty-only=true} (владелец 29.10): бид перед стеной, только пока запас меньше лота; есть лот —
+     *       обычный отступ.</li>
+     * </ul>
+     * Заменяет базовую цену уровня 0 целиком — скос на эту цену не действует.
+     */
+    static final String WALL_SIDE = blankToNull(System.getProperty("revx.exec.wall-side", ""));
+    static final double WALL_USD = Double.parseDouble(System.getProperty("revx.exec.wall-usd", "3750"));
+    static final double WALL_MIN_BP = Double.parseDouble(System.getProperty("revx.exec.wall-min-bp", "4"));
+    static final double WALL_MAX_BP = Double.parseDouble(System.getProperty("revx.exec.wall-max-bp", "30"));
+    static final boolean WALL_BID_EMPTY_ONLY = Boolean.getBoolean("revx.exec.wall-bid-empty-only");
+    /**
+     * Пороги по запасу (владелец 29.10.2026): бид перед стеной, пока запас меньше {@code wall-bid-max-lots} лотов
+     * (0 — всегда; {@code wall-bid-empty-only} = 1 лот); аск перед стеной, только когда запас БОЛЬШЕ
+     * {@code wall-ask-min-lots} лотов (0 — всегда), иначе обычный отступ.
+     */
+    static final double WALL_BID_MAX_LOTS = Double.parseDouble(System.getProperty("revx.exec.wall-bid-max-lots",
+            WALL_BID_EMPTY_ONLY ? "1" : "0"));
+    static final double WALL_ASK_MIN_LOTS = Double.parseDouble(System.getProperty("revx.exec.wall-ask-min-lots", "0"));
+    /**
+     * СТЕНА В ПОЛОСЕ (док. 223, 30.10.2026): {@code wall-band-in-bp} / {@code wall-band-out-bp} > 0 — стена ищется только в
+     * полосе [обычная цена − in; обычная цена + out] б.п. (обычная — с отступом и скосом), накопленное считается ОТ НАЧАЛА
+     * полосы; нашлась — шаг перед ней, нет — обычная цена. Целевой отступ остаётся своим у монеты, скос работает.
+     */
+    static final double WALL_BAND_IN_BP = Double.parseDouble(System.getProperty("revx.exec.wall-band-in-bp", "0"));
+    static final double WALL_BAND_OUT_BP = Double.parseDouble(System.getProperty("revx.exec.wall-band-out-bp", "0"));
+    /**
+     * СТЕНА ОТ ПОТОКА (владелец 29.10.2026, 221 §5б): {@code wall-flow-min} > 0 — порог стены не {@code wall-usd}, а столько
+     * минут встречного тейкерского потока скользящего часа (не меньше {@code wall-flow-floor-usd}). Поток $500 в час —
+     * и $100 впереди уже стена. Только стенд: ленту даёт {@link TakerFlow}.
+     */
+    public static final double WALL_FLOW_MIN = Double.parseDouble(System.getProperty("revx.exec.wall-flow-min", "0"));
+    static final double WALL_FLOW_FLOOR_USD = Double.parseDouble(System.getProperty("revx.exec.wall-flow-floor-usd", "25"));
+    private TakerFlow takerFlow;
+    private double wallThrSum;
+    private long wallThrN;
+
+    public void takerFlow(TakerFlow f) {
+        this.takerFlow = f;
+    }
+    private final long[] wallTicks = new long[2], wallFront = new long[2], wallMax = new long[2];
+    private final double[] wallBpSum = new double[2];
+
+    private double wallPrice(Side side, double base, double fair) {
+        boolean buy = side == Side.BUY;
+        if (!"both".equals(WALL_SIDE) && !(buy ? "bid" : "ask").equals(WALL_SIDE)) {
+            return base;
+        }
+        if (buy && WALL_BID_MAX_LOTS > 0 && inventory >= params.size() * WALL_BID_MAX_LOTS * (1 - 1e-6)) {
+            return base;
+        }
+        if (!buy && WALL_ASK_MIN_LOTS > 0 && inventory <= params.size() * WALL_ASK_MIN_LOTS * (1 + 1e-6)) {
+            return base;
+        }
+        if (bookSource == null || !(fair > 0)) {
+            return base;
+        }
+        org.home.data.revx.sim.BookView book = bookSource.apply(clock.now());
+        if (book == null) {
+            return base;
+        }
+        int s = buy ? 0 : 1;
+        wallTicks[s]++;
+        double thr = WALL_USD;
+        if (WALL_FLOW_MIN > 0) {
+            if (takerFlow == null) {
+                throw new IllegalStateException("стена от потока просит ленту: TakerFlow не подключён");
+            }
+            // встречный поток: по нашему биду бьют продавцы, по аску — покупатели
+            thr = Math.max(WALL_FLOW_FLOOR_USD, WALL_FLOW_MIN * takerFlow.usd(!buy, clock.now(), 3_600_000L) / 60.0);
+            wallThrSum += thr;
+            wallThrN++;
+        }
+        if (WALL_BAND_IN_BP > 0 || WALL_BAND_OUT_BP > 0) {
+            double near = buy ? base + fair * WALL_BAND_IN_BP / 10_000 : base - fair * WALL_BAND_IN_BP / 10_000;
+            double deep = buy ? base - fair * WALL_BAND_OUT_BP / 10_000 : base + fair * WALL_BAND_OUT_BP / 10_000;
+            double q = wallInBand(buy, otherOrders(buy ? book.bids() : book.asks(), buy ? bids : asks),
+                    Math.max(params.quoteStep(), 1e-12), thr, near, deep);
+            if (Double.isNaN(q)) {
+                return base;
+            }
+            double qbp = (buy ? fair - q : q - fair) / fair * 10_000;
+            if (qbp < WALL_MIN_BP) {
+                return base;
+            }
+            wallFront[s]++;
+            wallBpSum[s] += qbp;
+            return q;
+        }
+        double p = wallFrontPrice(buy, otherOrders(buy ? book.bids() : book.asks(), buy ? bids : asks),
+                Math.max(params.quoteStep(), 1e-12), thr);
+        double far = buy ? fair * (1 - WALL_MAX_BP / 10_000) : fair * (1 + WALL_MAX_BP / 10_000);
+        double bp = Double.isNaN(p) ? Double.POSITIVE_INFINITY : (buy ? fair - p : p - fair) / fair * 10_000;
+        if (bp < WALL_MIN_BP) {
+            return base;
+        }
+        if (bp > WALL_MAX_BP) {
+            wallMax[s]++;
+            wallBpSum[s] += WALL_MAX_BP;
+            return far;
+        }
+        wallFront[s]++;
+        wallBpSum[s] += bp;
+        return p;
+    }
+
+    /** Чистая часть «перед стеной»: шаг перед первым уровнем, где накопленное $ ≥ порога; NaN — стены нет. */
+    static double wallFrontPrice(boolean buy, java.util.List<org.home.data.revx.sim.BookView.Level> levels, double step, double wallUsd) {
+        double cum = 0;
+        for (org.home.data.revx.sim.BookView.Level l : levels) {
+            cum += l.qty() * l.price();
+            if (cum >= wallUsd) {
+                return buy ? l.price() + step : l.price() - step;
+            }
+        }
+        return Double.NaN;
+    }
+
+    /**
+     * ОТСТУП ИЗ ФУНКЦИИ (док. 223, 30.10.2026). Каждый тик для δ = {@code func-min-bp}…{@code func-max-bp} (шаг 1 б.п.)
+     * считается доход заявки D(δ) = P(δ) × M(δ):
+     * <pre>
+     *   z = c0 + c1·δ + c2·δ² + c3·L + c4·δ·L + c5·F + c6·δ·F + c7·N + c8·S,   P = 1 / (1 + e^(−z))
+     *   M = m0 + m1·δ + … + m8·S   (б.п.)
+     * </pre>
+     * L = ln(1 + $ чужих заявок по цене не хуже нашей), F = 1, если за последнюю минуту была встречная тейкерская сделка,
+     * N = ln(1 + встречный тейкерский $ за скользящий час / 60), S = спред книги, б.п. Заявка ставится на δ с наибольшим D.
+     * Коэффициенты — файл {@code revx.exec.func-file} (строки «МОНЕТА;сторона 0 бид / 1 аск;c0…c8;m0…m8», обучены на
+     * мысленных заявках по ленте, d222/FuncOpt). {@code func-band-in-bp} / {@code func-band-out-bp} > 0 — δ только в полосе
+     * вокруг обычной цены (скос работает); без полосы скос на эту цену не действует. Только стенд: ленту даёт {@link TakerFlow}.
+     */
+    public static final String FUNC_FILE = blankToNull(System.getProperty("revx.exec.func-file", ""));
+    static final int FUNC_MIN_BP = Integer.getInteger("revx.exec.func-min-bp", 4);
+    static final int FUNC_MAX_BP = Integer.getInteger("revx.exec.func-max-bp", 30);
+    /** цена дальше этого от опоры — отвод, функция её не трогает */
+    static final int FUNC_PARKED_BP = 300;
+    static final double FUNC_BAND_IN_BP = Double.parseDouble(System.getProperty("revx.exec.func-band-in-bp", "0"));
+    static final double FUNC_BAND_OUT_BP = Double.parseDouble(System.getProperty("revx.exec.func-band-out-bp", "0"));
+    private double[][] funcCoef;   // [сторона] → c0…c8, m0…m8
+    private final long[] funcTicks = new long[2];
+    private final double[] funcBpSum = new double[2];
+
+    /**
+     * ЦЕНА ЗАПАСА И ЦЕНА ПОСТАНОВКИ (док. 225 §4–6). С таблицей {@code func-inv-file} (строки «МОНЕТА;Q;γ;0;p_b(0)…p_b(Q−1)» и
+     * «МОНЕТА;Q;γ;1;p_a(1)…p_a(Q)», б.п.; считает d225/FuncInv по уравнению Беллмана) или с ценой постановки μ функция выбирает
+     * δ = argmax λ(δ)·(M(δ) − p), λ = −ln(1 − P)/5, p = цена запаса стороны при текущем запасе (в лотах, между целыми — линейно) + μ;
+     * максимум ≤ 0 — сторону не котировать. μ: стартовое {@code func-mu-bp}, при {@code func-mu-budget} > 0 раз в час
+     * μ ← max(0, μ + η·(постановок за скользящие сутки − бюджет)/бюджет), η = {@code func-mu-eta}.
+     */
+    static final String FUNC_INV_FILE = blankToNull(System.getProperty("revx.exec.func-inv-file", ""));
+    static final int FUNC_INV_Q = Integer.getInteger("revx.exec.func-inv-q", 10);
+    static final double FUNC_INV_GAMMA = Double.parseDouble(System.getProperty("revx.exec.func-inv-gamma", "0.002"));
+    static final double FUNC_MU_BP = Double.parseDouble(System.getProperty("revx.exec.func-mu-bp", "0"));
+    static final double FUNC_MU_BUDGET = Double.parseDouble(System.getProperty("revx.exec.func-mu-budget", "0"));
+    static final double FUNC_MU_ETA = Double.parseDouble(System.getProperty("revx.exec.func-mu-eta", "0.5"));
+    /**
+     * ЦЕНА ПОСТАНОВКИ ОТ ОСТАТКА (док. 224 §6.0, 30.10): всплески сделок в 2–2.6 раза выше среднего, и часовая μ за ними не
+     * успевает. Каждый тик μ_ост = {@code func-mu-head-bp} · x^{@code func-mu-head-pow}, x = (u − u0)/(1 − u0) в [0, 1],
+     * u = постановок за скользящие сутки / предел, u0 = {@code func-mu-head-from}. Складывается с часовой μ.
+     */
+    static final double FUNC_MU_HEAD_BP = Double.parseDouble(System.getProperty("revx.exec.func-mu-head-bp", "0"));
+    static final double FUNC_MU_HEAD_FROM = Double.parseDouble(System.getProperty("revx.exec.func-mu-head-from", "0.6"));
+    static final double FUNC_MU_HEAD_POW = Double.parseDouble(System.getProperty("revx.exec.func-mu-head-pow", "2"));
+    // только бид: продажа запаса у предела не дорожает (док. 227 §4 п. 2 — места под выход)
+    static final boolean FUNC_MU_HEAD_BID_ONLY = Boolean.getBoolean("revx.exec.func-mu-head-bid-only");
+    /**
+     * ОБЩАЯ ЦЕНА НА СЧЁТ (док. 227 §4 п. 2): при {@code func-mu-head-usd} > 0 и общем ведре занятость u = 1 − токенов / ёмкость
+     * ведра (весь счёт), а μ_max задана в ДОЛЛАРАХ на постановку и переводится в б.п. своего лота: места уходят тому, у кого
+     * постановка дороже. Порог и степень — те же {@code func-mu-head-from} / {@code -pow}.
+     */
+    static final double FUNC_MU_HEAD_USD = Double.parseDouble(System.getProperty("revx.exec.func-mu-head-usd", "0"));
+    static final boolean FUNC_RATE = FUNC_INV_FILE != null || FUNC_MU_BP > 0 || FUNC_MU_BUDGET > 0 || FUNC_MU_HEAD_BP > 0
+            || FUNC_MU_HEAD_USD > 0;
+    private double funcMuHead;
+    private long funcMuHeadSec = -1;
+    private double funcMuHeadSum;
+    private double funcMuHeadMax;
+
+    /** μ от остатка до предела постановок; пересчёт не чаще раза в секунду (счёт расхода живьём идёт по журналу). */
+    static double headMu(long used, int cap, double maxBp, double from, double pow) {
+        double u = (double) used / Math.max(1, cap);
+        double x = Math.min(1, Math.max(0, (u - from) / Math.max(1e-9, 1 - from)));
+        return maxBp * Math.pow(x, pow);
+    }
+
+    private double funcMuHeadNow(double fair) {
+        if (FUNC_MU_HEAD_USD > 0 && budget != null) {
+            long tenSec = clock.now() / 10_000;          // ведро — база SQLite, спрашиваем раз в 10 с
+            if (tenSec != funcMuHeadSec) {
+                funcMuHeadSec = tenSec;
+                double u = 1 - budget.state(tag.id(), clock.now()).tokens() / PlacementBudget.CAPACITY;
+                double lotBp = params.size() * fair * 1e-4;
+                funcMuHead = lotBp > 0 ? headMu(Math.round(u * 1e6), 1_000_000, FUNC_MU_HEAD_USD / lotBp,
+                        FUNC_MU_HEAD_FROM, FUNC_MU_HEAD_POW) : 0;
+                funcMuHeadMax = Math.max(funcMuHeadMax, funcMuHead);
+            }
+            return funcMuHead;
+        }
+        if (FUNC_MU_HEAD_BP <= 0) {
+            return 0;
+        }
+        long sec = clock.now() / 1000;
+        if (sec != funcMuHeadSec) {
+            funcMuHeadSec = sec;
+            int cap = LIVE_CAP > 0 ? LIVE_CAP : placementCap();
+            funcMuHead = headMu(placementsLastDay(), cap, FUNC_MU_HEAD_BP, FUNC_MU_HEAD_FROM, FUNC_MU_HEAD_POW);
+            funcMuHeadMax = Math.max(funcMuHeadMax, funcMuHead);
+        }
+        return funcMuHead;
+    }
+    private double[][] funcInv;          // [0] p_b(q = 0…Q−1), [1] p_a(q = 1…Q)
+    private double funcMu = FUNC_MU_BP;
+    private long funcMuHour = -1;
+    private final long[] funcSkip = new long[2];
+    private double funcMuSum;
+    private long funcMuN;
+
+    /** Цена запаса стороны при запасе q лотов (дробный — линейно между соседними целыми, за краями — крайнее значение). */
+    static double invPrice(double[] row, double x) {
+        if (row == null || row.length == 0) {
+            return 0;
+        }
+        if (x <= 0) {
+            return row[0];
+        }
+        if (x >= row.length - 1) {
+            return row[row.length - 1];
+        }
+        int i = (int) x;
+        double f = x - i;
+        return row[i] * (1 - f) + row[i + 1] * f;
+    }
+
+    static double[][] loadInv(String file, String coin, int q, double gamma) {
+        double[][] out = new double[2][];
+        try {
+            for (String line : java.nio.file.Files.readAllLines(java.nio.file.Path.of(file))) {
+                String[] p = line.trim().split(";");
+                if (p.length < 5 || !p[0].equalsIgnoreCase(coin) || Integer.parseInt(p[1]) != q
+                        || Math.abs(Double.parseDouble(p[2]) - gamma) > 1e-12 || p[3].equals("mu")) {
+                    continue;
+                }
+                double[] r = new double[p.length - 4];
+                for (int j = 0; j < r.length; j++) {
+                    // недостижимые состояния уравнение отдаёт миллионами — это «не котировать», держим в пределах
+                    r[j] = Math.max(-200, Math.min(200, Double.parseDouble(p[4 + j])));
+                }
+                out[Integer.parseInt(p[3])] = r;
+            }
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("не прочитался файл цены запаса " + file, e);
+        }
+        if (out[0] == null || out[1] == null) {
+            throw new IllegalStateException("в файле цены запаса " + file + " нет строк " + coin + " Q=" + q + " γ=" + gamma);
+        }
+        return out;
+    }
+
+    /** Раз в час: μ к бюджету постановок. */
+    private void funcMuStep() {
+        long hour = clock.now() / 3_600_000L;
+        if (hour == funcMuHour) {
+            return;
+        }
+        if (funcMuHour >= 0 && FUNC_MU_BUDGET > 0) {
+            long used = placementsLastDay();
+            double was = funcMu;
+            funcMu = Math.max(0, funcMu + FUNC_MU_ETA * (used - FUNC_MU_BUDGET) / FUNC_MU_BUDGET);
+            journal.event("func_mu", String.format(java.util.Locale.ROOT, "постановок за сутки %d при бюджете %.0f: μ %.2f → %.2f б.п.",
+                    used, FUNC_MU_BUDGET, was, funcMu));
+        }
+        funcMuHour = hour;
+    }
+
+    private Double funcPrice(Side side, double base, double fair) {
+        boolean buy = side == Side.BUY;
+        int s = buy ? 0 : 1;
+        // как у стены: бид по функции только для первых N лотов запаса, дальше обычная цена
+        if (buy && WALL_BID_MAX_LOTS > 0 && inventory >= params.size() * WALL_BID_MAX_LOTS * (1 - 1e-6)) {
+            return base;
+        }
+        // ⚠️ отвод (trend-nobid, тихий запрет, пауза по свипу, flow-cap — все 5–10% от опоры) функцией не пересчитывается:
+        // иначе она ставила заявку на свои 4–30 б.п., и правило на стенде с функцией не действовало вовсе (01.11.2026)
+        if (fair > 0 && (buy ? fair - base : base - fair) / fair * 10_000 > FUNC_PARKED_BP) {
+            return base;
+        }
+        if (funcCoef == null) {
+            // свой файл у бота: revx.exec.func-file-<бот> (стенд: два бота монеты в одном процессе, 02.11.2026)
+            String file = System.getProperty("revx.exec.func-file-" + tag.id(), FUNC_FILE);
+            funcByDay = loadFuncDaily(file, symbol.split("[^A-Za-z]")[0]);
+            funcCoef = funcByDay == null ? loadFunc(file, symbol.split("[^A-Za-z]")[0]) : new double[2][];
+        }
+        if (funcByDay != null) {
+            // суточные коэффициенты: строка своего дня, а если её нет — последняя более ранняя
+            java.time.LocalDate today = java.time.Instant.ofEpochMilli(clock.now()).atZone(java.time.ZoneOffset.UTC).toLocalDate();
+            var e = funcByDay.get(s).floorEntry(today);
+            funcCoef[s] = e == null ? null : e.getValue();
+        }
+        if (funcCoef[s] == null || bookSource == null || takerFlow == null || !(fair > 0)) {
+            if (takerFlow == null) {
+                throw new IllegalStateException("отступ из функции просит ленту: TakerFlow не подключён");
+            }
+            return base;
+        }
+        org.home.data.revx.sim.BookView book = bookSource.apply(clock.now());
+        if (book == null || book.bids().isEmpty() || book.asks().isEmpty()) {
+            return base;
+        }
+        double bb = book.bids().get(0).price(), ba = book.asks().get(0).price();
+        double spr = (ba / bb - 1) * 10_000;
+        double f = takerFlow.usd(!buy, clock.now(), 60_000L) > 0 ? 1 : 0;
+        double n = Math.log1p(takerFlow.usd(!buy, clock.now(), 3_600_000L) / 60.0);
+        java.util.List<org.home.data.revx.sim.BookView.Level> lv = otherOrders(buy ? book.bids() : book.asks(), buy ? bids : asks);
+        double baseBp = (buy ? fair - base : base - fair) / fair * 10_000;
+        double lo = FUNC_MIN_BP, hi = FUNC_MAX_BP;
+        if (FUNC_BAND_IN_BP > 0 || FUNC_BAND_OUT_BP > 0) {
+            lo = Math.max(lo, baseBp - FUNC_BAND_IN_BP);
+            hi = Math.min(hi, baseBp + FUNC_BAND_OUT_BP);
+        }
+        double[] c = funcCoef[s];
+        double shift = 0;
+        if (FUNC_RATE) {
+            if (FUNC_INV_FILE != null && funcInv == null) {
+                // своя таблица у бота: revx.exec.func-inv-file-<бот>, func-inv-q-<бот> (02.11.2026)
+                funcInv = loadInv(System.getProperty("revx.exec.func-inv-file-" + tag.id(), FUNC_INV_FILE),
+                        symbol.split("[^A-Za-z]")[0], Integer.getInteger("revx.exec.func-inv-q-" + tag.id(), FUNC_INV_Q), FUNC_INV_GAMMA);
+            }
+            funcMuStep();
+            double q = params.size() > 0 ? inventory / params.size() : 0;
+            double head = FUNC_MU_HEAD_BID_ONLY && !buy ? 0 : funcMuHeadNow(fair);
+            shift = funcMu + head + (funcInv == null ? 0 : buy ? invPrice(funcInv[0], q) : invPrice(funcInv[1], q - 1));
+            funcMuSum += funcMu;
+            funcMuHeadSum += head;
+            funcMuN++;
+        }
+        double bestD = FUNC_RATE ? 0 : Double.NEGATIVE_INFINITY, bestP = Double.NaN, bestBp = 0;
+        for (double d = Math.ceil(lo); d <= hi + 1e-9; d += 1) {
+            double p = buy ? fair * (1 - d / 10_000) : fair * (1 + d / 10_000);
+            if (buy ? p >= ba : p <= bb) {
+                continue;                     // перешла бы через рынок — post_only отвергнет
+            }
+            double ahead = 0;
+            for (org.home.data.revx.sim.BookView.Level l : lv) {
+                if (buy ? l.price() >= p - 1e-12 : l.price() <= p + 1e-12) {
+                    ahead += l.qty() * l.price();
+                }
+            }
+            double dv = FUNC_RATE ? funcRateValue(c, d, Math.log1p(ahead), f, n, spr, shift) : funcValue(c, d, Math.log1p(ahead), f, n, spr);
+            if (dv > bestD) {
+                bestD = dv;
+                bestP = p;
+                bestBp = d;
+            }
+        }
+        if (Double.isNaN(bestP)) {
+            if (FUNC_RATE) {
+                funcSkip[s]++;
+                return null;                  // ни один δ не окупает цену запаса и постановки — сторону не котировать
+            }
+            return base;
+        }
+        if (FUNC_RETREAT_BP > 0 && (buy || !FUNC_RETREAT_BID_ONLY)) {
+            double ahead = 0;
+            for (org.home.data.revx.sim.BookView.Level l : lv) {
+                if (buy ? l.price() >= bestP - 1e-12 : l.price() <= bestP + 1e-12) {
+                    ahead += l.qty() * l.price();
+                }
+            }
+            if (ahead < FUNC_RETREAT_USD) {
+                double step = Math.max(params.quoteStep(), 1e-12);
+                double far = buy ? bestP * (1 - FUNC_RETREAT_BP / 10_000) : bestP * (1 + FUNC_RETREAT_BP / 10_000);
+                double to = far;
+                for (org.home.data.revx.sim.BookView.Level l : lv) {
+                    if (l.qty() * l.price() < FUNC_RETREAT_USD) {
+                        continue;                 // мелочь (бот на $0.10) за чужую очередь не считается
+                    }
+                    if (buy ? l.price() < bestP - 1e-12 && l.price() >= far - 1e-12
+                            : l.price() > bestP + 1e-12 && l.price() <= far + 1e-12) {
+                        double cand = buy ? l.price() + step : l.price() - step;
+                        to = buy ? Math.max(to, cand) : Math.min(to, cand);
+                    }
+                }
+                if (buy ? to < bestP - 1e-12 : to > bestP + 1e-12) {
+                    bestP = to;
+                    bestBp = (buy ? fair - to : to - fair) / fair * 10_000;
+                    funcRetreats[s]++;
+                }
+            }
+        }
+        funcTicks[s]++;
+        funcBpSum[s] += bestBp;
+        return bestP;
+    }
+
+    /**
+     * ОТХОД ОТ ПУСТОЙ ОЧЕРЕДИ (02.11.2026, идея владельца). Функция выбрала цену, а впереди по ней или лучше чужих
+     * заявок меньше {@code func-retreat-usd} ($1, свои не в счёт) — мы первые в очереди и первыми попадём под рывок.
+     * Заявка отходит на шаг перед ближайшей чужой (не мельче того же $1) дальше от рынка, но не дальше
+     * {@code func-retreat-bp} от выбранной цены; чужих в этой полосе нет — ровно на {@code func-retreat-bp}.
+     * {@code func-retreat-bid-only} — только покупка (рывок вниз). 0 — выключено.
+     */
+    static final double FUNC_RETREAT_BP = Double.parseDouble(System.getProperty("revx.exec.func-retreat-bp", "0"));
+    static final double FUNC_RETREAT_USD = Double.parseDouble(System.getProperty("revx.exec.func-retreat-usd", "1"));
+    static final boolean FUNC_RETREAT_BID_ONLY = Boolean.getBoolean("revx.exec.func-retreat-bid-only");
+    private final long[] funcRetreats = new long[2];
+
+    /** D = P × M по коэффициентам строки (c0…c8, m0…m8). */
+    static double funcValue(double[] c, double d, double l, double f, double n, double s) {
+        double[] x = {1, d, d * d, l, d * l, f, d * f, n, s};
+        double z = 0, m = 0;
+        for (int j = 0; j < 9; j++) {
+            z += c[j] * x[j];
+            m += c[9 + j] * x[j];
+        }
+        return m / (1 + Math.exp(-z));
+    }
+
+    /** Док. 225: скорость снятия −ln(1 − P)/5 (раз в минуту) × (M − p). */
+    static double funcRateValue(double[] c, double d, double l, double f, double n, double s, double p) {
+        double[] x = {1, d, d * d, l, d * l, f, d * f, n, s};
+        double z = 0, m = 0;
+        for (int j = 0; j < 9; j++) {
+            z += c[j] * x[j];
+            m += c[9 + j] * x[j];
+        }
+        double pr = Math.min(0.999, 1 / (1 + Math.exp(-z)));
+        return -Math.log1p(-pr) / 5 * (m - p);
+    }
+
+    private java.util.List<java.util.TreeMap<java.time.LocalDate, double[]>> funcByDay;
+
+    /**
+     * Суточный файл (строки «МОНЕТА;сторона;ГГГГ-ММ-ДД;c0…c8;m0…m8», коэффициенты на каждые сутки обучены по прошлым
+     * 7 суткам — 223); null — файл не суточный.
+     */
+    static java.util.List<java.util.TreeMap<java.time.LocalDate, double[]>> loadFuncDaily(String file, String coin) {
+        java.util.List<java.util.TreeMap<java.time.LocalDate, double[]>> out = java.util.List.of(new java.util.TreeMap<>(), new java.util.TreeMap<>());
+        try {
+            for (String line : java.nio.file.Files.readAllLines(java.nio.file.Path.of(file))) {
+                String[] p = line.trim().split(";");
+                if (p.length != 21) {
+                    if (p.length == 20) {
+                        return null;          // обычный файл без дат
+                    }
+                    continue;
+                }
+                if (!p[0].equalsIgnoreCase(coin)) {
+                    continue;
+                }
+                double[] c = new double[18];
+                for (int j = 0; j < 18; j++) {
+                    c[j] = Double.parseDouble(p[3 + j]);
+                }
+                out.get(Integer.parseInt(p[1])).put(java.time.LocalDate.parse(p[2]), c);
+            }
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("не прочитался файл функции " + file, e);
+        }
+        return out.get(0).isEmpty() && out.get(1).isEmpty() ? null : out;
+    }
+
+    static double[][] loadFunc(String file, String coin) {
+        double[][] out = new double[2][];
+        try {
+            for (String line : java.nio.file.Files.readAllLines(java.nio.file.Path.of(file))) {
+                String[] p = line.trim().split(";");
+                if (p.length != 20 || !p[0].equalsIgnoreCase(coin)) {
+                    continue;
+                }
+                double[] c = new double[18];
+                for (int j = 0; j < 18; j++) {
+                    c[j] = Double.parseDouble(p[2 + j]);
+                }
+                out[Integer.parseInt(p[1])] = c;
+            }
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("не прочитался файл функции " + file, e);
+        }
+        if (out[0] == null && out[1] == null) {
+            throw new IllegalStateException("в файле функции " + file + " нет строк для " + coin);
+        }
+        return out;
+    }
+
+    /** Для стенда: средний δ, выбранный функцией. */
+    public String funcStats() {
+        if (FUNC_FILE == null) {
+            return "";
+        }
+        return String.format(java.util.Locale.ROOT, "отступ из функции: бид — тиков %d, средний δ %.1f б.п.; аск — тиков %d, средний δ %.1f б.п.",
+                funcTicks[0], funcTicks[0] > 0 ? funcBpSum[0] / funcTicks[0] : 0, funcTicks[1], funcTicks[1] > 0 ? funcBpSum[1] / funcTicks[1] : 0)
+                + (FUNC_RATE ? String.format(java.util.Locale.ROOT, "; цена запаса/постановки: не котировал бид %d, аск %d тиков, средняя μ %.2f, последняя %.2f б.п.",
+                funcSkip[0], funcSkip[1], funcMuN > 0 ? funcMuSum / funcMuN : 0, funcMu) : "")
+                + (FUNC_MU_HEAD_BP > 0 || FUNC_MU_HEAD_USD > 0 ? String.format(java.util.Locale.ROOT, "; μ от остатка: средняя %.2f, наибольшая %.2f б.п.",
+                funcMuN > 0 ? funcMuHeadSum / funcMuN : 0, funcMuHeadMax) : "")
+                + (FUNC_RETREAT_BP > 0 ? String.format(java.util.Locale.ROOT, "; отход от пустой очереди: бид %d, аск %d тиков",
+                funcRetreats[0], funcRetreats[1]) : "");
+    }
+
+    /**
+     * Чистая часть «стены в полосе»: уровни с ценой в [near; deep] (near — ближний к рынку край), накопленное $ считается от
+     * near; шаг перед первым уровнем, где оно ≥ порога. NaN — в полосе стены нет.
+     */
+    static double wallInBand(boolean buy, java.util.List<org.home.data.revx.sim.BookView.Level> levels, double step,
+                             double wallUsd, double near, double deep) {
+        double cum = 0;
+        for (org.home.data.revx.sim.BookView.Level l : levels) {
+            double pr = l.price();
+            boolean before = buy ? pr > near + 1e-12 : pr < near - 1e-12;
+            boolean past = buy ? pr < deep - 1e-12 : pr > deep + 1e-12;
+            if (before) {
+                continue;
+            }
+            if (past) {
+                break;
+            }
+            cum += l.qty() * pr;
+            if (cum >= wallUsd) {
+                double front = buy ? pr + step : pr - step;
+                return buy ? Math.min(front, near) : Math.max(front, near);
+            }
+        }
+        return Double.NaN;
+    }
+
+    /** Для стенда: как часто сработало «перед стеной». */
+    public String wallStats() {
+        if (WALL_SIDE == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder("перед стеной (" + WALL_SIDE + ", "
+                + (WALL_FLOW_MIN > 0 ? String.format(java.util.Locale.ROOT, "%.0f мин потока, средний порог $%.0f", WALL_FLOW_MIN,
+                        wallThrN > 0 ? wallThrSum / wallThrN : 0) : "$" + Math.round(WALL_USD)) + "):");
+        for (int s = 0; s < 2; s++) {
+            long n = wallFront[s] + wallMax[s];
+            sb.append(String.format(java.util.Locale.ROOT, " %s — тиков %d, перед стеной %d, на пределе %d, средний отступ %.1f б.п.;",
+                    s == 0 ? "бид" : "аск", wallTicks[s], wallFront[s], wallMax[s], n > 0 ? wallBpSum[s] / n : 0));
+        }
+        return sb.toString();
+    }
+
+    /**
      * Чистая часть правила (для теста). Уровни — лучшие первыми, только чужие. {@code in}/{@code out}
      * — в цене. Впереди цены p — всё по p и лучше.
      */
@@ -4845,6 +5580,106 @@ public final class QuoteLoop implements Runnable {
 
     private boolean askLevelOff(int level) {
         return ASK_LEVELS > 0 && level >= ASK_LEVELS;
+    }
+
+    /**
+     * ОТКУСАННЫЙ ЛОТ (28.10.2026, идея владельца): покупка уровнями НЕРАВНОГО размера, например
+     * {@code revx.exec.level-weights=0.2,0.8} — ближний уровень 20% лота, основной 80%, вместе не
+     * больше лота. Пусто — все уровни по лоту, как было. Продажа не трогается.
+     * Ближний (уровень 0) стоит, только пока открыты ворота:
+     * {@code revx.exec.near-level-gate} — расход постановок за скользящие сутки ниже этой доли предела
+     * (0 — ворот нет; предел — живой {@code revx.sim.live-cap}, если задан);
+     * {@code revx.exec.near-level-inv=true} — запас ниже цели скоса (продажи не идут — не нагружаться).
+     * Закрытый ближний не снимается, а ОТВОДИТСЯ заменой на {@code revx.exec.near-park-bp} (300) от
+     * опоры: снятие и новая постановка тратили бы предел на каждом переключении ворот.
+     */
+    static final double[] LEVEL_WEIGHTS = parseLevelBp(System.getProperty("revx.exec.level-weights", ""));
+    static final double NEAR_GATE = Double.parseDouble(System.getProperty("revx.exec.near-level-gate", "0"));
+    static final boolean NEAR_INV = Boolean.getBoolean("revx.exec.near-level-inv");
+    static final double NEAR_PARK_BP = Double.parseDouble(System.getProperty("revx.exec.near-park-bp", "300"));
+    private Boolean nearOpenWas;
+    long nearOpenTicks, nearClosedTicks;
+
+    /**
+     * То же зеркально на продаже ({@code revx.exec.near-ask=true}, владелец 28.10): ближний аск (уровень 0) стоит,
+     * только пока запас ВЫШЕ цели скоса. {@code revx.exec.near-min-lots} (0 — нет) — ближний ставится, только если
+     * на эту сторону есть не меньше стольких лотов (продажа — запас, покупка — место до потолка): мелочь по центам
+     * не выставляется; ворота расхода — те же. Пока ближний аск открыт, доли лота
+     * {@code level-weights} действуют и на продаже (вместе не больше лота); закрыт — основной продаёт целый лот.
+     */
+    static final boolean NEAR_ASK = Boolean.getBoolean("revx.exec.near-ask");
+    static final double NEAR_MIN_LOTS = Double.parseDouble(System.getProperty("revx.exec.near-min-lots", "0"));
+    private Boolean nearAskOpenWas;
+    private String nearAskWhy;
+    private String nearBuyWhy;
+    long nearAskOpenTicks, nearAskClosedTicks;
+
+    /** Закрыт ли ближний аск в этот тик (и почему); null — открыт. Звать раз за тик. */
+    private String nearAskClosed() {
+        String why = null;
+        if (NEAR_GATE > 0) {
+            int cap = LIVE_CAP > 0 ? LIVE_CAP : placementCap();
+            double share = (double) placementsLastDay() / Math.max(1, cap);
+            if (share >= NEAR_GATE) {
+                why = String.format(java.util.Locale.ROOT, "расход %.0f%% предела", 100 * share);
+            }
+        }
+        if (why == null && inventory <= skewTargetInventory() + 1e-12) {
+            why = "запас не выше цели";
+        }
+        if (why == null && inventory < NEAR_MIN_LOTS * params.size() - 1e-15) {
+            why = "на продажу меньше " + NEAR_MIN_LOTS + " лота";
+        }
+        boolean open = why == null;
+        if (open) nearAskOpenTicks++; else nearAskClosedTicks++;
+        if (nearAskOpenWas == null || nearAskOpenWas != open) {
+            journal.event("near_gate", open ? "ближний аск открыт" : "ближний аск закрыт: " + why);
+            nearAskOpenWas = open;
+        }
+        return why;
+    }
+
+    /** Доля лота уровня покупки; без весов — целый лот. */
+    private double levelWeight(int level) {
+        return LEVEL_WEIGHTS.length == 0 ? 1 : LEVEL_WEIGHTS[Math.min(level, LEVEL_WEIGHTS.length - 1)];
+    }
+
+    /**
+     * {@code revx.exec.near-closed-full=true} (владелец 28.10): пока ближний закрыт, основной (уровень 1) покупает
+     * целый лот, а не свою долю — иначе бот почти всё время торгует уменьшенным лотом.
+     */
+    static final boolean NEAR_CLOSED_FULL = Boolean.getBoolean("revx.exec.near-closed-full");
+
+    private double buyWeight(int level) {
+        return NEAR_CLOSED_FULL && level == 1 && nearBuyWhy != null ? 1 : levelWeight(level);
+    }
+
+    /** Закрыт ли ближний уровень покупки в этот тик (и почему); null — открыт или ворот нет. */
+    private String nearGateClosed(int level) {
+        if (level != 0 || (NEAR_GATE <= 0 && !NEAR_INV)) {
+            return null;
+        }
+        String why = null;
+        if (NEAR_GATE > 0) {
+            int cap = LIVE_CAP > 0 ? LIVE_CAP : placementCap();
+            double share = (double) placementsLastDay() / Math.max(1, cap);
+            if (share >= NEAR_GATE) {
+                why = String.format(java.util.Locale.ROOT, "расход %.0f%% предела", 100 * share);
+            }
+        }
+        if (why == null && NEAR_INV && inventory >= skewTargetInventory() - 1e-12) {
+            why = "запас не ниже цели";
+        }
+        if (why == null && NEAR_MIN_LOTS > 0 && params.inventoryCap() - inventory < NEAR_MIN_LOTS * params.size() - 1e-15) {
+            why = "до потолка меньше " + NEAR_MIN_LOTS + " лота";
+        }
+        boolean open = why == null;
+        if (open) nearOpenTicks++; else nearClosedTicks++;
+        if (nearOpenWas == null || nearOpenWas != open) {
+            journal.event("near_gate", open ? "ближний открыт" : "ближний закрыт: " + why);
+            nearOpenWas = open;
+        }
+        return why;
     }
 
     static final double REBUY_GAP_BP = Double.parseDouble(
@@ -5759,12 +6594,14 @@ public final class QuoteLoop implements Runnable {
             log.error("заявка {} на {} USDC превышает предел {} — не ставлю", side, notional,
                     maxOrderNotional);
             journal.event("limit_blocked", side + " нотионал " + notional);
+            refused("заявка " + side + " на " + fmt(notional) + " USDC выше предела " + fmt(maxOrderNotional));
             return 0;
         }
         if (exposure() + notional > maxExposure) {
             log.error("экспозиция превысила бы предел {} — не ставлю",
                     maxExposure);
             journal.event("limit_blocked", "экспозиция");
+            refused("экспозиция превысила бы предел " + fmt(maxExposure));
             return 0;
         }
 
@@ -6040,6 +6877,7 @@ public final class QuoteLoop implements Runnable {
                 + ", позиция " + fmt(inventory);
         log.warn("сторона {} не котируется — нечем ({})", side, detail);
         journal.event("no_funds", detail);
+        refused("нечем котировать: " + detail);
     }
 
     /**
@@ -6136,6 +6974,8 @@ public final class QuoteLoop implements Runnable {
      * взводится, когда расход опустится до 80% N); пик за каждые сутки UTC — событие {@code placements_day}.
      */
     static final int LIVE_CAP = Integer.getInteger("revx.sim.live-cap", 0);
+    /** стенд: писать событие placed на каждую постановку ({@code revx.sim.placed-events}, 02.11.2026) */
+    static final boolean PLACED_EVENTS = Boolean.getBoolean("revx.sim.placed-events");
     private boolean liveCapArmed = true;
     private long liveCapDay = -1;
     private int liveCapDayPeak;
@@ -6255,6 +7095,10 @@ public final class QuoteLoop implements Runnable {
         Venue.Response response = client.place(body);
         placements++;
         placedAt.addLast(clock.now());
+        if (PLACED_EVENTS && !(client instanceof TradeClient) && !(client instanceof VenueReads)) {
+            // Стенд: запросы в журнал не пишутся — момент постановки событием, для пика по аккаунту за скользящие сутки.
+            journal.event("placed", side == Side.BUY ? "buy" : "sell");
+        }
         liveCapWatch();
         if (response.ok()) {
             resting.venueId = extract(response.body());
@@ -7910,14 +8754,30 @@ public final class QuoteLoop implements Runnable {
     }
 
     private void parkSide(Side side, Resting resting, double price, String why) {
+        parkSide(side, resting, price, why, false);
+    }
+
+    /** {@code cancelPartial} — надкушенную снять (ближний «откусанного лота»); иначе как было. */
+    private void parkSide(Side side, Resting resting, double price, String why, boolean cancelPartial) {
         if (resting.venueId == null) {
             return;                       // отводить нечего
         }
         if (alreadyParked(side, resting, price)) {
             return;                       // уже стоит в стороне — не трогаем
         }
+        if (cancelPartial && resting.partial()) {
+            // Надкушенную заменить нельзя (422 навсегда), и replace() молча выходит: заявка оставалась у
+            // рынка, а «отведена» писалось каждый тик (стенд 28.10, ближний «откусанного лота»: 11 469 раз).
+            // Снятие постановок не тратит.
+            cancel(side, resting, why + " (надкушена — не двигается)");
+            return;
+        }
         int failuresBefore = resting.failures;
+        long replacesBefore = replaces;
         replace(side, resting, price, resting.size);
+        if (replaces == replacesBefore) {
+            return;                       // замена не ушла (предел в минуту) — попробуем на следующем тике
+        }
         if (resting.failures > failuresBefore) {
             // Площадка отказала — возможно, цена в 10% от рынка ей не нравится.
             // Оставить заявку там, где она есть, нельзя: гейт закрыт именно
@@ -9577,6 +10437,11 @@ public final class QuoteLoop implements Runnable {
         long used = placementsLastDay();
         journal.event("limit_blocked", "постановки за сутки: " + used + " из " + placementCap()
                 + " — распродано до нуля, остановка");
+        // Одно сообщение на остановку (02.11.2026, владелец): сторож «ни одной заявки» при выключенном котировании молчит,
+        // а включение само по себе (autoResume) о себе сообщает — без этого остановка была бы видна только в /all.
+        alert.accept("⏸ " + tag.id() + " " + symbol + ": постановок за сутки " + used + " из " + placementCap()
+                + " — распродано, стою; включусь сам, когда за скользящие сутки станет ≤ "
+                + (int) (placementCap() * LIMIT_RESUME_FRAC));
         limitStoppedMs = clock.now();
         stopQuoting();
     }
@@ -9636,6 +10501,13 @@ public final class QuoteLoop implements Runnable {
      */
     static final boolean LIMIT_AUTO_RESUME = !"false".equalsIgnoreCase(
             System.getProperty("revx.exec.limit-auto-resume", "true"));
+    /**
+     * Доля предела, на которой бот сам включается после остановки (02.11.2026, владелец: «не нравится, что бот
+     * останавливается и просто ждёт»). На 80% стенд большого окна стоял 4.7–11 ч. Ключ
+     * {@code revx.exec.limit-resume-frac}, по умолчанию прежние 0.8.
+     */
+    static final double LIMIT_RESUME_FRAC =
+            Double.parseDouble(System.getProperty("revx.exec.limit-resume-frac", String.valueOf(BUDGET_UNWIND_OFF)));
     private long autoResumeTriedMs;
 
     private void autoResume() {
@@ -9654,7 +10526,7 @@ public final class QuoteLoop implements Runnable {
         }
         limitStoppedMs = 0;
         String text = "постановок за сутки " + used + " из " + placementCap()
-                + " (≤ 80%) — включаюсь сам после остановки по пределу"
+                + " (≤ " + Math.round(LIMIT_RESUME_FRAC * 100) + "%) — включаюсь сам после остановки по пределу"
                 + (taken == null ? "" : ". " + taken);
         journal.event("auto_resume", text);
         alert.accept(symbol + ": " + text);

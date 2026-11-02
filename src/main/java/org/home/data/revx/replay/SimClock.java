@@ -80,13 +80,23 @@ public final class SimClock implements Clock {
     }
 
     /**
-     * Котировщик закончил. Без этого оставшиеся ждали бы его вечно.
+     * Котировщик закончил. Без этого оставшиеся ждали бы его вечно. Со слотом он выпадает из очереди хода: если ход
+     * был его — ход переходит к следующему живому, а если он ходил последним в шаге — шаг закрывается.
      */
     public synchronized void leave() {
+        Integer me = SLOT.get();
         parties--;
+        if (me != null && alive != null && me < alive.length && alive[me]) {
+            alive[me] = false;
+            if (turn == me) {
+                int next = nextAlive(me);
+                turn = next >= 0 ? next : firstAlive();
+            }
+        }
         if (parties > 0 && arrived >= parties) {
             arrived = 0;
             advanceOnce(0);
+            turn = firstAlive();
         }
         notifyAll();
     }
@@ -101,20 +111,50 @@ public final class SimClock implements Clock {
      * боту на 7 б.п. то 63 исполнения, то 545. Числа, снятые до 05.09.2026
      * этим способом, недостоверны.
      *
-     * ⚠️ НЕ РЕШЕНО. Очередь хода (слот 0 ходит, потом слот 1, потом время)
-     * пробовалась 05.09.2026 и снята: когда котировщик заканчивает и выходит,
-     * {@code turn} остаётся указывать на его слот, и остальные ждут ушедшего
-     * вечно — двухчасовое окно переставало проходить за десять минут. Чинить
-     * надо учётом живых слотов, а не заплаткой.
+     * Очередь хода (слот 0 ходит, потом слот 1, потом время) пробовалась 05.09.2026 и снята: когда котировщик
+     * заканчивал и выходил, {@code turn} оставался на его слоте, и остальные ждали ушедшего вечно.
      *
-     * Пока стоит простой барьер: гонка за ДАННЫЕ закрыта синхронизацией
-     * {@link SimVenue}, а вот порядок действий внутри тика остаётся
-     * произвольным. Значит МНОГОБОТОВЫЕ прогоны воспроизводятся лишь
-     * приблизительно, и разброс между запусками надо мерить, а не считать
-     * нулевым. Одиночные прогоны идут в один поток и точны.
+     * 🔑 РЕШЕНО 02.11.2026 учётом живых слотов. Поток котировщика берёт свой слот до первого действия; внутри шага
+     * ходят по порядку слотов, следующий начинает, когда предыдущий дошёл до {@link #sleep}; отходили все живые —
+     * сдвигается время, ход снова у первого живого. Ушедший ({@link #leave}) из очереди выпадает. Найдено по
+     * групповому прогону: один и тот же прогон 28–30.10 на одном jar давал по боту c −1.42 и −0.45. Многоботовые
+     * прогоны ДО 02.11.2026 воспроизводились лишь приблизительно. Поток без слота ходит по-старому (только барьер).
      */
-    /** Оставлено для совместимости вызова; очерёдность хода пока не реализована. */
     public void assignSlot(int index) {
+        synchronized (this) {
+            if (alive == null) {
+                alive = new boolean[Math.max(parties, index + 1)];
+                java.util.Arrays.fill(alive, true);
+            }
+        }
+        SLOT.set(index);
+        synchronized (this) {
+            while (turn != index) {
+                try {
+                    wait(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
+    private static final ThreadLocal<Integer> SLOT = new ThreadLocal<>();
+    private boolean[] alive;
+    private int turn;
+
+    private int nextAlive(int i) {
+        for (int j = i + 1; alive != null && j < alive.length; j++) {
+            if (alive[j]) {
+                return j;
+            }
+        }
+        return -1;
+    }
+
+    private int firstAlive() {
+        return Math.max(0, nextAlive(-1));
     }
 
     @Override
@@ -122,6 +162,31 @@ public final class SimClock implements Clock {
         if (parties <= 1) {
             synchronized (this) {
                 advanceOnce(ms);
+            }
+            return;
+        }
+        Integer me = SLOT.get();
+        if (me != null && alive != null) {
+            synchronized (this) {
+                long mine = step;
+                arrived++;
+                if (arrived >= parties) {
+                    arrived = 0;
+                    advanceOnce(ms);
+                    turn = firstAlive();
+                } else {
+                    int next = nextAlive(me);
+                    turn = next >= 0 ? next : firstAlive();
+                }
+                notifyAll();
+                while ((step == mine || turn != me) && parties > 1) {
+                    try {
+                        wait(1000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
             }
             return;
         }

@@ -67,7 +67,15 @@ public final class PlacementBudget implements AutoCloseable {
      * разовые команды вроде {@code --revx-order-probe}. Полтораста токенов —
      * плата за то, что зеркало неточно.
      */
-    public static final double CAPACITY = 900.0;
+    public static final double CAPACITY = Double.parseDouble(System.getProperty("revx.budget.capacity", "900"));
+
+    /**
+     * СКОЛЬЗЯЩЕЕ ОКНО ВМЕСТО КАПАЮЩЕГО ВЕДРА (30.10.2026, владелец: «ведро всегда полное»). У площадки предел — не больше
+     * 1000 за любые 24 ч (пробой 23.09, CLAUDE.md), а ведро на 900 с непрерывным пополнением при среднем расходе ~400
+     * в сутки стоит полным: давления нет, а за сутки оно пропустило бы до 900 + 900. С флагом свободно = ёмкость −
+     * постановок счёта за скользящие 24 ч, место возвращается ровно через сутки после постановки.
+     */
+    static final boolean WINDOW = Boolean.getBoolean("revx.budget.window");
 
     /** Пополнение: вся ёмкость за сутки, то есть 1 токен на 101.6 с. */
     private static final double REFILL_PER_MS = CAPACITY / 86_400_000.0;
@@ -167,6 +175,13 @@ public final class PlacementBudget implements AutoCloseable {
     private final int bots;
     /** Явный список участников (групповой прогон); null — первые {@code bots} меток карты. */
     private java.util.List<String> members;
+    private boolean window = WINDOW;
+
+    /** Скользящее окно вместо капающего ведра (по умолчанию — флаг {@code revx.budget.window}). */
+    public PlacementBudget window(boolean on) {
+        this.window = on;
+        return this;
+    }
 
     /** Участники ведра поимённо: в составе без a, b, c их брони быть не должно. */
     public PlacementBudget members(java.util.List<String> ids) {
@@ -372,6 +387,11 @@ public final class PlacementBudget implements AutoCloseable {
                 long elapsed = Math.max(0, nowMs - rs.getLong(2));
                 tokens = Math.min(CAPACITY, rs.getDouble(1) + elapsed * REFILL_PER_MS);
             }
+            if (WINDOW) {
+                try (ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM placement_spend WHERE ts_ms >= " + (nowMs - DAY_MS))) {
+                    tokens = CAPACITY - (rs.next() ? rs.getLong(1) : 0);
+                }
+            }
             java.util.Map<String, Long> spent = new java.util.HashMap<>();
             try (ResultSet rs = st.executeQuery(
                     "SELECT bot_id, COUNT(*) FROM placement_spend WHERE ts_ms >= "
@@ -393,6 +413,9 @@ public final class PlacementBudget implements AutoCloseable {
     }
 
     private double refill(long nowMs) throws Exception {
+        if (window) {
+            return CAPACITY - spendSince(null, nowMs - DAY_MS);
+        }
         double tokens = CAPACITY;
         long updated = nowMs;
         try (Statement st = connection.createStatement();

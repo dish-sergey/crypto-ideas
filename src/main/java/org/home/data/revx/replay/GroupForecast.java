@@ -75,7 +75,7 @@ public final class GroupForecast {
     }
 
     public static List<Result> run(List<Pair> pairs, org.home.data.revx.RevxConfig cfg,
-                                   boolean shareBudget, String journalOut) throws Exception {
+                                   boolean shareBudget, String journalOut, String standDbPath) throws Exception {
         long start = Long.MIN_VALUE;
         long end = Long.MAX_VALUE;
         for (Pair p : pairs) {
@@ -162,8 +162,23 @@ public final class GroupForecast {
                     // Свой суточный предел — всегда, как живьём (100/250).
                     loop.placementCap(p.caps().get(i));
                     loop.scaleLimitsForLot(spec.size() * refPrice);
+                    // Стоп по убытку — как в одиночном прогоне ({@link Forecast}): только явно, как в юните;
+                    // revx.sim.max-loss-<бот> — свой у бота (у живых он в юните каждого).
+                    double simMaxLoss = Double.parseDouble(System.getProperty("revx.sim.max-loss-" + spec.botId(),
+                            System.getProperty("revx.sim.max-loss", "0")));
+                    if (simMaxLoss > 0) {
+                        loop.maxTradingLoss(simMaxLoss);
+                    }
                     if (spec.dynOffsetK() > 0) {
                         loop.dynamicOffset(spec.dynOffsetK(), 1.0);
+                    }
+                    // Отступ из функции и стена от потока читают ленту — как в одиночном прогоне ({@link Forecast}).
+                    if (QuoteLoop.WALL_FLOW_MIN > 0 || QuoteLoop.FUNC_FILE != null) {
+                        if (standDbPath == null) {
+                            throw new IllegalStateException("отступ из функции просит базу стенда: ленту брать неоткуда");
+                        }
+                        loop.takerFlow(org.home.data.revx.exec.TakerFlow.preloaded(standDbPath, base.symbol(),
+                                Long.getLong("revx.exec.wall-flow-delay-ms", 2000), start - 3_600_000L - 60_000, endMs));
                     }
                     if (p.model() instanceof MarketFillModel mfm) {
                         loop.bookSource(mfm.market().fresh()::bookAt);
@@ -185,7 +200,9 @@ public final class GroupForecast {
             List<Throwable> crashes = Collections.synchronizedList(new ArrayList<>());
             List<Thread> threads = new ArrayList<>();
             for (QuoteLoop loop : loops) {
+                final int slot = threads.size();
                 Thread t = new Thread(() -> {
+                    clock.assignSlot(slot);      // очередь хода внутри тика — прогон воспроизводим (02.11.2026)
                     try {
                         loop.run();
                     } finally {
@@ -218,6 +235,9 @@ public final class GroupForecast {
             List<Result> out = new ArrayList<>();
             for (int i = 0; i < loops.size(); i++) {
                 QuoteLoop l = loops.get(i);
+                if (!l.funcStats().isEmpty()) {
+                    log.warn("бот {}: {}", l.botId(), l.funcStats());
+                }
                 ExecJournal j = journals.get(i);
                 Forecast.BotResult r = Forecast.measure(specs.get(i), j, l, owners.get(i).base(),
                         days, window(owners.get(i).ticks(), start, endMs), seeds.get(i));

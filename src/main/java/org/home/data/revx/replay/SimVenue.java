@@ -724,12 +724,16 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         String status = o != null
                 ? (filled > 1e-12 ? "partially_filled" : "new")
                 : (filled > 0 ? "filled" : "cancelled");
+        // ⚠️ quantity — ИСХОДНЫЙ размер, как у живой площадки, а не остаток: o.size убывает с исполнениями.
+        // До 28.10.2026 здесь стоял остаток, и сообщение «частичное исполнение … исполнено X из Y» на стенде
+        // показывало долю больше 100% (живьём таких 0 из 2205). Логику это не трогало: поле читает только текст.
+        double qty = o != null ? o.size + filled : filled;
         return new Response(200, String.format(Locale.ROOT,
                 "{\"data\":{\"id\":\"%s\",\"status\":\"%s\",\"filled_quantity\":\"%s\","
                         + "\"average_fill_price\":\"%s\",\"total_fee\":\"0\","
                         + "\"fee_currency\":\"%s\",\"price\":\"%s\",\"quantity\":\"%s\"}}",
                 id, status, plain(filled), plain(avg), quote,
-                plain(o != null ? o.price : avg), plain(o != null ? o.size : filled)), 0);
+                plain(o != null ? o.price : avg), plain(qty)), 0);
     }
 
     @Override

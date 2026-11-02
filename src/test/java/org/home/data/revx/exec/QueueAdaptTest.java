@@ -46,4 +46,32 @@ class QueueAdaptTest {
     void someoneAheadButBelowThresholdStays() {
         assertEquals(99.90, buy(99.90, List.of(new Level(99.95, 5), new Level(99.80, 50))), 1e-9);
     }
+
+    @Test
+    void wallFrontStepsBeforeFirstWall() {
+        // Бид: $500 на 99.95, $4000 на 99.85 — накопленное достигает $3750 на 99.85, встаём на 99.86.
+        assertEquals(99.86, QuoteLoop.wallFrontPrice(true, List.of(new Level(99.95, 5), new Level(99.85, 40)), 0.01, 3750), 1e-9);
+        // Аск: стена набирается из нескольких уровней — на 100.20 накоплено $4020.
+        assertEquals(100.19, QuoteLoop.wallFrontPrice(false, List.of(new Level(100.05, 20), new Level(100.10, 10), new Level(100.20, 10.2)), 0.01, 3750), 1e-9);
+        // Стены нет — NaN.
+        assertEquals(Double.NaN, QuoteLoop.wallFrontPrice(true, List.of(new Level(99.95, 5)), 0.01, 3750));
+    }
+
+    @Test
+    void wallInBandCountsFromBandStart() {
+        // Бид, полоса [99.92; 99.86]: $4000 на 99.95 вне полосы не в счёт; в полосе $500 на 99.90 и $4000 на 99.88 → 99.89.
+        assertEquals(99.89, QuoteLoop.wallInBand(true, List.of(new Level(99.95, 40), new Level(99.90, 5), new Level(99.88, 40)), 0.01, 3750, 99.92, 99.86), 1e-9);
+        // В полосе стены нет — NaN.
+        assertEquals(Double.NaN, QuoteLoop.wallInBand(true, List.of(new Level(99.90, 5), new Level(99.80, 40)), 0.01, 3750, 99.92, 99.86));
+        // Аск, стена на краю полосы: шаг перед ней, но не ближе края 100.08.
+        assertEquals(100.08, QuoteLoop.wallInBand(false, List.of(new Level(100.08, 40)), 0.01, 3750, 100.08, 100.14), 1e-9);
+    }
+
+    @Test
+    void funcValueIsProbabilityTimesMarkout() {
+        // z = 0 → P = 0.5; M = 2 + 1·δ → при δ = 4 доход 0.5 × 6 = 3.
+        double[] c = new double[18];
+        c[9] = 2; c[10] = 1;
+        assertEquals(3.0, QuoteLoop.funcValue(c, 4, 0, 0, 0, 0), 1e-12);
+    }
 }

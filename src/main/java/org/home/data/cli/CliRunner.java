@@ -294,7 +294,8 @@ public class CliRunner implements ApplicationRunner {
             if (args.containsOption("revx-dry-bot")) {
                 // Ни одного запроса к площадке: бот на живых ценах против DryVenue (пилот ADA).
                 executor.getObject().dryBot(Integer.parseInt(firstOr(args, "minutes", "60")),
-                        Double.parseDouble(firstOr(args, "dry-cash", "40")));
+                        Double.parseDouble(firstOr(args, "dry-cash", "40")),
+                        Double.parseDouble(firstOr(args, "dry-coins", "0")));
             }
             if (args.containsOption("revx-order-status")) {
                 // Только GET: спросить площадку про конкретные заявки целиком.

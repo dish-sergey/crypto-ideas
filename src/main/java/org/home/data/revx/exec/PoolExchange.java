@@ -83,10 +83,29 @@ public final class PoolExchange {
 
     /** Положить своё за шаг {@code hour} и дождаться остальных. */
     public Map<String, Entry> exchange(long hour, double delta, double capital0) {
+        post(hour, delta, capital0);
+        return collect(hour);
+    }
+
+    /**
+     * Только положить своё за шаг (02.11.2026). Два бота одной книги в одном процессе ходят по очереди
+     * ({@code SimClock.assignSlot}), и ждать соседа внутри своего хода нельзя — он не походит, пока не кончится наш.
+     * Поэтому на границе шага кладём, а забираем ({@link #collect}) на следующем тике.
+     */
+    public void post(long hour, double delta, double capital0) {
         Path h = dir.resolve("h" + hour);
         try {
             Files.createDirectories(h);
             write(h.resolve(me), String.format(java.util.Locale.ROOT, "%.17g %.17g", delta, capital0));
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("пул: обмен через " + h, e);
+        }
+    }
+
+    /** Дождаться отчётов всех за шаг {@code hour}. */
+    public Map<String, Entry> collect(long hour) {
+        Path h = dir.resolve("h" + hour);
+        try {
             long t0 = System.currentTimeMillis();
             while (true) {
                 Map<String, Entry> out = new TreeMap<>();

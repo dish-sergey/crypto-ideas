@@ -225,7 +225,7 @@ public class Park {
         String body = """
                 {"client_order_id":"%s","base_size":"%s","price":"%s",
                  "execution_instructions":["post_only"]}"""
-                .formatted(tag.newClientOrderId(), fmt(order.size()), fmt(price))
+                .formatted(tag.newClientOrderId(), fmt(order.size()), fmtPrice(price, spec.quoteStep))
                 .replaceAll("\\s*\\n\\s*", "");
         Venue.Response response = client.replace(order.id(), body);
         if (response.ok()) {
@@ -304,5 +304,20 @@ public class Park {
 
     private static String fmt(double value) {
         return java.math.BigDecimal.valueOf(value).stripTrailingZeros().toPlainString();
+    }
+
+    /**
+     * Цена парковки строкой — к шагу пары (02.11.2026). {@link #round} кладёт её на тик, но
+     * двоичная арифметика печатает {@code 2385.9500000000003}, и площадка отвечает
+     * {@code 400 price precision must not exceed 2 decimal places} — парковка при каждой
+     * остановке не сдвигала заявки. Здесь сдвигается только шум: цена уже на тике.
+     */
+    static String fmtPrice(double price, double step) {
+        if (!(step > 0)) {
+            return fmt(price);
+        }
+        java.math.BigDecimal s = java.math.BigDecimal.valueOf(step);
+        return java.math.BigDecimal.valueOf(price).divide(s, 0, java.math.RoundingMode.HALF_UP)
+                .multiply(s).stripTrailingZeros().toPlainString();
     }
 }

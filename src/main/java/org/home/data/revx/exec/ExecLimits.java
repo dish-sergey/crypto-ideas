@@ -54,8 +54,11 @@ public final class ExecLimits {
      * С 19.10.2026 — 100 (решение владельца): реинвестирование общим буфером растит
      * лот до трёх стартовых, у a/b/c это ~$37.5, и прежние 25 молча остановили бы
      * постановки. Лот и предел каждого бота видны в {@code /all}.
+     *
+     * С 02.11.2026 — 320: у e/d/f один уровень × 1.2 лота, лот = капитал / 1.2 ≈ $61.8, при капитале ×3 — ~$185;
+     * 320 держит его ниже порога предупреждения 60%.
      */
-    public static final double MAX_ORDER_NOTIONAL_USDC = 100.0;
+    public static final double MAX_ORDER_NOTIONAL_USDC = 320.0;
 
     /**
      * Потолок суммарной экспозиции ОДНОГО бота: стоящие заявки плюс инвентарь.
@@ -76,8 +79,10 @@ public final class ExecLimits {
      *
      * С 19.10.2026 — 250: при росте капитала в три раза запас доходит до ~$87, а с
      * заявками трёх уровней сверху до ~$125 — прежние 80 стали бы рабочим пределом.
+     *
+     * С 02.11.2026 — 500: запас 1.2 лота при капитале ×3 — ~$222, плюс заявка ~$185.
      */
-    public static final double MAX_TOTAL_EXPOSURE_USDC = 250.0;
+    public static final double MAX_TOTAL_EXPOSURE_USDC = 500.0;
 
     /**
      * ⚠️ <b>С 07.09.2026 это АВАРИЙНЫЙ потолок, а не рабочая доля.</b> Бюджет
@@ -220,6 +225,13 @@ public final class ExecLimits {
                     "g", PLACEMENTS_PILOT);
 
     /**
+     * Предел из юнита ({@code -Drevx.exec.placements-per-day=N}), 0 — по карте выше (02.11.2026, решение
+     * владельца: шесть одноуровневых по 160 = 960 из 1000 аккаунта). Ключ на процесс, то есть на бота.
+     * ⚠️ Сумму по аккаунту ключ не сторожит: следить, чтобы Σ по ботам не превысила 1000.
+     */
+    static final int PLACEMENTS_OVERRIDE = Integer.getInteger("revx.exec.placements-per-day", 0);
+
+    /**
      * Сколько постановок в сутки положено этому боту.
      *
      * ⚠️ Незнакомая метка получает САМУЮ МАЛУЮ долю из карты, а не среднюю.
@@ -229,6 +241,9 @@ public final class ExecLimits {
      * коде.
      */
     public static int maxPlacementsPerDay(String botId) {
+        if (PLACEMENTS_OVERRIDE > 0) {
+            return PLACEMENTS_OVERRIDE;
+        }
         String key = botId == null || botId.isBlank()
                 ? "" : botId.trim().substring(0, 1).toLowerCase(java.util.Locale.ROOT);
         return PLACEMENTS_BY_BOT.getOrDefault(key,

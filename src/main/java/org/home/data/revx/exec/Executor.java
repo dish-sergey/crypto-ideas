@@ -225,6 +225,7 @@ public class Executor {
                 || Double.parseDouble(System.getProperty("revx.exec.quiet-shift-bp", "0")) > 0) {
             loop.buyQuiet(BuyQuiet.live(standDbPath, symbol, Long.getLong("revx.exec.quiet-delay-ms", 2000)));
         }
+        liveTakerFlow(loop, journal);
         loop.maxTradingLoss(maxLossUsdc);
 
         // ГЕЙТ ПО ШИРИНЕ ОПОРЫ РАЗДВИГАЕТ ОТСТУП, А НЕ ВЫКЛЮЧАЕТ КОТИРОВАНИЕ.
@@ -373,6 +374,21 @@ public class Executor {
     }
 
     /**
+     * Лента тейкеров живьём (01.11.2026): нужна отступу из функции ({@code revx.exec.func-file}) и стене от потока —
+     * без неё {@link QuoteLoop} падает на первом тике. Читается из базы сборщика раз в 3 с ({@link TakerFlow#live}).
+     */
+    private void liveTakerFlow(QuoteLoop loop, ExecJournal journal) {
+        if (QuoteLoop.FUNC_FILE == null && QuoteLoop.WALL_FLOW_MIN <= 0) {
+            return;
+        }
+        loop.takerFlow(TakerFlow.live(standDbPath, symbol, Long.getLong("revx.exec.taker-refresh-ms", 3000)));
+        journal.event("func_on", "отступ из функции: " + QuoteLoop.FUNC_FILE
+                + (QuoteLoop.FUNC_INV_FILE != null ? ", таблица запаса " + QuoteLoop.FUNC_INV_FILE : "")
+                + "; лента тейкеров из " + standDbPath + " раз в "
+                + Long.getLong("revx.exec.taker-refresh-ms", 3000) + " мс");
+    }
+
+    /**
      * {@code --revx-dry-bot}: СУХОЙ ПРОГОН — тот же котировщик с теми же параметрами
      * ({@code --revx.exec.*} и {@code -D…}), на живых ценах, но против {@link DryVenue}:
      * ни одного запроса к площадке, реестр владения и ведро постановок не трогаются,
@@ -381,6 +397,11 @@ public class Executor {
      * рывке. Журнал — {@code revx.exec.journal} (дайте отдельный файл).
      */
     public void dryBot(int minutes, double cash) throws Exception {
+        dryBot(minutes, cash, 0);
+    }
+
+    /** То же со стартовыми монетами {@code coins} на сухом счёте — чтобы стоял и аск (01.11.2026). */
+    public void dryBot(int minutes, double cash, double coins) throws Exception {
         ExecJournal journal = new ExecJournal(journalPath);
         StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
@@ -394,10 +415,11 @@ public class Executor {
         FairSource fair = FastBnbFair.ENABLED ? FastBnbFair.fromProperties(symbol, standDbPath)
                 : LiveHybridFair.ENABLED ? new LiveHybridFair(stand, standDbPath, symbol, params.size(), journal)
                 : stand;
-        DryVenue venue = new DryVenue(symbol, cash);
+        DryVenue venue = new DryVenue(symbol, cash, coins);
         QuoteLoop loop = new QuoteLoop(venue, Clock.system(), fair, journal, params, symbol,
                 periodMs, minNotional(), tag, buildPolicy(params), ownPosition, positionSeed, spec.baseStep(),
                 parkDistance, null, levels, levelStep, innerFirst);
+        liveTakerFlow(loop, journal);
         loop.maxTradingLoss(maxLossUsdc);
         journal.event("boot", "СУХОЙ ПРОГОН (DryVenue) — " + bootDetail());
         Thread t = new Thread(loop, "revx-quote-loop");
@@ -406,8 +428,8 @@ public class Executor {
         long end = System.currentTimeMillis() + minutes * 60_000L;
         while (System.currentTimeMillis() < end && t.isAlive()) {
             Thread.sleep(Math.min(60_000, Math.max(1, end - System.currentTimeMillis())));
-            log.warn("сухой прогон {}: тиков от опоры {}, отмен на рывке {}, {}; бумажный хедж: {}",
-                    symbol, loop.wakeups(), loop.jumpCancels(), venue.stats(), loop.paperHedgeState());
+            log.warn("сухой прогон {}: тиков от опоры {}, отмен на рывке {}, {}; заявки {}; бумажный хедж: {}",
+                    symbol, loop.wakeups(), loop.jumpCancels(), venue.stats(), venue.live(), loop.paperHedgeState());
         }
         loop.shutdown();
         t.join(10_000);
@@ -1181,7 +1203,7 @@ public class Executor {
                 log.warn("группа: {} — тиков {}, ботов {}", sym, ticks.size(), bots.size());
             }
             var results = org.home.data.revx.replay.GroupForecast.run(pairs, cfg, shareBudget,
-                    journalOut);
+                    journalOut, standDbPath);
             log.info("{}", org.home.data.revx.replay.GroupForecast.render(results));
         } catch (Exception e) {
             log.error("групповой прогон не прошёл: {}", e.toString(), e);

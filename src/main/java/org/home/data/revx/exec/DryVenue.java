@@ -137,9 +137,12 @@ public final class DryVenue implements Venue {
             return new Response(404, "{\"message\":\"Order not found\"}", 0);
         }
         gone.put(id, "cancelled");
+        // ⚠️ Тело замены у площадки плоское ({"price", "base_size"} в корне), а не как у постановки — так его шлёт
+        // QuoteLoop.replace. Раньше цена искалась в order_configuration.limit, не находилась, и сухой прогон
+        // держал заявку на первой цене при любом числе замен (01.11.2026).
         JsonNode limit = n.path("order_configuration").path("limit");
-        double price = limit.path("price").asDouble(old.price);
-        double size = limit.path("base_size").asDouble(old.size);
+        double price = n.path("price").asDouble(limit.path("price").asDouble(old.price));
+        double size = n.path("base_size").asDouble(limit.path("base_size").asDouble(old.size));
         Order o = new Order(UUID.randomUUID().toString(), n.path("client_order_id").asText(old.clientId),
                 old.symbol, old.buy, price > 0 ? price : old.price, size > 0 ? size : old.size,
                 System.currentTimeMillis());
