@@ -2028,6 +2028,36 @@ public final class QuoteLoop implements Runnable {
      */
     static final double TREND_NOBID_BP = Double.parseDouble(System.getProperty("revx.exec.trend-nobid-bp", "0"));
     static final long TREND_WIN_MS = Long.getLong("revx.exec.trend-win-sec", 3600) * 1000L;
+    /**
+     * СИГНАЛ ПАДЕНИЯ ИЗ ФАЙЛА (02.11.2026, док. 234): строки «МОНЕТА;с_мс;по_мс» — интервалы, где модель по
+     * ликвидациям, объёму, волатильности и ходу перпа Бинанса ждёт падение в ближайшие 30 мин; бид в них
+     * отводится, как в {@link #TREND_NOBID_BP}. Пока только стенд: файл считается заранее (`d274/Emit.java`).
+     */
+    static final String FALL_FILE = System.getProperty("revx.exec.fall-file");
+    /** Вместо отвода на park-distance — бид дальше на столько б.п., пока сигнал горит (03.11.2026, владелец). 0 — отвод. */
+    static final double FALL_WIDEN_BP = Double.parseDouble(System.getProperty("revx.exec.fall-widen-bp", "0"));
+    private java.util.TreeMap<Long, Long> fallIntervals;
+    private boolean fallLast;
+
+    private boolean fallSignalOn(long now) {
+        if (fallIntervals == null) {
+            fallIntervals = new java.util.TreeMap<>();
+            String coin = symbol.split("[^A-Za-z]")[0];
+            try {
+                for (String l : java.nio.file.Files.readAllLines(java.nio.file.Path.of(FALL_FILE))) {
+                    String[] p = l.trim().split(";");
+                    if (p.length == 3 && p[0].equalsIgnoreCase(coin)) {
+                        fallIntervals.put(Long.parseLong(p[1]), Long.parseLong(p[2]));
+                    }
+                }
+            } catch (java.io.IOException e) {
+                throw new IllegalStateException("не прочитался файл сигнала падения " + FALL_FILE, e);
+            }
+            journal.event("fall_file", symbol + ": интервалов сигнала падения " + fallIntervals.size() + " из " + FALL_FILE);
+        }
+        var e = fallIntervals.floorEntry(now);
+        return e != null && now < e.getValue();
+    }
     private boolean trendNoBidLast;
     /**
      * ТЕНЕВЫЕ ПРАВИЛА (док. 193 шаг 7, 25.10.2026): бот считает, что сделали бы правила против падений,
@@ -2513,6 +2543,9 @@ public final class QuoteLoop implements Runnable {
             pausedReason = null;
             sellOnly = false;                // новая попытка — распродажа решается заново
             limitStoppedMs = 0;
+            ddStoppedMs = 0;                 // просадка считается заново от нынешнего результата
+            ddPeak = Double.NaN;
+            ddAlerted = false;
             journal.event("start", "котирование включено");
             log.warn("КОТИРОВАНИЕ ВКЛЮЧЕНО: {} по {} USDC", symbol, params.size());
         }
@@ -3683,10 +3716,12 @@ public final class QuoteLoop implements Runnable {
                 lotFromUsd(fair.price());
             }
             checkSizing(fair.price());
+            ddWatch(fair.price());
         }
 
         if (!quoting.get()) {
             pausedReason = "не запущен";
+            ddResumeTick();
             if (LIMIT_AUTO_RESUME && limitStoppedMs > 0 && AUTO_RESUME_MS <= 0
                     && placementsLastDay() <= placementCap() * LIMIT_RESUME_FRAC) {
                 autoResume();
@@ -3945,6 +3980,24 @@ public final class QuoteLoop implements Runnable {
             if (down && target.hasBid()) {
                 double far = parkDistance > 0 ? parkDistance : 0.10;
                 target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
+            }
+        }
+        if (FALL_FILE != null && fair.price() > 0) {
+            boolean on = fallSignalOn(clock.now());
+            if (on != fallLast) {
+                fallLast = on;
+                journal.event(on ? "fall_nobid" : "fall_nobid_off", String.format(java.util.Locale.ROOT,
+                        "%s: сигнал падения %s — бид %s, запас %s", symbol, on ? "выше порога" : "ниже порога",
+                        on ? "отведён" : "вернулся", fmt(inventory)));
+            }
+            if (on && target.hasBid()) {
+                if (FALL_WIDEN_BP > 0) {
+                    // мягкий вариант: бид не уходит, а отступает на FALL_WIDEN_BP (функция делает то же — см. funcPrice)
+                    target = new Quoter.Quotes(target.bid() * (1 - FALL_WIDEN_BP / 1e4), target.ask());
+                } else {
+                    double far = parkDistance > 0 ? parkDistance : 0.10;
+                    target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
+                }
             }
         }
         if (FLOW_CAP_H > 0 && buyQuiet != null && fair.price() > 0 && target.hasBid()) {
@@ -5252,6 +5305,17 @@ public final class QuoteLoop implements Runnable {
         funcMuHour = hour;
     }
 
+    static final boolean FAR_FUNC = Boolean.getBoolean("revx.exec.far-func");
+    private final long[] farFuncTicks = new long[2];
+    private final double[] farFuncSumBp = new double[2];
+
+    /** Сводка двойной опоры для отчёта стенда: сколько раз и на сколько сторона уходила на Бинанс. */
+    public String farFuncSummary() {
+        return FAR_FUNC ? String.format(java.util.Locale.ROOT, "двойная опора: бид от Бинанса %d раз (средн. %.2f б.п.), аск %d раз (%.2f б.п.)",
+                farFuncTicks[0], farFuncTicks[0] == 0 ? 0 : farFuncSumBp[0] / farFuncTicks[0],
+                farFuncTicks[1], farFuncTicks[1] == 0 ? 0 : farFuncSumBp[1] / farFuncTicks[1]) : null;
+    }
+
     private Double funcPrice(Side side, double base, double fair) {
         boolean buy = side == Side.BUY;
         int s = buy ? 0 : 1;
@@ -5285,6 +5349,23 @@ public final class QuoteLoop implements Runnable {
         org.home.data.revx.sim.BookView book = bookSource.apply(clock.now());
         if (book == null || book.bids().isEmpty() || book.asks().isEmpty()) {
             return base;
+        }
+        if (buy && FALL_FILE != null && FALL_WIDEN_BP > 0 && fallLast) {
+            fair *= 1 - FALL_WIDEN_BP / 1e4;          // сигнал падения: бид функции дальше на FALL_WIDEN_BP
+        }
+        if (FAR_FUNC) {
+            // ДВОЙНАЯ ОПОРА (02.11.2026, владелец): сторона, против которой пошёл Бинанс, — от Бинанса × базис,
+            // другая — от нашей опоры; то есть бид от меньшей, аск от большей из двух. Без этого «дальняя из двух»
+            // (far-side) при функции не действует: функция считает цену от общей опоры заново.
+            double[] rr = stand.rawRefs();
+            if (rr != null && rr[1] > 0) {
+                double was = fair;
+                fair = buy ? Math.min(fair, rr[1]) : Math.max(fair, rr[1]);
+                if (fair != was) {
+                    farFuncTicks[s]++;
+                    farFuncSumBp[s] += Math.abs(fair / was - 1) * 1e4;
+                }
+            }
         }
         double bb = book.bids().get(0).price(), ba = book.asks().get(0).price();
         double spr = (ba / bb - 1) * 10_000;
@@ -6174,6 +6255,100 @@ public final class QuoteLoop implements Runnable {
             log.info("СТОП ПО УБЫТКУ {} {}: продажи за окно {} при потолке ${}, запас {}", symbol,
                     java.time.Instant.ofEpochMilli(now), String.format(java.util.Locale.ROOT, "%+.4f", sum),
                     String.format(java.util.Locale.ROOT, "%.2f", capUsd), fmt(inventory));
+        }
+    }
+
+    /**
+     * ПРОСАДКА ОТ МАКСИМУМА (02.11.2026, владелец). Прежний стоп ({@code max-loss}) считает результат от начала
+     * журнала, и заработанное раньше растягивает его: у a «$4» на деле было $11, у f — $3.4. Здесь — просадка
+     * торгового результата от его максимума с последнего включения, в процентах денежного потолка:
+     * {@code dd-alert-pct} — одна тревога в Telegram (снова — после нового максимума),
+     * {@code dd-stop-pct} — распродажа (режим экстренной продажи) и выключение; включение само через
+     * {@code dd-resume-h} ч или /start владельца. 0 — выключено. Максимум живёт в памяти: перезапуск считает заново.
+     */
+    static final double DD_ALERT_PCT = Double.parseDouble(System.getProperty("revx.exec.dd-alert-pct", "0"));
+    static final double DD_STOP_PCT = Double.parseDouble(System.getProperty("revx.exec.dd-stop-pct", "0"));
+    static final long DD_RESUME_MS = (long) (Double.parseDouble(
+            System.getProperty("revx.exec.dd-resume-h", "6")) * 3_600_000L);
+    private double ddPeak = Double.NaN;
+    private boolean ddAlerted;
+    private boolean ddSelling;
+    private long ddStoppedMs;
+    private long ddResumeTriedMs;
+    private long ddStops;
+
+    public long ddStops() {
+        return ddStops;
+    }
+
+    private double currentPnl(double p) {
+        if (ownPosition) {
+            return tradingPnl(ownCash, seedCash, inventory, seedPosition, p);
+        }
+        return startCaptured ? tradingPnl(quoteTotal, startQuote, inventory, startInventory, p) : Double.NaN;
+    }
+
+    private void ddWatch(double p) {
+        if ((DD_ALERT_PCT <= 0 && DD_STOP_PCT <= 0) || !quoting.get() || !(p > 0)) {
+            return;
+        }
+        if (ddSelling) {
+            if (inventory * p < minNotional * DUST_PLACE_MULT) {
+                ddSelling = false;
+                panicOn = false;
+                ddStoppedMs = clock.now();
+                String text = String.format(java.util.Locale.ROOT, "⏸ %s %s: просадка — распродано, стою; включусь сам через %.0f ч или по /start",
+                        tag.id(), symbol, DD_RESUME_MS / 3_600_000.0);
+                journal.event("dd_off", text);
+                alert.accept(text);
+                stopQuoting();
+            }
+            return;
+        }
+        double pnl = currentPnl(p);
+        double cap = params.inventoryCap() * p;
+        if (Double.isNaN(pnl) || !(cap > 0)) {
+            return;
+        }
+        if (Double.isNaN(ddPeak) || pnl > ddPeak) {
+            ddPeak = pnl;
+            ddAlerted = false;
+        }
+        double dd = ddPeak - pnl;
+        if (DD_ALERT_PCT > 0 && !ddAlerted && dd >= DD_ALERT_PCT / 100 * cap) {
+            ddAlerted = true;
+            String text = String.format(java.util.Locale.ROOT, "⚠️ %s %s: просадка $%.2f от максимума (%.1f%% потолка $%.2f), запас %s",
+                    tag.id(), symbol, dd, dd / cap * 100, cap, fmt(inventory));
+            journal.event("dd_alert", text);
+            alert.accept(text);
+        }
+        if (DD_STOP_PCT > 0 && dd >= DD_STOP_PCT / 100 * cap) {
+            ddSelling = true;
+            ddStops++;
+            panicOn = true;
+            panicSince = clock.now();
+            String text = String.format(java.util.Locale.ROOT, "🛑 %s %s: просадка $%.2f от максимума (%.1f%% потолка $%.2f) — распродаю запас %s и выключаюсь",
+                    tag.id(), symbol, dd, dd / cap * 100, cap, fmt(inventory));
+            journal.event("dd_stop", text);
+            alert.accept(text);
+        }
+    }
+
+    /** Самовключение после стопа по просадке; зовётся, пока котирование выключено. */
+    private void ddResumeTick() {
+        if (ddStoppedMs > 0 && DD_RESUME_MS > 0 && clock.now() - ddStoppedMs >= DD_RESUME_MS
+                && clock.now() - ddResumeTriedMs >= 60_000) {
+            ddResumeTriedMs = clock.now();        // не чаще раза в минуту, если допуск кассы не пускает
+            String taken = topUpCash();
+            String blocked = cannotStart();
+            if (blocked != null) {
+                return;
+            }
+            String text = String.format(java.util.Locale.ROOT, "%s %s: включаюсь сам через %.0f ч после стопа по просадке%s",
+                    tag.id(), symbol, DD_RESUME_MS / 3_600_000.0, taken == null ? "" : ". " + taken);
+            journal.event("dd_resume", text);
+            alert.accept(text);
+            startQuoting();
         }
     }
 
@@ -10536,6 +10711,11 @@ public final class QuoteLoop implements Runnable {
     /** /stop человеком: остановка по пределу больше не считается — сам не включится. */
     public void stopByOwner() {
         limitStoppedMs = 0;
+        ddStoppedMs = 0;
+        if (ddSelling) {
+            ddSelling = false;
+            panicOn = false;
+        }
         stopQuoting();
     }
 

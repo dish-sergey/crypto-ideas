@@ -238,6 +238,9 @@ public final class GroupForecast {
                 if (!l.funcStats().isEmpty()) {
                     log.warn("бот {}: {}", l.botId(), l.funcStats());
                 }
+                if (l.farFuncSummary() != null) {
+                    log.warn("бот {}: {}", l.botId(), l.farFuncSummary());
+                }
                 ExecJournal j = journals.get(i);
                 Forecast.BotResult r = Forecast.measure(specs.get(i), j, l, owners.get(i).base(),
                         days, window(owners.get(i).ticks(), start, endMs), seeds.get(i));
