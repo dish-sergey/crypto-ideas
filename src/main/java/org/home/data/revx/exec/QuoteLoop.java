@@ -7317,6 +7317,80 @@ public final class QuoteLoop implements Runnable {
         }
     }
 
+    /** 429 без {@code Retry-After} (бывает с края площадки): столько ждём. */
+    static final long RATE_DEFAULT_WAIT_MS = 1000L;
+    /** Опасную замену повторяем сразу, если площадка просит подождать не дольше этого. */
+    static final long RATE_RETRY_MAX_MS = 500L;
+    /** Опасная замена ждёт жетон общего ведра не дольше этого, иначе — следующий тик. */
+    static final long BUCKET_WAIT_MAX_MS = 150L;
+    /**
+     * Общее ведро замен шести ботов ({@link ReplaceBucket}): файл, например {@code /dev/shm/revx-replace-bucket};
+     * пусто — выключено. Темп и ёмкость ниже 10/с: 13 секунд из 18 с отказом 429 несли меньше 10 замен (03.11.2026).
+     */
+    static final String BUCKET_FILE = System.getProperty("revx.exec.replace-bucket", "");
+    static final double BUCKET_RATE = Double.parseDouble(System.getProperty("revx.exec.replace-bucket-rate", "9"));
+    static final int BUCKET_BURST = Integer.getInteger("revx.exec.replace-bucket-burst", 7);
+    static final int BUCKET_RESERVE = Integer.getInteger("revx.exec.replace-bucket-reserve", 3);
+    private ReplaceBucket bucket;
+    private boolean bucketTried;
+    private long replace429, bucketTaken, bucketSkipped, bucketWaited, bucketDenied, bucketStatMs;
+
+    private boolean takeReplaceToken(boolean danger) {
+        long now = clock.now();
+        if (bucketStatMs == 0) {
+            bucketStatMs = now;
+        } else if (now - bucketStatMs >= 3_600_000L) {
+            bucketStatMs = now;
+            if (replace429 + bucketSkipped + bucketDenied > 0 || bucket != null) {
+                journal.event("replace_rate", String.format(java.util.Locale.ROOT,
+                        "за час: 429 %d; ведро: взято %d, безопасных пропущено %d, опасных ждали %d, опасных не дождались %d",
+                        replace429, bucketTaken, bucketSkipped, bucketWaited, bucketDenied));
+            }
+            replace429 = bucketTaken = bucketSkipped = bucketWaited = bucketDenied = 0;
+        }
+        if (BUCKET_FILE.isBlank()) {
+            return true;
+        }
+        if (!bucketTried) {
+            bucketTried = true;
+            try {
+                bucket = new ReplaceBucket(java.nio.file.Path.of(BUCKET_FILE), BUCKET_RATE, BUCKET_BURST, BUCKET_RESERVE);
+            } catch (Exception e) {
+                // Без ведра бот работает как раньше: это порядок очереди, а не защита денег.
+                log.error("общее ведро замен {} не открылось: {}", BUCKET_FILE, e.toString());
+                journal.event("replace_rate", "общее ведро не открылось: " + e);
+            }
+        }
+        if (bucket == null) {
+            return true;
+        }
+        long wait = bucket.tryTake(danger, System.currentTimeMillis());
+        if (wait > 0 && danger && wait <= BUCKET_WAIT_MAX_MS && pauseMs(wait)) {
+            bucketWaited++;
+            wait = bucket.tryTake(true, System.currentTimeMillis());
+        }
+        if (wait > 0) {
+            if (danger) {
+                bucketDenied++;
+            } else {
+                bucketSkipped++;
+            }
+            return false;
+        }
+        bucketTaken++;
+        return true;
+    }
+
+    private boolean pauseMs(long ms) {
+        try {
+            clock.sleep(ms);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
     private void replace(Side side, Resting resting, double price, double size) {
         trace("REPLACE", side, resting, price, size);
         if (replacesThisMinute >= ExecLimits.MAX_REPLACES_PER_MINUTE) {
@@ -7336,6 +7410,10 @@ public final class QuoteLoop implements Runnable {
             }
             size = fit;
         }
+        boolean danger = side == Side.BUY ? resting.price > price : resting.price < price;
+        if (!takeReplaceToken(danger)) {
+            return;                       // ведро общее: безопасная уступает опасным, следующий тик спросит снова
+        }
         String heirClientId = tag.newClientOrderId();
         String body = """
                 {"client_order_id":"%s","base_size":"%s","price":"%s",
@@ -7346,6 +7424,25 @@ public final class QuoteLoop implements Runnable {
         replaces++;
         replacesThisMinute++;
         noteVenueStall(response.latencyMs());
+        if (response.status() == 429) {
+            // 🔑 429 — НЕ ОТКАЗ ПО ЗАЯВКЕ (03.11.2026): запрос не исполнялся, заявка стоит как стояла, сверять нечего.
+            // Раньше шёл общий путь отказа: пауза от 2 с и сверка книги, при том что площадка просит 7–421 мс; на
+            // оживлении рынка опасная заявка стояла по старой цене лишние 2.5 с. Теперь ждём ровно сколько просят;
+            // опасную при короткой просьбе повторяем сразу, один раз.
+            replace429++;
+            long wait = response.retryAfterMs() >= 0 ? response.retryAfterMs() : RATE_DEFAULT_WAIT_MS;
+            if (danger && wait <= RATE_RETRY_MAX_MS && pauseMs(wait)) {
+                response = client.replace(resting.venueId, body);
+                replaces++;
+                replacesThisMinute++;
+                noteVenueStall(response.latencyMs());
+                wait = response.retryAfterMs() >= 0 ? response.retryAfterMs() : RATE_DEFAULT_WAIT_MS;
+            }
+            if (response.status() == 429) {
+                resting.blockedUntilMs = clock.now() + wait;
+                return;
+            }
+        }
         if (response.ok()) {
             // ⚠️ ПРЕДШЕСТВЕННИКА НАДО ДОПРОСИТЬ, ПОКА ЕГО ЕЩЁ ЕСТЬ О ЧЁМ
             // СПРОСИТЬ. Замена создаёт другую заявку, старый идентификатор

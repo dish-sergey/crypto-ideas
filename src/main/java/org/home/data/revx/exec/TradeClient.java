@@ -146,6 +146,21 @@ public final class TradeClient implements Venue {
         }
     }
 
+    /**
+     * Сколько просит подождать площадка при 429, мс; −1 — не сказала. В документации и по замерам
+     * {@code Retry-After} в МИЛЛИСЕКУНДАХ (секундное ведро 4–574, суточное — до 1 777 000).
+     */
+    static long retryAfterMs(int status, String header) {
+        if (status != 429 || header == null) {
+            return -1;
+        }
+        try {
+            return Math.max(0, Long.parseLong(header.trim()));
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
     private Venue.Response once(String method, String path, String body) {
         URI uri = URI.create(baseUrl + path);
         long started = System.currentTimeMillis();
@@ -167,7 +182,8 @@ public final class TradeClient implements Venue {
             long latency = System.currentTimeMillis() - started;
             journal.request(method, path, body, response.statusCode(),
                     withQuotaHeaders(response), latency, null);
-            return new Venue.Response(response.statusCode(), response.body(), latency);
+            return new Venue.Response(response.statusCode(), response.body(), latency,
+                    retryAfterMs(response.statusCode(), response.headers().firstValue("retry-after").orElse(null)));
         } catch (Exception e) {
             long latency = System.currentTimeMillis() - started;
             // Неотправленный запрос тоже пишется: «ответа нет» и «не спрашивали» —

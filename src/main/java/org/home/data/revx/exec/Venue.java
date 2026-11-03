@@ -28,7 +28,11 @@ package org.home.data.revx.exec;
 public interface Venue {
 
     /** Ответ площадки. {@code body} — сырой JSON, как пришёл. */
-    record Response(int status, String body, long latencyMs) {
+    record Response(int status, String body, long latencyMs, long retryAfterMs) {
+
+        public Response(int status, String body, long latencyMs) {
+            this(status, body, latencyMs, -1);
+        }
 
         public boolean ok() {
             return status >= 200 && status < 300;

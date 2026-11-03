@@ -76,6 +76,26 @@ public final class GroupForecast {
 
     public static List<Result> run(List<Pair> pairs, org.home.data.revx.RevxConfig cfg,
                                    boolean shareBudget, String journalOut, String standDbPath) throws Exception {
+        // ⚠️ До 03.11.2026 групповой стенд котировал от опоры-корзины (StandFair) без Бинанса, хотя живые боты
+        // с 06.10 стоят на гибриде «уровень Revolut × ход Бинанса» — одиночный стенд его включал (Forecast.runInner),
+        // групповой нет. Ключ revx.sim.group-hybrid=true включает гибрид и здесь (тем же HybridFair), а обе опоры
+        // тика отдаются котировщику (двойная опора far-func без них не работает). Без ключа — как раньше.
+        Map<String, double[][]> sidesBySymbol = new java.util.HashMap<>();
+        if (Boolean.getBoolean("revx.sim.group-hybrid") && HybridFair.enabled()) {
+            List<Pair> hp = new ArrayList<>();
+            for (Pair p : pairs) {
+                if (p.model() instanceof MarketFillModel mfm) {
+                    List<ReplayFair.Tick> t = HybridFair.apply(p.ticks(), p.symbol(), mfm.market().fresh(), p.base().size());
+                    if (HybridFair.sides != null && HybridFair.sides[0].length == t.size()) {
+                        sidesBySymbol.put(p.symbol(), HybridFair.sides);
+                    }
+                    hp.add(new Pair(p.symbol(), t, p.model(), p.base(), p.bots(), p.caps()));
+                } else {
+                    hp.add(p);
+                }
+            }
+            pairs = hp;
+        }
         long start = Long.MIN_VALUE;
         long end = Long.MAX_VALUE;
         for (Pair p : pairs) {
@@ -107,6 +127,9 @@ public final class GroupForecast {
                 BootParams base = p.base();
                 List<ReplayFair.Tick> ticks = p.ticks();
                 ReplayFair fair = new ReplayFair(ticks, clock);
+                if (sidesBySymbol.containsKey(p.symbol())) {
+                    fair.withSides(sidesBySymbol.get(p.symbol()));
+                }
                 double refPrice = Double.NaN;
                 for (ReplayFair.Tick t : ticks) {
                     if (Double.isFinite(t.fair()) && t.fair() > 0) {
