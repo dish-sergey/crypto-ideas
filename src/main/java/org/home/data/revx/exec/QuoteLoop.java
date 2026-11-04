@@ -2036,6 +2036,38 @@ public final class QuoteLoop implements Runnable {
     static final String FALL_FILE = System.getProperty("revx.exec.fall-file");
     /** Вместо отвода на park-distance — бид дальше на столько б.п., пока сигнал горит (03.11.2026, владелец). 0 — отвод. */
     static final double FALL_WIDEN_BP = Double.parseDouble(System.getProperty("revx.exec.fall-widen-bp", "0"));
+    /** Пока горит сигнал падения, и аск дальше на столько б.п. (буря: обе стороны). 0 — аск не трогаем. */
+    static final double FALL_WIDEN_ASK_BP = Double.parseDouble(System.getProperty("revx.exec.fall-widen-ask-bp", "0"));
+    /** Сигнал РОСТА из файла (та же модель с целью «резкий рост»): аск дальше на {@code rise-widen-bp}, пока горит. Только стенд. */
+    static final String RISE_FILE = System.getProperty("revx.exec.rise-file");
+    static final double RISE_WIDEN_BP = Double.parseDouble(System.getProperty("revx.exec.rise-widen-bp", "0"));
+    private java.util.TreeMap<Long, Long> riseIntervals;
+    private boolean riseLast;
+
+    private boolean riseSignalOn(long now) {
+        if (riseIntervals == null) {
+            riseIntervals = loadIntervals(RISE_FILE);
+            journal.event("rise_file", symbol + ": интервалов сигнала роста " + riseIntervals.size() + " из " + RISE_FILE);
+        }
+        var e = riseIntervals.floorEntry(now);
+        return e != null && now < e.getValue();
+    }
+
+    private java.util.TreeMap<Long, Long> loadIntervals(String file) {
+        java.util.TreeMap<Long, Long> out = new java.util.TreeMap<>();
+        String coin = symbol.split("[^A-Za-z]")[0];
+        try {
+            for (String l : java.nio.file.Files.readAllLines(java.nio.file.Path.of(file))) {
+                String[] p = l.trim().split(";");
+                if (p.length == 3 && p[0].equalsIgnoreCase(coin)) {
+                    out.put(Long.parseLong(p[1]), Long.parseLong(p[2]));
+                }
+            }
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("не прочитался файл сигнала " + file, e);
+        }
+        return out;
+    }
     private java.util.TreeMap<Long, Long> fallIntervals;
     private boolean fallLast;
 
@@ -3999,6 +4031,21 @@ public final class QuoteLoop implements Runnable {
                     target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
                 }
             }
+            if (on && FALL_WIDEN_ASK_BP > 0 && target.hasAsk()) {
+                target = new Quoter.Quotes(target.bid(), target.ask() * (1 + FALL_WIDEN_ASK_BP / 1e4));
+            }
+        }
+        if (RISE_FILE != null && fair.price() > 0) {
+            boolean on = riseSignalOn(clock.now());
+            if (on != riseLast) {
+                riseLast = on;
+                journal.event(on ? "rise_widen" : "rise_widen_off", String.format(java.util.Locale.ROOT,
+                        "%s: сигнал роста %s — аск %s, запас %s", symbol, on ? "выше порога" : "ниже порога",
+                        on ? "отодвинут" : "вернулся", fmt(inventory)));
+            }
+            if (on && RISE_WIDEN_BP > 0 && target.hasAsk()) {
+                target = new Quoter.Quotes(target.bid(), target.ask() * (1 + RISE_WIDEN_BP / 1e4));
+            }
         }
         if (FLOW_CAP_H > 0 && buyQuiet != null && fair.price() > 0 && target.hasBid()) {
             long win = (long) (FLOW_CAP_H * 3_600_000L);
@@ -5352,6 +5399,12 @@ public final class QuoteLoop implements Runnable {
         }
         if (buy && FALL_FILE != null && FALL_WIDEN_BP > 0 && fallLast) {
             fair *= 1 - FALL_WIDEN_BP / 1e4;          // сигнал падения: бид функции дальше на FALL_WIDEN_BP
+        }
+        if (!buy && FALL_FILE != null && FALL_WIDEN_ASK_BP > 0 && fallLast) {
+            fair *= 1 + FALL_WIDEN_ASK_BP / 1e4;      // буря: и аск функции дальше
+        }
+        if (!buy && RISE_FILE != null && RISE_WIDEN_BP > 0 && riseLast) {
+            fair *= 1 + RISE_WIDEN_BP / 1e4;          // сигнал роста: аск функции дальше
         }
         if (FAR_FUNC) {
             // ДВОЙНАЯ ОПОРА (02.11.2026, владелец): сторона, против которой пошёл Бинанс, — от Бинанса × базис,
