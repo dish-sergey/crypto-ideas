@@ -33,4 +33,18 @@ class InfoBotBufferTest {
         assertTrue(s.contains("USDC 29%⚠️"), s);
         assertFalse(s.contains("ETH 35%⚠️"), s);
     }
+
+    /** Порог — один лот на бота (05.11.2026): потолок пары $260, лоты $55.79 + $108.33. */
+    @Test
+    void порогОдинЛотНаБота() {
+        Map<String, Double> caps = new TreeMap<>(Map.of("BTC", 260.0 / 80_000));
+        Map<String, Double> lots = Map.of("BTC", 164.12 / 80_000);
+        Map<String, Double> px = Map.of("BTC", 80_000.0);
+        String low = InfoBot.bufferText(caps, Map.of("BTC", 151.0 / 80_000, "USDC", 200.0), px, lots);
+        assertTrue(low.contains("BTC 58%⚠️"), low);
+        assertTrue(low.contains("USDC 77%"), low);
+        assertTrue(low.contains("порог: один лот на бота, 63% потолков; USDC $200 из $164"), low);
+        String ok = InfoBot.bufferText(caps, Map.of("BTC", 170.0 / 80_000, "USDC", 200.0), px, lots);
+        assertFalse(ok.contains("⚠️"), ok);
+    }
 }

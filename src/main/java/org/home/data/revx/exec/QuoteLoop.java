@@ -2036,11 +2036,13 @@ public final class QuoteLoop implements Runnable {
     static final String FALL_FILE = System.getProperty("revx.exec.fall-file");
     /** Вместо отвода на park-distance — бид дальше на столько б.п., пока сигнал горит (03.11.2026, владелец). 0 — отвод. */
     static final double FALL_WIDEN_BP = Double.parseDouble(System.getProperty("revx.exec.fall-widen-bp", "0"));
-    /** Пока горит сигнал падения, и аск дальше на столько б.п. (буря: обе стороны). 0 — аск не трогаем. */
+    /** Пока горит сигнал падения, аск дальше на столько б.п.; меньше нуля — ближе к рынку (04.11.2026, владелец: идти по стене). 0 — аск не трогаем. */
     static final double FALL_WIDEN_ASK_BP = Double.parseDouble(System.getProperty("revx.exec.fall-widen-ask-bp", "0"));
     /** Сигнал РОСТА из файла (та же модель с целью «резкий рост»): аск дальше на {@code rise-widen-bp}, пока горит. Только стенд. */
     static final String RISE_FILE = System.getProperty("revx.exec.rise-file");
     static final double RISE_WIDEN_BP = Double.parseDouble(System.getProperty("revx.exec.rise-widen-bp", "0"));
+    /** Пока горит сигнал роста, бид дальше на столько б.п.; меньше нуля — ближе к рынку. */
+    static final double RISE_WIDEN_BID_BP = Double.parseDouble(System.getProperty("revx.exec.rise-widen-bid-bp", "0"));
     private java.util.TreeMap<Long, Long> riseIntervals;
     private boolean riseLast;
 
@@ -4031,7 +4033,7 @@ public final class QuoteLoop implements Runnable {
                     target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
                 }
             }
-            if (on && FALL_WIDEN_ASK_BP > 0 && target.hasAsk()) {
+            if (on && FALL_WIDEN_ASK_BP != 0 && target.hasAsk()) {
                 target = new Quoter.Quotes(target.bid(), target.ask() * (1 + FALL_WIDEN_ASK_BP / 1e4));
             }
         }
@@ -4045,6 +4047,9 @@ public final class QuoteLoop implements Runnable {
             }
             if (on && RISE_WIDEN_BP > 0 && target.hasAsk()) {
                 target = new Quoter.Quotes(target.bid(), target.ask() * (1 + RISE_WIDEN_BP / 1e4));
+            }
+            if (on && RISE_WIDEN_BID_BP != 0 && target.hasBid()) {
+                target = new Quoter.Quotes(target.bid() * (1 - RISE_WIDEN_BID_BP / 1e4), target.ask());
             }
         }
         if (FLOW_CAP_H > 0 && buyQuiet != null && fair.price() > 0 && target.hasBid()) {
@@ -5212,6 +5217,7 @@ public final class QuoteLoop implements Runnable {
     public static final String FUNC_FILE = blankToNull(System.getProperty("revx.exec.func-file", ""));
     static final int FUNC_MIN_BP = Integer.getInteger("revx.exec.func-min-bp", 4);
     static final int FUNC_MAX_BP = Integer.getInteger("revx.exec.func-max-bp", 30);
+    static final double FUNC_SHIFT_BP = Double.parseDouble(System.getProperty("revx.exec.func-shift-bp", "0"));
     /** цена дальше этого от опоры — отвод, функция её не трогает */
     static final int FUNC_PARKED_BP = 300;
     static final double FUNC_BAND_IN_BP = Double.parseDouble(System.getProperty("revx.exec.func-band-in-bp", "0"));
@@ -5400,11 +5406,14 @@ public final class QuoteLoop implements Runnable {
         if (buy && FALL_FILE != null && FALL_WIDEN_BP > 0 && fallLast) {
             fair *= 1 - FALL_WIDEN_BP / 1e4;          // сигнал падения: бид функции дальше на FALL_WIDEN_BP
         }
-        if (!buy && FALL_FILE != null && FALL_WIDEN_ASK_BP > 0 && fallLast) {
+        if (!buy && FALL_FILE != null && FALL_WIDEN_ASK_BP != 0 && fallLast) {
             fair *= 1 + FALL_WIDEN_ASK_BP / 1e4;      // буря: и аск функции дальше
         }
         if (!buy && RISE_FILE != null && RISE_WIDEN_BP > 0 && riseLast) {
             fair *= 1 + RISE_WIDEN_BP / 1e4;          // сигнал роста: аск функции дальше
+        }
+        if (buy && RISE_FILE != null && RISE_WIDEN_BID_BP != 0 && riseLast) {
+            fair *= 1 - RISE_WIDEN_BID_BP / 1e4;      // сигнал роста: бид функции ближе (при отрицательном значении)
         }
         if (FAR_FUNC) {
             // ДВОЙНАЯ ОПОРА (02.11.2026, владелец): сторона, против которой пошёл Бинанс, — от Бинанса × базис,
@@ -5441,6 +5450,8 @@ public final class QuoteLoop implements Runnable {
             }
             funcMuStep();
             double q = params.size() > 0 ? inventory / params.size() : 0;
+            // запас для таблицы — в «лотах таблицы»: revx.exec.func-inv-lots-scale[-<бот>], стенд мелкого лота (док. 236); по умолчанию 1
+            q *= Double.parseDouble(System.getProperty("revx.exec.func-inv-lots-scale-" + tag.id(), System.getProperty("revx.exec.func-inv-lots-scale", "1")));
             double head = FUNC_MU_HEAD_BID_ONLY && !buy ? 0 : funcMuHeadNow(fair);
             shift = funcMu + head + (funcInv == null ? 0 : buy ? invPrice(funcInv[0], q) : invPrice(funcInv[1], q - 1));
             funcMuSum += funcMu;
@@ -5472,6 +5483,15 @@ public final class QuoteLoop implements Runnable {
                 return null;                  // ни один δ не окупает цену запаса и постановки — сторону не котировать
             }
             return base;
+        }
+        if (FUNC_SHIFT_BP != 0) {
+            // сдвиг выбранного отступа, стенд мелкого лота (док. 236): меньше нуля — ближе к рынку, не ближе func-min-bp и не через рынок
+            double d2 = Math.max(FUNC_MIN_BP, bestBp + FUNC_SHIFT_BP);
+            double p2 = buy ? fair * (1 - d2 / 10_000) : fair * (1 + d2 / 10_000);
+            if (buy ? p2 < ba : p2 > bb) {
+                bestP = p2;
+                bestBp = d2;
+            }
         }
         if (FUNC_RETREAT_BP > 0 && (buy || !FUNC_RETREAT_BID_ONLY)) {
             double ahead = 0;
@@ -6795,7 +6815,7 @@ public final class QuoteLoop implements Runnable {
         // снимал «нечем котировать» и ставил снова — 9 постановок за 23 мин сожгли хвост
         // распродажи, и бот встал с лотом. Такой остаток продаётся вместе с этой заявкой.
         if (side == Side.SELL && size > 0 && pool > size
-                && (pool - size) * targetPrice < minNotional * DUST_PLACE_MULT
+                && (pool - size) * targetPrice < sellPlaceMinNow()
                 && pool * targetPrice <= maxOrderNotional) {
             size = pool;
         }
@@ -6810,7 +6830,8 @@ public final class QuoteLoop implements Runnable {
         // Гистерезис у минимума площадки: новую заявку ставим с запасом (×1.5), стоящую
         // снимаем, только если её стоимость ушла заметно ниже (×0.7) — иначе цена на грани
         // 0.1 USDC гоняет «поставил → снял → поставил», и каждая постановка из суточных.
-        double minHere = resting.venueId == null ? minNotional * DUST_PLACE_MULT : minNotional * 0.7;
+        double minHere = resting.venueId != null ? minNotional * 0.7
+                : side == Side.SELL ? sellPlaceMinNow() : minNotional * DUST_PLACE_MULT;
         if (size <= 0 || notional < minHere) {
             if (resting.venueId != null) {
                 cancel(side, resting, "нечем котировать эту сторону");
@@ -6926,6 +6947,25 @@ public final class QuoteLoop implements Runnable {
 
     /** Новая заявка — не дешевле стольких минимумов площадки (гистерезис против пыли). */
     static final double DUST_PLACE_MULT = 1.5;
+
+    /**
+     * НЕ СТАВИТЬ МЕЛКУЮ ПРОДАЖУ (04.11.2026, док. 236, владелец): {@code revx.exec.sell-min-usd} > 0 — новая продажа не мельче стольких USDC.
+     * Укус мелкого бота на $0.10 давал запас в 20 центов, и на него уходила постановка из суточных, которую тоже кусали: у b 13 таких за сутки.
+     * Распродажа (предел постановок, просадка) продаёт всё, почти до минимума площадки. 0 — как было.
+     */
+    static final double SELL_MIN_USD = Double.parseDouble(System.getProperty("revx.exec.sell-min-usd", "0"));
+    static final double SELL_ALL_MULT = 1.01;
+
+    static double sellPlaceMin(double minNotional, boolean sellAll, double sellMinUsd) {
+        if (sellMinUsd <= 0) {
+            return minNotional * DUST_PLACE_MULT;
+        }
+        return sellAll ? minNotional * SELL_ALL_MULT : Math.max(minNotional * DUST_PLACE_MULT, sellMinUsd);
+    }
+
+    private double sellPlaceMinNow() {
+        return sellPlaceMin(minNotional, sellOnly || ddSelling, SELL_MIN_USD);
+    }
 
     private static double stillHeld(Resting resting) {
         return resting.venueId == null && resting.questioned != null ? resting.qSize : 0;
@@ -7087,7 +7127,7 @@ public final class QuoteLoop implements Runnable {
         // 09.10.2026: и то, что уже стоит в продажах или ниже порога постановки (×1.5
         // минимума) — у f 30 ложных записей за 3 ч на 0.0009 SOL при стоящей продаже.
         if (side == Side.SELL && lastFair > 0
-                && Math.max(0, inventory - sellsMaybeAlive(null)) * lastFair < minNotional * DUST_PLACE_MULT) {
+                && Math.max(0, inventory - sellsMaybeAlive(null)) * lastFair < sellPlaceMinNow()) {
             return;
         }
         // 10.10.2026: покупать некуда — потолок запаса выбран (или занят заявками с
@@ -10755,7 +10795,7 @@ public final class QuoteLoop implements Runnable {
         // ⚠️ Порог тот же, что у постановки продажи (×DUST_PLACE_MULT минимума). С порогом в один
         // минимум остаток между 1 и 1.5 минимума не продавался и не выпускал из распродажи: стенд
         // ETH L3 (док. 193) 19.09 остался с $0.12 и молчал четыре недели — тики шли, запросов ноль.
-        if (!sellOnly || px <= 0 || inventory * px >= minNotional * DUST_PLACE_MULT) {
+        if (!sellOnly || px <= 0 || inventory * px >= sellPlaceMinNow()) {
             return;
         }
         sellOnly = false;

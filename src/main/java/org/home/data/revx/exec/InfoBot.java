@@ -157,6 +157,88 @@ public final class InfoBot implements Runnable {
     private final String venuePath =
             System.getProperty("revx.info.venue", "../revx-shared/venue.db");
     private long venueTold;
+
+    /**
+     * КЛЮЧИ API ПЕРЕСТАЛИ РАБОТАТЬ (05.11.2026, владелец): оператор Revolut сказал, что API для счетов
+     * из Польши не поддерживается, хотя у нас работает; если доступ отключат, боты останутся без
+     * управления, а заявки — в книге. Признак: у бота 401/403 идут дольше пяти минут без единого
+     * успешного ответа. Будит и повторяет раз в час. 403 бывает и при сбое всей площадки (20.10.2026) —
+     * будить надо и тогда.
+     */
+    static final long KEYS_BAD_MS = 5 * 60_000L;
+    static final long KEYS_WINDOW_MS = 30 * 60_000L;
+    private long keysChecked;
+    private long keysTold;
+
+    /** Состояние ключа по журналу бота: первый отказ после последнего успеха; {@code firstBadMs} 0 — отказов нет. */
+    record KeyState(long lastOkMs, long firstBadMs, long lastBadMs, int badStatus, long badCount) {
+        boolean bad(long now) {
+            return firstBadMs > 0 && now - firstBadMs >= KEYS_BAD_MS;
+        }
+    }
+
+    static KeyState keyState(String journalPath, long now) throws java.sql.SQLException {
+        long from = now - KEYS_WINDOW_MS;
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                "jdbc:sqlite:file:" + journalPath + "?mode=ro")) {
+            long lastOk = 0;
+            try (java.sql.PreparedStatement ps = c.prepareStatement(
+                    "SELECT MAX(ts_ms) FROM exec_request WHERE ts_ms >= ? AND status BETWEEN 200 AND 299")) {
+                ps.setLong(1, from);
+                try (java.sql.ResultSet rs = ps.executeQuery()) {
+                    lastOk = rs.next() ? rs.getLong(1) : 0;
+                }
+            }
+            try (java.sql.PreparedStatement ps = c.prepareStatement(
+                    "SELECT MIN(ts_ms), MAX(ts_ms), MAX(status), COUNT(*) FROM exec_request "
+                            + "WHERE ts_ms >= ? AND status IN (401, 403)")) {
+                ps.setLong(1, Math.max(from, lastOk + 1));
+                try (java.sql.ResultSet rs = ps.executeQuery()) {
+                    if (rs.next() && rs.getLong(4) > 0) {
+                        return new KeyState(lastOk, rs.getLong(1), rs.getLong(2), rs.getInt(3), rs.getLong(4));
+                    }
+                }
+            }
+            return new KeyState(lastOk, 0, 0, 0, 0);
+        }
+    }
+
+    void watchKeys() {                                   // пакетный доступ: тест
+        long now = System.currentTimeMillis();
+        if (now - keysChecked < 60_000L) {
+            return;
+        }
+        keysChecked = now;
+        StringBuilder bad = new StringBuilder();
+        boolean anyOk = false;
+        for (Watched w : watched) {
+            try {
+                KeyState k = keyState(w.journalPath(), now);
+                if (k.bad(now)) {
+                    bad.append("\n").append(w.botId().toUpperCase(Locale.ROOT)).append(" ").append(w.symbol())
+                            .append(": ").append(k.badStatus()).append(", отказов ").append(k.badCount())
+                            .append(", первый ").append(ago(now - k.firstBadMs()))
+                            .append(", успех ").append(k.lastOkMs() > 0 ? ago(now - k.lastOkMs()) : "не было за 30 мин");
+                } else if (k.firstBadMs() == 0 && now - k.lastOkMs() < KEYS_BAD_MS) {
+                    anyOk = true;
+                }
+            } catch (Exception e) {
+                log.debug("ключи {}: {}", w.botId(), e.toString());   // журнала нет — про это скажет /all
+            }
+        }
+        if (bad.length() > 0) {
+            if (keysTold == 0 || now - keysTold >= 3_600_000L) {
+                keysTold = now;
+                send("🔑 КЛЮЧИ API НЕ РАБОТАЮТ: площадка отвечает 401/403 дольше 5 минут." + bad
+                        + "\nЗаявки могут стоять в книге без управления: проверить и при нужде снять вручную в приложении."
+                        + "\nПроверить: ключи в веб-терминале, --revx-trade-check. Бывает и при общем сбое площадки.");
+            }
+        } else if (keysTold != 0 && anyOk) {
+            keysTold = 0;
+            send("🟢 Ключи API снова работают.");
+        }
+    }
+
     /** Про какие незаписанные исполнения уже сказали. */
     private final java.util.Set<String> shadowTold = new java.util.HashSet<>();
 
@@ -538,6 +620,7 @@ public final class InfoBot implements Runnable {
                 watchSilence();
                 watchHybrid();
                 watchVenue();
+                watchKeys();
                 watchDisk();
                 poolSteps();
                 for (JsonNode update : JSON.readTree(body).path("result")) {
@@ -1288,6 +1371,7 @@ public final class InfoBot implements Runnable {
      */
     private String bufferLine() {
         java.util.Map<String, Double> caps = new java.util.TreeMap<>();
+        java.util.Map<String, Double> lots = new java.util.HashMap<>();   // сумма лотов ботов монеты, в монетах
         // Бот в пуле: потолок = капитал (лот = капитал / лотов в потолке), в монетах по
         // текущей цене. Юнит его больше не задаёт — после /pool set он устарел бы (22.10.2026).
         java.util.Set<String> bases = new java.util.TreeSet<>();
@@ -1303,6 +1387,10 @@ public final class InfoBot implements Runnable {
             Double price = px.get(w.base());
             if (pm != null && price != null && price > 0) {
                 caps.merge(w.base(), pm.capital() / price, Double::sum);
+                double lotsInCap = lotsInCap(w);
+                if (lotsInCap > 0) {
+                    lots.merge(w.base(), pm.capital() / lotsInCap / price, Double::sum);
+                }
                 continue;
             }
             try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
@@ -1339,7 +1427,31 @@ public final class InfoBot implements Runnable {
         for (var e : bal.byCurrency().entrySet()) {
             free.put(e.getKey(), e.getValue().total() - claimed.getOrDefault(e.getKey(), 0.0));
         }
-        return bufferText(caps, free, px);
+        return bufferText(caps, free, px, lots);
+    }
+
+    /** Лотов в потолке бота — из последнего события {@code sizing}; 0, если записи нет. */
+    private static double lotsInCap(Watched w) {
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(
+                "jdbc:sqlite:file:" + w.journalPath() + "?mode=ro");
+             java.sql.Statement st = c.createStatement();
+             java.sql.ResultSet rs = st.executeQuery(
+                     "SELECT detail FROM exec_event WHERE kind = 'sizing' ORDER BY ts_ms DESC LIMIT 1")) {
+            if (rs.next()) {
+                var m = java.util.regex.Pattern.compile("лотов в потолке ([0-9.]+)").matcher(rs.getString(1));
+                if (m.find()) {
+                    return Double.parseDouble(m.group(1));
+                }
+            }
+        } catch (Exception ignore) {
+            // журнала нет — бот в норму не входит, про журнал скажет строка бота
+        }
+        return 0;
+    }
+
+    static String bufferText(java.util.Map<String, Double> caps, java.util.Map<String, Double> free,
+                             java.util.Map<String, Double> prices) {
+        return bufferText(caps, free, prices, java.util.Map.of());
     }
 
     /**
@@ -1348,31 +1460,44 @@ public final class InfoBot implements Runnable {
      * @param caps   сумма потолков ботов по базовой монете (в монетах)
      * @param free   ничейное по валютам (остаток минус претензии реестра)
      * @param prices курс монет в USDC; без курса монета в долю USDC не входит
+     * @param lots   сумма лотов ботов по монете, в монетах: порог ничейного — один лот на бота
+     *               (владелец, 05.11.2026), USDC — лоты всех ботов; пусто — прежние 30% и 60%
      */
     static String bufferText(java.util.Map<String, Double> caps, java.util.Map<String, Double> free,
-                             java.util.Map<String, Double> prices) {
+                             java.util.Map<String, Double> prices, java.util.Map<String, Double> lots) {
         StringBuilder sb = new StringBuilder();
         boolean low = false;
         double capUsd = 0;
+        double lotUsd = 0;
         for (var e : caps.entrySet()) {
-            double share = free.getOrDefault(e.getKey(), 0.0) / e.getValue();
-            boolean bad = share < BUFFER_COIN_MIN;
+            double have = free.getOrDefault(e.getKey(), 0.0);
+            double share = have / e.getValue();
+            Double lot = lots.get(e.getKey());
+            boolean bad = lot != null ? have < lot : share < BUFFER_COIN_MIN;
             low |= bad;
             sb.append(String.format(Locale.ROOT, "%s %s %.0f%%", sb.length() == 0 ? "" : " ·",
                     e.getKey(), share * 100)).append(bad ? "⚠️" : "");
             Double p = prices.get(e.getKey());
             if (p != null && p > 0) {
                 capUsd += e.getValue() * p;
+                if (lot != null) {
+                    lotUsd += lot * p;
+                }
             }
         }
+        double usdc = free.getOrDefault("USDC", 0.0);
         if (capUsd > 0) {
-            double share = free.getOrDefault("USDC", 0.0) / capUsd;
-            boolean bad = share < BUFFER_USDC_MIN;
+            double share = usdc / capUsd;
+            boolean bad = lotUsd > 0 ? usdc < lotUsd : share < BUFFER_USDC_MIN;
             low |= bad;
             sb.append(String.format(Locale.ROOT, " · USDC %.0f%%", share * 100)).append(bad ? "⚠️" : "");
         }
-        return String.format(Locale.ROOT, "%n%n%sБУФЕР к потолкам ботов:%s%n  порог: монеты %.0f%%, USDC %.0f%%",
-                low ? "⚠️ " : "", sb, BUFFER_COIN_MIN * 100, BUFFER_USDC_MIN * 100);
+        String rule = lotUsd > 0
+                ? String.format(Locale.ROOT, "порог: один лот на бота, %.0f%% потолков; USDC $%.0f из $%.0f",
+                        100 * lotUsd / capUsd, usdc, lotUsd)
+                : String.format(Locale.ROOT, "порог: монеты %.0f%%, USDC %.0f%%",
+                        BUFFER_COIN_MIN * 100, BUFFER_USDC_MIN * 100);
+        return String.format(Locale.ROOT, "%n%n%sБУФЕР к потолкам ботов:%s%n  %s", low ? "⚠️ " : "", sb, rule);
     }
 
     /**
