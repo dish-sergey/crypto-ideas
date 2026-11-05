@@ -599,6 +599,32 @@ public final class AllocRegistry implements AutoCloseable {
         }
     }
 
+    /**
+     * Обнулить статистику пула (05.11.2026, владелец: после обновления ботов смотреть с нуля):
+     * сколько принёс каждый бот, шаги, сколько ушло в капиталы и срезано. Точка отсчёта капитала
+     * (и пределы [½, 3] от неё) — нынешний капитал, как после {@link #poolSet}. Деньги не двигаются:
+     * капитал, буфер, претензии и ещё не разнесённое {@code pending} остаются.
+     *
+     * @return null или текст ошибки
+     */
+    public synchronized String poolResetStats(String name, long nowMs) {
+        try (PreparedStatement pm = connection.prepareStatement(
+                     "UPDATE pool_member SET contributed = 0, capital0 = capital WHERE pool = ?");
+             PreparedStatement pp = connection.prepareStatement(
+                     "UPDATE pool SET steps = 0, reinvested = 0, cut = 0 WHERE name = ?")) {
+            pm.setString(1, name);
+            pp.setString(1, name);
+            if (pp.executeUpdate() == 0) {
+                return "нет пула " + name;
+            }
+            pm.executeUpdate();
+            poolEvent(name, "reset", "статистика пула обнулена");
+            return null;
+        } catch (Exception e) {
+            return "не обнулить: " + e.getMessage();
+        }
+    }
+
     /** Итог {@link #poolFill}: сколько долито и цель буфера; {@code err} — почему не долито. */
     public record PoolFill(double moved, double buffer, double target, String err) {
     }

@@ -825,6 +825,16 @@ public final class InfoBot implements Runnable {
                                     f.buffer() - f.target())
                                     : f.buffer() < f.target() - 0.005 ? "\nДо цели не хватило ничейного." : "");
                 }
+                case "reset" -> {
+                    String name = poolName(args.length > 1 ? args[1] : null);
+                    if (name == null) {
+                        return "Какой пул? Их несколько — укажите имя.";
+                    }
+                    String err = r.poolResetStats(name, now);
+                    return err != null ? "Не обнулено: " + err
+                            : "Статистика пула " + name + " обнулена: что принёс каждый бот, шаги, в капиталы, срезано. "
+                            + "Точка отсчёта — нынешний капитал. Деньги не двигались.";
+                }
                 case "remove" -> {
                     if (args.length < 2) {
                         return "Формат: /pool remove <бот>";
@@ -844,6 +854,7 @@ public final class InfoBot implements Runnable {
                             /pool set all 40 — всем участникам сразу
                             /pool fill — долить буфер из ничейного до цели; /pool fill 3 — ровно на 3 USDC
                             /pool remove a — вывести
+                            /pool reset — обнулить статистику (принёс, шаги, в капиталы, срезано), деньги не двигаются
 
                             Весь реализованный доход и убыток участников идёт в буфер. Раз в час излишек
                             сверх цели (5% суммы капиталов) делится ПОРОВНУ в капиталы, недостача — поровну

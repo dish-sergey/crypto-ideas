@@ -25,6 +25,30 @@ class AllocPoolTest {
     }
 
     @Test
+    void resetClearsStatsAndMovesNoMoney(@TempDir Path dir) {
+        try (AllocRegistry r = open(dir)) {
+            assertNull(r.poolCreate("mm", 5, 0.5, 3, true, T0));
+            assertNull(r.poolAdd("mm", "a", 30, 200, T0));
+            r.poolReport("a", 2.0, T0);
+            r.poolStep("stand", T0 + H);
+            var before = r.poolOf("a");
+            double buffer = r.pools().get(0).buffer();
+            assertNull(r.poolResetStats("mm", T0 + H));
+            var after = r.poolOf("a");
+            assertEquals(0, after.contributed(), 1e-12);
+            assertEquals(before.capital(), after.capital(), 1e-12);
+            assertEquals(before.capital(), after.capital0(), 1e-12);
+            assertEquals(before.pending(), after.pending(), 1e-12);
+            var p = r.pools().get(0);
+            assertEquals(0, p.steps());
+            assertEquals(0, p.reinvested(), 1e-12);
+            assertEquals(0, p.cut(), 1e-12);
+            assertEquals(buffer, p.buffer(), 1e-12);
+            assertNotNull(r.poolResetStats("нет", T0));
+        }
+    }
+
+    @Test
     void addReservesBufferFromUnownedAndKeepsItAlive(@TempDir Path dir) {
         try (AllocRegistry r = open(dir)) {
             assertTrue(r.claim("a", U, 30, 200, 1, T0));
