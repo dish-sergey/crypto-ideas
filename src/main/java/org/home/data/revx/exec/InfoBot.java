@@ -394,7 +394,7 @@ public final class InfoBot implements Runnable {
 
     /**
      * Размеры из последнего {@code sizing} (19.10.2026, владелец: видеть лот и пределы):
-     * «лот 12.51 USDC, потолок 29.15 (2.33 лота), пределы: заявка 100, экспозиция 250».
+     * «лот 12.51 USDC, потолок 29.15 (2.33 лота)».
      * Лот и потолок переводятся в доллары по ТЕКУЩЕЙ цене, если событие несёт их в
      * монетах; старое событие (до 19.10) — как записано. null — события нет.
      */
@@ -422,10 +422,8 @@ public final class InfoBot implements Runnable {
                 cap = capQ * fair;
             }
             double lots = num.apply("лотов в потолке ([0-9.]+)");
-            double order = num.apply("предел заявки ([0-9.]+)");
-            double exp = num.apply("предел экспозиции ([0-9.]+)");
-            return String.format(Locale.ROOT, "лот %.2f USDC, потолок %.2f (%.2f лота), пределы: заявка %.0f%s",
-                    lot, cap, lots, order, Double.isNaN(exp) ? "" : String.format(Locale.ROOT, ", экспозиция %.0f", exp));
+            return String.format(Locale.ROOT, "лот %.2f USDC, потолок %.2f (%.2f лота)",
+                    lot, cap, lots);
         } catch (Exception ex) {
             return null;
         }
@@ -919,7 +917,7 @@ public final class InfoBot implements Runnable {
                             m.botId(), m.capital(), m.capital0(), m.contributed(), openText,
                             m.funded() ? "" : " · касса не сведена",
                             m.reportedMs() == 0 ? " · продаж ещё не было"
-                                    : quiet ? " · продаж не было " + ago(now - m.reportedMs()) : ""));
+                                    : quiet ? " · последняя продажа " + ago(now - m.reportedMs()) : ""));
                 }
                 if (anyOpen) {
                     sb.append("  не сведено: + бот ещё возьмёт из буфера, − ещё сдаст; сводит сам, "
@@ -1085,6 +1083,21 @@ public final class InfoBot implements Runnable {
         }
     }
 
+    /**
+     * Предел постановок бота для показа. Живой предел задан в юните бота (`placements-per-day`), а карта
+     * ExecLimits устарела: сводка показывала «159 из 95» (05.11.2026). Поэтому карта задаётся и в юните сводки:
+     * {@code -Drevx.info.caps=a:160,b:175}. При смене предела у бота менять и здесь.
+     */
+    static int capOf(String botId) {
+        for (String one : System.getProperty("revx.info.caps", "").split(",")) {
+            String[] p = one.trim().split(":");
+            if (p.length == 2 && p[0].equalsIgnoreCase(botId)) {
+                return Integer.parseInt(p[1].trim());
+            }
+        }
+        return ExecLimits.maxPlacementsPerDay(botId);
+    }
+
     private Snapshot read(Watched w) {
         long now = System.currentTimeMillis();
         try (ExecJournal j = ExecJournal.readOnly(w.journalPath())) {
@@ -1103,12 +1116,12 @@ public final class InfoBot implements Runnable {
                     ledger.tradingRealisedSince(dayStartMs(now)),
                     ledger.tradingClosedNotionalSince(dayStartMs(now)),
                     j.placementsSince(now - 86_400_000L),
-                    ExecLimits.maxPlacementsPerDay(w.botId()), null, formOf(j));
+                    capOf(w.botId()), null, formOf(j));
         } catch (Exception e) {
             // Недоступный журнал — это САМ ПО СЕБЕ результат: бот не запускался
             // или упал так, что файла нет. Молчать об этом нельзя.
             return new Snapshot(w.botId(), w.symbol(), false, false, null, 0, 0, 0, 0, 0, 0, 0, 0,
-                    ExecLimits.maxPlacementsPerDay(w.botId()), "журнал недоступен", "");
+                    capOf(w.botId()), "журнал недоступен", "");
         }
     }
 
@@ -1285,7 +1298,7 @@ public final class InfoBot implements Runnable {
                     "%s %s  %s%s — %s%n%s  закрытых пар сегодня %d, доход %+.4f USDC%n"
                             + "  инвентарь %.2f USDC%s, постановок за 24ч %d из %d (%d%%)%n"
                             + "  оборот сегодня %.2f USDC, доход %+.1f б.п. оборота%n"
-                            + "  отводов за час %d, тик %s%s%s%n%n",
+                            + "%s%s%n",
                     mark, s.botId().toUpperCase(Locale.ROOT), s.symbol(),
                     s.form() == null || s.form().isEmpty() ? "" : " · " + s.form(), what,
                     size == null ? "" : "  " + size + "\n",
@@ -1294,8 +1307,8 @@ public final class InfoBot implements Runnable {
                     s.placements24(), s.cap(), pct,
                     s.notional24(),
                     s.notional24() > 0 ? s.realised24() / s.notional24() * 10_000 : 0,
-                    s.parks1h(), age, clamp == null ? "" : ", " + clamp,
-                    s.note() == null ? "" : "\n  ⚠️ " + s.note()));
+                    clamp == null ? "" : "  " + clamp + "\n",
+                    s.note() == null ? "" : "  ⚠️ " + s.note() + "\n"));
         }
         sb.append(String.format(Locale.ROOT,
                 "ИТОГО сегодня (с 00:00): %+.4f USDC%n"
@@ -1304,10 +1317,10 @@ public final class InfoBot implements Runnable {
                 totalRealised, totalInventory, totalPlacements, totalCap));
         // ⚠️ Итоги считаются по ПОКАЗАННЫМ — иначе сумма не сходилась бы со
         // строками выше, а это худший вид неправды в отчёте.
-        sb.append(budgetLine(now));
         sb.append(hiddenNote());
         sb.append(poolLines());
         sb.append(bufferLine());
+        sb.append(fullCapitalLine(totalRealised));
         sb.append(newsLine(now));
         sb.append(unownedNote());
         sb.append(venueLine());
@@ -1321,36 +1334,6 @@ public final class InfoBot implements Runnable {
                 sb.append("⚠️ книга лежит дольше плановых 14 суток — ночная чистка "
                         + "не доехала (~/revx-prune.log на micro)\n");
             }
-        }
-        return sb.toString();
-    }
-
-    /**
-     * ОБЩЕЕ ВЕДРО ПОСТАНОВОК и давление каждого бота (29.09.2026, просьба
-     * владельца). Давление раздвигает бид до +50%, и прежде увидеть его можно было
-     * только в журнале: 29.09 бот d пять часов стоял с удвоенным отступом, а
-     * сводка показывала «торгует».
-     */
-    String budgetLine(long now) {
-        java.util.List<String> ids = new java.util.ArrayList<>();
-        for (Watched w : visible()) {
-            ids.add(read(w).botId());
-        }
-        java.util.Map<String, PlacementBudget.State> states =
-                PlacementBudget.readOnly(allocPath, ids, now);
-        if (states == null || states.isEmpty()) {
-            return "";
-        }
-        PlacementBudget.State any = states.values().iterator().next();
-        StringBuilder sb = new StringBuilder(String.format(Locale.ROOT,
-                "%n%nВЕДРО ПОСТАНОВОК: %.0f из %.0f, за сутки выдано %d%n",
-                any.tokens(), PlacementBudget.CAPACITY, any.totalSpendDay()));
-        for (var e : states.entrySet()) {
-            PlacementBudget.State s = e.getValue();
-            double p = s.pressure();
-            sb.append(String.format(Locale.ROOT, "  %s %d/%d гарант., давление %.2f%s%n",
-                    e.getKey().toUpperCase(Locale.ROOT), s.ownSpendDay(), s.ownFloor(), p,
-                    p > 0.01 ? String.format(Locale.ROOT, " → бид +%.0f%%", p * 50) : ""));
         }
         return sb.toString();
     }
@@ -1428,6 +1411,39 @@ public final class InfoBot implements Runnable {
             free.put(e.getKey(), e.getValue().total() - claimed.getOrDefault(e.getKey(), 0.0));
         }
         return bufferText(caps, free, px, lots);
+    }
+
+    /**
+     * НОРМА ПРИБЫЛИ НА ПОЛНЫЙ КАПИТАЛ (05.11.2026, владелец): всё, что лежит на счёте, вместе с буферами —
+     * буфер тоже деньги, которые должны работать, и чем больше лотов в потолке, тем он меньше.
+     * Считается по торгуемым монетам и USDC; без остатков или курса строки нет.
+     */
+    private String fullCapitalLine(double realisedToday) {
+        java.util.Set<String> bases = new java.util.TreeSet<>();
+        watched.forEach(w -> bases.add(w.base()));
+        java.util.Map<String, Double> px = prices(bases);
+        Balances bal = venueBalances();
+        if (bal.byCurrency().isEmpty() || !bal.byCurrency().containsKey("USDC")) {
+            return "";
+        }
+        double usd = bal.byCurrency().get("USDC").total();
+        for (String b : bases) {
+            Balance one = bal.byCurrency().get(b);
+            Double p = px.get(b);
+            if (one != null && p != null && p > 0) {
+                usd += one.total() * p;
+            }
+        }
+        return fullCapitalText(usd, realisedToday);
+    }
+
+    static String fullCapitalText(double capitalUsd, double realisedToday) {
+        if (capitalUsd <= 0) {
+            return "";
+        }
+        return String.format(Locale.ROOT, "%n%nПОЛНЫЙ КАПИТАЛ (всё на счёте, с буферами): %.2f USDC%n"
+                + "  доход сегодня %+.4f USDC = %+.3f%% на полный капитал",
+                capitalUsd, realisedToday, 100 * realisedToday / capitalUsd);
     }
 
     /** Лотов в потолке бота — из последнего события {@code sizing}; 0, если записи нет. */
@@ -1569,10 +1585,10 @@ public final class InfoBot implements Runnable {
                 sum += r.usd();
             }
         }
-        return "\n\n⚠️ НИЧЕЙНОЕ (ни за кем не числится):" + sb
+        return "\n\nНИЧЕЙНОЕ (буфер счёта, ни за кем не числится):" + sb
                 + String.format(Locale.ROOT, "\n  всего %.2f USDC%s", sum,
                         gaps ? " (без тех, у кого нет цены)" : "")
-                + "\nэтим никто не торгует — подробности /alloc";
+                + "\nподробности /alloc";
     }
 
     /**

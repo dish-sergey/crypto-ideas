@@ -34,6 +34,26 @@ class InfoBotBufferTest {
         assertFalse(s.contains("ETH 35%⚠️"), s);
     }
 
+    @Test
+    void пределИзЮнитаСводки() {
+        System.setProperty("revx.info.caps", "a:160,b:175");
+        try {
+            org.junit.jupiter.api.Assertions.assertEquals(160, InfoBot.capOf("a"));
+            org.junit.jupiter.api.Assertions.assertEquals(175, InfoBot.capOf("B"));
+            org.junit.jupiter.api.Assertions.assertEquals(235, InfoBot.capOf("d"));   // нет в карте — прежняя
+        } finally {
+            System.clearProperty("revx.info.caps");
+        }
+    }
+
+    @Test
+    void нормаПрибылиНаПолныйКапитал() {
+        String s = InfoBot.fullCapitalText(2000, 5);
+        assertTrue(s.contains("ПОЛНЫЙ КАПИТАЛ (всё на счёте, с буферами): 2000.00 USDC"), s);
+        assertTrue(s.contains("+5.0000 USDC = +0.250% на полный капитал"), s);
+        assertTrue(InfoBot.fullCapitalText(0, 5).isEmpty());
+    }
+
     /** Порог — один лот на бота (05.11.2026): потолок пары $260, лоты $55.79 + $108.33. */
     @Test
     void порогОдинЛотНаБота() {
