@@ -2072,6 +2072,8 @@ public final class QuoteLoop implements Runnable {
     }
     private java.util.TreeMap<Long, Long> fallIntervals;
     private boolean fallLast;
+    /** Сигнал падения поднимает цену запаса бида на столько б.п.: отступ выбирает функция (05.11.2026, док. 236); бид не паркуется. */
+    static final double FALL_INV_BP = Double.parseDouble(System.getProperty("revx.exec.fall-inv-bp", "0"));
 
     private boolean fallSignalOn(long now) {
         if (fallIntervals == null) {
@@ -2181,6 +2183,73 @@ public final class QuoteLoop implements Runnable {
         return lo == 0 ? 0 : fairHistPx[(fairHistHead + lo - 1) & 8191];
     }
 
+
+    /**
+     * БУРЯ ПО ВОЛАТИЛЬНОСТИ ЧАСА (05.11.2026, док. 236): СКО 30-секундных ходов опоры за
+     * последний час (120 непересекающихся шагов) выше порога монеты — цена запаса бида
+     * растёт на {@code storm-inv-bp}, отступ выбирает функция. Порог — 80-й перцентиль
+     * 15.09–17.10: {@code revx.exec.storm-vol=BTC:3.81,ETH:5.12,SOL:6.38}. По умолчанию выключено.
+     */
+    static final double STORM_INV_BP = Double.parseDouble(System.getProperty("revx.exec.storm-inv-bp", "0"));
+    /** Доля лота покупки на сигнале падения / в бурю (1 — как было). */
+    static final double FALL_LOT_MULT = Double.parseDouble(System.getProperty("revx.exec.fall-lot-mult", "1"));
+    static final double STORM_LOT_MULT = Double.parseDouble(System.getProperty("revx.exec.storm-lot-mult", "1"));
+    private boolean stormLast;
+    private long stormCheckedMs;
+    private double stormVolBp = Double.NaN;
+
+    static double stormThreshold(String spec, String coin) {
+        if (spec == null) {
+            return Double.NaN;
+        }
+        for (String p : spec.split(",")) {
+            String[] kv = p.trim().split(":");
+            if (kv.length == 2 && kv[0].trim().equalsIgnoreCase(coin)) {
+                return Double.parseDouble(kv[1].trim());
+            }
+        }
+        return Double.NaN;
+    }
+
+    /** СКО 30-секундных ходов опоры за час, б.п.; NaN, если истории меньше часа. */
+    double hourVolBp(long now) {
+        if (fairHistN == 0 || now - fairHistTs[fairHistHead] < 3_600_000L) {
+            return Double.NaN;
+        }
+        double s = 0;
+        int m = 0;
+        double prev = fairAt(now - 3_600_000L);
+        for (int k = 119; k >= 0; k--) {
+            double cur = fairAt(now - k * 30_000L);
+            if (prev > 0 && cur > 0) {
+                double r = Math.log(cur / prev) * 1e4;
+                s += r * r;
+                m++;
+            }
+            prev = cur;
+        }
+        return m > 60 ? Math.sqrt(s / m) : Double.NaN;
+    }
+
+    private boolean stormOn(long now) {
+        if (STORM_INV_BP <= 0 && STORM_LOT_MULT >= 1) {
+            return false;
+        }
+        if (now - stormCheckedMs < 10_000) {
+            return stormLast;
+        }
+        stormCheckedMs = now;
+        double thr = stormThreshold(System.getProperty("revx.exec.storm-vol"), symbol.split("[^A-Za-z]")[0]);
+        stormVolBp = hourVolBp(now);
+        boolean on = thr > 0 && stormVolBp >= thr;
+        if (on != stormLast) {
+            stormLast = on;
+            journal.event(on ? "storm_on" : "storm_off", String.format(java.util.Locale.ROOT,
+                    "%s: СКО 30 с за час %.2f б.п. %s порога %.2f — цена запаса бида %s на %.0f б.п., запас %s",
+                    symbol, stormVolBp, on ? "выше" : "ниже", thr, on ? "выше" : "обычная", STORM_INV_BP, fmt(inventory)));
+        }
+        return on;
+    }
     /** Тихо ли сейчас; пересчёт не чаще раза в 5 с, переходы — в журнал. */
     private boolean quiet(long now) {
         if (buyQuiet == null) {
@@ -4024,7 +4093,7 @@ public final class QuoteLoop implements Runnable {
                         "%s: сигнал падения %s — бид %s, запас %s", symbol, on ? "выше порога" : "ниже порога",
                         on ? "отведён" : "вернулся", fmt(inventory)));
             }
-            if (on && target.hasBid()) {
+            if (on && target.hasBid() && FALL_INV_BP <= 0) {
                 if (FALL_WIDEN_BP > 0) {
                     // мягкий вариант: бид не уходит, а отступает на FALL_WIDEN_BP (функция делает то же — см. funcPrice)
                     target = new Quoter.Quotes(target.bid() * (1 - FALL_WIDEN_BP / 1e4), target.ask());
@@ -5453,11 +5522,15 @@ public final class QuoteLoop implements Runnable {
             // запас для таблицы — в «лотах таблицы»: revx.exec.func-inv-lots-scale[-<бот>], стенд мелкого лота (док. 236); по умолчанию 1
             q *= Double.parseDouble(System.getProperty("revx.exec.func-inv-lots-scale-" + tag.id(), System.getProperty("revx.exec.func-inv-lots-scale", "1")));
             double head = FUNC_MU_HEAD_BID_ONLY && !buy ? 0 : funcMuHeadNow(fair);
-            shift = funcMu + head + (funcInv == null ? 0 : buy ? invPrice(funcInv[0], q) : invPrice(funcInv[1], q - 1));
+            shift = funcMu + head + (funcInv == null ? 0 : buy ? invPrice(funcInv[0], q) : invPrice(funcInv[1], q - 1))
+                    + (buy && FALL_FILE != null && FALL_INV_BP > 0 && fallLast ? FALL_INV_BP : 0)
+                    + (buy && stormOn(clock.now()) ? STORM_INV_BP : 0);
             funcMuSum += funcMu;
             funcMuHeadSum += head;
             funcMuN++;
         }
+        double f15 = c.length == 24 ? fairAt(clock.now() - 900_000L) : 0;
+        double r15 = f15 > 0 ? (fair / f15 - 1) * 10_000 : 0;      // ход опоры за 15 мин, б.п. (только для 24 коэффициентов)
         double bestD = FUNC_RATE ? 0 : Double.NEGATIVE_INFINITY, bestP = Double.NaN, bestBp = 0;
         for (double d = Math.ceil(lo); d <= hi + 1e-9; d += 1) {
             double p = buy ? fair * (1 - d / 10_000) : fair * (1 + d / 10_000);
@@ -5470,7 +5543,7 @@ public final class QuoteLoop implements Runnable {
                     ahead += l.qty() * l.price();
                 }
             }
-            double dv = FUNC_RATE ? funcRateValue(c, d, Math.log1p(ahead), f, n, spr, shift) : funcValue(c, d, Math.log1p(ahead), f, n, spr);
+            double dv = FUNC_RATE ? funcRateValue(c, d, Math.log1p(ahead), f, n, spr, shift, r15) : funcValue(c, d, Math.log1p(ahead), f, n, spr, r15);
             if (dv > bestD) {
                 bestD = dv;
                 bestP = p;
@@ -5540,25 +5613,40 @@ public final class QuoteLoop implements Runnable {
 
     /** D = P × M по коэффициентам строки (c0…c8, m0…m8). */
     static double funcValue(double[] c, double d, double l, double f, double n, double s) {
-        double[] x = {1, d, d * d, l, d * l, f, d * f, n, s};
+        return funcValue(c, d, l, f, n, s, 0);
+    }
+
+    static double funcValue(double[] c, double d, double l, double f, double n, double s, double r) {
+        double[] zm = funcZM(c, d, l, f, n, s, r);
+        return zm[1] / (1 + Math.exp(-zm[0]));
+    }
+
+    /**
+     * z и M функции. 18 коэффициентов — прежние 9 признаков; 24 — плюс ход опоры за 15 мин R, δ·R и min(R, 0), а M
+     * обучен на СЫРОМ маркауте, без вычитания хода часа (06.11.2026, док. 236: вычитание стирало продолжение падения,
+     * и покупки на падении выглядели лучшими, хотя они худшие).
+     */
+    static double[] funcZM(double[] c, double d, double l, double f, double n, double s, double r) {
+        boolean ext = c.length == 24;
+        double[] x = ext ? new double[]{1, d, d * d, l, d * l, f, d * f, n, s, r, d * r, Math.min(r, 0)} : new double[]{1, d, d * d, l, d * l, f, d * f, n, s};
+        int k = x.length;
         double z = 0, m = 0;
-        for (int j = 0; j < 9; j++) {
+        for (int j = 0; j < k; j++) {
             z += c[j] * x[j];
-            m += c[9 + j] * x[j];
+            m += c[k + j] * x[j];
         }
-        return m / (1 + Math.exp(-z));
+        return new double[]{z, m};
     }
 
     /** Док. 225: скорость снятия −ln(1 − P)/5 (раз в минуту) × (M − p). */
     static double funcRateValue(double[] c, double d, double l, double f, double n, double s, double p) {
-        double[] x = {1, d, d * d, l, d * l, f, d * f, n, s};
-        double z = 0, m = 0;
-        for (int j = 0; j < 9; j++) {
-            z += c[j] * x[j];
-            m += c[9 + j] * x[j];
-        }
-        double pr = Math.min(0.999, 1 / (1 + Math.exp(-z)));
-        return -Math.log1p(-pr) / 5 * (m - p);
+        return funcRateValue(c, d, l, f, n, s, p, 0);
+    }
+
+    static double funcRateValue(double[] c, double d, double l, double f, double n, double s, double p, double r) {
+        double[] zm = funcZM(c, d, l, f, n, s, r);
+        double pr = Math.min(0.999, 1 / (1 + Math.exp(-zm[0])));
+        return -Math.log1p(-pr) / 5 * (zm[1] - p);
     }
 
     private java.util.List<java.util.TreeMap<java.time.LocalDate, double[]>> funcByDay;
@@ -5573,7 +5661,7 @@ public final class QuoteLoop implements Runnable {
             for (String line : java.nio.file.Files.readAllLines(java.nio.file.Path.of(file))) {
                 String[] p = line.trim().split(";");
                 if (p.length != 21) {
-                    if (p.length == 20) {
+                    if (p.length == 20 || p.length == 26) {
                         return null;          // обычный файл без дат
                     }
                     continue;
@@ -5598,11 +5686,11 @@ public final class QuoteLoop implements Runnable {
         try {
             for (String line : java.nio.file.Files.readAllLines(java.nio.file.Path.of(file))) {
                 String[] p = line.trim().split(";");
-                if (p.length != 20 || !p[0].equalsIgnoreCase(coin)) {
+                if ((p.length != 20 && p.length != 26) || !p[0].equalsIgnoreCase(coin)) {
                     continue;
                 }
-                double[] c = new double[18];
-                for (int j = 0; j < 18; j++) {
+                double[] c = new double[p.length - 2];
+                for (int j = 0; j < c.length; j++) {
                     c[j] = Double.parseDouble(p[2 + j]);
                 }
                 out[Integer.parseInt(p[1])] = c;
@@ -7003,6 +7091,11 @@ public final class QuoteLoop implements Runnable {
                 && (side == Side.BUY || !"bid".equals(RANGE_WIDEN_LOT_SIDE))) {
             want *= RANGE_WIDEN_LOT;          // в бурю — дробный лот (владелец 16.10.2026)
         }
+        if (side == Side.BUY) {
+            // на сигнале падения и в бурю покупка меньшим лотом (владелец 06.11.2026, док. 236)
+            if (FALL_LOT_MULT < 1 && FALL_FILE != null && fallLast) want *= FALL_LOT_MULT;
+            if (STORM_LOT_MULT < 1 && stormLast) want *= STORM_LOT_MULT;
+        }
         if (side == Side.SELL && panicSizing) {
             want = Double.MAX_VALUE;          // экстренная продажа: весь запас одной заявкой
         } else if (side == Side.SELL && ASK_LOT_MULT != 1.0) {
@@ -7632,7 +7725,7 @@ public final class QuoteLoop implements Runnable {
             // нужна: исполнения приходят лентой, а 422 в затык — призрак без
             // наследника. Она давала только ложные тревоги «касса котла изменилась»
             // на любой /claim, /release или пополнение счёта (28.09.2026).
-            if (response.status() == 422 && heirPossible && !(VENUE_LOCKS && ledgerActive())) {
+            if (replaceMayHaveActed(response) && heirPossible && !(VENUE_LOCKS && ledgerActive())) {
                 // Запоминаем и СВОБОДНУЮ КАССУ в котле на этот момент: уликой
                 // служит её ИЗМЕНЕНИЕ, а не размер — см. claimHeirIfEvidenceMatches.
                 heir = new Heir(side, size, price, heirClientId, clock.now(), freePot(clock.now()));
@@ -7642,7 +7735,7 @@ public final class QuoteLoop implements Runnable {
             // Предок снят внутри этого же запроса, наследника нет, а резерв
             // предка площадка держит часами. Запоминаем, СКОЛЬКО он держал: это
             // наше, но недоступное, пока сверка не скажет иначе.
-            if (VENUE_LOCKS && response.status() == 422 && heirPossible
+            if (VENUE_LOCKS && replaceMayHaveActed(response) && heirPossible
                     && response.latencyMs() >= SLOW_REPLACE_MS && resting.size > 0) {
                 addGhostSuspect(side, resting.size, resting.price);
             }
@@ -7654,6 +7747,19 @@ public final class QuoteLoop implements Runnable {
             reconcile("отказ замены");
             refreshBalances();
         }
+    }
+
+    /**
+     * Мог ли неудачный ответ на замену всё же снять предка и родить наследника.
+     *
+     * 🔑 Не только 422: 05.11.2026 в 19:38:50 (затык, замены по 3–5 с) площадка
+     * ответила a/c/e/d на замену покупки {@code 500 Something went wrong!}, и после
+     * этого 352 USDC остались в резерве без видимой заявки — тот же призрак. Подозрение
+     * на 500 не заводилось, резерв нашёл только общий сторож. Ответ 5xx и потерянный
+     * ответ значат «что сделано — неизвестно», и это то же, что 422 в затык.
+     */
+    static boolean replaceMayHaveActed(Venue.Response r) {
+        return r.status() == 422 || r.status() >= 500 || r.lost();
     }
 
     /**
