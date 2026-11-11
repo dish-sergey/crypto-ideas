@@ -5509,6 +5509,13 @@ public final class QuoteLoop implements Runnable {
             lo = Math.max(lo, baseBp - FUNC_BAND_IN_BP);
             hi = Math.min(hi, baseBp + FUNC_BAND_OUT_BP);
         }
+        if (buy && FUNC_STORM_FLOOR != null) {
+            double floor = stormThreshold(FUNC_STORM_FLOOR, symbol.split("[^A-Za-z]")[0]);
+            if (floor > 0 && funcStormFloorOn(clock.now())) {
+                lo = Math.max(lo, floor);
+                funcStormFloorTicks++;
+            }
+        }
         double[] c = funcCoef[s];
         double shift = 0;
         if (FUNC_RATE) {
@@ -5522,15 +5529,25 @@ public final class QuoteLoop implements Runnable {
             // запас для таблицы — в «лотах таблицы»: revx.exec.func-inv-lots-scale[-<бот>], стенд мелкого лота (док. 236); по умолчанию 1
             q *= Double.parseDouble(System.getProperty("revx.exec.func-inv-lots-scale-" + tag.id(), System.getProperty("revx.exec.func-inv-lots-scale", "1")));
             double head = FUNC_MU_HEAD_BID_ONLY && !buy ? 0 : funcMuHeadNow(fair);
-            shift = funcMu + head + (funcInv == null ? 0 : buy ? invPrice(funcInv[0], q) : invPrice(funcInv[1], q - 1))
+            trInv = funcInv == null ? 0 : buy ? invPrice(funcInv[0], q) : invPrice(funcInv[1], q - 1);
+            trStorm = buy && stormOn(clock.now()) ? STORM_INV_BP : 0;
+            trMu = funcMu;
+            trHead = head;
+            shift = funcMu + head + trInv
                     + (buy && FALL_FILE != null && FALL_INV_BP > 0 && fallLast ? FALL_INV_BP : 0)
-                    + (buy && stormOn(clock.now()) ? STORM_INV_BP : 0);
+                    + trStorm;
             funcMuSum += funcMu;
             funcMuHeadSum += head;
             funcMuN++;
         }
-        double f15 = c.length == 24 ? fairAt(clock.now() - 900_000L) : 0;
+        double f15 = c.length >= 24 ? fairAt(clock.now() - 900_000L) : 0;
         double r15 = f15 > 0 ? (fair / f15 - 1) * 10_000 : 0;      // ход опоры за 15 мин, б.п. (только для 24 коэффициентов)
+        if (c.length == 22) {
+            // 22 коэффициента (док. 239): девятый и десятый признаки — V = ln(СКО 30-секундных ходов опоры за час) и δ·V.
+            // Через r в funcZM передаётся V; пока истории меньше часа — медиана обучения ETH (3.81 б.п.).
+            double hv = hourVolBp(clock.now());
+            r15 = Math.log(Math.max(0.5, Double.isNaN(hv) ? 3.81 : hv));
+        }
         double bestD = FUNC_RATE ? 0 : Double.NEGATIVE_INFINITY, bestP = Double.NaN, bestBp = 0;
         for (double d = Math.ceil(lo); d <= hi + 1e-9; d += 1) {
             double p = buy ? fair * (1 - d / 10_000) : fair * (1 + d / 10_000);
@@ -5596,7 +5613,74 @@ public final class QuoteLoop implements Runnable {
         }
         funcTicks[s]++;
         funcBpSum[s] += bestBp;
+        if (FUNC_TRACE != null && clock.now() - funcTraceLast[s] >= FUNC_TRACE_MS) {
+            funcTraceLast[s] = clock.now();
+            double ahead = 0;
+            for (org.home.data.revx.sim.BookView.Level l : lv) {
+                if (buy ? l.price() >= bestP - 1e-12 : l.price() <= bestP + 1e-12) {
+                    ahead += l.qty() * l.price();
+                }
+            }
+            funcTrace(String.format(java.util.Locale.ROOT, "%d,%s,%s,%.8g,%.8g,%.10g,%.2f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.0f,%.0f,%.3f",
+                    clock.now(), tag.id(), buy ? "buy" : "sell", inventory, params.size(), fair, bestBp, baseBp,
+                    trInv, trStorm, trMu, trHead, spr, n, f, ahead, r15));
+        }
         return bestP;
+    }
+
+    /**
+     * ЗАПИСЬ СЛАГАЕМЫХ ОТСТУПА ФУНКЦИИ (10.11.2026, план 239 шаг 1). {@code revx.exec.func-trace=<файл>} — раз в
+     * {@code func-trace-ms} (30 с) на сторону строка: время, бот, сторона, запас, лот, опора, выбранный δ, δ цели до
+     * функции, цена запаса по таблице, добавка бури, μ ведра, надбавка от остатка, спред, n, f, $ впереди на выбранной
+     * цене, ход опоры за 15 мин, расстояние базы. Пусто — выключено.
+     */
+    /**
+     * ПОЛ БИДА ФУНКЦИИ В БУРЮ (10.11.2026, план 239 шаг 2, грубая затычка). {@code revx.exec.func-storm-floor=ETH:12} —
+     * когда СКО 30-секундных ходов опоры за час не ниже порога монеты ({@code func-storm-floor-vol}, по умолчанию
+     * 80-й перцентиль 15.09–17.10, как у бури), функция не ставит бид ближе N б.п. к опоре. Монеты, которых нет в списке,
+     * не трогаются. Повод: у пустого ETH в бурю функция по признаку потока за час подводит бид к 8 б.п. (док. 239).
+     */
+    static final String FUNC_STORM_FLOOR = blankToNull(System.getProperty("revx.exec.func-storm-floor", ""));
+    static final String FUNC_STORM_FLOOR_VOL = System.getProperty("revx.exec.func-storm-floor-vol", "BTC:3.81,ETH:5.12,SOL:6.38");
+    private long funcStormFloorTicks;
+    private long funcStormFloorCheckedMs = Long.MIN_VALUE / 2;
+    private boolean funcStormFloorLast;
+
+    private boolean funcStormFloorOn(long now) {
+        if (now - funcStormFloorCheckedMs < 10_000) {
+            return funcStormFloorLast;
+        }
+        funcStormFloorCheckedMs = now;
+        double thr = stormThreshold(FUNC_STORM_FLOOR_VOL, symbol.split("[^A-Za-z]")[0]);
+        double v = hourVolBp(now);
+        funcStormFloorLast = thr > 0 && v >= thr;
+        return funcStormFloorLast;
+    }
+
+    /** Для стенда: сколько тиков действовал пол бида в бурю. */
+    public long funcStormFloorTicks() {
+        return funcStormFloorTicks;
+    }
+
+    static final String FUNC_TRACE = blankToNull(System.getProperty("revx.exec.func-trace", ""));
+    static final long FUNC_TRACE_MS = Long.getLong("revx.exec.func-trace-ms", 30_000L);
+    private final long[] funcTraceLast = {Long.MIN_VALUE / 2, Long.MIN_VALUE / 2};
+    private double trInv, trStorm, trMu, trHead;
+    private static java.io.PrintWriter funcTraceOut;
+
+    private static synchronized void funcTrace(String line) {
+        try {
+            if (funcTraceOut == null) {
+                boolean fresh = !java.nio.file.Files.exists(java.nio.file.Path.of(FUNC_TRACE));
+                funcTraceOut = new java.io.PrintWriter(new java.io.FileWriter(FUNC_TRACE, java.nio.charset.StandardCharsets.UTF_8, true), true);
+                if (fresh) {
+                    funcTraceOut.println("ts_ms,bot,side,inventory,lot,fair,delta_bp,target_bp,inv_price,storm,mu,head,spread_bp,n,f,ahead_usd,r15_bp");
+                }
+            }
+            funcTraceOut.println(line);
+        } catch (java.io.IOException e) {
+            // запись слагаемых — справочная; её сбой не должен трогать котирование
+        }
     }
 
     /**
@@ -5627,16 +5711,28 @@ public final class QuoteLoop implements Runnable {
      * и покупки на падении выглядели лучшими, хотя они худшие).
      */
     static double[] funcZM(double[] c, double d, double l, double f, double n, double s, double r) {
-        boolean ext = c.length == 24;
-        double[] x = ext ? new double[]{1, d, d * d, l, d * l, f, d * f, n, s, r, d * r, Math.min(r, 0)} : new double[]{1, d, d * d, l, d * l, f, d * f, n, s};
+        boolean ext = c.length >= 24;
+        double[] x = ext ? new double[]{1, d, d * d, l, d * l, f, d * f, n, s, r, d * r, Math.min(r, 0)}
+                : c.length == 22 ? new double[]{1, d, d * d, l, d * l, f, d * f, n, s, r, d * r}   // r = V (док. 239)
+                : new double[]{1, d, d * d, l, d * l, f, d * f, n, s};
         int k = x.length;
         double z = 0, m = 0;
         for (int j = 0; j < k; j++) {
             z += c[j] * x[j];
             m += c[k + j] * x[j];
         }
+        if (c.length == 36 && FUNC_TAIL_LAMBDA > 0) {
+            double t = 0;
+            for (int j = 0; j < k; j++) {
+                t += c[2 * k + j] * x[j];
+            }
+            m -= FUNC_TAIL_LAMBDA * Math.max(0, t);   // штраф за хвост: ожидаемый убыток хуже −30 б.п. (06.11.2026, док. 236)
+        }
         return new double[]{z, m};
     }
+
+    /** Вес штрафа за хвост в функции с 36 коэффициентами (третья регрессия T = E[max(0, −маркаут − 30)]); 0 — без штрафа. */
+    static final double FUNC_TAIL_LAMBDA = Double.parseDouble(System.getProperty("revx.exec.func-tail-lambda", "0"));
 
     /** Док. 225: скорость снятия −ln(1 − P)/5 (раз в минуту) × (M − p). */
     static double funcRateValue(double[] c, double d, double l, double f, double n, double s, double p) {
@@ -5661,7 +5757,7 @@ public final class QuoteLoop implements Runnable {
             for (String line : java.nio.file.Files.readAllLines(java.nio.file.Path.of(file))) {
                 String[] p = line.trim().split(";");
                 if (p.length != 21) {
-                    if (p.length == 20 || p.length == 26) {
+                    if (p.length == 20 || p.length == 24 || p.length == 26 || p.length == 38) {
                         return null;          // обычный файл без дат
                     }
                     continue;
@@ -5686,7 +5782,7 @@ public final class QuoteLoop implements Runnable {
         try {
             for (String line : java.nio.file.Files.readAllLines(java.nio.file.Path.of(file))) {
                 String[] p = line.trim().split(";");
-                if ((p.length != 20 && p.length != 26) || !p[0].equalsIgnoreCase(coin)) {
+                if ((p.length != 20 && p.length != 24 && p.length != 26 && p.length != 38) || !p[0].equalsIgnoreCase(coin)) {
                     continue;
                 }
                 double[] c = new double[p.length - 2];
