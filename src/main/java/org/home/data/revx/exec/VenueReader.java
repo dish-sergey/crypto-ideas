@@ -165,7 +165,7 @@ public class VenueReader {
             log.warn("зонд затыков включён: {} — заявка на ~{} USDC на {}% ниже рынка, замена раз в {} мс",
                     probeSymbol, StallProbe.NOTIONAL, (int) (StallProbe.AWAY * 100), StallProbe.PERIOD_MS);
         }
-        try (ResultSet rs = db.createStatement().executeQuery(
+        try (Statement qs = db.createStatement(); ResultSet rs = qs.executeQuery(
                 "SELECT symbol, MAX(tdt) FROM trade GROUP BY symbol")) {
             while (rs.next()) {
                 lastTdt.put(rs.getString(1), rs.getLong(2));
@@ -388,7 +388,7 @@ public class VenueReader {
         exec("INSERT OR REPLACE INTO raw_response(name, started_ms, body) VALUES(?,?,?)",
                 VenueReads.BALANCES, started, r.body);
         Map<String, Double> visible = new HashMap<>();
-        try (ResultSet rs = db.createStatement().executeQuery(
+        try (Statement qs = db.createStatement(); ResultSet rs = qs.executeQuery(
                 "SELECT symbol, side, leaves, price FROM live_order")) {
             while (rs.next()) {
                 String[] p = rs.getString(1).split("[/-]");

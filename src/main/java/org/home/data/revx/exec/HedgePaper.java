@@ -436,7 +436,7 @@ public class HedgePaper {
 
     /** После перезапуска виртуальные позиции продолжаются с того же места. */
     private void restore() throws Exception {
-        try (ResultSet rs = db.createStatement().executeQuery(
+        try (Statement qs = db.createStatement(); ResultSet rs = qs.executeQuery(
                 "SELECT bot, rule, perp, cash, fees, funding, trades, makers, pend_qty, pend_px, "
                         + "pend_ts, last_periodic FROM paper_state")) {
             while (rs.next()) {

@@ -13,6 +13,7 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.Statement;
 import java.time.Duration;
 import java.util.Locale;
 import java.util.UUID;
@@ -158,7 +159,7 @@ final class StallProbe {
 
     /** Своя заявка из последнего снимка активных — после перезапуска читателя. */
     private String adopt() throws Exception {
-        try (ResultSet rs = db.createStatement().executeQuery(
+        try (Statement qs = db.createStatement(); ResultSet rs = qs.executeQuery(
                 "SELECT oid FROM live_order WHERE client_order_id LIKE '" + PREFIX + "%' LIMIT 1")) {
             return rs.next() ? rs.getString(1) : null;
         }
