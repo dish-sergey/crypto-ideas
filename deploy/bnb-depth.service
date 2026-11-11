@@ -1,0 +1,14 @@
+[Unit]
+Description=Binance full order book (diff depth + snapshots), spot and perp, BTC/ETH/SOL — static-liquidity study 12.11.2026
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/home/ubuntu/bin/bnb-depth-collect.sh
+Restart=always
+RestartSec=10
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

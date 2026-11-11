@@ -13,7 +13,7 @@ set -u
 ROOT=${DATA_ARCHIVE:-/c/data-archive}
 KEYDIR=${KEYDIR:-$HOME/.ssh/data-keys}
 LOG=$ROOT/checks/pull-$(date +%Y%m%d).log
-mkdir -p "$ROOT"/{revx-inc,revx-sim-inc,binance-book,kraken-book,journal-archive,crypto-db,checks} "$ROOT"/binance-deriv/{perp,perpbook,spot,oi} "$KEYDIR"
+mkdir -p "$ROOT"/{revx-inc,revx-sim-inc,binance-book,kraken-book,journal-archive,crypto-db,checks} "$ROOT"/binance-deriv/{perp,perpbook,spot,oi} "$ROOT"/binance-depth/{spot,perp,spotsnap,perpsnap} "$KEYDIR"
 exec > >(tee -a "$LOG") 2>&1
 
 # Ключи: ssh под Windows не берёт файл с широкими правами, поэтому — копия без CR с chmod 600.
@@ -62,6 +62,11 @@ pull "$KARM"    $ARM    '~/revx-journal-archive'  '*.db.gz'                 "$RO
 # Запись деривативов и спота Бинанса (шаг Б док. 197, с 25.10.2026): на micro хранится 45 суток.
 for d in perp perpbook spot oi; do
   pull "$KMICRO" $MICRO "~/binance-deriv/$d" 'book-*.jsonl.gz' "$ROOT/binance-deriv/$d" gz
+done
+# Полный стакан Бинанса (bnb-depth, с 12.11.2026): изменения и снимки спота и перпа BTC/ETH/SOL, ~1 ГБ/сут сжатого.
+# ⚠️ На micro хранится только 7 суток: пропуск забора дольше недели — дыра навсегда.
+for d in spot perp spotsnap perpsnap; do
+  pull "$KMICRO" $MICRO "~/binance-depth/$d" 'book-*.jsonl.gz' "$ROOT/binance-depth/$d" gz
 done
 
 # Раз в неделю — снимок базы слоя данных (её копирует и Litestream в B2; локальная — на случай,

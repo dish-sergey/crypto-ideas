@@ -38,6 +38,8 @@ d=$(Q $D "select max(day) from onchain_daily"); [ -n "$d" ] && fresh "ончей
 fresh "захват книги Бинанса" $(age_file "$HOME/binance-book/book-*") 600
 fresh "захват книги Kraken" $(age_file "$HOME/kraken-book/book-*") 600
 for d in perp perpbook spot oi; do fresh "запись Бинанса: $d" $(age_file "$HOME/binance-deriv/$d/book-*") 600; done
+for d in spot perp; do fresh "стакан Бинанса: $d" $(age_file "$HOME/binance-depth/$d/book-*") 600; done
+for d in spotsnap perpsnap; do fresh "стакан Бинанса: $d" $(age_file "$HOME/binance-depth/$d/book-*") 2400; done
 fresh "инкремент стенда (revx-backup)" $(age_file "$HOME/revx-backups/revx-inc-*.db.gz") 93600
 s=$(stat -c %s $(ls -t ~/revx-backups/revx-inc-*.db.gz | head -1)); [ $s -gt 20000000 ] && echo "OK;размер инкремента;$((s/1000000)) МБ" || echo "FAIL;размер инкремента;$((s/1000000)) МБ — подозрительно мало"
 e=$(sudo journalctl -u litestream --since "-24h" --no-pager 2>/dev/null | grep -ciE "error|fail"); [ "${e:-0}" -lt 20 ] && echo "OK;litestream за сутки;ошибок $e" || echo "WARN;litestream за сутки;ошибок $e"
@@ -78,7 +80,7 @@ if [ -z "$lp" ]; then echo "local;FAIL;забор на диск;ни одног�
 elif [ $(( $(date +%s) - $(stat -c %Y "$lp") )) -gt 129600 ]; then echo "local;FAIL;забор на диск;последний $(basename "$lp")"
 elif grep -q 'ОШИБКА' "$lp"; then echo "local;FAIL;забор на диск;$(grep -c 'ОШИБКА' "$lp") ошибок в $(basename "$lp")"
 else echo "local;OK;забор на диск;$(basename "$lp") без ошибок"; fi
-for d in revx-inc revx-sim-inc binance-book kraken-book journal-archive binance-deriv/perp binance-deriv/perpbook binance-deriv/spot binance-deriv/oi; do
+for d in revx-inc revx-sim-inc binance-book kraken-book journal-archive binance-deriv/perp binance-deriv/perpbook binance-deriv/spot binance-deriv/oi binance-depth/spot binance-depth/perp binance-depth/spotsnap binance-depth/perpsnap; do
   f=$(ls -t "$ROOT/$d" 2>/dev/null | grep -v sha256 | head -1)
   if [ -z "$f" ]; then echo "local;FAIL;копия $d;пусто"; else a=$(( ($(date +%s) - $(stat -c %Y "$ROOT/$d/$f")) / 3600 )); [ $a -le 50 ] && echo "local;OK;копия $d;свежий файл $a ч назад" || echo "local;FAIL;копия $d;свежий файл $a ч назад"; fi
 done

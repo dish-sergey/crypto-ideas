@@ -72,6 +72,7 @@
 | `bnb-book` | `bookTicker` спота Бинанса BTC/ETH/SOL/XRP к USDC | `~/binance-book` | `deploy/bnb-collect.sh` |
 | `kr-book` | книга Kraken | `~/kraken-book` | `deploy/kr-collect.sh` |
 | `bnb-deriv` (с 25.10.2026, шаг Б док. 197) | сделки перпа и марк-цена (`perp`), верх книги перпа (`perpbook`), сделки спота USDT/USDC (`spot`), открытый интерес раз в 15 с (`oi`) | `~/binance-deriv/<поток>` | `deploy/bnb-deriv-collect.sh` |
+| `bnb-depth` (с 12.11.2026) | полный стакан Бинанса: изменения спота и перпа BTC/ETH/SOL к USDT + снимки раз в 15 мин, хранение 7 суток | `~/binance-depth/<поток>` | `deploy/bnb-depth-collect.sh` |
 
 - **Строка файла** — «мс приёма JSON». Сегодняшний файл открыт, вчерашний жмёт `~/bin/bnb-prune.sh` (крон 04:17 / 04:37 / 04:27, `DIR=…`), старше 45 суток удаляется.
 - **Сторож тишины** `~/bnb-rate-check.sh` (крон каждые 15 мин, на каждый каталог свой `STATE`) шлёт тревогу ботом S5, если последняя строка старше 5 минут.

@@ -5530,7 +5530,8 @@ public final class QuoteLoop implements Runnable {
             q *= Double.parseDouble(System.getProperty("revx.exec.func-inv-lots-scale-" + tag.id(), System.getProperty("revx.exec.func-inv-lots-scale", "1")));
             double head = FUNC_MU_HEAD_BID_ONLY && !buy ? 0 : funcMuHeadNow(fair);
             trInv = funcInv == null ? 0 : buy ? invPrice(funcInv[0], q) : invPrice(funcInv[1], q - 1);
-            trStorm = buy && stormOn(clock.now()) ? STORM_INV_BP : 0;
+            trStorm = (buy && stormOn(clock.now()) ? STORM_INV_BP : 0)
+                    + (buy ? stormEmptyBp(clock.now(), params.size() > 0 ? inventory / params.size() : 0) : 0);
             trMu = funcMu;
             trHead = head;
             shift = funcMu + head + trInv
@@ -5660,6 +5661,53 @@ public final class QuoteLoop implements Runnable {
     /** Для стенда: сколько тиков действовал пол бида в бурю. */
     public long funcStormFloorTicks() {
         return funcStormFloorTicks;
+    }
+
+    /**
+     * ЦЕНА ЗАПАСА ПУСТОГО В БУРЮ (12.11.2026, идея владельца). {@code revx.exec.storm-empty-bp=ETH:10} — когда СКО
+     * 30-секундных ходов опоры за час не ниже порога монеты ({@code storm-empty-vol}, по умолчанию 80-й перцентиль, как у
+     * бури) и запас меньше {@code storm-empty-max-lots} лотов (по умолчанию 1), цена запаса бида в функции растёт на N б.п.
+     * сверх всего остального (в том числе «всегда +5»): пустой бот в бурю не набирает первый лот так легко. Монеты, которых
+     * нет в списке, не трогаются. Действует только с ценой запаса ({@code func-rate}).
+     */
+    static final String STORM_EMPTY = blankToNull(System.getProperty("revx.exec.storm-empty-bp", ""));
+    static final String STORM_EMPTY_VOL = System.getProperty("revx.exec.storm-empty-vol", "BTC:3.81,ETH:5.12,SOL:6.38");
+    static final double STORM_EMPTY_MAX_LOTS = Double.parseDouble(System.getProperty("revx.exec.storm-empty-max-lots", "1"));
+    private long stormEmptyTicks;
+    private long stormEmptyCheckedMs = Long.MIN_VALUE / 2;
+    private boolean stormEmptyLast;
+
+    /** Надбавка к цене запаса бида пустого в бурю, б.п.; 0 — не действует. {@code lots} — запас в лотах бота. */
+    private double stormEmptyBp(long now, double lots) {
+        if (STORM_EMPTY == null || lots >= STORM_EMPTY_MAX_LOTS) {
+            return 0;
+        }
+        double add = stormThreshold(STORM_EMPTY, symbol.split("[^A-Za-z]")[0]);
+        if (!(add > 0)) {
+            return 0;
+        }
+        if (now - stormEmptyCheckedMs >= 10_000) {
+            stormEmptyCheckedMs = now;
+            double thr = stormThreshold(STORM_EMPTY_VOL, symbol.split("[^A-Za-z]")[0]);
+            double v = hourVolBp(now);
+            boolean on = thr > 0 && v >= thr;
+            if (on != stormEmptyLast) {
+                journal.event(on ? "storm_empty_on" : "storm_empty_off", String.format(java.util.Locale.ROOT,
+                        "%s: СКО 30 с за час %.2f б.п., порог %.2f — цена запаса пустого бида %s на %.0f б.п.",
+                        symbol, v, thr, on ? "выше" : "обычная", add));
+            }
+            stormEmptyLast = on;
+        }
+        if (!stormEmptyLast) {
+            return 0;
+        }
+        stormEmptyTicks++;
+        return add;
+    }
+
+    /** Для стенда: сколько тиков действовала надбавка пустому в бурю. */
+    public long stormEmptyTicks() {
+        return stormEmptyTicks;
     }
 
     static final String FUNC_TRACE = blankToNull(System.getProperty("revx.exec.func-trace", ""));
