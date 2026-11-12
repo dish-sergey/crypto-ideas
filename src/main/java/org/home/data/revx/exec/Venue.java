@@ -27,6 +27,11 @@ package org.home.data.revx.exec;
  */
 public interface Venue {
 
+    /** Стенд: задержка ответа не прожита, её проживает котировщик (13.11.2026). Живая площадка — false. */
+    default boolean simulated() {
+        return false;
+    }
+
     /** Ответ площадки. {@code body} — сырой JSON, как пришёл. */
     record Response(int status, String body, long latencyMs, long retryAfterMs) {
 

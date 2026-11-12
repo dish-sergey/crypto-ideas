@@ -3809,6 +3809,12 @@ public final class QuoteLoop implements Runnable {
 
     private void tick() {
         rollCounters();
+        if (simBusyUntil > clock.now()) {
+            return;                           // стенд: висит медленная замена — живой бот в это время ничего не делает
+        }
+        if (!deferredInspect.isEmpty()) {
+            runDeferredInspect();
+        }
         offsetScheduleTick(clock.now());
         offsetTempoTick(clock.now());
         StandReader.Fair fair = stand.latest(base, 30_000);
@@ -7996,7 +8002,13 @@ public final class QuoteLoop implements Runnable {
                 // покупка; стенд SOL w1/w6 — двойная продажа, запас до −1.1 лота). Тогда
                 // предка спрашиваем всегда: 404 кладёт его в «судьба неизвестна», его
                 // объём занят, лишняя продажа не встанет, а наследник уменьшится.
-                if (!venueCovers() || response.latencyMs() >= SLOW_REPLACE_MS) {
+                if (client.simulated() && SIM_BLOCKING_REPLACE && response.latencyMs() >= SLOW_REPLACE_MS) {
+                    // 13.11.2026: СТЕНД ПРОЖИВАЕТ МЕДЛЕННУЮ ЗАМЕНУ, как живой бот, висящий в запросе. Раньше бот сразу
+                    // спрашивал предка, а отложенная (lag) замена ещё не доехала — «предок жив», снятие и новая
+                    // постановка; так стенд делал 908 гонок на 1080 затыков против ~1% у живых и ставил в 5–8 раз чаще.
+                    simBusyUntil = Math.max(simBusyUntil, clock.now() + response.latencyMs());
+                    deferredInspect.add(new Object[]{side, oldId, resting.size});
+                } else if (!venueCovers() || response.latencyMs() >= SLOW_REPLACE_MS) {
                     String st = inspectGoneOrder(side, oldId, resting.size);
                     if (st != null && !terminal(st)) {
                         // Предок ЖИВ после успешной замены — гонка. Его объём занят
@@ -8517,6 +8529,31 @@ public final class QuoteLoop implements Runnable {
      * не промо), и появление любой ненулевой комиссии означает смену экономики, а
      * не параметра. Решение принимает человек.
      */
+    /** {@code revx.sim.blocking-replace} (по умолчанию да): стенд проживает задержку медленной замены. */
+    static final boolean SIM_BLOCKING_REPLACE = Boolean.parseBoolean(System.getProperty("revx.sim.blocking-replace", "true"));
+    private long simBusyUntil;
+    private final java.util.List<Object[]> deferredInspect = new java.util.ArrayList<>();
+
+    /** Отложенная проверка предков после медленных замен (стенд): то же, что сразу после замены у живого бота. */
+    private void runDeferredInspect() {
+        java.util.List<Object[]> todo = new java.util.ArrayList<>(deferredInspect);
+        deferredInspect.clear();
+        for (Object[] d : todo) {
+            Side side = (Side) d[0];
+            String oldId = (String) d[1];
+            double size = (Double) d[2];
+            String st = inspectGoneOrder(side, oldId, size);
+            if (st != null && !terminal(st)) {
+                strayOwn.put(oldId, new double[]{side.ordinal(), size});
+                Venue.Response c = client.cancel(oldId);
+                cancels++;
+                journal.event("replace_race", String.format(java.util.Locale.ROOT,
+                        "%s %s: после медленной замены предок жив («%s») — считаю его объём занятым и снимаю → %d",
+                        side, oldId, st, c.status()));
+            }
+        }
+    }
+
     private String inspectGoneOrder(Side side, String venueId, double size) {
         Venue.Response order = client.order(venueId);
         if (!order.ok() || order.body() == null) {

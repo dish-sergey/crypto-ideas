@@ -39,6 +39,11 @@ import java.util.UUID;
  */
 public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed {
 
+    @Override
+    public boolean simulated() {
+        return true;
+    }
+
     /**
      * Сдвиг минуты затыков посреди прогона: с момента {@code revx.sim.ghost-shift-at}
      * (ISO) окно встаёт на {@code revx.sim.ghost-at-sec-after}. Проверка того, что
