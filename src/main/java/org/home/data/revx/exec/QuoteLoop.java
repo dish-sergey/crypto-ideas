@@ -11377,6 +11377,21 @@ public final class QuoteLoop implements Runnable {
     /** Вторая минута (по призракам: доля ≥ {@link #QUIET_SECOND_SHARE}, не меньше двух событий); −1 — нет. */
     private int quietMinute2 = -1;
     private boolean quietFromGhosts;
+    private boolean quietRestored;
+
+    /** Минуты из текста события quiet_minute, выбранного по призракам: {первая, вторая или −1}; null — не по призракам или нет минуты. */
+    static int[] restoredQuiet(String detail) {
+        if (detail == null || !detail.contains("(по призракам)")) {
+            return null;
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(":([0-9]{2})").matcher(detail);
+        if (!m.find()) {
+            return null;
+        }
+        int first = Integer.parseInt(m.group(1));
+        int second = detail.contains(" и :") && m.find() ? Integer.parseInt(m.group(1)) : -1;
+        return first < 60 && second < 60 ? new int[]{first, second} : null;
+    }
     /** {@code revx.exec.quiet-by-ghosts} (по умолчанию да): в режиме auto минута выбирается по ghost_suspect, если их хватает. */
     static final boolean QUIET_BY_GHOSTS = Boolean.parseBoolean(System.getProperty("revx.exec.quiet-by-ghosts", "true"));
     static final double QUIET_SECOND_SHARE = 0.10;
@@ -11400,6 +11415,24 @@ public final class QuoteLoop implements Runnable {
     private void learnQuietMinute(long now) {
         if ("off".equals(QUIET_MINUTE) || now - quietLearnedMs < 3_600_000L) {
             return;
+        }
+        quietLearnedMs = now;
+        if (!quietRestored) {
+            // 13.11.2026: выбор по призракам переживает перезапуск. Иначе после трёх тихих суток (в разведённой минуте
+            // призраков нет) журнал за 72 ч пуст, и защита пропала бы, пока площадка не наплодит новых пять.
+            quietRestored = true;
+            if ("auto".equals(QUIET_MINUTE) && QUIET_BY_GHOSTS) {
+                String[] ev = journal.lastEventOf("quiet_minute");
+                int[] r = ev == null ? null : restoredQuiet(ev[1]);
+                if (r != null) {
+                    quietMinute = r[0];
+                    quietMinute2 = r[1];
+                    quietFromGhosts = true;
+                    journal.event("quiet_restored", String.format(java.util.Locale.ROOT,
+                            "минута затыков :%02d%s восстановлена из журнала после перезапуска (по призракам)", r[0],
+                            r[1] >= 0 ? String.format(java.util.Locale.ROOT, " и :%02d", r[1]) : ""));
+                }
+            }
         }
         quietLearnedMs = now;
         int was = quietMinute;

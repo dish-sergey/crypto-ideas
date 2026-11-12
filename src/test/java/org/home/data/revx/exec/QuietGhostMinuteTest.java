@@ -5,7 +5,9 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /** Минута затыков по призракам (13.11.2026): :38 — основная, :36 — вторая; затыки во все минуты выбор не сбивают. */
 class QuietGhostMinuteTest {
@@ -30,6 +32,14 @@ class QuietGhostMinuteTest {
         for (int h = 0; h < 30; h++) g.add(at(h, 38));
         g.add(at(40, 36));
         assertEquals(-1, QuoteLoop.secondGhostMinute(g, 38));
+    }
+
+    @Test
+    void restoreFromJournalText() {
+        assertArrayEquals(new int[]{38, 36}, QuoteLoop.restoredQuiet("минута затыков :38 и :36 — в неё заявки разведены и не трогаются (по призракам)"));
+        assertArrayEquals(new int[]{38, -1}, QuoteLoop.restoredQuiet("минута затыков :38 — в неё заявки разведены и не трогаются (по призракам)"));
+        assertNull(QuoteLoop.restoredQuiet("минута затыков :38 — в неё заявки разведены и не трогаются"));
+        assertNull(QuoteLoop.restoredQuiet("минута затыков не выражена — разведения нет"));
     }
 
     @Test
