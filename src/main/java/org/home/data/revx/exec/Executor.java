@@ -1171,9 +1171,14 @@ public class Executor {
                 if (ps == null) {
                     throw new IllegalStateException("нет спецификации пары " + sym);
                 }
-                var ticks = new org.home.data.revx.replay.StandFair(standDbPath, e.getKey(), limits,
-                        cfg.memecoins(), cfg.fairMaxSkewMs(),
-                        org.home.data.revx.exec.Clock.system(), fromMs, toMs).toTicks();
+                // 12.11.2026: тот же кэш опоры, что у одиночного прогона (ключ совпадает — кэши общие).
+                // Без него каждый групповой прогон wall строил StandFair заново: 23.5 мин из 41.
+                String coin = e.getKey();
+                var ticks = org.home.data.revx.replay.FairCache.ticks(standDbPath, coin, fromMs, toMs,
+                        limits + "|" + cfg.memecoins() + "|" + cfg.fairMaxSkewMs(),
+                        () -> new org.home.data.revx.replay.StandFair(standDbPath, coin, limits,
+                                cfg.memecoins(), cfg.fairMaxSkewMs(),
+                                org.home.data.revx.exec.Clock.system(), fromMs, toMs)).ticks();
                 if (ticks.isEmpty()) {
                     throw new IllegalStateException("нет снимков книги для " + sym);
                 }

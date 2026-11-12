@@ -141,7 +141,7 @@ final class HybridFair {
             // симуляцией иначе сравнивала бы две разные опоры.
             org.home.data.revx.exec.HybridCore core = new org.home.data.revx.exec.HybridCore(
                     LEVEL_MIX, DEPTH_K, TAU_MS / 1000, MAX_SPREAD_BP);
-            List<ReplayFair.Tick> out = new ArrayList<>(ticks.size());
+            List<ReplayFair.Tick> out = new TickColumns(ticks.size());
             long done = 0;
             long gate = 0;
             double[][] sd = new double[2][ticks.size()];
@@ -178,7 +178,7 @@ final class HybridFair {
             sides = sd;
             return out;
         }
-        List<ReplayFair.Tick> out = new ArrayList<>(ticks.size());
+        List<ReplayFair.Tick> out = new TickColumns(ticks.size());
         double emaM = Double.NaN;
         double emaB = Double.NaN;
         long prev = 0;

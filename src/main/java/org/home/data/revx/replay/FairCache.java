@@ -176,7 +176,7 @@ public final class FairCache {
                 table[i] = in.readUTF();
             }
             int n = in.readInt();
-            List<ReplayFair.Tick> ticks = new ArrayList<>(n);
+            List<ReplayFair.Tick> ticks = new TickColumns(n);
             for (int i = 0; i < n; i++) {
                 long ts = in.readLong();
                 double fair = in.readDouble();

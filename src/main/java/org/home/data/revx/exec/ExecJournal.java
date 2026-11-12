@@ -436,6 +436,7 @@ public final class ExecJournal implements AutoCloseable {
     }
 
     private boolean quotesOff;
+    private PreparedStatement quotePs;
 
     public synchronized void quote(double fair, Double bid, Double ask, double inventory,
                                    boolean quotable, String reason) {
@@ -464,9 +465,14 @@ public final class ExecJournal implements AutoCloseable {
         if (quotesOff) {
             return;
         }
-        try (PreparedStatement ps = connection.prepareStatement(
-                "INSERT INTO exec_quote(ts_ms, fair, bid, ask, inventory, quotable, reason,"
-                        + " pressure, ref_own, ref_bnb) VALUES (?,?,?,?,?,?,?,?,?,?)")) {
+        try {
+            // 12.11.2026: запрос готовится один раз на журнал, а не на каждый тик (котировка пишется каждый тик).
+            if (quotePs == null) {
+                quotePs = connection.prepareStatement(
+                        "INSERT INTO exec_quote(ts_ms, fair, bid, ask, inventory, quotable, reason,"
+                                + " pressure, ref_own, ref_bnb) VALUES (?,?,?,?,?,?,?,?,?,?)");
+            }
+            PreparedStatement ps = quotePs;
             ps.setLong(1, clock.now());
             ps.setDouble(2, fair);
             if (bid == null) ps.setNull(3, java.sql.Types.REAL); else ps.setDouble(3, bid);
@@ -1050,6 +1056,9 @@ public final class ExecJournal implements AutoCloseable {
         try {
             if (connection.isClosed()) {
                 return;
+            }
+            if (quotePs != null) {
+                quotePs.close();
             }
             if (batched) {
                 connection.commit();

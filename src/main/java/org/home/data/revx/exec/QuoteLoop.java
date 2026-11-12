@@ -5438,6 +5438,8 @@ public final class QuoteLoop implements Runnable {
                 farFuncTicks[1], farFuncTicks[1] == 0 ? 0 : farFuncSumBp[1] / farFuncTicks[1]) : null;
     }
 
+    private double funcInvLotsScale = Double.NaN;
+
     private Double funcPrice(Side side, double base, double fair) {
         boolean buy = side == Side.BUY;
         int s = buy ? 0 : 1;
@@ -5527,7 +5529,10 @@ public final class QuoteLoop implements Runnable {
             funcMuStep();
             double q = params.size() > 0 ? inventory / params.size() : 0;
             // запас для таблицы — в «лотах таблицы»: revx.exec.func-inv-lots-scale[-<бот>], стенд мелкого лота (док. 236); по умолчанию 1
-            q *= Double.parseDouble(System.getProperty("revx.exec.func-inv-lots-scale-" + tag.id(), System.getProperty("revx.exec.func-inv-lots-scale", "1")));
+            if (Double.isNaN(funcInvLotsScale)) {
+                funcInvLotsScale = Double.parseDouble(System.getProperty("revx.exec.func-inv-lots-scale-" + tag.id(), System.getProperty("revx.exec.func-inv-lots-scale", "1")));
+            }
+            q *= funcInvLotsScale;          // свойство читается один раз (12.11.2026): разбор на каждом тике был заметен в профиле
             double head = FUNC_MU_HEAD_BID_ONLY && !buy ? 0 : funcMuHeadNow(fair);
             trInv = funcInv == null ? 0 : buy ? invPrice(funcInv[0], q) : invPrice(funcInv[1], q - 1);
             trStorm = (buy && stormOn(clock.now()) ? STORM_INV_BP : 0)
@@ -5550,6 +5555,7 @@ public final class QuoteLoop implements Runnable {
             r15 = Math.log(Math.max(0.5, Double.isNaN(hv) ? 3.81 : hv));
         }
         double bestD = FUNC_RATE ? 0 : Double.NEGATIVE_INFINITY, bestP = Double.NaN, bestBp = 0;
+        double lastAhead = Double.NaN, lastLa = 0;   // ln(1 + $ впереди) меняется только на границах уровней — не пересчитывать (12.11.2026)
         for (double d = Math.ceil(lo); d <= hi + 1e-9; d += 1) {
             double p = buy ? fair * (1 - d / 10_000) : fair * (1 + d / 10_000);
             if (buy ? p >= ba : p <= bb) {
@@ -5561,7 +5567,11 @@ public final class QuoteLoop implements Runnable {
                     ahead += l.qty() * l.price();
                 }
             }
-            double dv = FUNC_RATE ? funcRateValue(c, d, Math.log1p(ahead), f, n, spr, shift, r15) : funcValue(c, d, Math.log1p(ahead), f, n, spr, r15);
+            if (Double.doubleToRawLongBits(ahead) != Double.doubleToRawLongBits(lastAhead)) {
+                lastAhead = ahead;
+                lastLa = Math.log1p(ahead);
+            }
+            double dv = FUNC_RATE ? funcRateValue(c, d, lastLa, f, n, spr, shift, r15) : funcValue(c, d, lastLa, f, n, spr, r15);
             if (dv > bestD) {
                 bestD = dv;
                 bestP = p;
@@ -7745,11 +7755,10 @@ public final class QuoteLoop implements Runnable {
             return;                       // ведро общее: безопасная уступает опасным, следующий тик спросит снова
         }
         String heirClientId = tag.newClientOrderId();
-        String body = """
-                {"client_order_id":"%s","base_size":"%s","price":"%s",
-                 "execution_instructions":["post_only"]}"""
-                .formatted(heirClientId, fmtSize(size), fmtPrice(price))
-                .replaceAll("\\s*\\n\\s*", "");
+        // 12.11.2026: склейкой, без formatted + replaceAll (регулярка на каждую замену — заметна в профиле стенда);
+        // строка та же до символа
+        String body = "{\"client_order_id\":\"" + heirClientId + "\",\"base_size\":\"" + fmtSize(size)
+                + "\",\"price\":\"" + fmtPrice(price) + "\",\"execution_instructions\":[\"post_only\"]}";
         Venue.Response response = client.replace(resting.venueId, body);
         replaces++;
         replacesThisMinute++;

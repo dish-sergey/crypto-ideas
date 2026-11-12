@@ -156,6 +156,8 @@ public final class GroupForecast {
                     ExecJournal journal = new ExecJournal(
                             dir.resolve("bot-" + spec.botId() + ".db").toString());
                     journal.clock(clock);
+                    // 12.11.2026: пачками, как в одиночном Forecast — иначе каждый тик своя транзакция.
+                    journal.batched();
                     if (journalOut == null || journalOut.isBlank()) {
                         journal.quotesOff();
                     }
@@ -319,6 +321,11 @@ public final class GroupForecast {
     }
 
     private static List<ReplayFair.Tick> window(List<ReplayFair.Tick> ticks, long from, long to) {
+        // 12.11.2026: ряд упорядочен по времени — окно это подсписок, без копии в объекты (полгода тиков — гигабайты)
+        if (ticks instanceof TickColumns tc) {
+            int lo = tc.lowerBound(from), hi = tc.lowerBound(to + 1);
+            return ticks.subList(lo, Math.max(lo, hi));
+        }
         return ticks.stream().filter(t -> t.tsMs() >= from && t.tsMs() <= to).toList();
     }
 

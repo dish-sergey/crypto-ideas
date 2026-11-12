@@ -186,7 +186,7 @@ public final class StandFair implements FairSource {
 
     public List<ReplayFair.Tick> toTicks(String forBase) {
         long[] when = schedule(forBase);
-        List<ReplayFair.Tick> out = new ArrayList<>(when.length);
+        List<ReplayFair.Tick> out = new TickColumns(when.length);
         SimClock own = new SimClock(when.length > 0 ? when[0] : 0);
         Clock saved = replaceClock(own);
         try {
