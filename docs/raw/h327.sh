@@ -43,6 +43,7 @@ TAG=${TAG}H; DDF="$DDF -Drevx.sim.group-hybrid=true"
 [ -n "$XD" ] && { TAG=${TAG}$XT; DDF="$DDF $XD"; }
 [ -n "$LADDER" ] && { TAG=${TAG}L$LADDER; DDF="$DDF -Drevx.exec.ladder-file=C:/revx-xrp/d277/ladder244-$LADDER.csv"; }
 [ "$LNF" = 1 ] && { TAG=${TAG}nf; DDF="$DDF -Drevx.exec.ladder-near-func=true"; }
+[ "$LH" = 1 ] && { TAG=${TAG}h; DDF="$DDF -Drevx.exec.ladder-hybrid=true"; }
 # h322 (12.11, док. 244 этап 1): DFN=N — у e/d/f потолок тот же (74.17), лотов N, лот 74.17/N; цена запаса в % потолка (масштаб 1.2/N), глубина опоры в тех же долларах, что при 1.2 (618.1 $).
 if [ -n "$DFN" ]; then DL=$(awk "BEGIN{printf \"%.3f\", 74.17/$DFN}"); DSC=$(awk "BEGIN{printf \"%.4f\", 1.2/$DFN}"); TAG=${TAG}D$DFN; DDF="$DDF -Drevx.fair.hybrid-depth-k=$(awk "BEGIN{printf \"%.3f\", 618.1/$DL}") -Drevx.exec.func-inv-lots-scale-e=$DSC -Drevx.exec.func-inv-lots-scale-d=$DSC -Drevx.exec.func-inv-lots-scale-f=$DSC"; fi
 [ -n "$TAGX" ] && TAG=${TAG}$TAGX
@@ -98,7 +99,7 @@ else
 fi
 mkdir -p C:/revx-xrp/hp
 for c in BTC ETH SOL; do
-  SP=$(spec $c); [ -n "$LADDER" ] && SP=$(echo $SP | sed -E "s/:(BTC|ETH|SOL):1:/:\1:4:/g"); [ -n "$DFN" ] && SP=$(echo $SP | sed "s/:61.81:1.2:/:$DL:$DFN:/g"); [ -n "$SOLO" ] && SP=$(echo $SP | tr , "\n" | grep -E "^($(echo $SOLO | tr , "|")):" | paste -sd,); [ -z "$SP" ] && continue
+  SP=$(spec $c); [ -n "$LADDER" ] && SP=$(echo $SP | sed -E "s/:(BTC|ETH|SOL):1:/:\1:${LLV:-4}:/g"); [ -n "$DFN" ] && SP=$(echo $SP | sed "s/:61.81:1.2:/:$DL:$DFN:/g"); [ -n "$SOLO" ] && SP=$(echo $SP | tr , "\n" | grep -E "^($(echo $SOLO | tr , "|")):" | paste -sd,); [ -z "$SP" ] && continue
   out=C:/revx-xrp/hp/$W-d$TAG-$c.log
   $JAVA_HOME/bin/java -Xmx$X $B $COM $POOL $LOSS $FN $G -Drevx.sim.placed-events=true -Drevx.sim.live-cap=$([ $c = BTC ] && echo $LB || echo $LIM) $(flags $c) $DDF $([ -n "$FTR" ] && echo -Drevx.exec.func-trace=$FTR-$c.csv) -jar C:/revx-xrp/${TOOLS:-tools187.jar} --revx-group-forecast --no-budget \
     --bots=$SP --from=$F --to=$T --journal-out=C:/revx-xrp/hp/j-$W-d$TAG-$c --revx.exec.park-distance=0.10 --revx.exec.stand-db=$DB > $out 2>&1 &
