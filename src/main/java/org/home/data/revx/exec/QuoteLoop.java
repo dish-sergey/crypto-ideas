@@ -4093,7 +4093,7 @@ public final class QuoteLoop implements Runnable {
                         "%s: сигнал падения %s — бид %s, запас %s", symbol, on ? "выше порога" : "ниже порога",
                         on ? "отведён" : "вернулся", fmt(inventory)));
             }
-            if (on && target.hasBid() && FALL_INV_BP <= 0) {
+            if (on && target.hasBid() && FALL_INV_BP <= 0 && !ladderOn()) {   // при лестнице сигнал — только класс ступеней
                 if (FALL_WIDEN_BP > 0) {
                     // мягкий вариант: бид не уходит, а отступает на FALL_WIDEN_BP (функция делает то же — см. funcPrice)
                     target = new Quoter.Quotes(target.bid() * (1 - FALL_WIDEN_BP / 1e4), target.ask());
@@ -4247,6 +4247,9 @@ public final class QuoteLoop implements Runnable {
         // ворота ближних — до выбора слота: закрытый ближний замену тика не забирает
         nearBuyWhy = nearGateClosed(0);
         nearAskWhy = NEAR_ASK ? nearAskClosed() : null;
+        if (ladderOn()) {
+            updateLadder(fair.price());       // состояние и ступени лестницы на этот тик (док. 244, этап 7)
+        }
         chooseReplaceSlot(target, fair);
         double buyRoom = buyRoom();
         for (int k = 0; k < levels; k++) {
@@ -4275,12 +4278,22 @@ public final class QuoteLoop implements Runnable {
                     buyCash = Math.max(0, buyCash - r.size * r.price);
                     buyRoom = Math.max(0, buyRoom - r.size);
                 }
+            } else if (ladderOn() && ladderUsd(Side.BUY, ib) <= 0) {
+                Resting r = bids.get(ib);                     // ступень пуста: отвести заменой, не снимать (постановки дороги)
+                parkSide(Side.BUY, r, lastTrustedFair * (1 - NEAR_PARK_BP / 1e4), "ступень пуста", true);
+                if (r.venueId != null && r.price > 0) {
+                    buyCash = Math.max(0, buyCash - r.size * r.price);
+                    buyRoom = Math.max(0, buyRoom - r.size);
+                }
             } else {
                 double cashCap = bidPrice != null && bidPrice > 0
                         ? buyCash / bidPrice : Double.MAX_VALUE;
-                double bought = syncSide(Side.BUY, ib, bids.get(ib), bidPrice, fair.price(),
-                        LEVEL_WEIGHTS.length == 0 ? Math.min(cashCap, buyRoom)
-                                : Math.min(Math.min(cashCap, buyRoom), buyWeight(ib) * params.size()));
+                double want = LEVEL_WEIGHTS.length == 0 ? Math.min(cashCap, buyRoom)
+                        : Math.min(Math.min(cashCap, buyRoom), buyWeight(ib) * params.size());
+                if (ladderOn() && bidPrice != null && bidPrice > 0) {
+                    want = Math.min(Math.min(cashCap, buyRoom), ladderUsd(Side.BUY, ib) / bidPrice);
+                }
+                double bought = syncSide(Side.BUY, ib, bids.get(ib), bidPrice, fair.price(), want);
                 buyCash = Math.max(0, buyCash - bought * (bidPrice == null ? 0 : bidPrice));
                 buyRoom = Math.max(0, buyRoom - bought);
             }
@@ -4299,9 +4312,18 @@ public final class QuoteLoop implements Runnable {
                 if (r.venueId != null) {
                     sellPool = Math.max(0, sellPool - r.size);
                 }
+            } else if (ladderOn() && ladderUsd(Side.SELL, i) <= 0) {
+                Resting r = asks.get(i);                      // ступень пуста: отвести заменой
+                parkSide(Side.SELL, r, lastTrustedFair * (1 + NEAR_PARK_BP / 1e4), "ступень пуста", true);
+                if (r.venueId != null) {
+                    sellPool = Math.max(0, sellPool - r.size);
+                }
             } else {
                 double pool = NEAR_ASK && nearAskWhy == null && LEVEL_WEIGHTS.length > 0
                         ? Math.min(sellPool, levelWeight(i) * params.size()) : sellPool;
+                if (ladderOn() && askPrice != null && askPrice > 0) {
+                    pool = Math.min(sellPool, ladderUsd(Side.SELL, i) / askPrice);
+                }
                 sellPool = Math.max(0,
                         sellPool - syncSide(Side.SELL, i, asks.get(i), askPrice, fair.price(), pool));
             }
@@ -4846,6 +4868,18 @@ public final class QuoteLoop implements Runnable {
      * кладётся поверх. Так уровни не спорят с политикой, а продолжают её.
      */
     private Double levelPrice(Side side, Double base, double fair, int level) {
+        if (ladderOn() && (level > 0 || !LADDER_NEAR_FUNC)) {
+            // ступень лестницы: расстояние из таблицы кривой (док. 244, этап 7); null у базовой — сторона закрыта гейтом
+            if (base == null) {
+                return null;
+            }
+            double[] st = side == Side.BUY ? ladderBuy : ladderSell;
+            if (st == null) {
+                return base;
+            }
+            double d = st[2 * Math.min(level, LADDER_SLOTS - 1)];
+            return side == Side.BUY ? fair * (1 - d / 1e4) : fair * (1 + d / 1e4);
+        }
         if (side == Side.BUY && levelCooling(level)) {
             return null;
         }
@@ -5990,6 +6024,92 @@ public final class QuoteLoop implements Runnable {
      * опоры: снятие и новая постановка тратили бы предел на каждом переключении ворот.
      */
     static final double[] LEVEL_WEIGHTS = parseLevelBp(System.getProperty("revx.exec.level-weights", ""));
+
+    /**
+     * ЛЕСТНИЦА ПО КРИВОЙ (док. 244, этап 7, 13.11.2026). {@code revx.exec.ladder-file[-<бот>]} — таблица ступеней из
+     * {@code d277/Ladder244.java}: на бота, сторону, класс состояния и долю запаса — до {@link #LADDER_SLOTS} ступеней
+     * (расстояние от опоры, б.п., и размер, $). Уровень i котировщика — ступень i (бот нужен с {@code levels} ≥ 4).
+     * Класс: 4 — горит сигнал из {@code fall-file} (состояние «ликвидации»), иначе по σ̂ = СКО 30-секундных ходов опоры за
+     * час × √2 (≈ СКО минутных, б.п./мин) против границ монеты из строки {@code #cls}. Доля запаса — запас × опора /
+     * {@code revx.exec.ladder-capital} (74.17), округлённая до десятой. Пустая ступень не снимается, а отводится заменой
+     * на {@code near-park-bp} — постановки дороги. {@code revx.exec.ladder-near-func=true}: ближняя ступень берёт ЦЕНУ из
+     * функции отступа (размер — из таблицы). Только стенд; по умолчанию выключено.
+     */
+    static final String LADDER_FILE = blankToNull(System.getProperty("revx.exec.ladder-file", ""));
+    static final boolean LADDER_NEAR_FUNC = Boolean.getBoolean("revx.exec.ladder-near-func");
+    static final int LADDER_SLOTS = 4;
+    private java.util.Map<String, double[]> ladderTab;
+    private double[] ladderCut;            // медиана, p40, p80, p95 σ̂ монеты
+    private double[] ladderBuy, ladderSell;
+    private double ladderCapital = Double.NaN;
+    private String ladderStateWas;
+    long[] ladderClassTicks = new long[5];
+
+    private Boolean ladderOnCached;
+
+    private boolean ladderOn() {
+        if (ladderOnCached == null) {
+            ladderOnCached = LADDER_FILE != null || System.getProperty("revx.exec.ladder-file-" + tag.id()) != null;
+        }
+        return ladderOnCached;
+    }
+
+    private void updateLadder(double fair) {
+        if (ladderTab == null) {
+            String file = System.getProperty("revx.exec.ladder-file-" + tag.id(), LADDER_FILE);
+            String coin = symbol.split("[^A-Za-z]")[0];
+            ladderTab = new java.util.HashMap<>();
+            try {
+                for (String l : java.nio.file.Files.readAllLines(java.nio.file.Path.of(file))) {
+                    String[] p = l.trim().split(";");
+                    if (p.length == 6 && p[0].equals("#cls") && p[1].equalsIgnoreCase(coin)) {
+                        ladderCut = new double[]{Double.parseDouble(p[2]), Double.parseDouble(p[3]),
+                                Double.parseDouble(p[4]), Double.parseDouble(p[5])};
+                    } else if (p.length == 4 + 2 * LADDER_SLOTS && p[0].equals(tag.id())) {
+                        double[] v = new double[2 * LADDER_SLOTS];
+                        for (int k = 0; k < v.length; k++) {
+                            v[k] = Double.parseDouble(p[4 + k]);
+                        }
+                        ladderTab.put(p[1] + "|" + p[2] + "|" + p[3], v);
+                    }
+                }
+            } catch (java.io.IOException e) {
+                throw new IllegalStateException("не прочиталась таблица лестницы " + file, e);
+            }
+            if (ladderCut == null || ladderTab.isEmpty()) {
+                throw new IllegalStateException("в таблице лестницы " + file + " нет строк бота " + tag.id() + " или границ " + coin);
+            }
+            ladderCapital = Double.parseDouble(System.getProperty("revx.exec.ladder-capital-" + tag.id(),
+                    System.getProperty("revx.exec.ladder-capital", "74.17")));
+            journal.event("ladder_file", String.format(java.util.Locale.ROOT, "%s: лестница из %s, строк %d, капитал %.2f",
+                    symbol, file, ladderTab.size(), ladderCapital));
+        }
+        int cl;
+        if (FALL_FILE != null && fallLast) {
+            cl = 4;
+        } else {
+            double hv = hourVolBp(clock.now());
+            double s = Double.isNaN(hv) ? ladderCut[0] : hv * Math.sqrt(2);
+            cl = s <= ladderCut[1] ? 0 : s <= ladderCut[2] ? 1 : s <= ladderCut[3] ? 2 : 3;
+        }
+        int qi = (int) Math.max(0, Math.min(10, Math.round(inventory * fair / ladderCapital * 10)));
+        ladderBuy = ladderTab.get("BUY|" + cl + "|" + qi);
+        ladderSell = ladderTab.get("SELL|" + cl + "|" + qi);
+        ladderClassTicks[cl]++;
+        String state = cl + "|" + qi;
+        if (!state.equals(ladderStateWas)) {
+            if (ladderStateWas == null || !ladderStateWas.startsWith(cl + "|")) {
+                journal.event("ladder_class", String.format(java.util.Locale.ROOT, "%s: класс %d, запас %d/10", symbol, cl, qi));
+            }
+            ladderStateWas = state;
+        }
+    }
+
+    /** Размер ступени в $; без таблицы — бесконечность (лестница не ограничивает). */
+    private double ladderUsd(Side side, int level) {
+        double[] st = side == Side.BUY ? ladderBuy : ladderSell;
+        return st == null ? Double.MAX_VALUE : st[2 * Math.min(level, LADDER_SLOTS - 1) + 1];
+    }
     static final double NEAR_GATE = Double.parseDouble(System.getProperty("revx.exec.near-level-gate", "0"));
     static final boolean NEAR_INV = Boolean.getBoolean("revx.exec.near-level-inv");
     static final double NEAR_PARK_BP = Double.parseDouble(System.getProperty("revx.exec.near-park-bp", "300"));
