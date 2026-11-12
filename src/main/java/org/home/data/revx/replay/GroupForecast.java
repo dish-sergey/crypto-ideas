@@ -209,6 +209,10 @@ public final class GroupForecast {
                         loop.bookSource(mfm.market().fresh()::bookAt);
                     }
                     loop.statsInventoryCap(spec.inventoryCap());
+                    var bnbSeries = HybridFair.BNB_BY_SYMBOL.get(p.symbol());
+                    if (QuoteLoop.JUMP_BP > 0 && bnbSeries != null) {
+                        loop.simJump((now, win) -> HybridFair.moves(bnbSeries, now, win));   // рывок Бинанса на стенде (док. 245 П5)
+                    }
                     loops.add(loop);
                     specs.add(spec);
                     owners.add(p);

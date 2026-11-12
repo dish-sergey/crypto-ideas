@@ -49,6 +49,23 @@ final class HybridFair {
     static final String DIR = System.getProperty("revx.fair.hybrid-dir", "");
     static final double TAU_MS = Double.parseDouble(System.getProperty("revx.fair.hybrid-tau-sec", "60")) * 1000;
     static final long LAG_MS = Long.getLong("revx.fair.hybrid-lag-ms", 300L);
+    /** Секундные закрытия Бинанса по паре — последний загруженный ряд (стенд: рывок Бинанса, 13.11.2026). */
+    public static final java.util.Map<String, TreeMap<Long, Double>> BNB_BY_SYMBOL = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Ход Бинанса за окно, как {@code FastBnbFair.moves}: {падение от максимума, рост от минимума}, б.п.; свеча [s, s+1 с) известна в s+1 с + задержка. */
+    public static double[] moves(TreeMap<Long, Double> bnb, long now, long windowMs) {
+        long t = now - LAG_MS - 1000;
+        var e = bnb.floorEntry(t);
+        if (e == null) {
+            return new double[]{0, 0};
+        }
+        double p = e.getValue(), hi = p, lo = p;
+        for (double v : bnb.subMap(t - windowMs, true, t, true).values()) {
+            hi = Math.max(hi, v);
+            lo = Math.min(lo, v);
+        }
+        return new double[]{(hi - p) / hi * 1e4, (p - lo) / lo * 1e4};
+    }
     static final double MAX_SPREAD_BP = Double.parseDouble(System.getProperty("revx.fair.hybrid-max-spread-bp", "50"));
     /**
      * Откуда уровень: {@code own} — середина своей книги (сдвигает опору вверх на
@@ -132,6 +149,9 @@ final class HybridFair {
         String base = symbol.substring(0, symbol.indexOf('/'));
         TreeMap<Long, Double> bnb = LEVEL_BOOK ? new TreeMap<>() : load(base, ticks.get(0).tsMs() - 3_600_000L,
                 ticks.get(ticks.size() - 1).tsMs());
+        if (!bnb.isEmpty()) {
+            BNB_BY_SYMBOL.put(symbol, bnb);           // для рывка на стенде (revx.exec.jump-bp, док. 245 П5)
+        }
         if (bnb.isEmpty() && !LEVEL_BOOK) {
             log.error("ГИБРИД: нет секундных свечей {}USDC в {} — опора прежняя", base, DIR);
             return ticks;

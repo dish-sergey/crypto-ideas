@@ -3031,7 +3031,7 @@ public final class QuoteLoop implements Runnable {
      * среднем); у ADA рывков ≥ 20 б.п. за секунду ~9 в сутки на сторону, то есть ~18
      * постановок на возврат. 0 — выключено.
      */
-    static final double JUMP_BP = Double.parseDouble(System.getProperty("revx.exec.jump-bp", "0"));
+    public static final double JUMP_BP = Double.parseDouble(System.getProperty("revx.exec.jump-bp", "0"));
     static final long JUMP_WINDOW_MS = Long.getLong("revx.exec.jump-window-ms", 1000L);
     static final long JUMP_CALM_MS = Long.getLong("revx.exec.jump-calm-ms", 2000L);
     private double jumpBp = JUMP_BP;
@@ -3052,16 +3052,28 @@ public final class QuoteLoop implements Runnable {
         return jumpCancels;
     }
 
+    /** Ход Бинанса на стенде (секундные свечи), когда живого потока нет: {падение, рост}, б.п. (док. 245 П5). */
+    private java.util.function.BiFunction<Long, Long, double[]> simJump;
+    /** {@code revx.exec.jump-bid-only=true} — рывок снимает только биды (док. 245 П5: снятие бидов на падении). */
+    static final boolean JUMP_BID_ONLY = Boolean.getBoolean("revx.exec.jump-bid-only");
+
+    public void simJump(java.util.function.BiFunction<Long, Long, double[]> src) {
+        this.simJump = src;
+    }
+
     private Quoter.Quotes jumpGuard(Quoter.Quotes t) {
-        if (fast == null || !(jumpBp > 0)) {
+        if ((fast == null && simJump == null) || !(jumpBp > 0)) {
             return t;
         }
         long now = clock.now();
-        double[] mv = fast.moves(now, jumpWindowMs);
+        double[] mv = fast != null ? fast.moves(now, jumpWindowMs) : simJump.apply(now, jumpWindowMs);
         if (mv[0] >= jumpBp) {
+            if (now >= bidJumpUntil) {
+                journal.event("jump_bid", String.format(java.util.Locale.ROOT, "рывок Бинанса −%.1f б.п. за %d мс — биды сняты на %d с", mv[0], jumpWindowMs, jumpCalmMs / 1000));
+            }
             bidJumpUntil = now + jumpCalmMs;
         }
-        if (mv[1] >= jumpBp) {
+        if (mv[1] >= jumpBp && !JUMP_BID_ONLY) {
             askJumpUntil = now + jumpCalmMs;
         }
         Double bid = t.bid();
@@ -3844,11 +3856,13 @@ public final class QuoteLoop implements Runnable {
         // монету всё равно нельзя. В обоих случаях лучшее действие — никакого.
         learnQuietMinute(clock.now());
         settleQuietProbe(clock.now());
-        if (inQuietWindow(clock.now(), quietMinute) && !quietProbe(clock.now())) {
+        boolean q2 = inQuietWindow(clock.now(), quietMinute2);
+        if ((inQuietWindow(clock.now(), quietMinute) && (quietFromGhosts || !quietProbe(clock.now()))) || q2) {
             // Разводим заменой (без постановок) один раз и дальше не трогаем: в
             // самой минуте ни одного запроса записи — затыку нечего поймать.
+            // Минута по призракам проверочного часа не имеет: проверка стоила бы призрака (запертых денег).
             pausedReason = String.format(java.util.Locale.ROOT,
-                    "минута затыков :%02d — заявки разведены", quietMinute);
+                    "минута затыков :%02d — заявки разведены", q2 ? quietMinute2 : quietMinute);
             countTick();
             journal.quote(fair.price(), null, null, inventory, false, pausedReason, 0, stand.rawRefs());
             if (parkDistance > 0 && lastTrustedFair > 0) {
@@ -11360,6 +11374,27 @@ public final class QuoteLoop implements Runnable {
     static final long QUIET_LEAD_MS = 10_000L;
 
     private int quietMinute = -1;
+    /** Вторая минута (по призракам: доля ≥ {@link #QUIET_SECOND_SHARE}, не меньше двух событий); −1 — нет. */
+    private int quietMinute2 = -1;
+    private boolean quietFromGhosts;
+    /** {@code revx.exec.quiet-by-ghosts} (по умолчанию да): в режиме auto минута выбирается по ghost_suspect, если их хватает. */
+    static final boolean QUIET_BY_GHOSTS = Boolean.parseBoolean(System.getProperty("revx.exec.quiet-by-ghosts", "true"));
+    static final double QUIET_SECOND_SHARE = 0.10;
+
+    /** Вторая по числу призраков минута, если её доля ≥ QUIET_SECOND_SHARE и событий ≥ 2; иначе −1. */
+    static int secondGhostMinute(java.util.List<Long> ghosts, int first) {
+        int[] by = new int[60];
+        for (long t : ghosts) {
+            by[(int) ((t / 60_000L) % 60)]++;
+        }
+        int best = -1;
+        for (int m = 0; m < 60; m++) {
+            if (m != first && (best < 0 || by[m] > by[best])) {
+                best = m;
+            }
+        }
+        return best >= 0 && by[best] >= 2 && by[best] >= QUIET_SECOND_SHARE * ghosts.size() ? best : -1;
+    }
     private long quietLearnedMs = Long.MIN_VALUE / 2;
 
     private void learnQuietMinute(long now) {
@@ -11368,16 +11403,33 @@ public final class QuoteLoop implements Runnable {
         }
         quietLearnedMs = now;
         int was = quietMinute;
+        int was2 = quietMinute2;
+        java.util.List<Long> ghosts = "auto".equals(QUIET_MINUTE) && QUIET_BY_GHOSTS
+                ? journal.eventTimes("ghost_suspect", now - QUIET_LOOKBACK_MS) : java.util.List.of();
+        int byGhost = ghosts.size() >= QUIET_MIN_EVENTS ? pickQuietMinute(ghosts, -1, new long[60]) : -1;
         if (!"auto".equals(QUIET_MINUTE)) {
             quietMinute = Integer.parseInt(QUIET_MINUTE.trim());
+        } else if (byGhost >= 0) {
+            // 13.11.2026: ПО ПРИЗРАКАМ, а не по всем затыкам. В ноябре затыки идут во все минуты часа, доля :38
+            // упала до ~6% и выбор выключил защиту (с 11.11), а призраки по-прежнему на :38 (75–90%) и :36 —
+            // 12.11 они заперли 1263 USDC. Призраков в разведённой минуте не бывает, поэтому выбор держится трое суток.
+            quietMinute = byGhost;
+            quietMinute2 = secondGhostMinute(ghosts, byGhost);
+            quietFromGhosts = true;
+        } else if (quietFromGhosts && quietMinute >= 0) {
+            // липкость: в разведённой минуте призраков нет, их отсутствие — не довод; держим, пока они не появятся в ДРУГОЙ минуте
         } else if (client instanceof StallFeed feed && feed.observedMs(now) >= QUIET_FEED_TRUST_MS) {
             // Зонд видит все минуты, включая разведённую: его расписанию верим как есть,
             // без липкости и без проверочного часа.
             // 12 ч, а не трое суток: зонд видит КАЖДЫЙ час, дюжины часов хватает с
             // запасом, а длинная история после переезда минуты перевешивала бы новую.
             quietMinute = pickQuietMinute(feed.stallTimes(now - QUIET_FEED_LOOKBACK_MS), -1, ignoredBefore);
+            quietMinute2 = -1;
+            quietFromGhosts = false;
         } else {
             java.util.List<Long> own = journal.eventTimes("venue_stall", now - QUIET_LOOKBACK_MS);
+            quietMinute2 = -1;
+            quietFromGhosts = false;
             if (quietMinute < 0) {
                 quietMinute = pickQuietMinute(own, -1, ignoredBefore);
             } else {
@@ -11398,11 +11450,13 @@ public final class QuoteLoop implements Runnable {
             // её без защиты (28.09.2026 19:38: a, b, e, f торговали в :38 «проверкой»).
             lastQuietProbeMs = now;
         }
-        if (quietMinute != was) {
+        if (quietMinute != was || quietMinute2 != was2) {
             String text = quietMinute < 0
                     ? "минута затыков не выражена — разведения нет"
                     : String.format(java.util.Locale.ROOT,
-                            "минута затыков :%02d — в неё заявки разведены и не трогаются", quietMinute);
+                            "минута затыков :%02d%s — в неё заявки разведены и не трогаются%s", quietMinute,
+                            quietMinute2 >= 0 ? String.format(java.util.Locale.ROOT, " и :%02d", quietMinute2) : "",
+                            quietFromGhosts ? " (по призракам)" : "");
             log.info(text);
             journal.event("quiet_minute", text);
         }
