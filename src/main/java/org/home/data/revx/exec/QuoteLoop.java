@@ -71,6 +71,8 @@ public final class QuoteLoop implements Runnable {
      * «повторять чаще». Сначала перестали пробивать лимит, потом сократили паузу.
      */
     private static final long MAX_PLACE_BACKOFF_MS = 15_000L;
+    /** Предел паузы, когда один и тот же определённый отказ (4xx без заявки) повторяется 3+ раза подряд. */
+    private static final long MAX_PLACE_BACKOFF_REPEAT_MS = 300_000L;
     /**
      * Сколько заявка считается «свежей». Список активных отстаёт от постановки,
      * и вывод «её там нет, значит исполнилась» на свежем id даёт дубль.
@@ -7665,7 +7667,10 @@ public final class QuoteLoop implements Runnable {
             // (0 — без предела). Покупки — прежние лоты на своих уровнях.
             want = ASK_LOT_MULT > 0 ? params.size() * ASK_LOT_MULT : Double.MAX_VALUE;
         }
-        double ownSize = resting.venueId == null ? 0 : resting.size;
+        // 14.11.2026: у надкушенной заявки резерв площадки — только НЕисполненный остаток. Полный размер
+        // завышал доступное ровно на исполненную часть: c 87 раз подряд получил 422 «Insufficient balance of
+        // Ξ0.01929261; required Ξ0.01945439 (extra Ξ0.00016178)» — 0.00016178 и была исполненная часть.
+        double ownSize = resting.venueId == null ? 0 : ownRemaining(resting.size, resting.partialFilled);
         double affordable = affordable(side, price, baseAvailable, quoteBalance,
                 ownSize, resting.price);
         // ⚠️ Продать больше СВОЕЙ позиции нельзя, даже если на счёте есть чужое.
@@ -7753,6 +7758,11 @@ public final class QuoteLoop implements Runnable {
      * объём прибавляется к доступному. Иначе перевыставить полностью
      * зарезервированную заявку стало бы невозможно.
      */
+    /** Резерв своей стоящей заявки у площадки: размер минус исполненная часть (не меньше нуля). */
+    static double ownRemaining(double size, double partialFilled) {
+        return Math.max(0, size - Math.max(0, partialFilled));
+    }
+
     static double affordable(Side side, double price, double baseAvailable,
                              double quoteAvailable, double ownSize, double ownPrice) {
         if (side == Side.SELL) {
@@ -8052,7 +8062,11 @@ public final class QuoteLoop implements Runnable {
             if (definitelyNotPlaced) {
                 budget.refund(tag.id(), clock.now());
             }
-            long pause = Math.min(MAX_PLACE_BACKOFF_MS, 5_000L << Math.min(4, resting.failures - 1));
+            // 14.11.2026: определённый отказ, повторённый 3 раза подряд, — не случайность, а неверный расчёт
+            // (c: 87 одинаковых 422 по одной каждые 15 с). Дальше пауза растёт до 5 мин.
+            boolean definite4xx = response.status() >= 400 && response.status() < 500 && extract(response.body()) == null;
+            long cap = definite4xx && resting.failures >= 3 ? MAX_PLACE_BACKOFF_REPEAT_MS : MAX_PLACE_BACKOFF_MS;
+            long pause = Math.min(cap, 5_000L << Math.min(6, resting.failures - 1));
             resting.blockedUntilMs = clock.now() + pause;
             log.warn("постановка {} не прошла: {} {} — пауза {} с", side, response.status(),
                     response.body(), pause / 1000);

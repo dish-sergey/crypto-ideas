@@ -895,9 +895,13 @@ public final class ExecJournal implements AutoCloseable {
      */
     public synchronized long placementsSince(long fromMs) {
         try (PreparedStatement ps = connection.prepareStatement(
+                // 14.11.2026 (владелец): определённый отказ 4xx без номера заявки (422 «Insufficient balance» и
+                // т. п.) заявки не создал и в счёт не идёт — c сжёг так 87 из 160 за 23 мин. Считаются 2xx, 5xx и
+                // запросы без ответа (дошли ли — неизвестно). 429 по-прежнему не считается (он тоже 4xx).
                 "SELECT COUNT(*) FROM exec_request WHERE method = 'POST' "
                         + "AND path LIKE '%/orders' AND ts_ms >= ? "
-                        + "AND (status IS NULL OR status <> 429)")) {
+                        + "AND (status IS NULL OR status < 400 OR status >= 500 "
+                        + "OR response LIKE '%venue_order_id%')")) {
             ps.setLong(1, fromMs);
             try (ResultSet rs = ps.executeQuery()) {
                 return rs.next() ? rs.getLong(1) : 0;

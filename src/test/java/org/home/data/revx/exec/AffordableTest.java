@@ -45,6 +45,18 @@ class AffordableTest {
         assertEquals((39.02 + LOT * PRICE) / PRICE, withOwn, 1e-12);
     }
 
+    /**
+     * 14.11.2026, бот c: надкушенная продажа 0.01945439 ETH, исполнено 0.00016178. Площадка держит в
+     * резерве только остаток, и доступно с ним 0.01929261. Полный размер давал 0.01945439 — 87 отказов 422 подряд.
+     */
+    @Test
+    void partiallyFilledOwnOrderWidensOnlyByItsRemainder() {
+        double own = QuoteLoop.ownRemaining(0.01945439, 0.00016178);
+        assertEquals(0.01929261, own, 1e-12);
+        assertEquals(0.01929261, QuoteLoop.affordable(Side.SELL, 1830.0, 0.0, 0.0, own, 1830.0), 1e-12);
+        assertEquals(0.0, QuoteLoop.ownRemaining(0.01, 0.02), 1e-12);
+    }
+
     @Test
     void neverNegativeAndNeverDividesByZeroPrice() {
         assertEquals(0.0, QuoteLoop.affordable(Side.SELL, PRICE, -1.0, 40.0, 0.0, 0.0), 1e-12);
