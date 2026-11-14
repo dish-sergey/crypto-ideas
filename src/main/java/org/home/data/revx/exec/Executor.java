@@ -1179,6 +1179,16 @@ public class Executor {
                         () -> new org.home.data.revx.replay.StandFair(standDbPath, coin, limits,
                                 cfg.memecoins(), cfg.fairMaxSkewMs(),
                                 org.home.data.revx.exec.Clock.system(), fromMs, toMs)).ticks();
+                // 13.11.2026, док. 246 §6а (ансамбль): сдвиг старта. Кэш опоры строится на всё окно
+                // (ключ тот же, новых кэшей нет), прогон начинается на N мс позже.
+                long shiftMs = Long.getLong("revx.forecast.start-shift-ms", 0L);
+                // рынок грузится на всё окно, как без сдвига: иначе ключ кэша рынка свой у каждого сдвига (13.11: +70 ГБ кэшей)
+                long mk0 = ticks.isEmpty() ? fromMs : ticks.get(0).tsMs(), mk1 = ticks.isEmpty() ? toMs : ticks.get(ticks.size() - 1).tsMs();
+                if (shiftMs > 0) {
+                    long t0 = fromMs + shiftMs;
+                    ticks = ticks.stream().filter(t -> t.tsMs() >= t0).toList();
+                    log.warn("группа: {} — старт сдвинут на {} мс", sym, shiftMs);
+                }
                 if (ticks.isEmpty()) {
                     throw new IllegalStateException("нет снимков книги для " + sym);
                 }
@@ -1202,7 +1212,7 @@ public class Executor {
                         0.0007, cfg.simSkewK(), 0.3, 1000, ps.minNotional(), ps.baseStep(),
                         ps.quoteStep(), 0.10, -1, -1, 0, 0.02, 0.5, true, 1, 0, true);
                 var market = org.home.data.revx.replay.MarketData.load(standDbPath, sym,
-                        ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
+                        mk0, mk1);
                 pairs.add(new org.home.data.revx.replay.GroupForecast.Pair(sym, ticks,
                         new org.home.data.revx.replay.MarketFillModel(market), base, bots, caps));
                 log.warn("группа: {} — тиков {}, ботов {}", sym, ticks.size(), bots.size());

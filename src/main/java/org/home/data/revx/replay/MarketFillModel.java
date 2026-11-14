@@ -120,6 +120,8 @@ public final class MarketFillModel implements FillModel {
      * ошибка ПОВЕРКИ, а не модели: сторона заявки выводилась из тела {@code PUT},
      * где её нет, и слоты продаж приходили покупками выше аска. Снято.
      */
+    static final double FILL_DROP = Double.parseDouble(System.getProperty("revx.sim.fill-drop", "0"));
+    private final java.util.Random dropRnd = new java.util.Random(Long.getLong("revx.sim.seed", 1L));
     private final boolean interceptOn =
             Boolean.parseBoolean(System.getProperty("revx.fill.intercept", "true"));
 
@@ -575,6 +577,15 @@ public final class MarketFillModel implements FillModel {
                         verdict = "volume";
                     }
                     break;
+                }
+                // ВОЗМУЩЕНИЕ ТРАЕКТОРИИ (14.11.2026, док. 246 §6а): с вероятностью fill-drop принт эту заявку не
+                // берёт — по зерну revx.sim.seed. Сдвиг старта траектории не разводит (стенд сходится сам);
+                // ансамбль зёрен показывает, насколько итог зависит от того, какие именно сделки случились.
+                if (FILL_DROP > 0 && dropRnd.nextDouble() < FILL_DROP) {
+                    if (verdict == null) {
+                        verdict = "dropped";
+                    }
+                    continue;
                 }
                 double qty = Math.min(left.get(r.id()), volume);
                 left.merge(r.id(), -qty, Double::sum);
