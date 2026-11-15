@@ -147,6 +147,18 @@ public final class QuoteLoop implements Runnable {
         String partialId;
         long partialSinceMs;
         double partialFilled;
+        /** Неисполненный остаток надкушенной заявки по словам площадки (quantity − filled); NaN — не знаем. */
+        double partialLeaves = Double.NaN;
+
+        /**
+         * Неисполненный остаток стоящей заявки (15.11.2026, сверка на стенде).
+         * ⚠️ {@link #size} после сверки со списком активных УЖЕ остаток ({@code leaves_quantity}), поэтому вычитать
+         * из него исполненное нельзя: при надкусе 87% остаток выходил нулём, и бот снимал свою же продажу как
+         * «нечем котировать». Остаток берётся у площадки и только у ТЕКУЩЕЙ надкушенной ({@link #partial()}).
+         */
+        double remaining() {
+            return remainingOf(size, partialId, venueId, partialLeaves);
+        }
 
         /** Стоит ли в слоте частично исполненная заявка. Её заменить нельзя. */
         boolean partial() {
@@ -5121,7 +5133,7 @@ public final class QuoteLoop implements Runnable {
         java.util.List<double[]> mine = new java.util.ArrayList<>();
         for (Resting r : own) {
             if (r.venueId != null && r.price > 0) {
-                mine.add(new double[]{r.price, Math.max(0, r.size - r.partialFilled)});
+                mine.add(new double[]{r.price, r.remaining()});
             }
         }
         return withoutOwn(levels, mine);
@@ -7681,7 +7693,7 @@ public final class QuoteLoop implements Runnable {
      * нельзя никогда — ни ради лота, ни ради «пыли в заявку» (14.11.2026, см. {@link #absorbDust}).
      */
     private double hardCapFor(Side side, double price, Resting resting) {
-        double ownSize = resting.venueId == null ? 0 : ownRemaining(resting.size, resting.partialFilled);
+        double ownSize = resting.venueId == null ? 0 : resting.remaining();
         return hardCap(side, price, baseAvailable, quoteBalance, ownSize, resting.price, inventory,
                 side == Side.SELL ? lockedBaseEff() : 0, params.inventoryCap(), frozenUnwind,
                 alloc == null || side != Side.SELL ? Double.NaN : alloc.own(tag.id(), base),
@@ -7796,7 +7808,18 @@ public final class QuoteLoop implements Runnable {
         return size;
     }
 
-    /** Резерв своей стоящей заявки у площадки: размер минус исполненная часть (не меньше нуля). */
+    /**
+     * Остаток заявки слота: у текущей надкушенной — не больше того, что площадка назвала неисполненным
+     * ({@code leaves}), иначе размер слота. {@code size} бывает и исходным (надкус узнан вопросом о заявке), и уже
+     * остатком (узнан по списку активных), поэтому берётся меньшее, а не разность.
+     */
+    static double remainingOf(double size, String partialId, String venueId, double leaves) {
+        boolean current = partialId != null && partialId.equals(venueId);
+        return current && Double.isFinite(leaves) ? Math.max(0, Math.min(size, leaves)) : Math.max(0, size);
+    }
+
+    /** Размер минус исполненная часть (не меньше нуля) — когда размер заведомо исходный. */
+
     static double ownRemaining(double size, double partialFilled) {
         return Math.max(0, size - Math.max(0, partialFilled));
     }
@@ -8471,13 +8494,17 @@ public final class QuoteLoop implements Runnable {
      * число сверок.
      */
     private void markPartial(Side side, Resting resting, double filled, double quantity) {
+        // number() отдаёт 0 на пропавшее поле: без исходного размера остатка не знаем (NaN — держим размер слота)
+        double leaves = quantity > 0 && filled >= 0 ? quantity - filled : Double.NaN;
         if (resting.partial()) {
             resting.partialFilled = filled;
+            resting.partialLeaves = leaves;
             return;                       // уже помечена, счётчик не портим
         }
         resting.partialId = resting.venueId;
         resting.partialSinceMs = clock.now();
         resting.partialFilled = filled;
+        resting.partialLeaves = leaves;
         partials++;
         double share = quantity > 0 ? filled / quantity * 100 : 0;
         String text = side + " " + resting.venueId + " исполнено " + fmt(filled)
@@ -8498,6 +8525,8 @@ public final class QuoteLoop implements Runnable {
     private void closePartial(Resting resting, String outcome) {
         if (!resting.partial()) {
             resting.partialId = null;
+            resting.partialFilled = 0;   // 15.11.2026: не оставлять исполненное следующей заявке слота
+            resting.partialLeaves = Double.NaN;
             return;
         }
         long waited = Math.max(0, clock.now() - resting.partialSinceMs);
@@ -8506,6 +8535,8 @@ public final class QuoteLoop implements Runnable {
         log.warn("частичная заявка: {}", text);
         journal.event("partial_done", text);
         resting.partialId = null;
+        resting.partialFilled = 0;   // 15.11.2026: не оставлять исполненное следующей заявке слота
+        resting.partialLeaves = Double.NaN;
     }
 
     /**
@@ -11217,7 +11248,7 @@ public final class QuoteLoop implements Runnable {
         double s = 0;
         for (Resting r : asks) {
             if (r.venueId != null) {
-                s += ownRemaining(r.size, r.partialFilled);
+                s += r.remaining();
             }
         }
         return s;
@@ -11487,7 +11518,7 @@ public final class QuoteLoop implements Runnable {
             }
         }
         if (bookHasOwn) {
-            atOurs = Math.max(0, atOurs - Math.max(0, r.size - r.partialFilled));
+            atOurs = Math.max(0, atOurs - r.remaining());
         }
         return ahead + atOurs;
     }
