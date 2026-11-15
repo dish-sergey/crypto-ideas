@@ -6877,6 +6877,12 @@ public final class QuoteLoop implements Runnable {
             }
             panicTakerNextMs = now + 10_000;
             Double tpx = onTick(Side.BUY, ref * (1 - PANIC_TAKER_DEPTH_BP / 1e4));
+            // 14.11.2026: тейкерская продажа тоже не выше жёсткого предела (доступное на счёте, претензия в
+            // реестре) — до этого она ставила «позиция − запертое» мимо проверки, и расхождение счётчика на обвале
+            // дало бы петлю 422 или продажу чужого. Своей заявки в слоте здесь нет (снята выше).
+            if (tpx != null && tpx > 0) {
+                pool = Math.min(pool, hardCapFor(Side.SELL, tpx, a));
+            }
             if (tpx != null && tpx > 0 && pool * tpx >= minNotional) {
                 panicTakers++;
                 journal.event("panic_taker", String.format(java.util.Locale.ROOT,
@@ -7466,10 +7472,9 @@ public final class QuoteLoop implements Runnable {
         // на грани 0.1 USDC его стоимость гуляет с ценой, и бот ставил его, через тик
         // снимал «нечем котировать» и ставил снова — 9 постановок за 23 мин сожгли хвост
         // распродажи, и бот встал с лотом. Такой остаток продаётся вместе с этой заявкой.
-        if (side == Side.SELL && size > 0 && pool > size
-                && (pool - size) * targetPrice < sellPlaceMinNow()
-                && pool * targetPrice <= maxOrderNotional) {
-            size = pool;
+        if (side == Side.SELL) {
+            size = absorbDust(size, pool, hardCapFor(side, targetPrice, resting), targetPrice,
+                    sellPlaceMinNow(), maxOrderNotional);
         }
         dump(String.format(java.util.Locale.ROOT,
                 "ВСТР %s ур%d: слот=%s цена=%.8f размер=%.6f | цель=%.8f | пул=%.6f | размер=%.6f",
@@ -7667,12 +7672,32 @@ public final class QuoteLoop implements Runnable {
             // (0 — без предела). Покупки — прежние лоты на своих уровнях.
             want = ASK_LOT_MULT > 0 ? params.size() * ASK_LOT_MULT : Double.MAX_VALUE;
         }
-        // 14.11.2026: у надкушенной заявки резерв площадки — только НЕисполненный остаток. Полный размер
-        // завышал доступное ровно на исполненную часть: c 87 раз подряд получил 422 «Insufficient balance of
-        // Ξ0.01929261; required Ξ0.01945439 (extra Ξ0.00016178)» — 0.00016178 и была исполненная часть.
+        return Math.min(want, hardCapFor(side, price, resting));
+    }
+
+    /**
+     * ЖЁСТКИЙ ПРЕДЕЛ заявки — всё, кроме желаемого лота: доступное на счёте (с возвратом резерва своей заявки
+     * при замене), своя позиция без запертого призраком, претензия в реестре, своя касса. Выше него поставить
+     * нельзя никогда — ни ради лота, ни ради «пыли в заявку» (14.11.2026, см. {@link #absorbDust}).
+     */
+    private double hardCapFor(Side side, double price, Resting resting) {
         double ownSize = resting.venueId == null ? 0 : ownRemaining(resting.size, resting.partialFilled);
+        return hardCap(side, price, baseAvailable, quoteBalance, ownSize, resting.price, inventory,
+                side == Side.SELL ? lockedBaseEff() : 0, params.inventoryCap(), frozenUnwind,
+                alloc == null || side != Side.SELL ? Double.NaN : alloc.own(tag.id(), base),
+                alloc == null || side != Side.BUY ? Double.NaN : alloc.own(tag.id(), quote),
+                side == Side.BUY ? lockedQuoteEff() : 0);
+    }
+
+    /** Чистая функция жёсткого предела (тесты: {@code HardCapTest}). claimBase / claimQuote = NaN — реестра нет. */
+    static double hardCap(Side side, double price, double baseAvailable, double quoteBalance, double ownSize,
+                          double ownPrice, double inventory, double lockedBase, double inventoryCap,
+                          boolean frozenUnwind, double claimBase, double claimQuote, double lockedQuote) {
+        // Резерв своей стоящей заявки считаем по НЕисполненному остатку (14.11.2026). Площадка проводит
+        // исполненную часть надкушенной заявки по остаткам только при её закрытии, поэтому полный размер может
+        // быть и верным — но остаток всегда в сторону «поставить меньше», а надкушенную заменить нельзя вовсе.
         double affordable = affordable(side, price, baseAvailable, quoteBalance,
-                ownSize, resting.price);
+                ownSize, ownPrice);
         // ⚠️ Продать больше СВОЕЙ позиции нельзя, даже если на счёте есть чужое.
         //
         // `affordable` для продажи смотрит на `baseAvailable` — общий остаток
@@ -7702,8 +7727,8 @@ public final class QuoteLoop implements Runnable {
         // позицию к нулю, а не в том, чтобы менять её состав.
         // Запертое призраком (§3.6) в позиции есть, а продать его нельзя.
         double ownPositionCap = side == Side.SELL
-                ? Math.max(0, inventory - lockedBaseEff())
-                : (frozenUnwind ? 0 : Math.max(0, params.inventoryCap() - inventory));
+                ? Math.max(0, inventory - lockedBase)
+                : (frozenUnwind ? 0 : Math.max(0, inventoryCap - inventory));
         // Симметрично для покупки: тратить можно только СВОЮ долю кассы, иначе
         // бот покупает на деньги соседа. У бота B это стоило 197 отказов
         // «Insufficient balance» за сутки — каждый из них тратит постановку из
@@ -7713,8 +7738,8 @@ public final class QuoteLoop implements Runnable {
         // нормальное рабочее состояние: 04.09.2026 счёта хватало на $46.21 при
         // сумме потолков $49.13, и требовать полного покрытия было бы нельзя.
         double ownCashCap = Double.MAX_VALUE;
-        if (side == Side.BUY && alloc != null && price > 0) {
-            ownCashCap = Math.max(0, alloc.own(tag.id(), quote) - lockedQuoteEff()) / price;
+        if (side == Side.BUY && !Double.isNaN(claimQuote) && price > 0) {
+            ownCashCap = Math.max(0, claimQuote - lockedQuote) / price;
         }
         // ⚠️ ПРОДАЖУ ОГРАНИЧИВАЕТ И ЗАХВАТ, А НЕ ТОЛЬКО СВОЙ СЧЁТЧИК.
         //
@@ -7736,11 +7761,10 @@ public final class QuoteLoop implements Runnable {
         // Теперь расхождение счётчика приводит к НЕДОпродаже, а не к продаже
         // чужого. Само расхождение по-прежнему только логируется.
         double ownClaimCap = Double.MAX_VALUE;
-        if (side == Side.SELL && alloc != null) {
-            ownClaimCap = Math.max(0, alloc.own(tag.id(), base) - lockedBaseEff());
+        if (side == Side.SELL && !Double.isNaN(claimBase)) {
+            ownClaimCap = Math.max(0, claimBase - lockedBase);
         }
-        return Math.min(Math.min(want, ownClaimCap),
-                Math.min(Math.min(affordable, ownPositionCap), ownCashCap));
+        return Math.min(ownClaimCap, Math.min(Math.min(affordable, ownPositionCap), ownCashCap));
     }
 
     /**
@@ -7758,6 +7782,20 @@ public final class QuoteLoop implements Runnable {
      * объём прибавляется к доступному. Иначе перевыставить полностью
      * зарезервированную заявку стало бы невозможно.
      */
+    /**
+     * ПЫЛЬ В ЗАЯВКУ, НО НЕ ВЫШЕ ЖЁСТКОГО ПРЕДЕЛА. Остаток пула мельче минимальной продажи отдельной заявкой не
+     * живёт (09.10.2026) и продаётся вместе с этой. ⚠️ До 14.11.2026 размер становился равен пулу целиком, мимо
+     * проверки доступного: у c доступно 0.01929261 ETH, пул 0.01945439, «пыль» 0.00016178 (~$0.30) — продажа
+     * на весь пул получила 422 «Insufficient balance» 87 раз подряд и сожгла суточный предел постановок.
+     */
+    static double absorbDust(double size, double pool, double hardCap, double price, double sellMin,
+                             double maxNotional) {
+        if (size > 0 && pool > size && (pool - size) * price < sellMin && pool * price <= maxNotional) {
+            return Math.max(size, Math.min(pool, hardCap));
+        }
+        return size;
+    }
+
     /** Резерв своей стоящей заявки у площадки: размер минус исполненная часть (не меньше нуля). */
     static double ownRemaining(double size, double partialFilled) {
         return Math.max(0, size - Math.max(0, partialFilled));
@@ -11150,8 +11188,39 @@ public final class QuoteLoop implements Runnable {
     /** Запертая своя монета, НЕ покрытая буфером: её одну и нельзя продавать. */
     double lockedBaseEff() {
         double locked = lockedBase();
-        return locked <= 0 ? 0
-                : Math.max(0, locked - ownerlessFree(base, baseTotalAccount, baseAvailable));
+        // 14.11.2026, бот a: своя стоящая продажа держит свои монеты в резерве и уменьшает available. Без
+        // возврата её остатка ничейный буфер «сжимался», запертое росло, продажа снималась как «нечем
+        // котировать», available возвращался — и через минуту она ставилась снова (качели 15:38–17:45: 57
+        // постановок, 27 таких снятий, предел 160 выбран). Остаток своих продаж — наше же, считаем его свободным.
+        if (locked <= 0 || alloc == null || !Double.isFinite(baseTotalAccount)) {
+            return locked <= 0 ? 0 : Math.max(0, locked);
+        }
+        return lockedUncovered(locked, baseTotalAccount, claimedAll(base, clock.now()), baseAvailable, ownRestingSells());
+    }
+
+    /**
+     * Запертое призраком своё, НЕ покрытое ничейным буфером. Ничейное свободное = min(всего − претензии всех ботов,
+     * доступно + остаток своих стоящих продаж). ⚠️ Результат не должен зависеть от того, стоит ли своя продажа:
+     * её постановка переводит монеты из «доступно» в её резерв, и без второго слагаемого запертое росло на объём
+     * собственной заявки — бот снимал её как «нечем котировать» и ставил снова (a, 14.11.2026).
+     */
+    static double lockedUncovered(double locked, double total, double claimedAll, double available, double ownRestingSells) {
+        if (locked <= 0) {
+            return 0;
+        }
+        double ownerlessFree = Math.max(0, Math.min(total - claimedAll, available + Math.max(0, ownRestingSells)));
+        return Math.max(0, locked - ownerlessFree);
+    }
+
+    /** Неисполненный остаток своих стоящих продаж (резерв площадки под ними). */
+    private double ownRestingSells() {
+        double s = 0;
+        for (Resting r : asks) {
+            if (r.venueId != null) {
+                s += ownRemaining(r.size, r.partialFilled);
+            }
+        }
+        return s;
     }
 
     /** Запертая своя касса, не покрытая ничейными USDC. */
