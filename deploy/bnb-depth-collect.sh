@@ -13,6 +13,7 @@
 #
 # ⚠️ История стакана в архив Бинанса не попадает (bookDepth — только суммы по полосам ±1…5%), поэтому каждый час без
 # записи — дыра навсегда (принцип 4). Грабли websocat — см. bnb-collect.sh: FIFO-держатель подписки, -E с пингами,
+# -B 1048576 (14.11.2026: буфер по умолчанию 64 КБ резал крупные пачки изменений перпа — 460 из 515 тыс. за 12.11),
 # дата по каждой строке.
 set -u
 ROOT="${ROOT:-$HOME/binance-depth}"
@@ -38,7 +39,7 @@ ws_loop() {  # $1 — адрес, $2 — подписка, $3 — каталог
         mkfifo "$fifo" || { sleep 5; continue; }
         ( echo "{\"method\":\"SUBSCRIBE\",\"params\":[$subs],\"id\":1}"; while :; do sleep 10; done ) > "$fifo" &
         holder=$!
-        "$WS" -t -E --ping-interval "$PING_INTERVAL" --ping-timeout "$PING_TIMEOUT" "$url" < "$fifo" | stamp "$dir"
+        "$WS" -t -E -B 1048576 --ping-interval "$PING_INTERVAL" --ping-timeout "$PING_TIMEOUT" "$url" < "$fifo" | stamp "$dir"
         kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
         rm -f "$fifo"
         echo "$(date -u +%FT%TZ) $dir: сессия закончилась, переподключаюсь" >&2

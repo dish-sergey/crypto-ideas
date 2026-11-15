@@ -474,6 +474,15 @@ public class CliRunner implements ApplicationRunner {
                 Runtime.getRuntime().addShutdownHook(new Thread(feed::stop));
                 feed.run();                          // блокирует: демон
             }
+            if (args.containsOption("revx-liq-state")) {
+                // Поток ликвидаций для живых ботов (док. 246 §3): micro, одна строка в файл раз в 3 с.
+                var w = new org.home.data.revx.exec.LiqStateWriter(firstOr(args, "db", "data/crypto.db"),
+                        firstOr(args, "out", "data/liq-state.txt"), Long.parseLong(firstOr(args, "period-ms", "3000")),
+                        Long.getLong("revx.liq.window-sec", 300), Double.parseDouble(System.getProperty("revx.liq.share-pct", "1.6")),
+                        Integer.getInteger("revx.liq.days", 30), Double.parseDouble(System.getProperty("revx.liq.fixed-usd", "1000000")));
+                Runtime.getRuntime().addShutdownHook(new Thread(w::stop));
+                w.run();                             // блокирует: демон
+            }
             if (args.containsOption("revx-venue")) {
                 // Читатель площадки: единственный, кто спрашивает её GET-ами, пишет
                 // revx-shared/venue.db. Этап 1 — в тени (ЧИТАТЕЛЬ-ПЛОЩАДКИ.md).

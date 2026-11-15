@@ -45,6 +45,19 @@ class AffordableTest {
         assertEquals((39.02 + LOT * PRICE) / PRICE, withOwn, 1e-12);
     }
 
+    /**
+     * Своя надкушенная заявка возвращает при замене не больше неисполненного остатка — в сторону «поставить
+     * меньше» (14.11.2026). ⚠️ Отказы c в тот день шли не отсюда, а от «пыли в заявку» мимо доступного — см.
+     * {@code HardCapTest}. Числа взяты из того случая.
+     */
+    @Test
+    void partiallyFilledOwnOrderWidensOnlyByItsRemainder() {
+        double own = QuoteLoop.ownRemaining(0.01945439, 0.00016178);
+        assertEquals(0.01929261, own, 1e-12);
+        assertEquals(0.01929261, QuoteLoop.affordable(Side.SELL, 1830.0, 0.0, 0.0, own, 1830.0), 1e-12);
+        assertEquals(0.0, QuoteLoop.ownRemaining(0.01, 0.02), 1e-12);
+    }
+
     @Test
     void neverNegativeAndNeverDividesByZeroPrice() {
         assertEquals(0.0, QuoteLoop.affordable(Side.SELL, PRICE, -1.0, 40.0, 0.0, 0.0), 1e-12);

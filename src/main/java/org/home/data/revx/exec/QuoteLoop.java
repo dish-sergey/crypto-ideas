@@ -71,6 +71,8 @@ public final class QuoteLoop implements Runnable {
      * «повторять чаще». Сначала перестали пробивать лимит, потом сократили паузу.
      */
     private static final long MAX_PLACE_BACKOFF_MS = 15_000L;
+    /** Предел паузы, когда один и тот же определённый отказ (4xx без заявки) повторяется 3+ раза подряд. */
+    private static final long MAX_PLACE_BACKOFF_REPEAT_MS = 300_000L;
     /**
      * Сколько заявка считается «свежей». Список активных отстаёт от постановки,
      * и вывод «её там нет, значит исполнилась» на свежем id даёт дубль.
@@ -145,6 +147,18 @@ public final class QuoteLoop implements Runnable {
         String partialId;
         long partialSinceMs;
         double partialFilled;
+        /** Неисполненный остаток надкушенной заявки по словам площадки (quantity − filled); NaN — не знаем. */
+        double partialLeaves = Double.NaN;
+
+        /**
+         * Неисполненный остаток стоящей заявки (15.11.2026, сверка на стенде).
+         * ⚠️ {@link #size} после сверки со списком активных УЖЕ остаток ({@code leaves_quantity}), поэтому вычитать
+         * из него исполненное нельзя: при надкусе 87% остаток выходил нулём, и бот снимал свою же продажу как
+         * «нечем котировать». Остаток берётся у площадки и только у ТЕКУЩЕЙ надкушенной ({@link #partial()}).
+         */
+        double remaining() {
+            return remainingOf(size, partialId, venueId, partialLeaves);
+        }
 
         /** Стоит ли в слоте частично исполненная заявка. Её заменить нельзя. */
         boolean partial() {
@@ -2075,7 +2089,69 @@ public final class QuoteLoop implements Runnable {
     /** Сигнал падения поднимает цену запаса бида на столько б.п.: отступ выбирает функция (05.11.2026, док. 236); бид не паркуется. */
     static final double FALL_INV_BP = Double.parseDouble(System.getProperty("revx.exec.fall-inv-bp", "0"));
 
+    /**
+     * ПОТОК ЛИКВИДАЦИЙ ЖИВЬЁМ (13.11.2026, док. 246 §3). {@code revx.exec.liq-live-file=<файл>} — одна строка
+     * «время_мс;сумма_$;порог_$», её раз в 2–5 с переписывает micro ({@code --revx-liq-state}): лонги Bybit + OKX по
+     * BTC, ETH, SOL вместе за последние 5 мин по времени получения, порог — уровень, выше которого сумма лежала 1.6%
+     * времени за 30 суток. Состояние горит, пока сумма ≥ порога. Файл старше {@code liq-live-stale-sec} (30 с) или
+     * нечитаемый — состояние выключено, событие {@code liq_stale}.
+     * <p>
+     * {@code liq-live-shadow=true} (по умолчанию) — ТЕНЬ: бот пишет {@code liq_state_on/off}, торговлю не меняет. С
+     * {@code false} состояние питает то же правило, что файл стенда {@code fall-file} (бид {@code fall-widen-bp}, лот
+     * покупки {@code fall-lot-mult}); оба сразу задавать нельзя.
+     */
+    static final String LIQ_LIVE = blankToNull(System.getProperty("revx.exec.liq-live-file", ""));
+    static final boolean LIQ_SHADOW = Boolean.parseBoolean(System.getProperty("revx.exec.liq-live-shadow", "true"));
+    static final long LIQ_STALE_MS = Long.getLong("revx.exec.liq-live-stale-sec", 30) * 1000L;
+    static final boolean FALL_SRC = FALL_FILE != null || (LIQ_LIVE != null && !LIQ_SHADOW);
+    private long liqCheckedMs = Long.MIN_VALUE / 2;
+    private boolean liqOn, liqStale, liqInit;
+
+    /** Состояние «ликвидации» по живому файлу; события на переходах. Читает файл не чаще раза в секунду. */
+    boolean liqLiveOn(long now) {
+        if (FALL_FILE != null) {
+            throw new IllegalStateException("заданы и revx.exec.fall-file, и revx.exec.liq-live-file — оставить один");
+        }
+        if (now - liqCheckedMs < 1000) {
+            return liqOn;
+        }
+        liqCheckedMs = now;
+        long ts = -1;
+        double sum = Double.NaN, thr = Double.NaN;
+        try {
+            String l = java.nio.file.Files.readString(java.nio.file.Path.of(LIQ_LIVE)).trim();
+            String[] p = l.split(";");
+            ts = Long.parseLong(p[0]);
+            sum = Double.parseDouble(p[1]);
+            thr = Double.parseDouble(p[2]);
+        } catch (Exception e) {
+            ts = -1;
+        }
+        boolean stale = ts < 0 || now - ts > LIQ_STALE_MS || !(thr > 0);
+        if (stale != liqStale || !liqInit) {
+            if (stale) {
+                journal.event("liq_stale", String.format(java.util.Locale.ROOT, "%s: поток ликвидаций %s — состояние выключено",
+                        symbol, ts < 0 ? "не читается (" + LIQ_LIVE + ")" : "устарел на " + (now - ts) / 1000 + " с"));
+            } else if (liqInit) {
+                journal.event("liq_fresh", symbol + ": поток ликвидаций снова свежий");
+            }
+            liqStale = stale;
+        }
+        boolean on = !stale && sum >= thr;
+        if (on != liqOn) {
+            journal.event(on ? "liq_state_on" : "liq_state_off", String.format(java.util.Locale.ROOT,
+                    "%s: ликвидации лонгов за 5 мин $%.0f, порог $%.0f%s", symbol, sum, thr, LIQ_SHADOW ? " (тень)" : ""));
+        }
+        liqOn = on;
+        liqInit = true;
+        return on;
+    }
+
     private boolean fallSignalOn(long now) {
+        if (LIQ_LIVE != null) {
+            boolean on = liqLiveOn(now);
+            return !LIQ_SHADOW && on;
+        }
         if (fallIntervals == null) {
             fallIntervals = new java.util.TreeMap<>();
             String coin = symbol.split("[^A-Za-z]")[0];
@@ -2123,6 +2199,11 @@ public final class QuoteLoop implements Runnable {
     public static final boolean NO_GREED = Boolean.getBoolean("revx.exec.no-greed");
     /** «Не ловить нож» в бою (док. 193 шаг 4.1): пока нож включён, бид отводится заменой. */
     static final boolean KNIFE = Boolean.getBoolean("revx.exec.knife");
+    /**
+     * Мягкий нож (15.11.2026, док. 248, владелец: «доход плоский — при любом намёке на падение стоять дальше»): пока нож
+     * включён, бид отходит на столько б.п., а не отводится совсем. 0 — прежнее поведение (отвод на {@code park-distance}).
+     */
+    static final double KNIFE_WIDEN_BP = Double.parseDouble(System.getProperty("revx.exec.knife-widen-bp", "0"));
     private boolean knifeLast;
     private String shadowState = "";
     private boolean knifeOn;
@@ -2406,6 +2487,8 @@ public final class QuoteLoop implements Runnable {
             // Сообщение о сбое опоры называет фактическое действие: сколько запаса
             // продаём или что встаём в паузу (владелец, 07.10.2026).
             h.attach(() -> new double[]{inventory, lastFair, quoting.get() ? 1 : 0});
+            // Опора без своих заявок (revx.fair.hybrid-exclude-own, док. 248): тот же список, что у очереди.
+            h.ownOrders(this::ownRestingLevels);
             // Живая своя книга — для очереди перед надкушенной заявкой; в ней стоим и мы сами.
             this.bookSource = h::bookNow;
             this.bookHasOwn = true;
@@ -4105,7 +4188,7 @@ public final class QuoteLoop implements Runnable {
                 target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
             }
         }
-        if (FALL_FILE != null && fair.price() > 0) {
+        if ((FALL_SRC || LIQ_LIVE != null) && fair.price() > 0) {
             boolean on = fallSignalOn(clock.now());
             if (on != fallLast) {
                 fallLast = on;
@@ -4165,8 +4248,13 @@ public final class QuoteLoop implements Runnable {
                         fmtPrice(knifeLow), knifeOn ? "отведён" : "вернулся", fmt(inventory)));
             }
             if (knifeOn && target.hasBid()) {
-                double far = parkDistance > 0 ? parkDistance : 0.10;
-                target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
+                if (KNIFE_WIDEN_BP > 0) {
+                    // мягкий нож (док. 248, 15.11.2026): бид не убирается, а отходит на KNIFE_WIDEN_BP
+                    target = new Quoter.Quotes(target.bid() * (1 - KNIFE_WIDEN_BP / 1e4), target.ask());
+                } else {
+                    double far = parkDistance > 0 ? parkDistance : 0.10;
+                    target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
+                }
             }
         }
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
@@ -5057,10 +5145,24 @@ public final class QuoteLoop implements Runnable {
         java.util.List<double[]> mine = new java.util.ArrayList<>();
         for (Resting r : own) {
             if (r.venueId != null && r.price > 0) {
-                mine.add(new double[]{r.price, Math.max(0, r.size - r.partialFilled)});
+                mine.add(new double[]{r.price, r.remaining()});
             }
         }
         return withoutOwn(levels, mine);
+    }
+
+    /** Свои стоящие заявки {цена, остаток}: [0] — покупки, [1] — продажи (для опоры без своих, док. 248). */
+    @SuppressWarnings("unchecked")
+    java.util.List<double[]>[] ownRestingLevels() {
+        java.util.List<double[]>[] out = new java.util.List[]{new java.util.ArrayList<double[]>(), new java.util.ArrayList<double[]>()};
+        for (int s = 0; s < 2; s++) {
+            for (Resting r : s == 0 ? bids : asks) {
+                if (r.venueId != null && r.price > 0 && r.remaining() > 0) {
+                    out[s].add(new double[]{r.price, r.remaining()});
+                }
+            }
+        }
+        return out;
     }
 
     /** Вычесть свои объёмы {цена, остаток} из уровней книги; опустевшие уровни выпадают. */
@@ -5438,6 +5540,91 @@ public final class QuoteLoop implements Runnable {
     private long funcMuN;
 
     /** Цена запаса стороны при запасе q лотов (дробный — линейно между соседними целыми, за краями — крайнее значение). */
+    /**
+     * ЦЕНА ЗАПАСА ПО ТЕКУЩЕЙ ВОЛАТИЛЬНОСТИ (14.11.2026, док. 248). Таблица {@code func-inv-file} посчитана один раз с σ² минутного
+     * хода опоры обучающих суток 15.09–05.10 (док. 224: BTC 22, ETH 44, SOL 62 б.п.²) и сама не подстраивается; неделя 07–14.11
+     * у ETH шла с σ² ~81, и ручной множитель ×1.5 к таблице выиграл на всех окнах. Здесь цена запаса умножается на
+     * (σ²_сейчас / σ²_обучения)^pow, σ² — средний квадрат минутного хода опоры за {@code func-inv-vol-min} минут (по умолчанию
+     * сутки; пока истории меньше часа — множитель 1). {@code revx.exec.func-inv-vol=BTC:22,ETH:44,SOL:62} включает, пусто —
+     * выключено. pow 0.5 — перекос ~ √(γσ²) (Guéant, Lehalle, Fernandez-Tapia 2013); множитель в [vol-lo, vol-hi].
+     */
+    static final String FUNC_INV_VOL = blankToNull(System.getProperty("revx.exec.func-inv-vol", ""));
+    static final int FUNC_INV_VOL_MIN = Integer.getInteger("revx.exec.func-inv-vol-min", 1440);
+    static final double FUNC_INV_VOL_POW = Double.parseDouble(System.getProperty("revx.exec.func-inv-vol-pow", "0.5"));
+    static final double FUNC_INV_VOL_LO = Double.parseDouble(System.getProperty("revx.exec.func-inv-vol-lo", "0.5"));
+    static final double FUNC_INV_VOL_HI = Double.parseDouble(System.getProperty("revx.exec.func-inv-vol-hi", "3"));
+    /**
+     * Основа + колебания (владелец 14.11): длинное окно {@code func-inv-vol-long-min} (например 43200 = 30 суток), заполненное на
+     * старте значением {@code func-inv-vol-seed=ETH:…} (σ² за 30 суток до начала, по минутным свечам Бинанса), и короткое
+     * {@code func-inv-vol-min}. σ²_eff = σ²_long^(1−w) · σ²_short^w, w = {@code func-inv-vol-w}. Без длинного окна — только короткое.
+     */
+    static final int FUNC_INV_VOL_LONG_MIN = Integer.getInteger("revx.exec.func-inv-vol-long-min", 0);
+    static final String FUNC_INV_VOL_SEED = blankToNull(System.getProperty("revx.exec.func-inv-vol-seed", ""));
+    static final double FUNC_INV_VOL_W = Double.parseDouble(System.getProperty("revx.exec.func-inv-vol-w", "0.5"));
+    private double[] ivRing, ivLong;
+    private int ivN, ivHead, ivLongHead;
+    private double ivSum, ivLongSum, ivFair, ivScale = 1, ivRef = Double.NaN, ivScaleSum;
+    private long ivMin = -1, ivScaleN, ivLogMin = -1;
+
+    double invVolScale(long now, double fair) {
+        if (FUNC_INV_VOL == null || !(fair > 0)) {
+            return 1;
+        }
+        if (Double.isNaN(ivRef)) {
+            String coin = symbol.split("[^A-Za-z]")[0];
+            ivRef = stormThreshold(FUNC_INV_VOL, coin);
+            ivRing = new double[Math.max(2, FUNC_INV_VOL_MIN)];
+            if (FUNC_INV_VOL_LONG_MIN > 0) {
+                double seed = stormThreshold(FUNC_INV_VOL_SEED, coin);
+                ivLong = new double[FUNC_INV_VOL_LONG_MIN];
+                java.util.Arrays.fill(ivLong, seed > 0 ? seed : ivRef);
+                ivLongSum = (seed > 0 ? seed : ivRef) * FUNC_INV_VOL_LONG_MIN;
+            }
+        }
+        if (!(ivRef > 0)) {
+            return 1;
+        }
+        long m = now / 60_000L;
+        if (m != ivMin) {
+            if (ivMin >= 0 && m == ivMin + 1 && ivFair > 0) {
+                double r = Math.log(fair / ivFair) * 1e4, r2 = r * r;
+                if (ivN == ivRing.length) {
+                    ivSum -= ivRing[ivHead];
+                } else {
+                    ivN++;
+                }
+                ivRing[ivHead] = r2;
+                ivSum += r2;
+                ivHead = (ivHead + 1) % ivRing.length;
+                if (ivLong != null) {
+                    ivLongSum += r2 - ivLong[ivLongHead];
+                    ivLong[ivLongHead] = r2;
+                    ivLongHead = (ivLongHead + 1) % ivLong.length;
+                }
+            }
+            ivMin = m;
+            ivFair = fair;
+            int need = Math.min(ivRing.length, 60);
+            double vs = ivN >= need ? Math.max(ivSum, 0) / ivN : Double.NaN, ve;
+            if (ivLong != null) {
+                double vl = Math.max(ivLongSum, 1e-9) / ivLong.length;
+                ve = Double.isNaN(vs) ? vl : Math.pow(vl, 1 - FUNC_INV_VOL_W) * Math.pow(Math.max(vs, 1e-9), FUNC_INV_VOL_W);
+            } else {
+                ve = vs;
+            }
+            ivScale = Double.isNaN(ve) ? 1 : Math.max(FUNC_INV_VOL_LO, Math.min(FUNC_INV_VOL_HI, Math.pow(ve / ivRef, FUNC_INV_VOL_POW)));
+            ivScaleSum += ivScale;
+            ivScaleN++;
+            if (m / 360 != ivLogMin) {     // раз в 6 ч — в журнал процесса, чтобы видеть, что множитель живой
+                ivLogMin = m / 360;
+                log.info("ЦЕНА ЗАПАСА ПО σ {} {}: σ² {} б.п.² за {} мин (обучение {}), множитель {}, средний {}", symbol, tag.id(),
+                        String.format(java.util.Locale.ROOT, "%.1f", ivN > 0 ? ivSum / ivN : Double.NaN), ivN, ivRef,
+                        String.format(java.util.Locale.ROOT, "%.3f", ivScale), String.format(java.util.Locale.ROOT, "%.3f", ivScaleSum / ivScaleN));
+            }
+        }
+        return ivScale;
+    }
+
     static double invPrice(double[] row, double x) {
         if (row == null || row.length == 0) {
             return 0;
@@ -5541,10 +5728,15 @@ public final class QuoteLoop implements Runnable {
         if (book == null || book.bids().isEmpty() || book.asks().isEmpty()) {
             return base;
         }
-        if (buy && FALL_FILE != null && FALL_WIDEN_BP > 0 && fallLast) {
+        if (buy && FALL_SRC && FALL_WIDEN_BP > 0 && fallLast) {
             fair *= 1 - FALL_WIDEN_BP / 1e4;          // сигнал падения: бид функции дальше на FALL_WIDEN_BP
         }
-        if (!buy && FALL_FILE != null && FALL_WIDEN_ASK_BP != 0 && fallLast) {
+        if (buy && KNIFE && KNIFE_WIDEN_BP > 0 && knifeOn) {
+            // мягкий нож внутри функции (15.11.2026): функция считает бид от опоры заново, и правка цели после неё
+            // до заявки не доходила (311 срабатываний за 14.11 — итог до цента как без ножа)
+            fair *= 1 - KNIFE_WIDEN_BP / 1e4;
+        }
+        if (!buy && FALL_SRC && FALL_WIDEN_ASK_BP != 0 && fallLast) {
             fair *= 1 + FALL_WIDEN_ASK_BP / 1e4;      // буря: и аск функции дальше
         }
         if (!buy && RISE_FILE != null && RISE_WIDEN_BP > 0 && riseLast) {
@@ -5602,12 +5794,13 @@ public final class QuoteLoop implements Runnable {
             q *= funcInvLotsScale;          // свойство читается один раз (12.11.2026): разбор на каждом тике был заметен в профиле
             double head = FUNC_MU_HEAD_BID_ONLY && !buy ? 0 : funcMuHeadNow(fair);
             trInv = funcInv == null ? 0 : buy ? invPrice(funcInv[0], q) : invPrice(funcInv[1], q - 1);
+            trInv *= invVolScale(clock.now(), fair);
             trStorm = (buy && stormOn(clock.now()) ? STORM_INV_BP : 0)
                     + (buy ? stormEmptyBp(clock.now(), params.size() > 0 ? inventory / params.size() : 0) : 0);
             trMu = funcMu;
             trHead = head;
             shift = funcMu + head + trInv
-                    + (buy && FALL_FILE != null && FALL_INV_BP > 0 && fallLast ? FALL_INV_BP : 0)
+                    + (buy && FALL_SRC && FALL_INV_BP > 0 && fallLast ? FALL_INV_BP : 0)
                     + trStorm;
             funcMuSum += funcMu;
             funcMuHeadSum += head;
@@ -5623,6 +5816,7 @@ public final class QuoteLoop implements Runnable {
         }
         double bestD = FUNC_RATE ? 0 : Double.NEGATIVE_INFINITY, bestP = Double.NaN, bestBp = 0;
         double lastAhead = Double.NaN, lastLa = 0;   // ln(1 + $ впереди) меняется только на границах уровней — не пересчитывать (12.11.2026)
+        double zMono = Double.POSITIVE_INFINITY;    // бегущий минимум логита P по δ (func-p-monotone)
         for (double d = Math.ceil(lo); d <= hi + 1e-9; d += 1) {
             double p = buy ? fair * (1 - d / 10_000) : fair * (1 + d / 10_000);
             if (buy ? p >= ba : p <= bb) {
@@ -5638,7 +5832,15 @@ public final class QuoteLoop implements Runnable {
                 lastAhead = ahead;
                 lastLa = Math.log1p(ahead);
             }
-            double dv = FUNC_RATE ? funcRateValue(c, d, lastLa, f, n, spr, shift, r15) : funcValue(c, d, lastLa, f, n, spr, r15);
+            double dv;
+            if (FUNC_P_MONO) {
+                double[] zm = funcZM(c, d, lastLa, f, n, spr, r15);
+                zm[0] = Math.min(zm[0], zMono);           // вероятность исполнения не растёт с удалением
+                zMono = zm[0];
+                dv = funcValueOf(zm, FUNC_RATE, shift);
+            } else {
+                dv = FUNC_RATE ? funcRateValue(c, d, lastLa, f, n, spr, shift, r15) : funcValue(c, d, lastLa, f, n, spr, r15);
+            }
             if (dv > bestD) {
                 bestD = dv;
                 bestP = p;
@@ -5688,6 +5890,10 @@ public final class QuoteLoop implements Runnable {
                     funcRetreats[s]++;
                 }
             }
+        }
+        if (FUNC_STATES != null && FUNC_RATE && clock.now() - funcStatesLast[s] >= FUNC_TRACE_MS) {
+            funcStatesLast[s] = clock.now();
+            funcStatesRow(buy, c, lo, hi, lv, fair, bb, ba, f, n, spr, r15, shift - trInv);
         }
         funcTicks[s]++;
         funcBpSum[s] += bestBp;
@@ -5787,6 +5993,76 @@ public final class QuoteLoop implements Runnable {
         return stormEmptyTicks;
     }
 
+    /**
+     * ТРАССА СОСТОЯНИЙ ЗАПАСА (13.11.2026, док. 246 §6а, прибор 1). {@code revx.exec.func-states=<файл>} — раз в
+     * {@code func-trace-ms} на сторону: время, бот, сторона, опора, лучший бид и аск книги, лот (монет), лотов в потолке,
+     * фактический запас (лотов), затем для каждого запаса q = 0, ¼, ½ … до потолка (лотов) тройка «δ;P5;M» — что выбрала бы
+     * функция при этом запасе (тот же цикл, та же книга, та же цена запаса, без сдвигов и отводов после выбора). Сторона,
+     * которую функция при этом запасе не котирует, — «NaN;NaN;NaN». Только при цене запаса ({@code func-rate}).
+     */
+    static final String FUNC_STATES = blankToNull(System.getProperty("revx.exec.func-states", ""));
+    private final long[] funcStatesLast = {Long.MIN_VALUE / 2, Long.MIN_VALUE / 2};
+    private static java.io.PrintWriter funcStatesOut;
+
+    private void funcStatesRow(boolean buy, double[] c, double lo, double hi,
+                               java.util.List<org.home.data.revx.sim.BookView.Level> lv, double fair, double bb, double ba,
+                               double f, double n, double spr, double r15, double shiftNoInv) {
+        double lot = params.size(), capLots = lot > 0 ? params.inventoryCap() / lot : 0;
+        StringBuilder sb = new StringBuilder(256);
+        sb.append(clock.now()).append(',').append(tag.id()).append(',').append(buy ? "buy" : "sell").append(',')
+                .append(String.format(java.util.Locale.ROOT, "%.10g,%.10g,%.10g,%.8g,%.4f,%.4f", fair, bb, ba, lot, capLots,
+                        lot > 0 ? inventory / lot : 0));
+        int nq = (int) Math.floor(capLots * 4 + 1e-9);
+        // $ впереди по δ — один раз на строку (не зависит от запаса)
+        int nd = (int) Math.floor(hi - Math.ceil(lo) + 1e-9) + 1;
+        double[] la = new double[Math.max(0, nd)];
+        boolean[] ok = new boolean[la.length];
+        for (int i = 0; i < la.length; i++) {
+            double d = Math.ceil(lo) + i;
+            double p = buy ? fair * (1 - d / 10_000) : fair * (1 + d / 10_000);
+            ok[i] = !(buy ? p >= ba : p <= bb);
+            double ahead = 0;
+            for (org.home.data.revx.sim.BookView.Level l : lv) {
+                if (buy ? l.price() >= p - 1e-12 : l.price() <= p + 1e-12) {
+                    ahead += l.qty() * l.price();
+                }
+            }
+            la[i] = Math.log1p(ahead);
+        }
+        for (int k = 0; k <= nq; k++) {
+            double q = Math.min(k / 4.0, capLots) * funcInvLotsScale;
+            double inv = funcInv == null ? 0 : buy ? invPrice(funcInv[0], q) : invPrice(funcInv[1], q - 1);
+            double best = 0, bd = Double.NaN;
+            for (int i = 0; i < la.length; i++) {
+                if (!ok[i]) {
+                    continue;
+                }
+                double d = Math.ceil(lo) + i;
+                double v = funcRateValue(c, d, la[i], f, n, spr, shiftNoInv + inv, r15);
+                if (v > best) {
+                    best = v;
+                    bd = d;
+                }
+            }
+            if (Double.isNaN(bd)) {
+                sb.append(",NaN;NaN;NaN");
+            } else {
+                double[] zm = funcZM(c, bd, la[(int) (bd - Math.ceil(lo))], f, n, spr, r15);
+                sb.append(String.format(java.util.Locale.ROOT, ",%.0f;%.5f;%.3f", bd, Math.min(0.999, 1 / (1 + Math.exp(-zm[0]))), zm[1]));
+            }
+        }
+        synchronized (QuoteLoop.class) {
+            try {
+                if (funcStatesOut == null) {
+                    funcStatesOut = new java.io.PrintWriter(new java.io.FileWriter(FUNC_STATES, java.nio.charset.StandardCharsets.UTF_8, true), true);
+                }
+                funcStatesOut.println(sb);
+            } catch (java.io.IOException e) {
+                log.warn("трасса состояний не записана: {}", e.getMessage());
+            }
+        }
+    }
+
     static final String FUNC_TRACE = blankToNull(System.getProperty("revx.exec.func-trace", ""));
     static final long FUNC_TRACE_MS = Long.getLong("revx.exec.func-trace-ms", 30_000L);
     private final long[] funcTraceLast = {Long.MIN_VALUE / 2, Long.MIN_VALUE / 2};
@@ -5858,6 +6134,24 @@ public final class QuoteLoop implements Runnable {
 
     /** Вес штрафа за хвост в функции с 36 коэффициентами (третья регрессия T = E[max(0, −маркаут − 30)]); 0 — без штрафа. */
     static final double FUNC_TAIL_LAMBDA = Double.parseDouble(System.getProperty("revx.exec.func-tail-lambda", "0"));
+
+    /**
+     * МОНОТОННАЯ ВЕРОЯТНОСТЬ ИСПОЛНЕНИЯ (15.11.2026, док. 248). В P есть член δ² с плюсом: на обучающих δ = 2…30 он
+     * лишь изгибает кривую, а дальше перевешивает, и P растёт с удалением (у общих наклонов ETH на 70 б.п. выше, чем
+     * на 20). Маркаут растёт с δ линейно, поэтому D улетал к краю перебора: с краем 50 пустой бид стоял на 40–48 б.п.
+     * весь день. {@code revx.exec.func-p-monotone=true} — при переборе от близкого δ к дальнему логит P берётся бегущим
+     * минимумом: дальше никогда не вероятнее, чем ближе. По умолчанию выключено.
+     */
+    static final boolean FUNC_P_MONO = Boolean.getBoolean("revx.exec.func-p-monotone");
+
+    /** D по готовым z и M: {@code rate} — скорость снятия × (M − shift) (док. 225), иначе P × M. */
+    static double funcValueOf(double[] zm, boolean rate, double shift) {
+        if (rate) {
+            double pr = Math.min(0.999, 1 / (1 + Math.exp(-zm[0])));
+            return -Math.log1p(-pr) / 5 * (zm[1] - shift);
+        }
+        return zm[1] / (1 + Math.exp(-zm[0]));
+    }
 
     /** Док. 225: скорость снятия −ln(1 − P)/5 (раз в минуту) × (M − p). */
     static double funcRateValue(double[] c, double d, double l, double f, double n, double s, double p) {
@@ -6126,7 +6420,7 @@ public final class QuoteLoop implements Runnable {
                     symbol, file, ladderTab.size(), ladderCapital));
         }
         int cl;
-        if (FALL_FILE != null && fallLast) {
+        if (FALL_SRC && fallLast) {
             cl = 4;
         } else {
             double hv = hourVolBp(clock.now());
@@ -6653,6 +6947,12 @@ public final class QuoteLoop implements Runnable {
             }
             panicTakerNextMs = now + 10_000;
             Double tpx = onTick(Side.BUY, ref * (1 - PANIC_TAKER_DEPTH_BP / 1e4));
+            // 14.11.2026: тейкерская продажа тоже не выше жёсткого предела (доступное на счёте, претензия в
+            // реестре) — до этого она ставила «позиция − запертое» мимо проверки, и расхождение счётчика на обвале
+            // дало бы петлю 422 или продажу чужого. Своей заявки в слоте здесь нет (снята выше).
+            if (tpx != null && tpx > 0) {
+                pool = Math.min(pool, hardCapFor(Side.SELL, tpx, a));
+            }
             if (tpx != null && tpx > 0 && pool * tpx >= minNotional) {
                 panicTakers++;
                 journal.event("panic_taker", String.format(java.util.Locale.ROOT,
@@ -7242,10 +7542,9 @@ public final class QuoteLoop implements Runnable {
         // на грани 0.1 USDC его стоимость гуляет с ценой, и бот ставил его, через тик
         // снимал «нечем котировать» и ставил снова — 9 постановок за 23 мин сожгли хвост
         // распродажи, и бот встал с лотом. Такой остаток продаётся вместе с этой заявкой.
-        if (side == Side.SELL && size > 0 && pool > size
-                && (pool - size) * targetPrice < sellPlaceMinNow()
-                && pool * targetPrice <= maxOrderNotional) {
-            size = pool;
+        if (side == Side.SELL) {
+            size = absorbDust(size, pool, hardCapFor(side, targetPrice, resting), targetPrice,
+                    sellPlaceMinNow(), maxOrderNotional);
         }
         dump(String.format(java.util.Locale.ROOT,
                 "ВСТР %s ур%d: слот=%s цена=%.8f размер=%.6f | цель=%.8f | пул=%.6f | размер=%.6f",
@@ -7433,7 +7732,7 @@ public final class QuoteLoop implements Runnable {
         }
         if (side == Side.BUY) {
             // на сигнале падения и в бурю покупка меньшим лотом (владелец 06.11.2026, док. 236)
-            if (FALL_LOT_MULT < 1 && FALL_FILE != null && fallLast) want *= FALL_LOT_MULT;
+            if (FALL_LOT_MULT < 1 && FALL_SRC && fallLast) want *= FALL_LOT_MULT;
             if (STORM_LOT_MULT < 1 && stormLast) want *= STORM_LOT_MULT;
         }
         if (side == Side.SELL && panicSizing) {
@@ -7443,9 +7742,32 @@ public final class QuoteLoop implements Runnable {
             // (0 — без предела). Покупки — прежние лоты на своих уровнях.
             want = ASK_LOT_MULT > 0 ? params.size() * ASK_LOT_MULT : Double.MAX_VALUE;
         }
-        double ownSize = resting.venueId == null ? 0 : resting.size;
+        return Math.min(want, hardCapFor(side, price, resting));
+    }
+
+    /**
+     * ЖЁСТКИЙ ПРЕДЕЛ заявки — всё, кроме желаемого лота: доступное на счёте (с возвратом резерва своей заявки
+     * при замене), своя позиция без запертого призраком, претензия в реестре, своя касса. Выше него поставить
+     * нельзя никогда — ни ради лота, ни ради «пыли в заявку» (14.11.2026, см. {@link #absorbDust}).
+     */
+    private double hardCapFor(Side side, double price, Resting resting) {
+        double ownSize = resting.venueId == null ? 0 : resting.remaining();
+        return hardCap(side, price, baseAvailable, quoteBalance, ownSize, resting.price, inventory,
+                side == Side.SELL ? lockedBaseEff() : 0, params.inventoryCap(), frozenUnwind,
+                alloc == null || side != Side.SELL ? Double.NaN : alloc.own(tag.id(), base),
+                alloc == null || side != Side.BUY ? Double.NaN : alloc.own(tag.id(), quote),
+                side == Side.BUY ? lockedQuoteEff() : 0);
+    }
+
+    /** Чистая функция жёсткого предела (тесты: {@code HardCapTest}). claimBase / claimQuote = NaN — реестра нет. */
+    static double hardCap(Side side, double price, double baseAvailable, double quoteBalance, double ownSize,
+                          double ownPrice, double inventory, double lockedBase, double inventoryCap,
+                          boolean frozenUnwind, double claimBase, double claimQuote, double lockedQuote) {
+        // Резерв своей стоящей заявки считаем по НЕисполненному остатку (14.11.2026). Площадка проводит
+        // исполненную часть надкушенной заявки по остаткам только при её закрытии, поэтому полный размер может
+        // быть и верным — но остаток всегда в сторону «поставить меньше», а надкушенную заменить нельзя вовсе.
         double affordable = affordable(side, price, baseAvailable, quoteBalance,
-                ownSize, resting.price);
+                ownSize, ownPrice);
         // ⚠️ Продать больше СВОЕЙ позиции нельзя, даже если на счёте есть чужое.
         //
         // `affordable` для продажи смотрит на `baseAvailable` — общий остаток
@@ -7475,8 +7797,8 @@ public final class QuoteLoop implements Runnable {
         // позицию к нулю, а не в том, чтобы менять её состав.
         // Запертое призраком (§3.6) в позиции есть, а продать его нельзя.
         double ownPositionCap = side == Side.SELL
-                ? Math.max(0, inventory - lockedBaseEff())
-                : (frozenUnwind ? 0 : Math.max(0, params.inventoryCap() - inventory));
+                ? Math.max(0, inventory - lockedBase)
+                : (frozenUnwind ? 0 : Math.max(0, inventoryCap - inventory));
         // Симметрично для покупки: тратить можно только СВОЮ долю кассы, иначе
         // бот покупает на деньги соседа. У бота B это стоило 197 отказов
         // «Insufficient balance» за сутки — каждый из них тратит постановку из
@@ -7486,8 +7808,8 @@ public final class QuoteLoop implements Runnable {
         // нормальное рабочее состояние: 04.09.2026 счёта хватало на $46.21 при
         // сумме потолков $49.13, и требовать полного покрытия было бы нельзя.
         double ownCashCap = Double.MAX_VALUE;
-        if (side == Side.BUY && alloc != null && price > 0) {
-            ownCashCap = Math.max(0, alloc.own(tag.id(), quote) - lockedQuoteEff()) / price;
+        if (side == Side.BUY && !Double.isNaN(claimQuote) && price > 0) {
+            ownCashCap = Math.max(0, claimQuote - lockedQuote) / price;
         }
         // ⚠️ ПРОДАЖУ ОГРАНИЧИВАЕТ И ЗАХВАТ, А НЕ ТОЛЬКО СВОЙ СЧЁТЧИК.
         //
@@ -7509,11 +7831,10 @@ public final class QuoteLoop implements Runnable {
         // Теперь расхождение счётчика приводит к НЕДОпродаже, а не к продаже
         // чужого. Само расхождение по-прежнему только логируется.
         double ownClaimCap = Double.MAX_VALUE;
-        if (side == Side.SELL && alloc != null) {
-            ownClaimCap = Math.max(0, alloc.own(tag.id(), base) - lockedBaseEff());
+        if (side == Side.SELL && !Double.isNaN(claimBase)) {
+            ownClaimCap = Math.max(0, claimBase - lockedBase);
         }
-        return Math.min(Math.min(want, ownClaimCap),
-                Math.min(Math.min(affordable, ownPositionCap), ownCashCap));
+        return Math.min(ownClaimCap, Math.min(Math.min(affordable, ownPositionCap), ownCashCap));
     }
 
     /**
@@ -7531,6 +7852,36 @@ public final class QuoteLoop implements Runnable {
      * объём прибавляется к доступному. Иначе перевыставить полностью
      * зарезервированную заявку стало бы невозможно.
      */
+    /**
+     * ПЫЛЬ В ЗАЯВКУ, НО НЕ ВЫШЕ ЖЁСТКОГО ПРЕДЕЛА. Остаток пула мельче минимальной продажи отдельной заявкой не
+     * живёт (09.10.2026) и продаётся вместе с этой. ⚠️ До 14.11.2026 размер становился равен пулу целиком, мимо
+     * проверки доступного: у c доступно 0.01929261 ETH, пул 0.01945439, «пыль» 0.00016178 (~$0.30) — продажа
+     * на весь пул получила 422 «Insufficient balance» 87 раз подряд и сожгла суточный предел постановок.
+     */
+    static double absorbDust(double size, double pool, double hardCap, double price, double sellMin,
+                             double maxNotional) {
+        if (size > 0 && pool > size && (pool - size) * price < sellMin && pool * price <= maxNotional) {
+            return Math.max(size, Math.min(pool, hardCap));
+        }
+        return size;
+    }
+
+    /**
+     * Остаток заявки слота: у текущей надкушенной — не больше того, что площадка назвала неисполненным
+     * ({@code leaves}), иначе размер слота. {@code size} бывает и исходным (надкус узнан вопросом о заявке), и уже
+     * остатком (узнан по списку активных), поэтому берётся меньшее, а не разность.
+     */
+    static double remainingOf(double size, String partialId, String venueId, double leaves) {
+        boolean current = partialId != null && partialId.equals(venueId);
+        return current && Double.isFinite(leaves) ? Math.max(0, Math.min(size, leaves)) : Math.max(0, size);
+    }
+
+    /** Размер минус исполненная часть (не меньше нуля) — когда размер заведомо исходный. */
+
+    static double ownRemaining(double size, double partialFilled) {
+        return Math.max(0, size - Math.max(0, partialFilled));
+    }
+
     static double affordable(Side side, double price, double baseAvailable,
                              double quoteAvailable, double ownSize, double ownPrice) {
         if (side == Side.SELL) {
@@ -7830,7 +8181,11 @@ public final class QuoteLoop implements Runnable {
             if (definitelyNotPlaced) {
                 budget.refund(tag.id(), clock.now());
             }
-            long pause = Math.min(MAX_PLACE_BACKOFF_MS, 5_000L << Math.min(4, resting.failures - 1));
+            // 14.11.2026: определённый отказ, повторённый 3 раза подряд, — не случайность, а неверный расчёт
+            // (c: 87 одинаковых 422 по одной каждые 15 с). Дальше пауза растёт до 5 мин.
+            boolean definite4xx = response.status() >= 400 && response.status() < 500 && extract(response.body()) == null;
+            long cap = definite4xx && resting.failures >= 3 ? MAX_PLACE_BACKOFF_REPEAT_MS : MAX_PLACE_BACKOFF_MS;
+            long pause = Math.min(cap, 5_000L << Math.min(6, resting.failures - 1));
             resting.blockedUntilMs = clock.now() + pause;
             log.warn("постановка {} не прошла: {} {} — пауза {} с", side, response.status(),
                     response.body(), pause / 1000);
@@ -8197,13 +8552,17 @@ public final class QuoteLoop implements Runnable {
      * число сверок.
      */
     private void markPartial(Side side, Resting resting, double filled, double quantity) {
+        // number() отдаёт 0 на пропавшее поле: без исходного размера остатка не знаем (NaN — держим размер слота)
+        double leaves = quantity > 0 && filled >= 0 ? quantity - filled : Double.NaN;
         if (resting.partial()) {
             resting.partialFilled = filled;
+            resting.partialLeaves = leaves;
             return;                       // уже помечена, счётчик не портим
         }
         resting.partialId = resting.venueId;
         resting.partialSinceMs = clock.now();
         resting.partialFilled = filled;
+        resting.partialLeaves = leaves;
         partials++;
         double share = quantity > 0 ? filled / quantity * 100 : 0;
         String text = side + " " + resting.venueId + " исполнено " + fmt(filled)
@@ -8224,6 +8583,8 @@ public final class QuoteLoop implements Runnable {
     private void closePartial(Resting resting, String outcome) {
         if (!resting.partial()) {
             resting.partialId = null;
+            resting.partialFilled = 0;   // 15.11.2026: не оставлять исполненное следующей заявке слота
+            resting.partialLeaves = Double.NaN;
             return;
         }
         long waited = Math.max(0, clock.now() - resting.partialSinceMs);
@@ -8232,6 +8593,8 @@ public final class QuoteLoop implements Runnable {
         log.warn("частичная заявка: {}", text);
         journal.event("partial_done", text);
         resting.partialId = null;
+        resting.partialFilled = 0;   // 15.11.2026: не оставлять исполненное следующей заявке слота
+        resting.partialLeaves = Double.NaN;
     }
 
     /**
@@ -10914,8 +11277,39 @@ public final class QuoteLoop implements Runnable {
     /** Запертая своя монета, НЕ покрытая буфером: её одну и нельзя продавать. */
     double lockedBaseEff() {
         double locked = lockedBase();
-        return locked <= 0 ? 0
-                : Math.max(0, locked - ownerlessFree(base, baseTotalAccount, baseAvailable));
+        // 14.11.2026, бот a: своя стоящая продажа держит свои монеты в резерве и уменьшает available. Без
+        // возврата её остатка ничейный буфер «сжимался», запертое росло, продажа снималась как «нечем
+        // котировать», available возвращался — и через минуту она ставилась снова (качели 15:38–17:45: 57
+        // постановок, 27 таких снятий, предел 160 выбран). Остаток своих продаж — наше же, считаем его свободным.
+        if (locked <= 0 || alloc == null || !Double.isFinite(baseTotalAccount)) {
+            return locked <= 0 ? 0 : Math.max(0, locked);
+        }
+        return lockedUncovered(locked, baseTotalAccount, claimedAll(base, clock.now()), baseAvailable, ownRestingSells());
+    }
+
+    /**
+     * Запертое призраком своё, НЕ покрытое ничейным буфером. Ничейное свободное = min(всего − претензии всех ботов,
+     * доступно + остаток своих стоящих продаж). ⚠️ Результат не должен зависеть от того, стоит ли своя продажа:
+     * её постановка переводит монеты из «доступно» в её резерв, и без второго слагаемого запертое росло на объём
+     * собственной заявки — бот снимал её как «нечем котировать» и ставил снова (a, 14.11.2026).
+     */
+    static double lockedUncovered(double locked, double total, double claimedAll, double available, double ownRestingSells) {
+        if (locked <= 0) {
+            return 0;
+        }
+        double ownerlessFree = Math.max(0, Math.min(total - claimedAll, available + Math.max(0, ownRestingSells)));
+        return Math.max(0, locked - ownerlessFree);
+    }
+
+    /** Неисполненный остаток своих стоящих продаж (резерв площадки под ними). */
+    private double ownRestingSells() {
+        double s = 0;
+        for (Resting r : asks) {
+            if (r.venueId != null) {
+                s += r.remaining();
+            }
+        }
+        return s;
     }
 
     /** Запертая своя касса, не покрытая ничейными USDC. */
@@ -11182,7 +11576,7 @@ public final class QuoteLoop implements Runnable {
             }
         }
         if (bookHasOwn) {
-            atOurs = Math.max(0, atOurs - Math.max(0, r.size - r.partialFilled));
+            atOurs = Math.max(0, atOurs - r.remaining());
         }
         return ahead + atOurs;
     }
