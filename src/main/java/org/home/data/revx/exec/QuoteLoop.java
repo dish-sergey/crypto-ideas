@@ -2199,6 +2199,11 @@ public final class QuoteLoop implements Runnable {
     public static final boolean NO_GREED = Boolean.getBoolean("revx.exec.no-greed");
     /** «Не ловить нож» в бою (док. 193 шаг 4.1): пока нож включён, бид отводится заменой. */
     static final boolean KNIFE = Boolean.getBoolean("revx.exec.knife");
+    /**
+     * Мягкий нож (15.11.2026, док. 248, владелец: «доход плоский — при любом намёке на падение стоять дальше»): пока нож
+     * включён, бид отходит на столько б.п., а не отводится совсем. 0 — прежнее поведение (отвод на {@code park-distance}).
+     */
+    static final double KNIFE_WIDEN_BP = Double.parseDouble(System.getProperty("revx.exec.knife-widen-bp", "0"));
     private boolean knifeLast;
     private String shadowState = "";
     private boolean knifeOn;
@@ -2482,6 +2487,8 @@ public final class QuoteLoop implements Runnable {
             // Сообщение о сбое опоры называет фактическое действие: сколько запаса
             // продаём или что встаём в паузу (владелец, 07.10.2026).
             h.attach(() -> new double[]{inventory, lastFair, quoting.get() ? 1 : 0});
+            // Опора без своих заявок (revx.fair.hybrid-exclude-own, док. 248): тот же список, что у очереди.
+            h.ownOrders(this::ownRestingLevels);
             // Живая своя книга — для очереди перед надкушенной заявкой; в ней стоим и мы сами.
             this.bookSource = h::bookNow;
             this.bookHasOwn = true;
@@ -4241,8 +4248,13 @@ public final class QuoteLoop implements Runnable {
                         fmtPrice(knifeLow), knifeOn ? "отведён" : "вернулся", fmt(inventory)));
             }
             if (knifeOn && target.hasBid()) {
-                double far = parkDistance > 0 ? parkDistance : 0.10;
-                target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
+                if (KNIFE_WIDEN_BP > 0) {
+                    // мягкий нож (док. 248, 15.11.2026): бид не убирается, а отходит на KNIFE_WIDEN_BP
+                    target = new Quoter.Quotes(target.bid() * (1 - KNIFE_WIDEN_BP / 1e4), target.ask());
+                } else {
+                    double far = parkDistance > 0 ? parkDistance : 0.10;
+                    target = new Quoter.Quotes(fair.price() * (1 - far), target.ask());
+                }
             }
         }
         // Пишется КАЖДЫЙ тик: без справедливой цены в момент исполнения захват
@@ -5139,6 +5151,20 @@ public final class QuoteLoop implements Runnable {
         return withoutOwn(levels, mine);
     }
 
+    /** Свои стоящие заявки {цена, остаток}: [0] — покупки, [1] — продажи (для опоры без своих, док. 248). */
+    @SuppressWarnings("unchecked")
+    java.util.List<double[]>[] ownRestingLevels() {
+        java.util.List<double[]>[] out = new java.util.List[]{new java.util.ArrayList<double[]>(), new java.util.ArrayList<double[]>()};
+        for (int s = 0; s < 2; s++) {
+            for (Resting r : s == 0 ? bids : asks) {
+                if (r.venueId != null && r.price > 0 && r.remaining() > 0) {
+                    out[s].add(new double[]{r.price, r.remaining()});
+                }
+            }
+        }
+        return out;
+    }
+
     /** Вычесть свои объёмы {цена, остаток} из уровней книги; опустевшие уровни выпадают. */
     static java.util.List<org.home.data.revx.sim.BookView.Level> withoutOwn(
             java.util.List<org.home.data.revx.sim.BookView.Level> levels, java.util.List<double[]> mine) {
@@ -5705,6 +5731,11 @@ public final class QuoteLoop implements Runnable {
         if (buy && FALL_SRC && FALL_WIDEN_BP > 0 && fallLast) {
             fair *= 1 - FALL_WIDEN_BP / 1e4;          // сигнал падения: бид функции дальше на FALL_WIDEN_BP
         }
+        if (buy && KNIFE && KNIFE_WIDEN_BP > 0 && knifeOn) {
+            // мягкий нож внутри функции (15.11.2026): функция считает бид от опоры заново, и правка цели после неё
+            // до заявки не доходила (311 срабатываний за 14.11 — итог до цента как без ножа)
+            fair *= 1 - KNIFE_WIDEN_BP / 1e4;
+        }
         if (!buy && FALL_SRC && FALL_WIDEN_ASK_BP != 0 && fallLast) {
             fair *= 1 + FALL_WIDEN_ASK_BP / 1e4;      // буря: и аск функции дальше
         }
@@ -5785,6 +5816,7 @@ public final class QuoteLoop implements Runnable {
         }
         double bestD = FUNC_RATE ? 0 : Double.NEGATIVE_INFINITY, bestP = Double.NaN, bestBp = 0;
         double lastAhead = Double.NaN, lastLa = 0;   // ln(1 + $ впереди) меняется только на границах уровней — не пересчитывать (12.11.2026)
+        double zMono = Double.POSITIVE_INFINITY;    // бегущий минимум логита P по δ (func-p-monotone)
         for (double d = Math.ceil(lo); d <= hi + 1e-9; d += 1) {
             double p = buy ? fair * (1 - d / 10_000) : fair * (1 + d / 10_000);
             if (buy ? p >= ba : p <= bb) {
@@ -5800,7 +5832,15 @@ public final class QuoteLoop implements Runnable {
                 lastAhead = ahead;
                 lastLa = Math.log1p(ahead);
             }
-            double dv = FUNC_RATE ? funcRateValue(c, d, lastLa, f, n, spr, shift, r15) : funcValue(c, d, lastLa, f, n, spr, r15);
+            double dv;
+            if (FUNC_P_MONO) {
+                double[] zm = funcZM(c, d, lastLa, f, n, spr, r15);
+                zm[0] = Math.min(zm[0], zMono);           // вероятность исполнения не растёт с удалением
+                zMono = zm[0];
+                dv = funcValueOf(zm, FUNC_RATE, shift);
+            } else {
+                dv = FUNC_RATE ? funcRateValue(c, d, lastLa, f, n, spr, shift, r15) : funcValue(c, d, lastLa, f, n, spr, r15);
+            }
             if (dv > bestD) {
                 bestD = dv;
                 bestP = p;
@@ -6094,6 +6134,24 @@ public final class QuoteLoop implements Runnable {
 
     /** Вес штрафа за хвост в функции с 36 коэффициентами (третья регрессия T = E[max(0, −маркаут − 30)]); 0 — без штрафа. */
     static final double FUNC_TAIL_LAMBDA = Double.parseDouble(System.getProperty("revx.exec.func-tail-lambda", "0"));
+
+    /**
+     * МОНОТОННАЯ ВЕРОЯТНОСТЬ ИСПОЛНЕНИЯ (15.11.2026, док. 248). В P есть член δ² с плюсом: на обучающих δ = 2…30 он
+     * лишь изгибает кривую, а дальше перевешивает, и P растёт с удалением (у общих наклонов ETH на 70 б.п. выше, чем
+     * на 20). Маркаут растёт с δ линейно, поэтому D улетал к краю перебора: с краем 50 пустой бид стоял на 40–48 б.п.
+     * весь день. {@code revx.exec.func-p-monotone=true} — при переборе от близкого δ к дальнему логит P берётся бегущим
+     * минимумом: дальше никогда не вероятнее, чем ближе. По умолчанию выключено.
+     */
+    static final boolean FUNC_P_MONO = Boolean.getBoolean("revx.exec.func-p-monotone");
+
+    /** D по готовым z и M: {@code rate} — скорость снятия × (M − shift) (док. 225), иначе P × M. */
+    static double funcValueOf(double[] zm, boolean rate, double shift) {
+        if (rate) {
+            double pr = Math.min(0.999, 1 / (1 + Math.exp(-zm[0])));
+            return -Math.log1p(-pr) / 5 * (zm[1] - shift);
+        }
+        return zm[1] / (1 + Math.exp(-zm[0]));
+    }
 
     /** Док. 225: скорость снятия −ln(1 − P)/5 (раз в минуту) × (M − p). */
     static double funcRateValue(double[] c, double d, double l, double f, double n, double s, double p) {

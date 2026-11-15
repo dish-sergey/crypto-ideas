@@ -246,6 +246,19 @@ public final class HybridCore {
      */
     public Out step(long tsMs, double oldFair, boolean oldQuotable, BookView book, double lotQty,
                     double bnb) {
+        return step(tsMs, oldFair, oldQuotable, book, book, lotQty, bnb);
+    }
+
+    /**
+     * То же, но уровень по глубине — по {@code levelBook} (книга без своих заявок, док. 248, 15.11.2026),
+     * а ширина книги для гейта — по полной {@code book}: без своих заявок верх книги шире, и гейт
+     * «своя книга шире 50 б.п.» срабатывал бы там, где котировать можно.
+     */
+    public Out step(long tsMs, double oldFair, boolean oldQuotable, BookView book, BookView levelBook,
+                    double lotQty, double bnb) {
+        if (levelBook == null || levelBook.empty()) {
+            levelBook = book;
+        }
         if (book == null || book.empty() || !(bnb > 0)) {
             return null;
         }
@@ -261,10 +274,13 @@ public final class HybridCore {
         }
         double topMid = (book.bestBid() + book.bestAsk()) / 2;
         double spreadBp = (book.bestAsk() - book.bestBid()) / topMid * 1e4;
-        double bookMid = topMid;
+        double bookMid = levelBook == book ? topMid : (levelBook.bestBid() + levelBook.bestAsk()) / 2;
+        if (!(bookMid > 0)) {
+            bookMid = topMid;
+        }
         if (depthK > 0 && lotQty > 0) {
-            double bd = depthPrice(book.bids(), depthK * lotQty);
-            double ad = depthPrice(book.asks(), depthK * lotQty);
+            double bd = depthPrice(levelBook.bids(), depthK * lotQty);
+            double ad = depthPrice(levelBook.asks(), depthK * lotQty);
             if (Double.isFinite(bd) && Double.isFinite(ad)) {
                 bookMid = (bd + ad) / 2;
                 depthUsed++;

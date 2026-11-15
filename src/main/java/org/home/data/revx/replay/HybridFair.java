@@ -149,6 +149,9 @@ final class HybridFair {
         String base = symbol.substring(0, symbol.indexOf('/'));
         TreeMap<Long, Double> bnb = LEVEL_BOOK ? new TreeMap<>() : load(base, ticks.get(0).tsMs() - 3_600_000L,
                 ticks.get(ticks.size() - 1).tsMs());
+        if (!LEVEL_BOOK) {
+            requireCoverage(base, bnb, ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
+        }
         if (!bnb.isEmpty()) {
             BNB_BY_SYMBOL.put(symbol, bnb);           // для рывка на стенде (revx.exec.jump-bp, док. 245 П5)
         }
@@ -165,10 +168,12 @@ final class HybridFair {
             long done = 0;
             long gate = 0;
             double[][] sd = new double[2][ticks.size()];
+            LiveOrders live = LiveOrders.load(base);
             for (ReplayFair.Tick t : ticks) {
                 var e = bnb.floorEntry(t.tsMs() - LAG_MS - 1000);
-                var o = core.step(t.tsMs(), t.fair(), t.quotable(), market.bookAt(t.tsMs()), lotQty,
-                        e == null ? Double.NaN : e.getValue());
+                BookView raw = market.bookAt(t.tsMs());
+                var o = core.step(t.tsMs(), t.fair(), t.quotable(), raw, live == null ? raw : live.without(raw, t.tsMs()),
+                        lotQty, e == null ? Double.NaN : e.getValue());
                 if (o == null) {
                     out.add(t);
                     continue;
@@ -190,6 +195,9 @@ final class HybridFair {
                             + "глубины не хватило на %d, поводок к Бинансу ±%.1f б.п. держал %.2f%% тиков",
                     symbol, LEVEL_MIX, DEPTH_K, TAU_MS / 1000, done,
                     ticks.size(), gate, core.depthShort(), core.clampBp(), 100 * core.clampedShare()));
+            if (live != null) {
+                log.warn(live.report(symbol));
+            }
             if (core.stormClampBp() > 0) {
                 log.warn(String.format(Locale.ROOT, "ПОВОДОК БУРИ %s: ±%.2f б.п. при размахе Бинанса ≥ %.0f б.п. — "
                         + "%.2f%% тиков", symbol, core.stormClampBp(), core.stormRangeBp(),
@@ -310,6 +318,56 @@ final class HybridFair {
      * ликвиднее и ведёт USDC, как у пилота ADA). Файлы обеих пар — в том же каталоге.
      */
     static final String BNB_QUOTE = System.getProperty("revx.fair.hybrid-bnb-quote", "USDC").toUpperCase(Locale.ROOT);
+
+    /**
+     * Наибольшая допустимая дыра в секундном Бинансе внутри окна, мс ({@code revx.sim.bnb-max-gap-min}, по умолчанию 15 мин).
+     * Секундные свечи есть только у секунд со сделками, поэтому короткие дыры — норма; дыры в часы — нет.
+     */
+    static final long BNB_MAX_GAP_MS = 60_000L * Long.getLong("revx.sim.bnb-max-gap-min", 15);
+
+    /**
+     * ЗАЩИТА ОТ ПРОГОНА БЕЗ БИНАНСА (15.11.2026, док. 248). Прогоны 14.11 шли без файлов
+     * {@code <монета>USDC-1s-2026-11-14.zip}: стенд писал предупреждение «нет файла» и продолжал. Опора
+     * без хода Бинанса отставала от падения на 30–65 б.п., аск стоял над рынком, бид упирался в книгу —
+     * f сделал 28 сделок против 101 живьём, и по этим числам чуть не выбрали функцию для живых.
+     * Теперь дыра длиннее {@link #BNB_MAX_GAP_MS} в окне тиков (или пустой ряд) останавливает прогон.
+     * Обойти — только явно: {@code -Drevx.sim.allow-missing-bnb=true}.
+     */
+    static void requireCoverage(String base, TreeMap<Long, Double> bnb, long fromMs, long toMs) {
+        String why = coverageProblem(bnb, fromMs, toMs, BNB_MAX_GAP_MS);
+        if (why == null) {
+            return;
+        }
+        String msg = "ГИБРИД " + base + ": секундный Бинанс в " + DIR + " неполон — " + why
+                + ". Докачать data.binance.vision/data/spot/daily/klines/" + base + "USDC/1s/ или запустить с -Drevx.sim.allow-missing-bnb=true";
+        if (Boolean.getBoolean("revx.sim.allow-missing-bnb")) {
+            log.error("{} (продолжаю: allow-missing-bnb)", msg);
+            return;
+        }
+        throw new IllegalStateException(msg);
+    }
+
+    /** Что не так с покрытием окна [fromMs, toMs]; null — всё на месте. */
+    static String coverageProblem(TreeMap<Long, Double> bnb, long fromMs, long toMs, long maxGapMs) {
+        if (bnb.isEmpty()) {
+            return "нет ни одной секунды";
+        }
+        Long first = bnb.ceilingKey(fromMs - maxGapMs);
+        if (first == null || first > fromMs + maxGapMs) {
+            return "нет данных с " + Instant.ofEpochMilli(fromMs);
+        }
+        long prev = first;
+        for (long t : bnb.subMap(first, false, toMs, true).keySet()) {
+            if (t - prev > maxGapMs) {
+                return "дыра " + Instant.ofEpochMilli(prev) + " — " + Instant.ofEpochMilli(t);
+            }
+            prev = t;
+        }
+        if (toMs - prev > maxGapMs) {
+            return "дыра " + Instant.ofEpochMilli(prev) + " — конец окна " + Instant.ofEpochMilli(toMs);
+        }
+        return null;
+    }
 
     /** Закрытия секундных свечей Бинанса по открытию секунды (мс), в USDC. */
     private static TreeMap<Long, Double> load(String base, long fromMs, long toMs) {

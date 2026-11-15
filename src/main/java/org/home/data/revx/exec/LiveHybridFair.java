@@ -85,6 +85,34 @@ public final class LiveHybridFair implements FairSource {
     public void attach(java.util.function.Supplier<double[]> state) {
         this.botState = state;
     }
+
+    /**
+     * ОПОРА БЕЗ СВОИХ ЗАЯВОК (15.11.2026, док. 248). Уровень своей книги по глубине k лотов считался по
+     * книге, в которой стоим и мы: у SOL в 10 б.п. от середины ~$1400, наши два бота держат $57 и $112 на
+     * сторону и в 85–92% сделок сами задают лучшую цену — опора частично считалась от нашей же заявки
+     * (петля «заявка сдвигает опору, опора сдвигает заявку»). {@code revx.fair.hybrid-exclude-own=true} —
+     * свои стоящие заявки {цена, остаток} вычитаются из книги перед расчётом уровня ({@link QuoteLoop#withoutOwn}).
+     * По умолчанию выключено. ⚠️ Заявки второго бота той же монеты сюда не входят — их этот процесс не знает.
+     */
+    public static final boolean EXCLUDE_OWN = Boolean.getBoolean("revx.fair.hybrid-exclude-own");
+    private java.util.function.Supplier<java.util.List<double[]>[]> ownOrders;
+
+    /** Свои стоящие заявки: [0] — покупки, [1] — продажи, элементы {цена, остаток}. */
+    public void ownOrders(java.util.function.Supplier<java.util.List<double[]>[]> own) {
+        this.ownOrders = own;
+    }
+
+    /** Книга для уровня опоры: без своих заявок, если включено. */
+    BookView forLevel(BookView b) {
+        if (!EXCLUDE_OWN || b == null || ownOrders == null) {
+            return b;
+        }
+        java.util.List<double[]>[] own = ownOrders.get();
+        if (own == null || (own[0].isEmpty() && own[1].isEmpty())) {
+            return b;
+        }
+        return new BookView(QuoteLoop.withoutOwn(b.bids(), own[0]), QuoteLoop.withoutOwn(b.asks(), own[1]));
+    }
     private long hybridTicks;
     private long fallbackTicks;
 
@@ -230,7 +258,7 @@ public final class LiveHybridFair implements FairSource {
             } else if (!(mid > 0)) {
                 why = "Бинанс " + bnbSymbol + " молчит дольше " + MAX_AGE_MS / 1000 + " с";
             } else {
-                HybridCore.Out o = core.step(now, f.price(), f.quotable(), b, lotQty, mid);
+                HybridCore.Out o = core.step(now, f.price(), f.quotable(), b, forLevel(b), lotQty, mid);
                 if (o == null) {
                     why = "нет прежней опоры";
                 } else {
@@ -255,7 +283,7 @@ public final class LiveHybridFair implements FairSource {
         }
         fallbackTicks++;
         // Аварийная опора: уровень по своей книге без Бинанса, если книга есть.
-        Double level = b == null ? null : core.levelOnly(now, f.price(), b, lotQty);
+        Double level = b == null ? null : core.levelOnly(now, f.price(), forLevel(b), lotQty);
         broken(now, why, f, level);
         if (level != null) {
             boolean ok = (b.bestAsk() - b.bestBid()) / ((b.bestAsk() + b.bestBid()) / 2) * 1e4
