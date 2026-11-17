@@ -384,6 +384,10 @@ public class CliRunner implements ApplicationRunner {
                         !args.containsOption("no-budget"),
                         firstOr(args, "journal-out", ""));
             }
+            if (args.containsOption("revx-day-prep")) {
+                executor.getObject().dayPrep(firstOr(args, "from", ""), firstOr(args, "to", ""),
+                        firstOr(args, "days-dir", "D:/revx-days"), firstOr(args, "bases", "BTC,ETH,SOL"));
+            }
             if (args.containsOption("revx-assemble")) {
                 org.home.data.revx.replay.StandAssembler.assemble(
                         firstOr(args, "from-dir", "/d/revx-data"),

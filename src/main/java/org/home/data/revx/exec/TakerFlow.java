@@ -61,6 +61,22 @@ public final class TakerFlow {
         return f;
     }
 
+    /** То же из готовой ленты ({@link org.home.data.revx.replay.DayStore}): сделки без стороны пропускаются, как в базе. */
+    public static TakerFlow preloaded(java.util.List<org.home.data.revx.sim.MarketTrade> trades, long delayMs) {
+        TakerFlow f = new TakerFlow(delayMs);
+        java.util.List<long[]> t = new java.util.ArrayList<>();
+        java.util.List<Double> v = new java.util.ArrayList<>();
+        for (var x : trades) {
+            if (x.aggressor() == null) {
+                continue;
+            }
+            t.add(new long[]{x.tsMs(), x.aggressor() == org.home.data.revx.sim.Side.BUY ? 1 : 0});
+            v.add(x.price() * x.qty());
+        }
+        f.fill(t, v);
+        return f;
+    }
+
     /** Живьём: лента из базы сборщика ({@code revx_trade}), перечитывается не чаще {@code refreshMs}. */
     public static TakerFlow live(String dbPath, String symbol, long refreshMs) {
         TakerFlow f = new TakerFlow(0);
