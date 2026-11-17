@@ -199,11 +199,18 @@ public final class GroupForecast {
                     }
                     // Отступ из функции и стена от потока читают ленту — как в одиночном прогоне ({@link Forecast}).
                     if (QuoteLoop.WALL_FLOW_MIN > 0 || QuoteLoop.FUNC_FILE != null) {
-                        if (standDbPath == null) {
-                            throw new IllegalStateException("отступ из функции просит базу стенда: ленту брать неоткуда");
+                        long delay = Long.getLong("revx.exec.wall-flow-delay-ms", 2000);
+                        if (standDbPath == null && DayStore.enabled()) {
+                            // дни (17.11.2026): лента та же, из суточных файлов, с часом до старта
+                            loop.takerFlow(org.home.data.revx.exec.TakerFlow.preloaded(
+                                    DayStore.rawTrades(base.symbol(), start - 3_600_000L - 60_000, endMs), delay));
+                        } else {
+                            if (standDbPath == null) {
+                                throw new IllegalStateException("отступ из функции просит базу стенда: ленту брать неоткуда");
+                            }
+                            loop.takerFlow(org.home.data.revx.exec.TakerFlow.preloaded(standDbPath, base.symbol(),
+                                    delay, start - 3_600_000L - 60_000, endMs));
                         }
-                        loop.takerFlow(org.home.data.revx.exec.TakerFlow.preloaded(standDbPath, base.symbol(),
-                                Long.getLong("revx.exec.wall-flow-delay-ms", 2000), start - 3_600_000L - 60_000, endMs));
                     }
                     if (p.model() instanceof MarketFillModel mfm) {
                         loop.bookSource(mfm.market().fresh()::bookAt);

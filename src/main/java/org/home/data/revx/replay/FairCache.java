@@ -126,6 +126,22 @@ public final class FairCache {
         return HexFormat.of().formatHex(h, 0, 8);
     }
 
+    /**
+     * Ключ настроек опоры БЕЗ базы и окна — для суточных файлов {@link DayStore}: ряд дня зависит
+     * от пределов, мемкоинов, перекоса ног и свойств {@code revx.fair.*} (кроме гибрида).
+     */
+    static String settingsKey(String keyExtra) throws Exception {
+        Map<String, String> props = new TreeMap<>();
+        for (String k : System.getProperties().stringPropertyNames()) {
+            if (k.startsWith("revx.fair.") && !k.startsWith("revx.fair.hybrid")) {
+                props.put(k, System.getProperty(k));
+            }
+        }
+        String s = "day-v" + VERSION + "|" + keyExtra + "|" + props;
+        byte[] h = MessageDigest.getInstance("SHA-256").digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return HexFormat.of().formatHex(h, 0, 8);
+    }
+
     static void write(Path file, Result r) throws IOException {
         Map<String, Integer> reasons = new HashMap<>();
         List<String> table = new ArrayList<>();

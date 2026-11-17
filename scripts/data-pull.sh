@@ -13,7 +13,7 @@ set -u
 ROOT=${DATA_ARCHIVE:-/c/data-archive}
 KEYDIR=${KEYDIR:-$HOME/.ssh/data-keys}
 LOG=$ROOT/checks/pull-$(date +%Y%m%d).log
-mkdir -p "$ROOT"/{revx-inc,revx-sim-inc,binance-book,kraken-book,journal-archive,crypto-db,checks} "$ROOT"/binance-deriv/{perp,perpbook,spot,oi} "$ROOT"/binance-depth/{spot,perp,spotsnap,perpsnap} "$KEYDIR"
+mkdir -p "$ROOT"/{bot-accounting,revx-inc,revx-sim-inc,binance-book,kraken-book,journal-archive,crypto-db,checks} "$ROOT"/binance-deriv/{perp,perpbook,spot,oi} "$ROOT"/binance-depth/{spot,perp,spotsnap,perpsnap} "$KEYDIR"
 exec > >(tee -a "$LOG") 2>&1
 
 # Ключи: ssh под Windows не берёт файл с широкими правами, поэтому — копия без CR с chmod 600.
@@ -68,6 +68,34 @@ done
 for d in spot perp spotsnap perpsnap; do
   pull "$KMICRO" $MICRO "~/binance-depth/$d" 'book-*.jsonl.gz' "$ROOT/binance-depth/$d" gz
 done
+
+# Каждый день — снимок УЧЁТА ботов с bot-arm (17.11.2026): exec_fill / exec_event / exec_state каждого
+# журнала (не чистятся, живут только на ARM), плюс alloc.db (реестр и пул), venue.db, hedge_paper.db.
+# Запросы и котировки сюда не идут — они уходят в journal-archive. exec_open_order не берём: он
+# восстанавливается из запросов, а весит ~300 МБ на бота. Читается через mode=ro, 0.2 с на журнал.
+mkdir -p "$ROOT/bot-accounting"
+a=acct-$(date +%Y%m%d)
+if [ ! -s "$ROOT/bot-accounting/$a.tar.gz" ]; then
+  if ssh -i "$KARM" "${SSH_OPTS[@]}" $ARM "set -e; rm -rf /tmp/$a; mkdir /tmp/$a; cd ~
+      for f in revx-exec*/state/exec*.db; do case \$f in *manual-test*) continue;; esac
+        o=/tmp/$a/\$(dirname \$(dirname \$f))--\$(basename \$f)
+        nice -n 19 sqlite3 \$o \"ATTACH 'file:/home/ubuntu/\$f?mode=ro' AS s; CREATE TABLE exec_fill AS SELECT * FROM s.exec_fill; CREATE TABLE exec_event AS SELECT * FROM s.exec_event; CREATE TABLE exec_state AS SELECT * FROM s.exec_state;\"
+      done
+      for f in alloc venue hedge_paper; do nice -n 19 sqlite3 \"file:/home/ubuntu/revx-shared/\$f.db?mode=ro\" \"VACUUM INTO '/tmp/$a/\$f.db'\"; done
+      cd /tmp && nice -n 19 tar -czf $a.tar.gz $a && rm -rf /tmp/$a" \
+     && scp -q -i "$KARM" "${SSH_OPTS[@]}" "$ARM:/tmp/$a.tar.gz" "$ROOT/bot-accounting/$a.tar.gz.part" \
+     && tar -tzf "$ROOT/bot-accounting/$a.tar.gz.part" >/dev/null; then
+    mv -f "$ROOT/bot-accounting/$a.tar.gz.part" "$ROOT/bot-accounting/$a.tar.gz"
+    note "учёт ботов: $a.tar.gz ($(du -h "$ROOT/bot-accounting/$a.tar.gz" | cut -f1), $(tar -tzf "$ROOT/bot-accounting/$a.tar.gz" | grep -c '\.db$') баз)"
+    # таблицы учёта только растут, поэтому свежий снимок содержит всё; старые — от порчи.
+    # Держим 30 последних суток и первый снимок каждого месяца.
+    ls "$ROOT/bot-accounting"/acct-*.tar.gz | sort | head -n -30 | while read -r f; do
+      case $(basename "$f") in acct-??????01.tar.gz) ;; *) rm -f "$f";; esac; done
+  else
+    note "ОШИБКА: снимок учёта ботов не снят"; FAIL=1; rm -f "$ROOT/bot-accounting/$a.tar.gz.part"
+  fi
+  ssh -i "$KARM" "${SSH_OPTS[@]}" $ARM "rm -rf /tmp/$a /tmp/$a.tar.gz" 2>/dev/null
+fi
 
 # Раз в неделю — снимок базы слоя данных (её копирует и Litestream в B2; локальная — на случай,
 # если пропадёт и бакет). VACUUM INTO берёт согласованный срез без перезапусков, как у .backup.

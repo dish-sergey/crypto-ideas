@@ -1137,6 +1137,27 @@ public class Executor {
      * через запятую. Умолчания как у живых: один уровень — лот $6.3, 2.33 лота,
      * предел 100; три уровня — лот $2.2, 7 лотов, шаг 3 б.п., предел 250.
      */
+    /**
+     * {@code --revx-day-prep}: дневные файлы стенда ({@link org.home.data.revx.replay.DayStore}) за
+     * сутки {@code [from, to]} (даты UTC) из базы {@code revx.exec.stand-db}; каталог — {@code --days-dir}.
+     */
+    public void dayPrep(String from, String to, String daysDir, String bases) {
+        FairPrice.Limits limits = new FairPrice.Limits(cfg.fairMinPairs(),
+                cfg.fairMaxDispersionPct(), cfg.fairMaxReferenceSpreadPct(),
+                cfg.fairMaxResidualPct());
+        try {
+            if (Double.parseDouble(System.getProperty("revx.sim.min-print-usd", "0")) > 0) {
+                throw new IllegalStateException("дни пишутся со всей лентой: уберите revx.sim.min-print-usd");
+            }
+            org.home.data.revx.replay.DayStore.prep(standDbPath, daysDir,
+                    java.time.LocalDate.parse(from), java.time.LocalDate.parse(to),
+                    java.util.Arrays.stream(bases.split(",")).map(String::trim).toList(),
+                    limits, cfg.memecoins(), cfg.fairMaxSkewMs());
+        } catch (Exception e) {
+            log.error("дни не подготовлены: {}", e.toString(), e);
+        }
+    }
+
     public void groupForecast(String botsSpec, String from, String to, boolean shareBudget,
                               String journalOut) {
         long fromMs = from == null || from.isBlank()
@@ -1162,19 +1183,41 @@ public class Executor {
                     f.length > 6 ? Integer.parseInt(f[6]) : multi ? 250 : 100);
             byCoin.computeIfAbsent(w.coin(), k -> new java.util.ArrayList<>()).add(w);
         }
-        try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(), limits,
+        // ДНИ (17.11.2026, -Drevx.days-dir): рынок, опора, затыки и каталог пар — из суточных файлов
+        // DayStore, база окна не читается вовсе. Расписание затыков строится по дням и подменяет
+        // revx.sim.stall-schedule.
+        boolean days = org.home.data.revx.replay.DayStore.enabled();
+        if (days) {
+            try {
+                System.setProperty("revx.sim.stall-schedule",
+                        org.home.data.revx.replay.DayStore.stallSchedule(fromMs, toMs));
+            } catch (Exception e) {
+                throw new IllegalStateException("дни: расписание затыков не построено", e);
+            }
+            log.warn("дни: данные из {}, база окна не читается", org.home.data.revx.replay.DayStore.dir());
+        }
+        try (StandReader stand = days ? null : new StandReader(standDbPath, cfg.memecoins(), limits,
                 cfg.fairMaxSkewMs())) {
             List<org.home.data.revx.replay.GroupForecast.Pair> pairs = new java.util.ArrayList<>();
             for (var e : byCoin.entrySet()) {
                 String sym = e.getKey() + "/USDC";
-                StandReader.PairSpec ps = stand.spec(sym);
+                StandReader.PairSpec ps;
+                if (days) {
+                    double[] s = org.home.data.revx.replay.DayStore.spec(sym, toMs);
+                    ps = s == null ? null : new StandReader.PairSpec(sym, s[0], s[1], s[2]);
+                } else {
+                    ps = stand.spec(sym);
+                }
                 if (ps == null) {
                     throw new IllegalStateException("нет спецификации пары " + sym);
                 }
                 // 12.11.2026: тот же кэш опоры, что у одиночного прогона (ключ совпадает — кэши общие).
                 // Без него каждый групповой прогон wall строил StandFair заново: 23.5 мин из 41.
                 String coin = e.getKey();
-                var ticks = org.home.data.revx.replay.FairCache.ticks(standDbPath, coin, fromMs, toMs,
+                var ticks = days
+                        ? org.home.data.revx.replay.DayStore.fair(coin, fromMs, toMs,
+                        limits + "|" + cfg.memecoins() + "|" + cfg.fairMaxSkewMs()).ticks()
+                        : org.home.data.revx.replay.FairCache.ticks(standDbPath, coin, fromMs, toMs,
                         limits + "|" + cfg.memecoins() + "|" + cfg.fairMaxSkewMs(),
                         () -> new org.home.data.revx.replay.StandFair(standDbPath, coin, limits,
                                 cfg.memecoins(), cfg.fairMaxSkewMs(),
@@ -1211,14 +1254,14 @@ public class Executor {
                 var base = new org.home.data.revx.replay.BootParams(sym, "a", lot0, lot0 * 7,
                         0.0007, cfg.simSkewK(), 0.3, 1000, ps.minNotional(), ps.baseStep(),
                         ps.quoteStep(), 0.10, -1, -1, 0, 0.02, 0.5, true, 1, 0, true);
-                var market = org.home.data.revx.replay.MarketData.load(standDbPath, sym,
-                        mk0, mk1);
+                var market = days ? org.home.data.revx.replay.DayStore.market(sym, mk0, mk1)
+                        : org.home.data.revx.replay.MarketData.load(standDbPath, sym, mk0, mk1);
                 pairs.add(new org.home.data.revx.replay.GroupForecast.Pair(sym, ticks,
                         new org.home.data.revx.replay.MarketFillModel(market), base, bots, caps));
                 log.warn("группа: {} — тиков {}, ботов {}", sym, ticks.size(), bots.size());
             }
             var results = org.home.data.revx.replay.GroupForecast.run(pairs, cfg, shareBudget,
-                    journalOut, standDbPath);
+                    journalOut, days ? null : standDbPath);
             log.info("{}", org.home.data.revx.replay.GroupForecast.render(results));
         } catch (Exception e) {
             log.error("групповой прогон не прошёл: {}", e.toString(), e);

@@ -80,10 +80,13 @@ if [ -z "$lp" ]; then echo "local;FAIL;забор на диск;ни одног�
 elif [ $(( $(date +%s) - $(stat -c %Y "$lp") )) -gt 129600 ]; then echo "local;FAIL;забор на диск;последний $(basename "$lp")"
 elif grep -q 'ОШИБКА' "$lp"; then echo "local;FAIL;забор на диск;$(grep -c 'ОШИБКА' "$lp") ошибок в $(basename "$lp")"
 else echo "local;OK;забор на диск;$(basename "$lp") без ошибок"; fi
-for d in revx-inc revx-sim-inc binance-book kraken-book journal-archive binance-deriv/perp binance-deriv/perpbook binance-deriv/spot binance-deriv/oi binance-depth/spot binance-depth/perp binance-depth/spotsnap binance-depth/perpsnap; do
+for d in bot-accounting revx-inc revx-sim-inc binance-book kraken-book journal-archive binance-deriv/perp binance-deriv/perpbook binance-deriv/spot binance-deriv/oi binance-depth/spot binance-depth/perp binance-depth/spotsnap binance-depth/perpsnap; do
   f=$(ls -t "$ROOT/$d" 2>/dev/null | grep -v sha256 | head -1)
   if [ -z "$f" ]; then echo "local;FAIL;копия $d;пусто"; else a=$(( ($(date +%s) - $(stat -c %Y "$ROOT/$d/$f")) / 3600 )); [ $a -le 50 ] && echo "local;OK;копия $d;свежий файл $a ч назад" || echo "local;FAIL;копия $d;свежий файл $a ч назад"; fi
 done
+# дни стенда (17.11.2026, scripts/days-build.sh): последний архив не старше позавчера — день d готов утром d+2
+DA=${DAYS_ARCHIVE:-/d/revx-days/archive}; ld=$(ls "$DA" 2>/dev/null | grep -E "^[0-9]{8}.tgz$" | sort | tail -1 | cut -c1-8)
+if [ -z "$ld" ]; then echo "local;WARN;дни стенда;архива нет"; elif [ "$ld" -ge "$(date -d "-2 days" +%Y%m%d)" ]; then echo "local;OK;дни стенда;последний $ld"; else echo "local;WARN;дни стенда;последний $ld — см. /d/revx-days/build.log"; fi
 p=$(df --output=pcent "$ROOT" | tail -1 | tr -dc 0-9); [ $p -lt 90 ] && echo "local;OK;локальный диск;занято $p%" || echo "local;FAIL;локальный диск;занято $p%"
 } > "$OUT"
 

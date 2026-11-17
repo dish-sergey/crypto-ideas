@@ -50,6 +50,15 @@ public final class MarketData {
     private final int[] bidOff;
     private final int[] askOff;
     private final MemorySegment lv;
+    /**
+     * ДНИ (17.11.2026, {@link DayStore}): рынок, склеенный из суточных файлов, держит уровни
+     * несколькими отображениями — по одному на сутки, без копирования. Снимок целиком лежит в
+     * одном дне. {@code segs == null} — один сегмент {@link #lv}, как раньше.
+     */
+    private final MemorySegment[] segs;
+    /** Глобальный номер первого уровня каждого сегмента; последний элемент — всего уровней. */
+    private final long[] segBase;
+    private int segHint;
     private int tradeCursor;
     private int bookCursor;
     private int afterCursor;
@@ -75,11 +84,18 @@ public final class MarketData {
 
     private MarketData(List<MarketTrade> trades, long[] bookTs, int[] bidOff, int[] askOff,
                        MemorySegment lv) {
+        this(trades, bookTs, bidOff, askOff, lv, null, null);
+    }
+
+    private MarketData(List<MarketTrade> trades, long[] bookTs, int[] bidOff, int[] askOff,
+                       MemorySegment lv, MemorySegment[] segs, long[] segBase) {
         this.trades = trades;
         this.bookTs = bookTs;
         this.bidOff = bidOff;
         this.askOff = askOff;
         this.lv = lv;
+        this.segs = segs;
+        this.segBase = segBase;
     }
 
     /**
@@ -181,11 +197,38 @@ public final class MarketData {
     }
 
     private double px(int k) {
-        return lv.getAtIndex(D, 2L * k);
+        if (segs == null) {
+            return lv.getAtIndex(D, 2L * k);
+        }
+        int s = segOf(k);
+        return segs[s].getAtIndex(D, 2L * (k - segBase[s]));
     }
 
     private double qty(int k) {
-        return lv.getAtIndex(D, 2L * k + 1);
+        if (segs == null) {
+            return lv.getAtIndex(D, 2L * k + 1);
+        }
+        int s = segOf(k);
+        return segs[s].getAtIndex(D, 2L * (k - segBase[s]) + 1);
+    }
+
+    /** Сегмент уровня {@code k}: повтор идёт вперёд, поэтому сначала проверяется прошлый. */
+    private int segOf(long k) {
+        int s = segHint;
+        if (k >= segBase[s] && k < segBase[s + 1]) {
+            return s;
+        }
+        int lo = 0, hi = segs.length - 1;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) >>> 1;
+            if (segBase[mid] <= k) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        segHint = lo;
+        return lo;
     }
 
     /** Снимок {@code i} как {@link BookView}; последний собранный держится в кэше. */
@@ -214,7 +257,7 @@ public final class MarketData {
      * пару по нескольким отступам и двум моделям, поэтому копия обязательна.
      */
     public MarketData fresh() {
-        return new MarketData(trades, bookTs, bidOff, askOff, lv);
+        return new MarketData(trades, bookTs, bidOff, askOff, lv, segs, segBase);
     }
 
     public int tradeCount() {
@@ -398,6 +441,94 @@ public final class MarketData {
             log.warn("кэш рынка не записан ({}) — читаю базу в кучу", e.toString());
             return loadDb(standDbPath, symbol, fromMs, toMs, null);
         }
+    }
+
+    /**
+     * Рынок суток в файл {@code file} (+ {@code file.lv}) — формат кэша рынка ({@link DayStore}).
+     * Окно {@code [fromMs, toMs]} включительно, как у {@link #load}.
+     */
+    static void writeDay(String standDbPath, String symbol, long fromMs, long toMs, java.nio.file.Path file)
+            throws java.io.IOException {
+        java.nio.file.Files.createDirectories(file.getParent());
+        java.nio.file.Path tmpLv = java.nio.file.Files.createTempFile(file.getParent(),
+                file.getFileName().toString() + ".lv", ".tmp");
+        MarketData m;
+        try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(tmpLv,
+                java.nio.file.StandardOpenOption.WRITE, java.nio.file.StandardOpenOption.TRUNCATE_EXISTING)) {
+            m = loadDb(standDbPath, symbol, fromMs, toMs, ch);
+        }
+        java.nio.file.Files.move(tmpLv, levelsPath(file), java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        java.nio.file.Path tmp = java.nio.file.Files.createTempFile(file.getParent(),
+                file.getFileName().toString(), ".tmp");
+        m.writeBin(tmp);
+        java.nio.file.Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+    }
+
+    /**
+     * Рынок окна {@code [fromMs, toMs]} (включительно) из суточных файлов по порядку. Ряды
+     * обрезаются по времени ровно как запрос {@link #loadDb}; уровни не копируются — каждый
+     * день остаётся своим отображением файла.
+     */
+    static MarketData concat(List<java.nio.file.Path> dayFiles, long fromMs, long toMs, boolean dropSmall)
+            throws java.io.IOException {
+        List<MarketTrade> trades = new ArrayList<>();
+        long[] ts = new long[0];
+        int[] bo = new int[]{0};
+        int[] ao = new int[0];
+        List<MemorySegment> segs = new ArrayList<>();
+        List<Long> bases = new ArrayList<>();
+        int n = 0;
+        long total = 0;
+        for (java.nio.file.Path f : dayFiles) {
+            MarketData d = readCache(f);
+            for (MarketTrade t : d.trades) {
+                if (t.tsMs() >= fromMs && t.tsMs() <= toMs
+                        && !(dropSmall && MIN_PRINT_USD > 0 && t.price() * t.qty() < MIN_PRINT_USD)) {
+                    trades.add(t);
+                }
+            }
+            int i0 = 0;
+            while (i0 < d.bookTs.length && d.bookTs[i0] < fromMs) {
+                i0++;
+            }
+            int i1 = i0;
+            while (i1 < d.bookTs.length && d.bookTs[i1] <= toMs) {
+                i1++;
+            }
+            if (i1 == i0) {
+                continue;
+            }
+            int k0 = d.bidOff[i0];
+            int k1 = d.bidOff[i1];
+            if (total + (k1 - k0) > Integer.MAX_VALUE) {
+                throw new IllegalStateException("уровней книги больше 2^31 — окно слишком длинное для int-смещений");
+            }
+            int cnt = i1 - i0;
+            ts = java.util.Arrays.copyOf(ts, n + cnt);
+            bo = java.util.Arrays.copyOf(bo, n + cnt + 1);
+            ao = java.util.Arrays.copyOf(ao, n + cnt);
+            for (int i = i0; i < i1; i++) {
+                ts[n] = d.bookTs[i];
+                bo[n] = (int) (total + d.bidOff[i] - k0);
+                ao[n] = (int) (total + d.askOff[i] - k0);
+                n++;
+            }
+            segs.add(d.lv.asSlice(16L * k0, 16L * (k1 - k0)));
+            bases.add(total);
+            total += k1 - k0;
+            bo[n] = (int) total;
+        }
+        if (segs.isEmpty()) {
+            return new MarketData(trades, ts, bo, ao, MemorySegment.ofArray(new double[0]));
+        }
+        long[] sb = new long[bases.size() + 1];
+        for (int i = 0; i < bases.size(); i++) {
+            sb[i] = bases.get(i);
+        }
+        sb[bases.size()] = total;
+        return new MarketData(trades, ts, bo, ao, null, segs.toArray(new MemorySegment[0]), sb);
     }
 
     private static final int CACHE_MAGIC = 0x4D4B5432;   // "MKT2"
