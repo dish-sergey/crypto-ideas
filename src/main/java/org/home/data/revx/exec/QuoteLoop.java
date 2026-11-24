@@ -845,6 +845,47 @@ public final class QuoteLoop implements Runnable {
         return new Quoter.Quotes(Math.max(target.bid(), pulled), target.ask());
     }
 
+    /**
+     * ОТВОД ПО РАСХОДУ СВОИХ ПОСТАНОВОК (24.11.2026, владелец: «когда постановок мало, раздвинуть заявки — до нас реже
+     * будут доходить, и снимать придётся меньше»). {@code revx.exec.place-widen=ОТ:БП}: расход за скользящие сутки
+     * дошёл до доли ОТ своего предела — бид отходит на величину, растущую линейно до БП б.п. к 90% предела (там
+     * начинается распродажа). {@code place-widen-side=both} — и аск. Давление общего ведра аккаунта
+     * ({@link #widenForBudget}) на живых 20–23.11 было нулём всё время: к пределу бота оно не привязано.
+     */
+    static final double[] PLACE_WIDEN = parsePlaceWiden(System.getProperty("revx.exec.place-widen", ""));
+    static final boolean PLACE_WIDEN_BOTH = "both".equalsIgnoreCase(System.getProperty("revx.exec.place-widen-side", "bid"));
+    private long placeWidenAt;
+    private double placeWidenBp;
+    private long placeWidenTicks;
+
+    static double[] parsePlaceWiden(String v) {
+        if (v == null || v.isBlank()) {
+            return null;
+        }
+        String[] p = v.trim().split(":");
+        return new double[]{Double.parseDouble(p[0]), Double.parseDouble(p[1])};
+    }
+
+    private Quoter.Quotes placeWiden(Quoter.Quotes t, double price) {
+        if (PLACE_WIDEN == null || !(price > 0)) {
+            return t;
+        }
+        long now = clock.now();
+        if (now - placeWidenAt >= 15_000) {      // счёт по журналу — не чаще раза в 15 с
+            placeWidenAt = now;
+            double u = (double) placementsLastDay() / Math.max(1, placementCap());
+            double from = PLACE_WIDEN[0], top = Math.max(from + 1e-6, BUDGET_UNWIND_ON);
+            placeWidenBp = PLACE_WIDEN[1] * Math.max(0, Math.min(1, (u - from) / (top - from)));
+        }
+        if (!(placeWidenBp > 0)) {
+            return t;
+        }
+        placeWidenTicks++;
+        double d = price * placeWidenBp / 1e4;
+        return new Quoter.Quotes(t.bid() == null ? null : t.bid() - d,
+                t.ask() == null || !PLACE_WIDEN_BOTH ? t.ask() : t.ask() + d);
+    }
+
     static Quoter.Quotes widenForBudget(Quoter.Quotes target, double price, double pressure) {
         if (!(pressure > 0) || !(price > 0)) {
             return target;
@@ -3071,6 +3112,14 @@ public final class QuoteLoop implements Runnable {
     private long wakeups;
 
     private void onFastPrice(double p) {
+        if (guardThreat(p)) {
+            synchronized (wakeLock) {
+                guardUrgent = true;
+                wakePending = true;
+                wakeLock.notifyAll();
+            }
+            return;
+        }
         double ref = tickFair;
         if (!(ref > 0) || Math.abs(p / ref - 1) * 1e4 >= WAKE_BP) {
             synchronized (wakeLock) {
@@ -3089,6 +3138,11 @@ public final class QuoteLoop implements Runnable {
                 if (now >= deadline) {
                     break;
                 }
+                if (guardUrgent) {
+                    guardWakes++;
+                    guardWokeTick = true;
+                    break;                // страж: Бинанс подошёл к заявке в заморозке — без ожидания
+                }
                 if (wakePending && now >= earliest) {
                     wakeups++;
                     break;
@@ -3096,6 +3150,7 @@ public final class QuoteLoop implements Runnable {
                 wakeLock.wait(Math.max(1, (wakePending ? earliest : deadline) - now));
             }
             wakePending = false;
+            guardUrgent = false;
         }
     }
 
@@ -3139,6 +3194,198 @@ public final class QuoteLoop implements Runnable {
     private java.util.function.BiFunction<Long, Long, double[]> simJump;
     /** {@code revx.exec.jump-bid-only=true} — рывок снимает только биды (док. 245 П5: снятие бидов на падении). */
     static final boolean JUMP_BID_ONLY = Boolean.getBoolean("revx.exec.jump-bid-only");
+
+    /**
+     * СТРАЖ БИНАНСА (23.11.2026, по вопросу владельца о плохих сделках): живые 20–22.11 — 151 сделка из 785 прошла,
+     * когда заявка уже стояла за «Бинанс × базис» (покупка дороже, продажа дешевле); они отняли 7.6 $, худшие 41 —
+     * после рывка Бинанса на 19 б.п. за 3 с, маркаут −18. Заявка не успевает уйти: тик плюс ~0.45 с на замену. С
+     * {@code revx.exec.bnb-guard-bp=G}: если «Бинанс × базис» ближе G б.п. к заявке или пересёк её — ОТМЕНА (50 мс), а
+     * не замена; цель той стороны не ближе G б.п. к «Бинанс × базис». G меньше нуля — срабатывает, когда Бинанс уже
+     * прошёл заявку на |G| (живые 20–22.11: при −5 это ~37 отмен в сутки на бота против 197 при 0). 0 — выключено.
+     */
+    static final double BNB_GUARD_BP = Double.parseDouble(System.getProperty("revx.exec.bnb-guard-bp", "0"));
+    private long bnbGuardCancels, bnbGuardClamps;
+    /** После срабатывания стража — отвод на {@code guard-widen-bp}, пока {@code guard-calm-sec} нет новых (23.11.2026, владелец). */
+    static final double GUARD_WIDEN_BP = Double.parseDouble(System.getProperty("revx.exec.guard-widen-bp", "0"));
+    static final long GUARD_CALM_MS = Long.getLong("revx.exec.guard-calm-sec", 60L) * 1000L;
+    static final boolean GUARD_WIDEN_BOTH = "both".equalsIgnoreCase(System.getProperty("revx.exec.guard-widen-side", "bid"));
+    private long guardWidenUntil, guardStorms;
+
+    double guardWidenBp(boolean buy) {
+        return GUARD_WIDEN_BP > 0 && clock.now() < guardWidenUntil && (buy || GUARD_WIDEN_BOTH) ? GUARD_WIDEN_BP : 0;
+    }
+
+    /**
+     * СТРАЖ ЗАМОРОЗКИ (24.11.2026, разбор живых 20–23.11): в заморозке после медленной замены
+     * ({@code stall-freeze-sec}) бот не шлёт ни замен, ни отмен, и заявка стоит, пока рынок идёт на неё. Живьём
+     * 378 сделок из 1399 пришлись на заморозку (5–13% времени) и дали −19.5 $ против +39.4 $ вне её; 181 из них —
+     * когда Бинанс×базис уже был за нашей ценой (медиана 0.7 с до сделки). Отмена в затык идёт ~50 мс и призрака не
+     * рождает (наследника нет), поэтому в заморозке заявку, к которой Бинанс×базис подошёл ближе
+     * {@code revx.exec.stall-guard-bp} б.п. (0 — дошёл до цены, отрицательное — прошёл), снимаем отменой. Замены
+     * по-прежнему не шлём; вернётся заявка обычной постановкой после заморозки. Выключено (NaN) по умолчанию.
+     */
+    static final double STALL_GUARD_BP = Double.parseDouble(System.getProperty("revx.exec.stall-guard-bp", "NaN"));
+    /** Страж заморозки только на покупки ({@code revx.exec.stall-guard-side=buy}); по умолчанию обе стороны. */
+    static final boolean STALL_GUARD_BUY_ONLY = "buy".equalsIgnoreCase(System.getProperty("revx.exec.stall-guard-side", "both"));
+    private long stallGuardCancels;
+
+    /**
+     * СТРАЖ ОТ ВЕБ-СОКЕТА (24.11.2026, владелец: «чтобы он нигде время не терял»). Тик будится ходом Бинанса не чаще
+     * раза в {@link #WAKE_MIN_MS} (400 мс) и только на {@link #WAKE_BP} (2 б.п.). В заморозке поток котировщика
+     * свободен (запросов записи нет), поэтому обработчик цены сам сравнивает Бинанс×базис, перенесённый на свежую
+     * цену, со снимком стоящих заявок и при угрозе будит тик сразу, мимо обоих порогов; отмену шлёт тик (поток
+     * один — состояние заявок трогает только он). Снимок пишется в заморозке после стража; пока его нет (заморозка
+     * только началась) — будим на первой же цене.
+     */
+    private volatile double gSnapBid = Double.NaN, gSnapAsk = Double.NaN, gSnapAnchor = Double.NaN, gSnapFair = Double.NaN;
+    private volatile long gSnapAt;
+    private volatile boolean guardUrgent;
+    private boolean guardWokeTick;
+    private long guardWakes;
+
+    private void guardSnapshot(double anchor) {
+        double mb = Double.NaN, ma = Double.NaN;
+        for (Resting r : bids) {
+            if (r.venueId != null && !(r.price <= mb)) {
+                mb = r.price;
+            }
+        }
+        for (Resting r : asks) {
+            if (r.venueId != null && !(r.price >= ma)) {
+                ma = r.price;
+            }
+        }
+        gSnapBid = mb;
+        gSnapAsk = ma;
+        gSnapAnchor = anchor;
+        gSnapFair = tickFair;
+        gSnapAt = clock.now();
+    }
+
+    /** Из потока веб-сокета: в заморозке Бинанс подошёл к заявке — будить тик немедленно. */
+    private boolean guardThreat(double p) {
+        long now = clock.now();
+        if (Double.isNaN(STALL_GUARD_BP) || now >= stallUntilMs || now - gLastUrgentMs < 150) {
+            return false;             // не чаще раза в 150 мс: угроза держится, пока тик не снимет заявку
+        }
+        if (gSnapAt < lastStallMs) {
+            gLastUrgentMs = now;
+            return true;                  // заморозка свежая, снимка ещё нет — один тик, он и снимет, и запишет
+        }
+        double f0 = gSnapFair, a0 = gSnapAnchor;
+        if (!(f0 > 0) || !(a0 > 0) || !(p > 0)) {
+            return false;
+        }
+        double a = a0 * p / f0;
+        boolean threat = gSnapBid > a * (1 - STALL_GUARD_BP / 1e4) || (!STALL_GUARD_BUY_ONLY && gSnapAsk < a * (1 + STALL_GUARD_BP / 1e4));
+        if (threat) {
+            gLastUrgentMs = now;
+        }
+        return threat;
+    }
+
+    private volatile long gLastUrgentMs;
+
+    public long guardWakes() {
+        return guardWakes;
+    }
+
+    private void stallGuard() {
+        if (Double.isNaN(STALL_GUARD_BP)) {
+            return;
+        }
+        double[] rr = stand.rawRefs();
+        if (rr == null || rr.length < 2 || !(rr[1] > 0)) {
+            return;
+        }
+        String via = guardWokeTick ? " (от веб-сокета)" : "";
+        guardWokeTick = false;
+        double maxBid = rr[1] * (1 - STALL_GUARD_BP / 1e4), minAsk = rr[1] * (1 + STALL_GUARD_BP / 1e4);
+        for (Resting r : bids) {
+            if (r.venueId != null && r.price > maxBid) {
+                stallGuardCancels++;
+                cancel(Side.BUY, r, String.format(java.util.Locale.ROOT, "страж заморозки: бид %.2f, Бинанс×базис %.2f", r.price, rr[1]) + via);
+            }
+        }
+        for (Resting r : asks) {
+            if (!STALL_GUARD_BUY_ONLY && r.venueId != null && r.price < minAsk) {
+                stallGuardCancels++;
+                cancel(Side.SELL, r, String.format(java.util.Locale.ROOT, "страж заморозки: аск %.2f, Бинанс×базис %.2f", r.price, rr[1]) + via);
+            }
+        }
+        guardSnapshot(rr[1]);
+    }
+
+    private Quoter.Quotes bnbGuard(Quoter.Quotes t) {
+        if (BNB_GUARD_BP == 0) {
+            return t;
+        }
+        double[] rr = stand.rawRefs();
+        if (rr == null || rr.length < 2 || !(rr[1] > 0)) {
+            return t;
+        }
+        double maxBid = rr[1] * (1 - BNB_GUARD_BP / 1e4), minAsk = rr[1] * (1 + BNB_GUARD_BP / 1e4);
+        long cancelsBefore = bnbGuardCancels;
+        for (Resting r : bids) {
+            if (r.venueId != null && r.price > maxBid) {
+                bnbGuardCancels++;
+                cancel(Side.BUY, r, String.format(java.util.Locale.ROOT, "страж Бинанса: бид %.2f ближе %.1f б.п. к Бинансу×базис %.2f", r.price, BNB_GUARD_BP, rr[1]));
+            }
+        }
+        for (Resting r : asks) {
+            if (r.venueId != null && r.price < minAsk) {
+                bnbGuardCancels++;
+                cancel(Side.SELL, r, String.format(java.util.Locale.ROOT, "страж Бинанса: аск %.2f ближе %.1f б.п. к Бинансу×базис %.2f", r.price, BNB_GUARD_BP, rr[1]));
+            }
+        }
+        if (bnbGuardCancels > cancelsBefore && GUARD_WIDEN_BP > 0) {
+            if (clock.now() >= guardWidenUntil) {
+                guardStorms++;
+            }
+            guardWidenUntil = clock.now() + GUARD_CALM_MS;   // буря: отводим, пока C секунд нет новых срабатываний
+        }
+        Double bid = t.bid(), ask = t.ask();
+        if (bid != null && bid > maxBid) {
+            bid = maxBid;
+            bnbGuardClamps++;
+        }
+        if (ask != null && ask < minAsk) {
+            ask = minAsk;
+            bnbGuardClamps++;
+        }
+        return bid == t.bid() && ask == t.ask() ? t : new Quoter.Quotes(bid, ask);
+    }
+
+    /**
+     * НЕ ПОДХОДИТЬ К БИНАНСУ (23.11.2026, владелец): живые 20–22.11 — почти вся прибыль от сделок, где до «Бинанс × базис»
+     * было ≥ 6 б.п. {@code revx.exec.bnb-clamp-bp=G}: цель бида не выше «Бинанс × базис» − G, аска не ниже + G; без отмены —
+     * заявку переставляет обычная замена (у замен нет суточного предела). От рывка не спасает, но вблизи не стоим. 0 — выкл.
+     */
+    static final double BNB_CLAMP_BP = Double.parseDouble(System.getProperty("revx.exec.bnb-clamp-bp", "0"));
+    private long bnbClampTicks;
+
+    private Quoter.Quotes bnbClamp(Quoter.Quotes t) {
+        if (!(BNB_CLAMP_BP > 0)) {
+            return t;
+        }
+        double[] rr = stand.rawRefs();
+        if (rr == null || rr.length < 2 || !(rr[1] > 0)) {
+            return t;
+        }
+        double maxBid = rr[1] * (1 - BNB_CLAMP_BP / 1e4), minAsk = rr[1] * (1 + BNB_CLAMP_BP / 1e4);
+        Double bid = t.bid(), ask = t.ask();
+        if (bid != null && bid > maxBid) {
+            bid = maxBid;
+        }
+        if (ask != null && ask < minAsk) {
+            ask = minAsk;
+        }
+        if (bid == t.bid() && ask == t.ask()) {
+            return t;
+        }
+        bnbClampTicks++;
+        return new Quoter.Quotes(bid, ask);
+    }
 
     public void simJump(java.util.function.BiFunction<Long, Long, double[]> src) {
         this.simJump = src;
@@ -3959,8 +4206,11 @@ public final class QuoteLoop implements Runnable {
             }
             return;
         }
+        simFreeze();
         String venuePause = venuePauseReason();
-        if (venuePause != null) {
+        // 23.11.2026: с лесенкой затыка бот не замирает — котирует с надбавкой к отступу, замены к рынку придерживает
+        // (см. replace), отводящие от рынка шлёт. Запертая монета — по-прежнему пауза.
+        if (venuePause != null && !(STALL_LADDER.length > 0 && !frozenPaused)) {
             pausedReason = venuePause;
             countTick();
             journal.quote(fair.price(), null, null, inventory, false, pausedReason, 0, stand.rawRefs());
@@ -3981,6 +4231,7 @@ public final class QuoteLoop implements Runnable {
                     // которая УЖЕ в пути, и отмена после первого медленного ответа его
                     // не спасает. Поэтому STALL_FREEZE_MS никаких запросов записи — ни
                     // замен, ни отмен — и продолжаем с теми же заявками.
+                    stallGuard();
                     if (STALL_CANCEL_BID) {
                         // Док. 193 шаг 4.4: замена в затык висит секундами, а отмена проходит
                         // за ~50 мс (живые журналы 20–25.10) — бид снимается отменой, аск стоит.
@@ -4068,7 +4319,7 @@ public final class QuoteLoop implements Runnable {
         boolean overTarget = inventory > skewTargetInventory() + 1e-12;
         // Б: опора ниже — и аск ближе, и бид дальше на те же пункты; расстояние между ними (захват) прежнее.
         double quietBp = quietNow && overTarget && QUIET_SHIFT_BP > 0 ? -QUIET_SHIFT_BP : 0;
-        double quoteFair = fair.price() * (1 + (sweepBp + flowBp + quietBp) / 1e4);
+        double quoteFair = fallBnbFair(fair.price()) * (1 + (sweepBp + flowBp + quietBp) / 1e4);
         if (sweepBp != 0) {
             SweepWatch.Sweep sw = sweeps.lastSweep(clock.now());
             if (sweeps.isNew(sw)) {
@@ -4082,11 +4333,13 @@ public final class QuoteLoop implements Runnable {
         if (rampTgt == null && newsFlat()) {
             volTgt = -1.0;                         // перед событием: цель запаса 0, не покупать
         }
+        // запас ДЛЯ ЦЕНЫ (23.11.2026): с price-inv-floor-lots пустой бот ставит цены как при половине лота
+        double pInv = frozenUnwind || budgetUnwind ? inventory : priceInventory();
         Quoter.Quotes target = frozenUnwind || budgetUnwind
                 ? unwindQuoter().quotes(quoteFair, inventory, drift)
-                : rampTgt != null ? rampQuoter(rampTgt).quotes(quoteFair, inventory, drift)
-                : volTgt != null ? rampQuoter(Math.max(0, volTgt)).quotes(quoteFair, inventory, drift)
-                : policy.quotes(quoteFair, inventory, drift);
+                : rampTgt != null ? rampQuoter(rampTgt).quotes(quoteFair, pInv, drift)
+                : volTgt != null ? rampQuoter(Math.max(0, volTgt)).quotes(quoteFair, pInv, drift)
+                : policy.quotes(quoteFair, pInv, drift);
         if (volTgt != null && volTgt < 0 && !frozenUnwind && !budgetUnwind) {
             target = new Quoter.Quotes(null, target.ask());   // ступень «не покупать»
         }
@@ -4126,7 +4379,7 @@ public final class QuoteLoop implements Runnable {
         if (sweepBp + flowBp != 0 && sweepSide != SweepSide.BOTH) {
             Quoter.Quotes plain = frozenUnwind
                     ? unwindQuoter().quotes(fair.price(), inventory, drift)
-                    : policy.quotes(fair.price(), inventory, drift);
+                    : policy.quotes(fair.price(), pInv, drift);
             target = spliceSide(target, plain, sweepSide);
         }
         if (widened) {
@@ -4142,6 +4395,7 @@ public final class QuoteLoop implements Runnable {
         double pressure = pressureFromRecord != null
                 ? pressureFromRecord.applyAsDouble(clock.now()) : budgetPressure;
         target = widenForBudget(target, fair.price(), pressure);
+        target = placeWiden(target, fair.price());
         target = freqWiden(target, fair.price());
         if (STALL_NOBID_MS > 0 || REBUY_VEL_K > 0) {
             lastMove60 = move60(fair.price());
@@ -4167,6 +4421,8 @@ public final class QuoteLoop implements Runnable {
         target = crossPause(target, fair.price(),
                 () -> policy.quotes(fair.price(), params.inventoryCap(), driftNow).ask());
         target = jumpGuard(target);
+        target = bnbGuard(target);
+        target = bnbClamp(target);
         if (QUIET_NOBUY && quietNow && target.hasBid()
                 && inventory >= skewTargetInventory() - 1e-12 && fair.price() > 0) {
             // А: в тишине не покупать сверх цели. Отвод, а не снятие: замена суточных постановок не тратит.
@@ -4196,7 +4452,8 @@ public final class QuoteLoop implements Runnable {
                         "%s: сигнал падения %s — бид %s, запас %s", symbol, on ? "выше порога" : "ниже порога",
                         on ? "отведён" : "вернулся", fmt(inventory)));
             }
-            if (on && target.hasBid() && FALL_INV_BP <= 0 && !ladderOn()) {   // при лестнице сигнал — только класс ступеней
+            // fall-bnb-fair без отвода: на ликвидациях меняется только опора, бид не уводится (23.11.2026)
+            if (on && target.hasBid() && FALL_INV_BP <= 0 && !ladderOn() && !(FALL_BNB_FAIR && FALL_WIDEN_BP <= 0)) {   // при лестнице сигнал — только класс ступеней
                 if (FALL_WIDEN_BP > 0) {
                     // мягкий вариант: бид не уходит, а отступает на FALL_WIDEN_BP (функция делает то же — см. funcPrice)
                     target = new Quoter.Quotes(target.bid() * (1 - FALL_WIDEN_BP / 1e4), target.ask());
@@ -4208,6 +4465,20 @@ public final class QuoteLoop implements Runnable {
             if (on && FALL_WIDEN_ASK_BP != 0 && target.hasAsk()) {
                 target = new Quoter.Quotes(target.bid(), target.ask() * (1 + FALL_WIDEN_ASK_BP / 1e4));
             }
+        }
+        double ladderBp0 = stallLadderBp();
+        if (FUNC_FILE == null && EMPTY_FIRST_BP != 0 && (ladderBp0 <= 0 || EMPTY_FIRST_BP < 0) && !fallLast && target.hasBid() && emptyFirstNow()) {
+            target = new Quoter.Quotes(target.bid() * (1 + EMPTY_FIRST_BP / 1e4), target.ask());   // первый лот ближе
+            emptyFirstTicks++;
+        }
+        if (ladderBp0 > 0 && fair.price() > 0 && FUNC_FILE == null) {
+            // лесенка затыка без функции — правка цели (с функцией надбавка внутри funcPrice)
+            // наибольший, а не сумма: сигнал падения уже отвёл бид/аск — лесенка добавляет только сверх него
+            boolean fallNow = (FALL_SRC || LIQ_LIVE != null) && fallLast && !WIDEN_SUM;
+            double bidX = fallNow && FALL_WIDEN_BP > 0 ? Math.max(0, ladderBp0 - FALL_WIDEN_BP) : ladderBp0;
+            double askX = fallNow && FALL_WIDEN_ASK_BP > 0 ? Math.max(0, ladderBp0 - FALL_WIDEN_ASK_BP) : ladderBp0;
+            target = new Quoter.Quotes(target.hasBid() ? target.bid() * (1 - bidX / 1e4) : target.bid(),
+                    target.hasAsk() ? target.ask() * (1 + askX / 1e4) : target.ask());
         }
         if (RISE_FILE != null && fair.price() > 0) {
             boolean on = riseSignalOn(clock.now());
@@ -5033,6 +5304,17 @@ public final class QuoteLoop implements Runnable {
         if (side == Side.BUY && base != null) {
             base = rebuyCap(base);
         }
+        if (base != null && BNB_CLAMP_BP > 0) {
+            // после функции: функция считает цену заново, правка цели до неё до заявки не дошла бы
+            double[] rr = stand.rawRefs();
+            if (rr != null && rr.length > 1 && rr[1] > 0) {
+                double lim = side == Side.BUY ? rr[1] * (1 - BNB_CLAMP_BP / 1e4) : rr[1] * (1 + BNB_CLAMP_BP / 1e4);
+                if (side == Side.BUY ? base > lim : base < lim) {
+                    base = lim;
+                    bnbClampTicks++;
+                }
+            }
+        }
         if (base == null || level == 0 || levelStep <= 0) {
             if (base == null || QA_ON == null) {
                 return base;                  // ⚠️ не тернарником: он распаковал бы null в double
@@ -5697,6 +5979,7 @@ public final class QuoteLoop implements Runnable {
     private Double funcPrice(Side side, double base, double fair) {
         boolean buy = side == Side.BUY;
         int s = buy ? 0 : 1;
+        fair = fallBnbFair(fair);
         // как у стены: бид по функции только для первых N лотов запаса, дальше обычная цена
         if (buy && WALL_BID_MAX_LOTS > 0 && inventory >= params.size() * WALL_BID_MAX_LOTS * (1 - 1e-6)) {
             return base;
@@ -5728,22 +6011,54 @@ public final class QuoteLoop implements Runnable {
         if (book == null || book.bids().isEmpty() || book.asks().isEmpty()) {
             return base;
         }
+        // 🔑 ОТВОДЫ БЕРУТСЯ ПО НАИБОЛЬШЕМУ, А НЕ СКЛАДЫВАЮТСЯ (23.11.2026, владелец): причины отвести заявку
+        // (сигнал падения, нож, сигнал роста, лесенка затыка) говорят об одном — «рынок опасен», и сумма их двойным
+        // счётом уводила бы заявку за любой разумный отступ. Отрицательные (ближе к рынку) складываются отдельно.
+        // revx.exec.widen-combine=sum — прежнее сложение (умножением).
+        java.util.List<Double> away = new java.util.ArrayList<>(4);
+        double closerBp = 0;
         if (buy && FALL_SRC && FALL_WIDEN_BP > 0 && fallLast) {
-            fair *= 1 - FALL_WIDEN_BP / 1e4;          // сигнал падения: бид функции дальше на FALL_WIDEN_BP
+            away.add(FALL_WIDEN_BP);                  // сигнал падения: бид функции дальше на FALL_WIDEN_BP
+        }
+        double ladderBp = stallLadderBp();
+        if (ladderBp > 0) {
+            away.add(ladderBp);                       // лесенка затыка: обе стороны дальше
+        }
+        double gw = guardWidenBp(buy);
+        if (gw > 0) {
+            away.add(gw);                             // буря после срабатывания стража Бинанса
         }
         if (buy && KNIFE && KNIFE_WIDEN_BP > 0 && knifeOn) {
             // мягкий нож внутри функции (15.11.2026): функция считает бид от опоры заново, и правка цели после неё
             // до заявки не доходила (311 срабатываний за 14.11 — итог до цента как без ножа)
-            fair *= 1 - KNIFE_WIDEN_BP / 1e4;
+            away.add(KNIFE_WIDEN_BP);
         }
         if (!buy && FALL_SRC && FALL_WIDEN_ASK_BP != 0 && fallLast) {
-            fair *= 1 + FALL_WIDEN_ASK_BP / 1e4;      // буря: и аск функции дальше
+            if (FALL_WIDEN_ASK_BP > 0) away.add(FALL_WIDEN_ASK_BP); else closerBp += FALL_WIDEN_ASK_BP;   // буря: аск
         }
         if (!buy && RISE_FILE != null && RISE_WIDEN_BP > 0 && riseLast) {
-            fair *= 1 + RISE_WIDEN_BP / 1e4;          // сигнал роста: аск функции дальше
+            away.add(RISE_WIDEN_BP);                  // сигнал роста: аск функции дальше
         }
         if (buy && RISE_FILE != null && RISE_WIDEN_BID_BP != 0 && riseLast) {
-            fair *= 1 - RISE_WIDEN_BID_BP / 1e4;      // сигнал роста: бид функции ближе (при отрицательном значении)
+            if (RISE_WIDEN_BID_BP > 0) away.add(RISE_WIDEN_BID_BP); else closerBp += RISE_WIDEN_BID_BP;   // рост: бид
+        }
+        if (buy && EMPTY_FIRST_BP != 0 && (away.isEmpty() || EMPTY_FIRST_BP < 0) && emptyFirstNow()) {
+            closerBp -= EMPTY_FIRST_BP;               // первый лот пустого бота — ближе к рынку
+            emptyFirstTicks++;
+        }
+        if (!away.isEmpty() || closerBp != 0) {
+            if (WIDEN_SUM) {
+                for (double w : away) {
+                    fair *= buy ? 1 - w / 1e4 : 1 + w / 1e4;
+                }
+            } else {
+                double w = 0;
+                for (double x : away) {
+                    w = Math.max(w, x);
+                }
+                fair *= buy ? 1 - w / 1e4 : 1 + w / 1e4;
+            }
+            fair *= buy ? 1 - closerBp / 1e4 : 1 + closerBp / 1e4;
         }
         if (FAR_FUNC) {
             // ДВОЙНАЯ ОПОРА (02.11.2026, владелец): сторона, против которой пошёл Бинанс, — от Бинанса × базис,
@@ -5786,7 +6101,7 @@ public final class QuoteLoop implements Runnable {
                         symbol.split("[^A-Za-z]")[0], Integer.getInteger("revx.exec.func-inv-q-" + tag.id(), FUNC_INV_Q), FUNC_INV_GAMMA);
             }
             funcMuStep();
-            double q = params.size() > 0 ? inventory / params.size() : 0;
+            double q = params.size() > 0 ? priceInventory() / params.size() : 0;
             // запас для таблицы — в «лотах таблицы»: revx.exec.func-inv-lots-scale[-<бот>], стенд мелкого лота (док. 236); по умолчанию 1
             if (Double.isNaN(funcInvLotsScale)) {
                 funcInvLotsScale = Double.parseDouble(System.getProperty("revx.exec.func-inv-lots-scale-" + tag.id(), System.getProperty("revx.exec.func-inv-lots-scale", "1")));
@@ -7256,7 +7571,7 @@ public final class QuoteLoop implements Runnable {
      */
     static final long STALL_NOBID_MS = Long.getLong("revx.exec.stall-nobid-sec", 0L) * 1000L;
     static final double REBUY_VEL_K = Double.parseDouble(System.getProperty("revx.exec.rebuy-vel-k", "0"));
-    private long lastStallMs;
+    private volatile long lastStallMs;
     private long lastBuyAnyMs;
     private long noBidUntilMs;
     private double velLastBuy = Double.NaN;
@@ -7733,6 +8048,7 @@ public final class QuoteLoop implements Runnable {
         if (side == Side.BUY) {
             // на сигнале падения и в бурю покупка меньшим лотом (владелец 06.11.2026, док. 236)
             if (FALL_LOT_MULT < 1 && FALL_SRC && fallLast) want *= FALL_LOT_MULT;
+            if (emptyFirstNow()) want = Math.min(want, params.size() * EMPTY_FIRST_FRAC);   // первый лот пустого — доля
             if (STORM_LOT_MULT < 1 && stormLast) want *= STORM_LOT_MULT;
         }
         if (side == Side.SELL && panicSizing) {
@@ -8292,6 +8608,24 @@ public final class QuoteLoop implements Runnable {
             size = fit;
         }
         boolean danger = side == Side.BUY ? resting.price > price : resting.price < price;
+        if (RETREAT_EXTRA_BP > 0) {
+            int si = side.ordinal();
+            if (danger) {
+                // ОТВОД С ЗАПАСОМ (23.11.2026, владелец): от рынка — на RETREAT_EXTRA_BP дальше цели, пока площадка
+                // отвечает на замену ~0.45 с, у заявки остаются эти пункты, если рынок идёт дальше на неё
+                price = side == Side.BUY ? price * (1 - RETREAT_EXTRA_BP / 1e4) : price * (1 + RETREAT_EXTRA_BP / 1e4);
+                lastRetreatMs[si] = clock.now();
+                retreats++;
+            } else if (clock.now() - lastRetreatMs[si] < RETREAT_HOLD_MS
+                    && Math.abs(price / resting.price - 1) * 1e4 <= RETREAT_EXTRA_BP + 0.5) {
+                retreatHeld++;
+                return;                   // к рынку не возвращаем, пока разница не больше запаса
+            }
+        }
+        if (STALL_LADDER.length > 0 && !danger && clock.now() < stallUntilMs) {
+            stallHeldReplaces++;
+            return;                       // затык: к рынку не двигаем (цена ушла от заявки — она не опасна), ждём конца
+        }
         if (!takeReplaceToken(danger)) {
             return;                       // ведро общее: безопасная уступает опасным, следующий тик спросит снова
         }
@@ -8357,7 +8691,7 @@ public final class QuoteLoop implements Runnable {
                 // покупка; стенд SOL w1/w6 — двойная продажа, запас до −1.1 лота). Тогда
                 // предка спрашиваем всегда: 404 кладёт его в «судьба неизвестна», его
                 // объём занят, лишняя продажа не встанет, а наследник уменьшится.
-                if (client.simulated() && SIM_BLOCKING_REPLACE && response.latencyMs() >= SLOW_REPLACE_MS) {
+                if (client.simulated() && SIM_BLOCKING_REPLACE && response.latencyMs() >= SIM_BLOCK_MIN_MS) {
                     // 13.11.2026: СТЕНД ПРОЖИВАЕТ МЕДЛЕННУЮ ЗАМЕНУ, как живой бот, висящий в запросе. Раньше бот сразу
                     // спрашивал предка, а отложенная (lag) замена ещё не доехала — «предок жив», снятие и новая
                     // постановка; так стенд делал 908 гонок на 1080 затыков против ~1% у живых и ставил в 5–8 раз чаще.
@@ -8894,6 +9228,8 @@ public final class QuoteLoop implements Runnable {
      */
     /** {@code revx.sim.blocking-replace} (по умолчанию да): стенд проживает задержку медленной замены. */
     static final boolean SIM_BLOCKING_REPLACE = Boolean.parseBoolean(System.getProperty("revx.sim.blocking-replace", "true"));
+    /** С какой задержки стендовый бот «висит» в ответе на замену (23.11.2026: с задержкой обычной замены — 1 мс). */
+    static final long SIM_BLOCK_MIN_MS = Long.getLong("revx.sim.blocking-replace-min-ms", 1_000L);
     private long simBusyUntil;
     private final java.util.List<Object[]> deferredInspect = new java.util.ArrayList<>();
 
@@ -8988,6 +9324,120 @@ public final class QuoteLoop implements Runnable {
     static final long SLOW_REPLACE_MS = 1_000;
 
     /**
+     * ПОРОГ ЗАМОРОЗКИ ({@code revx.exec.slow-replace-ms}, 24.11.2026; по умолчанию {@link #SLOW_REPLACE_MS}). Живые
+     * 20–23.11, 919 тыс. замен: 1–1.5 с — 2.9% замен, в 56% случаев ни у одного другого бота в ±0.5 с медленной нет, и
+     * следующая своя замена после такого ответа — медиана 534 мс, ни одной дольше 2.5 с. Опасные ~3 с (422, кандидаты
+     * в призраки, 43 за 4 дня) приходят разом у нескольких ботов и почти всегда после БЫСТРОЙ своей замены — заморозка
+     * после 1–1.5 с их не предупреждает. Проверка гонки и подозрение на призрака по-прежнему с порога 1 с.
+     */
+    static final long STALL_TRIGGER_MS = Long.getLong("revx.exec.slow-replace-ms", SLOW_REPLACE_MS);
+
+    /**
+     * ЛЕСЕНКА ЗАТЫКА (23.11.2026, идея владельца): задержка ответа на замену → надбавка к отступу обеих сторон,
+     * {@code revx.exec.stall-ladder=500:1,1000:5,1500:10,2000:15,2500:20} (мс:б.п., берётся наибольшая ступень не выше
+     * задержки). Держится {@code stall-ladder-hold-sec} (5) после последнего медленного ответа. С лесенкой бот в затык
+     * не замирает: замену, отводящую заявку от рынка, шлёт (лучше призрак, чем покупка по плохой цене), замену к рынку
+     * придерживает. Живые 20–22.11: каждая пятая сделка шла замороженной (захват 2.3 б.п. против 10.7, в минусе),
+     * от первого медленного ответа до сделки — медиана 2.5 с при замене ~1.1 с. Пусто — выключено.
+     */
+    /**
+     * ПЕРВЫЙ ЛОТ ПУСТОГО БОТА (23.11.2026, идея владельца): пустой бот чаще набирает неудачно. Пока запас меньше
+     * половины малого лота, покупка — доля {@code revx.exec.empty-first-frac} лота (0 — выключено) и ближе к рынку на
+     * {@code revx.exec.empty-first-bp} б.п. (меньше нуля — дальше); набрав её, бот ставит следующий лот на обычном отступе. При причине отвода
+     * (лесенка затыка, сигнал падения, нож) к рынку не подходит.
+     */
+    static final double EMPTY_FIRST_FRAC = Double.parseDouble(System.getProperty("revx.exec.empty-first-frac", "0"));
+    static final double EMPTY_FIRST_BP = Double.parseDouble(System.getProperty("revx.exec.empty-first-bp", "0"));
+    private long emptyFirstTicks;
+
+    boolean emptyFirstNow() {
+        return EMPTY_FIRST_FRAC > 0 && inventory < params.size() * EMPTY_FIRST_FRAC * 0.5;
+    }
+
+    /**
+     * ЗАПАС ДЛЯ ЦЕНЫ НЕ МЕНЬШЕ ПОЛОВИНЫ ЛОТА (23.11.2026, идея владельца): {@code revx.exec.price-inv-floor-lots=0.5} —
+     * пока запаса меньше стольких лотов, скос и цена запаса в функции считаются так, будто он есть; пустой бот не
+     * подтягивает бид к рынку. Размеры, продажи и учёт — по настоящему запасу. Живые 20–22.11: покупки пустого бота
+     * (301 из 360) — захват 4.8 б.п., маркаут −4.8, в минусе; после одного лота — захват 11.9. 0 — выключено.
+     */
+    static final double PRICE_INV_FLOOR_LOTS = Double.parseDouble(System.getProperty("revx.exec.price-inv-floor-lots", "0"));
+
+    double priceInventory() {
+        return PRICE_INV_FLOOR_LOTS > 0 ? Math.max(inventory, PRICE_INV_FLOOR_LOTS * params.size()) : inventory;
+    }
+
+    /**
+     * НА ЛИКВИДАЦИЯХ ОПОРА ТОЛЬКО ПО БИНАНСУ (23.11.2026, владелец): {@code revx.exec.fall-bnb-fair=true} — пока горит
+     * состояние «ликвидации» (fall-file / поток ликвидаций), опора = «Бинанс × обычный базис» без своей книги: своя
+     * книга в каскаде нестабильна и через поводок уводит опору до ±5 б.п. не в ту сторону.
+     */
+    static final boolean FALL_BNB_FAIR = Boolean.getBoolean("revx.exec.fall-bnb-fair");
+    /** Опора ВСЕГДА «Бинанс × обычный базис», без своей книги ({@code revx.exec.bnb-fair=true}, 23.11.2026, владелец). */
+    static final boolean BNB_FAIR_ALWAYS = Boolean.getBoolean("revx.exec.bnb-fair");
+    private long fallBnbTicks;
+
+    private double fallBnbFair(double fair) {
+        if (!BNB_FAIR_ALWAYS && (!FALL_BNB_FAIR || !fallLast)) {
+            return fair;
+        }
+        double[] rr = stand.rawRefs();
+        if (rr != null && rr.length > 1 && rr[1] > 0) {
+            fallBnbTicks++;
+            return rr[1];
+        }
+        return fair;
+    }
+
+    /** Отводы складывать по-старому ({@code revx.exec.widen-combine=sum}); по умолчанию — наибольший. */
+    static final boolean WIDEN_SUM = "sum".equalsIgnoreCase(System.getProperty("revx.exec.widen-combine", "max"));
+    /** Отвод от рынка с запасом, б.п. ({@code revx.exec.retreat-extra-bp}; 0 — выключено) и сколько держать запас. */
+    static final double RETREAT_EXTRA_BP = Double.parseDouble(System.getProperty("revx.exec.retreat-extra-bp", "0"));
+    static final long RETREAT_HOLD_MS = Long.getLong("revx.exec.retreat-hold-sec", 3L) * 1000L;
+    private final long[] lastRetreatMs = new long[2];
+    private long retreats, retreatHeld;
+    static final double[][] STALL_LADDER = parseStallLadder(System.getProperty("revx.exec.stall-ladder", ""));
+    static final long STALL_LADDER_HOLD_MS = Long.getLong("revx.exec.stall-ladder-hold-sec", 5L) * 1000L;
+    private double stallLadderBpNow;
+    private long stallLadderUntilMs;
+    private long stallLadderStarts;
+    private long stallHeldReplaces;
+
+    static double[][] parseStallLadder(String spec) {
+        if (spec == null || spec.isBlank()) {
+            return new double[0][];
+        }
+        java.util.List<double[]> out = new java.util.ArrayList<>();
+        for (String p : spec.split(",")) {
+            String[] kv = p.trim().split(":");
+            out.add(new double[]{Double.parseDouble(kv[0]), Double.parseDouble(kv[1])});
+        }
+        out.sort(java.util.Comparator.comparingDouble(x -> x[0]));
+        return out.toArray(new double[0][]);
+    }
+
+    static double stallLadderFor(long latencyMs) {
+        double bp = 0;
+        for (double[] st : STALL_LADDER) {
+            if (latencyMs >= st[0]) {
+                bp = st[1];
+            }
+        }
+        return bp;
+    }
+
+    /** Надбавка лесенки сейчас, б.п. */
+    double stallLadderBp() {
+        return clock.now() < stallLadderUntilMs ? stallLadderBpNow : 0;
+    }
+
+    /** Для отчёта стенда: сколько раз лесенка включалась и сколько замен к рынку придержано в затык. */
+    public String stallLadderDiag() {
+        return "лесенка затыка: включений " + stallLadderStarts + ", придержано замен к рынку " + stallHeldReplaces
+                + "; первый лот ближе: тиков " + emptyFirstTicks + "; отводов с запасом " + retreats + ", придержано возвратов " + retreatHeld
+                + "; опора по Бинансу на ликвидациях: " + fallBnbTicks + "; страж Бинанса: отмен " + bnbGuardCancels + ", целей прижато " + bnbGuardClamps + ", бурь " + guardStorms + "; не ближе к Бинансу: тиков " + bnbClampTicks + "; страж заморозки: отмен " + stallGuardCancels + "; тиков заморозки по живому " + simFreezeTicks;
+    }
+
+    /**
      * Сколько стоим в стороне после затыка.
      *
      * Призраки приходят ПАЧКАМИ: 40 штук за двое суток уместились примерно в
@@ -9050,8 +9500,55 @@ public final class QuoteLoop implements Runnable {
         return null;
     }
 
+    /**
+     * ЗАМОРОЗКА КАК У ЖИВОГО (стенд, 24.11.2026): {@code revx.sim.freeze-dir=<каталог>} с файлами {@code fz-<бот>.txt}
+     * («начало конец» в мс, интервалы, когда живой бот стоял с причиной «площадка тормозит на заменах»). Стенд сам
+     * получал медленных ответов вдвое меньше живого (заморозка 20–23.11: 6–7% против 12–14% времени), а весь минус
+     * прода — в заморозке. Тормоза площадки внешние и общие для ботов, поэтому их можно подложить данными. С ключом
+     * свои медленные ответы стенда заморозку не включают — только расписание живого.
+     */
+    static final String SIM_FREEZE_DIR = System.getProperty("revx.sim.freeze-dir", "");
+    private long[][] simFreezeIv;
+    private int simFreezeAt;
+    private long simFreezeTicks;
+
+    private void simFreeze() {
+        if (SIM_FREEZE_DIR.isEmpty()) {
+            return;
+        }
+        if (simFreezeIv == null) {
+            java.nio.file.Path p = java.nio.file.Path.of(SIM_FREEZE_DIR, "fz-" + botId() + ".txt");
+            try {
+                simFreezeIv = java.nio.file.Files.exists(p) ? java.nio.file.Files.readAllLines(p).stream().filter(l -> !l.isBlank())
+                        .map(l -> l.trim().split("\s+")).map(x -> new long[]{Long.parseLong(x[0]), Long.parseLong(x[1])})
+                        .sorted(java.util.Comparator.comparingLong(x -> x[0])).toArray(long[][]::new) : new long[0][];
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+            log.warn("СТЕНД: заморозка по расписанию живого, интервалов {} ({})", simFreezeIv.length, p);
+        }
+        long now = clock.now();
+        while (simFreezeAt < simFreezeIv.length && simFreezeIv[simFreezeAt][1] <= now) {
+            simFreezeAt++;
+        }
+        if (simFreezeAt < simFreezeIv.length && simFreezeIv[simFreezeAt][0] <= now) {
+            stallUntilMs = Math.max(stallUntilMs, simFreezeIv[simFreezeAt][1]);
+            simFreezeTicks++;
+        }
+    }
+
     private void noteVenueStall(long latencyMs) {
-        if (latencyMs < SLOW_REPLACE_MS) {
+        double bp = stallLadderFor(latencyMs);
+        if (bp > 0) {
+            long now0 = clock.now();
+            boolean fresh0 = now0 >= stallLadderUntilMs;
+            stallLadderBpNow = fresh0 ? bp : Math.max(stallLadderBpNow, bp);
+            stallLadderUntilMs = now0 + STALL_LADDER_HOLD_MS;
+            if (fresh0) {
+                stallLadderStarts++;
+            }
+        }
+        if (latencyMs < STALL_TRIGGER_MS) {
             return;
         }
         long now = clock.now();
@@ -9060,6 +9557,9 @@ public final class QuoteLoop implements Runnable {
             noBidUntilMs = Math.max(noBidUntilMs, now + STALL_NOBID_MS);   // покупка была — в затык не докупаем
         }
         boolean fresh = now >= stallUntilMs;
+        if (!SIM_FREEZE_DIR.isEmpty()) {
+            return;                       // стенд: заморозка только по расписанию живого
+        }
         stallUntilMs = now + (STALL_FREEZE_MS > 0 ? STALL_FREEZE_MS : STALL_STAND_ASIDE_MS);
         if (!fresh) {
             return;                       // всплеск продолжается — окно продлили, шуметь незачем

@@ -384,6 +384,12 @@ public class CliRunner implements ApplicationRunner {
                         !args.containsOption("no-budget"),
                         firstOr(args, "journal-out", ""));
             }
+            if (args.containsOption("revx-anchor")) {
+                executor.getObject().anchorCheck(firstOr(args, "bots", ""), firstOr(args, "from", ""),
+                        firstOr(args, "to", ""), firstOr(args, "anchors", ""),
+                        Long.parseLong(firstOr(args, "pre-sec", "60")) * 1000, Long.parseLong(firstOr(args, "post-sec", "30")) * 1000,
+                        firstOr(args, "live-fair", ""));
+            }
             if (args.containsOption("revx-day-prep")) {
                 executor.getObject().dayPrep(firstOr(args, "from", ""), firstOr(args, "to", ""),
                         firstOr(args, "days-dir", "D:/revx-days"), firstOr(args, "bases", "BTC,ETH,SOL"));

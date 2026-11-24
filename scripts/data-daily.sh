@@ -11,4 +11,9 @@ for d in /d/revx-days/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]; do
   [ -d "$d" ] && cmd //c "compact /c /exe:lzx /s:$(cygpath -w "$d") /i /q" > /dev/null
 done
 echo "$(date +%F' '%T) страховочный LZX-проход сделан" >> /d/revx-days/build.log
+# Вывод прогонов стенда (журналы j-* и логи): сжимаются LZX файлы старше двух суток — прогон к тому времени
+# кончился. Журналы SQLite ужимаются ~2.5×, логи сильнее; читать как прежде, а перезапись молча распакует.
+for out in ${STAND_OUT:-C:/revx-xrp/hp D:/revx-data/hp-j}; do
+  powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w scripts/lzx-old.ps1)" -Dir "$(cygpath -w "$out")" -Days 2 >> /d/revx-days/build.log 2>&1
+done
 bash scripts/data-check.sh

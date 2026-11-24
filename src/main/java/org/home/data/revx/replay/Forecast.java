@@ -499,6 +499,12 @@ public final class Forecast {
                 // Пауза стороны после неожиданного свипа (11.10.2026): ключи -D, по
                 // умолчанию выключена. Порог свипа $1000 — p90 события у BTC/ETH/SOL.
                 long pauseSec = Long.getLong("revx.exec.sweep-pause-sec", 0);
+                if (standDbPath == null && DayStore.enabled() && (pauseSec > 0
+                        || Long.getLong("revx.exec.cross-pause-sec", 0) > 0 || spec.sweepCoef() != 0)) {
+                    // дни (17.11.2026): сторожа свипов и лент других монет в днях нет — молча выключить нельзя
+                    throw new IllegalStateException("пауза по свипу, перекрёстная пауза и реакция на свип в режиме дней "
+                            + "не поддержаны — запускать по базе окна");
+                }
                 if (pauseSec > 0 && standDbPath != null) {
                     var pw = org.home.data.revx.exec.SweepWatch.preloadedForPause(standDbPath,
                             base.symbol(),
@@ -564,11 +570,18 @@ public final class Forecast {
                             Long.getLong("revx.exec.quiet-delay-ms", 2000), start - win - 60_000, end));
                 }
                 if (QuoteLoop.WALL_FLOW_MIN > 0 || QuoteLoop.FUNC_FILE != null) {
-                    if (standDbPath == null) {
-                        throw new IllegalStateException("стена от потока и отступ из функции просят базу стенда: ленту брать неоткуда");
+                    long delay = Long.getLong("revx.exec.wall-flow-delay-ms", 2000);
+                    if (standDbPath == null && DayStore.enabled()) {
+                        // дни (17.11.2026): та же лента из суточных файлов, с часом до старта
+                        loop.takerFlow(org.home.data.revx.exec.TakerFlow.preloaded(
+                                DayStore.rawTrades(base.symbol(), start - 3_600_000L - 60_000, end), delay));
+                    } else {
+                        if (standDbPath == null) {
+                            throw new IllegalStateException("стена от потока и отступ из функции просят базу стенда: ленту брать неоткуда");
+                        }
+                        loop.takerFlow(org.home.data.revx.exec.TakerFlow.preloaded(standDbPath, base.symbol(),
+                                delay, start - 3_600_000L - 60_000, end));
                     }
-                    loop.takerFlow(org.home.data.revx.exec.TakerFlow.preloaded(standDbPath, base.symbol(),
-                            Long.getLong("revx.exec.wall-flow-delay-ms", 2000), start - 3_600_000L - 60_000, end));
                 }
                 if (model instanceof MarketFillModel mfm) {
                     loop.bookSource(mfm.market().fresh()::bookAt);

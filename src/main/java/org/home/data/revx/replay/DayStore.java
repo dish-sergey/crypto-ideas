@@ -77,11 +77,12 @@ public final class DayStore {
         return day.atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli();
     }
 
-    /** Сутки, которые задевает окно {@code [fromMs, toMs]}. */
+    /** Сутки, которые задевает окно {@code [fromMs, toMs)}. 23.11.2026: конец ИСКЛЮЧИТЕЛЬНЫЙ — окно до 00:00
+     *  не требует следующего дня (его может ещё не быть: ежедневное задание собирает вчерашний). */
     static List<LocalDate> days(long fromMs, long toMs) {
         List<LocalDate> out = new ArrayList<>();
         LocalDate d = Instant.ofEpochMilli(fromMs).atZone(ZoneOffset.UTC).toLocalDate();
-        LocalDate last = Instant.ofEpochMilli(toMs).atZone(ZoneOffset.UTC).toLocalDate();
+        LocalDate last = Instant.ofEpochMilli(toMs > fromMs ? toMs - 1 : toMs).atZone(ZoneOffset.UTC).toLocalDate();
         for (; !d.isAfter(last); d = d.plusDays(1)) {
             out.add(d);
         }
@@ -259,14 +260,17 @@ public final class DayStore {
             long s = r[0];
             long e = s + r[1] + 5_000;
             if (!w.isEmpty() && s <= w.get(w.size() - 1)[1] + 10_000) {
-                w.get(w.size() - 1)[1] = Math.max(w.get(w.size() - 1)[1], e);
+                long[] last = w.get(w.size() - 1);
+                last[1] = Math.max(last[1], e);
+                last[2] = Math.max(last[2], r[1]);
             } else {
-                w.add(new long[]{s, e});
+                w.add(new long[]{s, e, r[1]});
             }
         }
+        // третья колонка (23.11.2026) — наибольшая задержка в окне: SimVenue отличает лёгкий затык от тяжёлого
         StringBuilder sb = new StringBuilder();
         for (long[] x : w) {
-            sb.append(x[0]).append(' ').append(x[1]).append('\n');
+            sb.append(x[0]).append(' ').append(x[1]).append(' ').append(x[2]).append('\n');
         }
         Path f = Files.createTempFile("revx-days-stalls", ".txt");
         f.toFile().deleteOnExit();
@@ -277,7 +281,7 @@ public final class DayStore {
 
     /** Шаги пары из каталога последнего дня окна: {@code [base_step, quote_step, min_notional]}. */
     public static double[] spec(String symbol, long toMs) throws Exception {
-        for (Path p : need(dir(), toMs, toMs, "pairs.txt")) {
+        for (Path p : need(dir(), toMs - 1, toMs - 1, "pairs.txt")) {
             for (String line : Files.readAllLines(p)) {
                 String[] f = line.trim().split("\\s+");
                 if (f.length >= 4 && f[0].equals(symbol)) {

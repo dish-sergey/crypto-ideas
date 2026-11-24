@@ -69,6 +69,32 @@ for d in spot perp spotsnap perpsnap; do
   pull "$KMICRO" $MICRO "~/binance-depth/$d" 'book-*.jsonl.gz' "$ROOT/binance-depth/$d" gz
 done
 
+# Каждый день — СВЕЖИЙ ДЕНЬ журналов ботов (23.11.2026): вчерашние сутки UTC — запросы (GET без тела ответа),
+# котировки и события каждого журнала. Нужен стенду сразу, а не через 14 суток (journal-archive): настоящие
+# задержки замен (revx.sim.latency-dir), цены живых заявок (func-live-twin), сверка по якорям. Не невосполнимое —
+# через 14 суток то же приезжает архивом, поэтому лежит на D рядом со стендом, хранится 30 суток. ~5 МБ/бот/сутки.
+FRESH=${JOURNAL_FRESH:-/d/revx-data/journal-fresh}
+mkdir -p "$FRESH"
+JD=${JF_DAY:-$(date -u -d yesterday +%F)}; yd=$(date -u -d "$JD" +%Y%m%d); d0=$(date -u -d "$JD 00:00" +%s)000; d1=$((d0 + 86400000))
+if ! ls "$FRESH"/*-$yd.db.gz > /dev/null 2>&1; then
+  if ssh -i "$KARM" "${SSH_OPTS[@]}" $ARM "set -e; rm -rf /tmp/jf-$yd; mkdir /tmp/jf-$yd; cd ~
+      for f in revx-exec*/state/exec*.db; do case \$f in *manual-test*) continue;; esac
+        n=\$(echo \$f | sed 's#/state/#-#; s#\\.db\$##'); o=/tmp/jf-$yd/\$n-$yd.db
+        sqlite3 \"file:\$f?mode=ro\" \"ATTACH '\$o' AS o;
+          CREATE TABLE o.exec_request AS SELECT id, ts_ms, method, path, CASE WHEN method='GET' THEN NULL ELSE body END body, status,
+            CASE WHEN method='GET' THEN NULL ELSE response END response, latency_ms, error FROM exec_request WHERE ts_ms >= $d0 AND ts_ms < $d1;
+          CREATE TABLE o.exec_quote AS SELECT * FROM exec_quote WHERE ts_ms >= $d0 AND ts_ms < $d1;
+          CREATE TABLE o.exec_event AS SELECT * FROM exec_event WHERE ts_ms >= $d0 AND ts_ms < $d1;\"
+        gzip -f \$o
+      done"; then
+    scp -q -i "$KARM" "${SSH_OPTS[@]}" "$ARM:/tmp/jf-$yd/*.db.gz" "$FRESH/" && note "свежий день журналов $yd: $(ls "$FRESH"/*-$yd.db.gz | wc -l) файлов"
+  else
+    note "⚠️ свежий день журналов $yd не снят"
+  fi
+  ssh -i "$KARM" "${SSH_OPTS[@]}" $ARM "rm -rf /tmp/jf-$yd" || true
+fi
+find "$FRESH" -name '*.db.gz' -mtime +30 -delete 2>/dev/null
+
 # Каждый день — снимок УЧЁТА ботов с bot-arm (17.11.2026): exec_fill / exec_event / exec_state каждого
 # журнала (не чистятся, живут только на ARM), плюс alloc.db (реестр и пул), venue.db, hedge_paper.db.
 # Запросы и котировки сюда не идут — они уходят в journal-archive. exec_open_order не берём: он

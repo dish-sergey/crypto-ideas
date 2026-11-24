@@ -36,18 +36,36 @@ final class LiveOrders {
     private final List<String> names = new ArrayList<>();
     private long looked, found, books;
 
+    /**
+     * ДВОЙНИК В КНИГЕ ФУНКЦИИ (23.11.2026): один бот из каталога {@code dir} — его живые заявки вычитаются из книги,
+     * которую видит функция отступа стендового бота с тем же именем. Живой бот вычитает из книги только свои заявки,
+     * а стендовый видел в записанной книге ещё и заявку своего живого двойника — лишний объём «впереди» на своей же
+     * цене. Цены — настоящие, из тел запросов (не цели котировщика).
+     */
+    static LiveOrders loadBot(String dir, String bot) {
+        return loadFrom(dir, java.util.List.of(bot));
+    }
+
     /** null — каталог не задан или ботов монеты в нём нет. */
     static LiveOrders load(String base) {
         if (DIR.isBlank()) {
             return null;
         }
-        LiveOrders lo = new LiveOrders();
+        java.util.List<String> bots = new ArrayList<>();
         for (String bc : BOTS.split(",")) {
             String[] p = bc.split(":");
-            if (!p[1].equals(base)) {
-                continue;
+            if (p[1].equals(base)) {
+                bots.add(p[0]);
             }
-            Path q = Path.of(DIR, "q-" + p[0] + ".csv.gz"), f = Path.of(DIR, "f-" + p[0] + ".csv");
+        }
+        return loadFrom(DIR, bots);
+    }
+
+    private static LiveOrders loadFrom(String dir, java.util.List<String> bots) {
+        LiveOrders lo = new LiveOrders();
+        for (String bot : bots) {
+            String[] p = {bot};
+            Path q = Path.of(dir, "q-" + p[0] + ".csv.gz"), f = Path.of(dir, "f-" + p[0] + ".csv");
             if (!Files.exists(q) || !Files.exists(f)) {
                 throw new IllegalStateException("ЗАЯВКИ ЖИВЫХ: нет " + q + " или " + f);
             }

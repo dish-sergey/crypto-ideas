@@ -74,6 +74,11 @@ public final class GroupForecast {
     private GroupForecast() {
     }
 
+    /** Гибридная опора на готовых тиках (для эмуляции по якорям: один раз на всё окно). */
+    public static List<ReplayFair.Tick> hybridTicks(List<ReplayFair.Tick> ticks, String symbol, MarketData market, double lot) {
+        return Boolean.getBoolean("revx.sim.group-hybrid") && HybridFair.enabled() ? HybridFair.apply(ticks, symbol, market, lot) : ticks;
+    }
+
     public static List<Result> run(List<Pair> pairs, org.home.data.revx.RevxConfig cfg,
                                    boolean shareBudget, String journalOut, String standDbPath) throws Exception {
         // ⚠️ До 03.11.2026 групповой стенд котировал от опоры-корзины (StandFair) без Бинанса, хотя живые боты
@@ -119,6 +124,9 @@ public final class GroupForecast {
         List<AllocRegistry> allocs = new ArrayList<>();
         List<ExecJournal> journals = new ArrayList<>();
         List<QuoteLoop> loops = new ArrayList<>();
+        List<SimVenue> simVenues = new ArrayList<>();
+        List<LiveOrders> twins = new ArrayList<>();
+        List<String> twinNames = new ArrayList<>();
         List<Forecast.BotSpec> specs = new ArrayList<>();
         List<Pair> owners = new ArrayList<>();
         List<Double> seeds = new ArrayList<>();
@@ -145,6 +153,7 @@ public final class GroupForecast {
                 double startBase = Forecast.startInventory(ticks, p.bots());
                 SimVenue venue = new SimVenue(clock, p.model(), base.symbol(), startBase,
                         quoteStart, base.minNotional());
+                simVenues.add(venue);
                 String baseCur = base.symbol().substring(0, base.symbol().indexOf('/'));
                 String quoteCur = base.symbol().substring(base.symbol().indexOf('/') + 1);
                 AllocRegistry alloc = new AllocRegistry(
@@ -213,7 +222,17 @@ public final class GroupForecast {
                         }
                     }
                     if (p.model() instanceof MarketFillModel mfm) {
-                        loop.bookSource(mfm.market().fresh()::bookAt);
+                        String twinDir = System.getProperty("revx.sim.func-live-twin", "");
+                        if (twinDir.isBlank()) {
+                            loop.bookSource(mfm.market().fresh()::bookAt);
+                        } else {
+                            // 23.11.2026: книга функции без заявки живого двойника (см. LiveOrders.loadBot)
+                            LiveOrders twin = LiveOrders.loadBot(twinDir, spec.botId());
+                            var mk = mfm.market().fresh();
+                            loop.bookSource(t -> twin.without(mk.bookAt(t), t));
+                            twins.add(twin);
+                            twinNames.add(spec.botId() + " " + base.symbol());
+                        }
                     }
                     loop.statsInventoryCap(spec.inventoryCap());
                     var bnbSeries = HybridFair.BNB_BY_SYMBOL.get(p.symbol());
@@ -257,6 +276,20 @@ public final class GroupForecast {
             long timeout = Forecast.JOIN_TIMEOUT_MS * 4;
             for (Thread t : threads) {
                 t.join(timeout);
+            }
+            // 23.11.2026: исполнения, о которых бот не узнал (раньше печатал только одиночный прогон).
+            for (SimVenue v : simVenues) {
+                log.warn("объём: {}", v.fillDiag());
+                log.warn("затыки площадки: {}", v.stallDiag());
+                for (String l : v.lostFills()) {
+                    log.warn("  бот не увидел: {}", l);
+                }
+            }
+            for (QuoteLoop l : loops) {
+                log.warn("бот {}: {}", l.botId(), l.stallLadderDiag());
+            }
+            for (int k = 0; k < twins.size(); k++) {
+                log.warn("двойник {}: {}", twinNames.get(k), twins.get(k).report(twinNames.get(k)));
             }
             List<String> stuck = threads.stream().filter(Thread::isAlive)
                     .map(Thread::getName).toList();

@@ -1042,19 +1042,30 @@ public class Executor {
                              double levelStepBp, boolean innerFirst,
                              String from, String to, String journalOut,
                              double lotUsd, double capLots) {
-        try (StandReader stand = new StandReader(standDbPath, cfg.memecoins(),
+        // ДНИ (17.11.2026, -Drevx.days-dir): как у группового прогона — данные из суточных файлов.
+        boolean days = org.home.data.revx.replay.DayStore.enabled();
+        try (StandReader stand = days ? null : new StandReader(standDbPath, cfg.memecoins(),
                 new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
                         cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct()),
                 cfg.fairMaxSkewMs())) {
-            StandReader.PairSpec ps = stand.spec(pairSymbol);
-            if (ps == null) {
-                throw new IllegalStateException("нет спецификации пары " + pairSymbol);
-            }
             long fromMs = from == null || from.isBlank()
                     ? System.currentTimeMillis() - 9L * 86_400_000
                     : java.time.Instant.parse(from).toEpochMilli();
             long toMs = to == null || to.isBlank()
                     ? System.currentTimeMillis() : java.time.Instant.parse(to).toEpochMilli();
+            StandReader.PairSpec ps;
+            if (days) {
+                double[] s = org.home.data.revx.replay.DayStore.spec(pairSymbol, toMs);
+                ps = s == null ? null : new StandReader.PairSpec(pairSymbol, s[0], s[1], s[2]);
+                System.setProperty("revx.sim.stall-schedule",
+                        org.home.data.revx.replay.DayStore.stallSchedule(fromMs, toMs));
+                log.warn("дни: данные из {}, база окна не читается", org.home.data.revx.replay.DayStore.dir());
+            } else {
+                ps = stand.spec(pairSymbol);
+            }
+            if (ps == null) {
+                throw new IllegalStateException("нет спецификации пары " + pairSymbol);
+            }
 
             String pairBase = pairSymbol.substring(0, pairSymbol.indexOf('/'));
             FairPrice.Limits fairLimits = new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
@@ -1062,7 +1073,9 @@ public class Executor {
             // Ряд опоры одинаков у всех прогонов окна и пары — берём из кэша, если он включён
             // (revx.forecast.cache-dir). Срезы корзины курса (~0.8 ГБ на 24 днях) после постройки
             // не держим.
-            var cached = org.home.data.revx.replay.FairCache.ticks(standDbPath, pairBase, fromMs, toMs,
+            var cached = days ? org.home.data.revx.replay.DayStore.fair(pairBase, fromMs, toMs,
+                    fairLimits + "|" + cfg.memecoins() + "|" + cfg.fairMaxSkewMs())
+                    : org.home.data.revx.replay.FairCache.ticks(standDbPath, pairBase, fromMs, toMs,
                     fairLimits + "|" + cfg.memecoins() + "|" + cfg.fairMaxSkewMs(),
                     () -> new org.home.data.revx.replay.StandFair(standDbPath, pairBase, fairLimits,
                             cfg.memecoins(), cfg.fairMaxSkewMs(),
@@ -1108,7 +1121,10 @@ public class Executor {
             // Верхняя граница («touch») — ещё один полный прогон (на w24 11 мин из 71), а в
             // очередях стенда её не читают: -Drevx.forecast.models=market её снимает.
             for (String name : System.getProperty("revx.forecast.models", "market,touch").split(",")) {
-                var market = org.home.data.revx.replay.MarketData.load(standDbPath, pairSymbol,
+                var market = days
+                        ? org.home.data.revx.replay.DayStore.market(pairSymbol,
+                        ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs())
+                        : org.home.data.revx.replay.MarketData.load(standDbPath, pairSymbol,
                         ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
                 org.home.data.revx.replay.FillModel model = "touch".equals(name)
                         ? new org.home.data.revx.replay.TouchFillModel(market)
@@ -1117,7 +1133,7 @@ public class Executor {
                 // заведомо завышена (ТЗ §4.3), и считать по ней цену запаса
                 // значило бы мерить свойство модели, а не рынка.
                 var results = org.home.data.revx.replay.Forecast.run(ticks, model, bp, bots, cfg,
-                        standDbPath, "market".equals(name) ? journalOut : null);
+                        days ? null : standDbPath, "market".equals(name) ? journalOut : null);
                 out.append('\n').append(org.home.data.revx.replay.Forecast.render(
                         model.describe(), results));
                 out.append(org.home.data.revx.replay.Forecast.renderDays(
@@ -1265,6 +1281,112 @@ public class Executor {
             log.info("{}", org.home.data.revx.replay.GroupForecast.render(results));
         } catch (Exception e) {
             log.error("групповой прогон не прошёл: {}", e.toString(), e);
+        }
+    }
+
+    /**
+     * ЭМУЛЯЦИЯ ПО ЯКОРЯМ (23.11.2026, владелец): для каждой сделки живого бота отрезок стенда [T − pre, T + post]
+     * с тем же запасом на старте. Дни, опора и рынок грузятся один раз; отрезок — свежая площадка и котировщик.
+     * Файл якорей: строки «метка T_мс запас». {@code --live-fair=<журнал живого>} — опора из журнала живого бота
+     * (колонка fair таблицы q или exec_quote), иначе своя опора стенда. Выход — {@code revx.sim.anchor-out}
+     * (заявки стенда в момент T) и {@code revx.sim.fills-out} (исполнения с меткой отрезка).
+     */
+    public void anchorCheck(String botSpec, String from, String to, String anchorsFile, long preMs, long postMs,
+                            String liveFairDb) {
+        long fromMs = java.time.Instant.parse(from).toEpochMilli();
+        long toMs = java.time.Instant.parse(to).toEpochMilli();
+        FairPrice.Limits limits = new FairPrice.Limits(cfg.fairMinPairs(), cfg.fairMaxDispersionPct(),
+                cfg.fairMaxReferenceSpreadPct(), cfg.fairMaxResidualPct());
+        try {
+            if (!org.home.data.revx.replay.DayStore.enabled()) {
+                throw new IllegalStateException("эмуляция по якорям — только по дням (-Drevx.days-dir)");
+            }
+            System.setProperty("revx.sim.stall-schedule", org.home.data.revx.replay.DayStore.stallSchedule(fromMs, toMs));
+            String[] f = botSpec.trim().split(":");
+            String botId = f[0], coin = f[1].toUpperCase(java.util.Locale.ROOT), sym = coin + "/USDC";
+            int levels = Integer.parseInt(f[2]);
+            double offsetBp = Double.parseDouble(f[3]), lotUsd = Double.parseDouble(f[4]), capLots = Double.parseDouble(f[5]);
+            int cap = Integer.parseInt(f[6]);
+            double[] s = org.home.data.revx.replay.DayStore.spec(sym, toMs);
+            StandReader.PairSpec ps = new StandReader.PairSpec(sym, s[0], s[1], s[2]);
+            var ticks = org.home.data.revx.replay.DayStore.fair(coin, fromMs, toMs,
+                    limits + "|" + cfg.memecoins() + "|" + cfg.fairMaxSkewMs()).ticks();
+            var market = org.home.data.revx.replay.DayStore.market(sym, ticks.get(0).tsMs(), ticks.get(ticks.size() - 1).tsMs());
+            double price = ticks.get(ticks.size() / 2).fair();
+            double lot = Math.max(ps.baseStep(), Math.round(lotUsd / price / ps.baseStep()) * ps.baseStep());
+            var spec = new org.home.data.revx.replay.Forecast.BotSpec(botId, offsetBp / 10_000, 0.3, lot * capLots,
+                    levels, levels > 1 ? 3.0 / 10_000 : 0, lot, true);
+            var base = new org.home.data.revx.replay.BootParams(sym, "a", lot, lot * 7, 0.0007, cfg.simSkewK(), 0.3, 1000,
+                    ps.minNotional(), ps.baseStep(), ps.quoteStep(), 0.10, -1, -1, 0, 0.02, 0.5, true, 1, 0, true);
+            // гибрид — один раз на всё окно, отрезки берут готовые тики
+            ticks = org.home.data.revx.replay.GroupForecast.hybridTicks(ticks, sym, market.fresh(), lot);
+            System.clearProperty("revx.sim.group-hybrid");
+            java.util.NavigableMap<Long, Double> liveFair = null;
+            if (liveFairDb != null && !liveFairDb.isBlank()) {
+                liveFair = new java.util.TreeMap<>();
+                try (var c = java.sql.DriverManager.getConnection("jdbc:sqlite:" + liveFairDb);
+                     var st = c.createStatement()) {
+                    String t = "q";
+                    try (var rs = st.executeQuery("SELECT name FROM sqlite_master WHERE name='exec_quote'")) {
+                        if (rs.next()) {
+                            t = "exec_quote";
+                        }
+                    }
+                    try (var rs = st.executeQuery("SELECT ts_ms, fair FROM " + t + " WHERE fair IS NOT NULL AND ts_ms >= "
+                            + (fromMs - 60_000) + " AND ts_ms <= " + toMs)) {
+                        while (rs.next()) {
+                            liveFair.put(rs.getLong(1), rs.getDouble(2));
+                        }
+                    }
+                }
+                log.warn("якоря: опора из журнала живого — {} тиков", liveFair.size());
+            }
+            List<String> lines = java.nio.file.Files.readAllLines(java.nio.file.Path.of(anchorsFile));
+            int done = 0, bad = 0;
+            for (String line : lines) {
+                String[] a = line.trim().split("\\s+");
+                if (a.length < 3) {
+                    continue;
+                }
+                String tag = a[0];
+                long t = Long.parseLong(a[1]);
+                double inv0 = Double.parseDouble(a[2]);
+                long t0 = t - preMs, t1 = t + postMs;
+                List<org.home.data.revx.replay.ReplayFair.Tick> seg = new java.util.ArrayList<>();
+                for (var tk : ticks) {
+                    if (tk.tsMs() < t0 || tk.tsMs() > t1) {
+                        continue;
+                    }
+                    double fv = tk.fair();
+                    if (liveFair != null) {
+                        var e = liveFair.floorEntry(tk.tsMs());
+                        if (e == null) {
+                            continue;
+                        }
+                        fv = e.getValue();
+                    }
+                    seg.add(new org.home.data.revx.replay.ReplayFair.Tick(tk.tsMs(), fv, tk.bid(), tk.ask(),
+                            seg.isEmpty() ? inv0 : 0, tk.quotable() || liveFair != null, tk.reason(), tk.pressure()));
+                }
+                if (seg.size() < 10) {
+                    bad++;
+                    continue;
+                }
+                System.setProperty("revx.sim.anchor-tag", tag);
+                System.setProperty("revx.sim.anchor-at", Long.toString(t));
+                try {
+                    var pair = new org.home.data.revx.replay.GroupForecast.Pair(sym, seg,
+                            new org.home.data.revx.replay.MarketFillModel(market), base, List.of(spec), List.of(cap));
+                    org.home.data.revx.replay.GroupForecast.run(List.of(pair), cfg, false, null, null);
+                    done++;
+                } catch (Exception e) {
+                    bad++;
+                    log.error("якорь {} не прошёл: {}", tag, e.toString());
+                }
+            }
+            log.warn("якоря {}: прогнано {}, пропущено {}", botId, done, bad);
+        } catch (Exception e) {
+            log.error("эмуляция по якорям не прошла: {}", e.toString(), e);
         }
     }
 

@@ -103,6 +103,135 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
     private final Map<String, Order> live = new LinkedHashMap<>();
     /** Что по какой заявке исполнилось: {объём, оборот}. Источник filled_quantity. */
     private final Map<String, double[]> done = new LinkedHashMap<>();
+    /** 23.11.2026: момент первого исполнения и сторона по заявке — для разбора потерянных ботом исполнений. */
+    private final Map<String, String> doneNote = new java.util.HashMap<>();
+    /** Первый вопрос о судьбе ушедшей заявки в затык — от него отсчитывается предел 404. */
+    private final Map<String, Long> staleSince = new java.util.HashMap<>();
+    static final long STALE_MAX_MS = Long.getLong("revx.sim.stale-max-ms", 60_000L);
+    /**
+     * Задержка обычной замены: {@code revx.sim.replace-delay=live} — из распределения живых 20–22.11 (квантили ниже),
+     * число — постоянная задержка в мс; пусто — замена мгновенна (как до 23.11).
+     */
+    static final String REPLACE_DELAY_SPEC = System.getProperty("revx.sim.replace-delay", "");
+    static final boolean REPLACE_DELAY = !REPLACE_DELAY_SPEC.isBlank();
+    private static final double[][] LIVE_REPLACE_Q = {{0, 60}, {0.1, 138}, {0.5, 442}, {0.75, 477}, {0.9, 761},
+            {0.97, 882}, {0.99, 1139}, {1.0, 1500}};
+    private final java.util.Random delayRnd = new java.util.Random(Long.getLong("revx.sim.seed", 1L) * 7919L + 17L);
+    private long delayedReplaces;
+
+    /**
+     * ЗАДЕРЖКИ ЖИВОГО ДВОЙНИКА (23.11.2026): {@code revx.sim.latency-dir} — файлы {@code lat-<бот>.txt} («начало_мс задержка_мс»
+     * каждой замены живого). Замена стендового бота получает задержку той замены живого, что ушла ближе всего по времени
+     * (±1 с); дальше — по распределению. Так заморозки стенда приходятся на те же моменты, что у живого.
+     */
+    static final String LATENCY_DIR = blankNull(System.getProperty("revx.sim.latency-dir", ""));
+    private static final Map<String, long[][]> LAT = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Насколько далеко по времени искать замену живого (23.11.2026: ±1 с находит пару лишь 30–55% замен стенда). */
+    static final long LATENCY_WINDOW_MS = Long.getLong("revx.sim.latency-window-ms", 1000L);
+    private long liveLatHits, liveLatMiss;
+
+    private static String blankNull(String v) {
+        return v == null || v.isBlank() ? null : v;
+    }
+
+    private long liveLatency(String clientId, long now) {
+        if (clientId == null || clientId.isEmpty()) {
+            return -1;
+        }
+        long[][] a = LAT.computeIfAbsent(clientId.substring(0, 1), b -> {
+            java.nio.file.Path p = java.nio.file.Path.of(LATENCY_DIR, "lat-" + b + ".txt");
+            if (!java.nio.file.Files.exists(p)) {
+                return new long[0][];
+            }
+            try {
+                return java.nio.file.Files.readAllLines(p).stream().filter(l -> !l.isBlank())
+                        .map(l -> l.trim().split("\s+")).map(f -> new long[]{Long.parseLong(f[0]), Long.parseLong(f[1])})
+                        .sorted(java.util.Comparator.comparingLong(x -> x[0])).toArray(long[][]::new);
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        });
+        int lo = 0, hi = a.length - 1, best = -1;
+        while (lo <= hi) {
+            int m = (lo + hi) >>> 1;
+            if (a[m][0] <= now) {
+                best = m;
+                lo = m + 1;
+            } else {
+                hi = m - 1;
+            }
+        }
+        int pick = -1;
+        long bd = Long.MAX_VALUE;
+        for (int k = Math.max(0, best); k <= Math.min(a.length - 1, best + 1); k++) {
+            if (k >= 0 && Math.abs(a[k][0] - now) < bd) {
+                bd = Math.abs(a[k][0] - now);
+                pick = k;
+            }
+        }
+        if (pick < 0 || bd > LATENCY_WINDOW_MS) {
+            liveLatMiss++;
+            return -1;
+        }
+        liveLatHits++;
+        return a[pick][1];
+    }
+
+    private long sampleReplaceDelay() {
+        if (!"live".equalsIgnoreCase(REPLACE_DELAY_SPEC)) {
+            return Long.parseLong(REPLACE_DELAY_SPEC.trim());
+        }
+        double u = delayRnd.nextDouble();
+        for (int k = 1; k < LIVE_REPLACE_Q.length; k++) {
+            if (u <= LIVE_REPLACE_Q[k][0]) {
+                double[] a = LIVE_REPLACE_Q[k - 1], b = LIVE_REPLACE_Q[k];
+                return Math.round(a[1] + (b[1] - a[1]) * (u - a[0]) / (b[0] - a[0]));
+            }
+        }
+        return 1500;
+    }
+
+    /**
+     * ЭМУЛЯЦИЯ ПО ЯКОРЯМ (23.11.2026, {@code --revx-anchor}): отрезок стенда стартует перед сделкой живого бота;
+     * в момент якоря {@code revx.sim.anchor-at} пишется, какие свои заявки стояли в книге (последний опрос ДО якоря),
+     * в файл {@code revx.sim.anchor-out}. Метка отрезка {@code revx.sim.anchor-tag} — и в журнале исполнений.
+     */
+    private final String anchorTag = System.getProperty("revx.sim.anchor-tag", "");
+    private final long anchorAt = Long.getLong("revx.sim.anchor-at", 0L);
+    private final String anchorOut = System.getProperty("revx.sim.anchor-out", "");
+    private String anchorBook = "";
+    private long anchorBookAt;
+    private boolean anchorDone;
+
+    private void anchorSnapshot() {
+        if (anchorAt <= 0 || anchorDone || anchorOut.isBlank()) {
+            return;
+        }
+        long now = clock.now();
+        if (now < anchorAt) {
+            StringBuilder sb = new StringBuilder();
+            for (Order o : live.values()) {
+                if (hiddenUntil.containsKey(o.id)) {
+                    continue;
+                }
+                sb.append(o.buy ? "BUY:" : "SELL:").append(plain(o.price)).append(':').append(plain(o.size)).append(';');
+            }
+            anchorBook = sb.toString();
+            anchorBookAt = now;
+            return;
+        }
+        anchorDone = true;
+        try {
+            java.nio.file.Files.writeString(java.nio.file.Path.of(anchorOut),
+                    anchorTag + " " + anchorAt + " " + anchorBookAt + " " + (anchorBook.isEmpty() ? "-" : anchorBook) + "\n",
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+    }
+
+    /** Куда писать каждое исполнение площадки стенда (префикс файла; пусто — не писать). */
+    static final String FILLS_OUT = System.getProperty("revx.sim.fills-out");
     private double baseTotal;
     private double quoteTotal;
 
@@ -205,9 +334,9 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
     public synchronized String stallDiag() {
         return String.format(Locale.ROOT, "призраков %d, 204-с-жизнью %d, 404-на-живой %d, "
                         + "404-о-судьбе %d, исполнено после «отмены» %d; затыков по ходу цены %d, "
-                        + "гонок замены %d, невидимых свежих %d, поздних замен %d (исполнено по старой цене %d)",
+                        + "гонок замены %d, невидимых свежих %d, поздних замен %d (исполнено по старой цене %d); лёгких ответов %d, замен с задержкой %d (по живому %d, без пары %d)",
                 ghostsMade, late204Made, live404Made, staleMade, fillsAfterCancel,
-                volStalls, raceMade, fresh404Made, lagMade, lagFills);
+                volStalls, raceMade, fresh404Made, lagMade, lagFills, lightReplies, delayedReplaces, liveLatHits, liveLatMiss);
     }
 
     private boolean effect(String name) {
@@ -279,7 +408,7 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         long end = now < volStallUntil ? volStallUntil : now;
         if (schedule != null) {
             for (long[] w : schedule) {
-                if (w[0] <= now && now <= w[1]) {
+                if (w[0] <= now && now <= w[1] && !light(w)) {
                     end = Math.max(end, w[1]);
                 }
                 if (w[0] > now) {
@@ -304,6 +433,10 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
             double[] acc = done.remove(p.oldId);
             if (acc != null) {
                 done.put(newId, acc);           // исполненное у предка бот увидит у наследника
+                String note = doneNote.remove(p.oldId);
+                if (note != null) {
+                    doneNote.put(newId, note + " (у предка " + p.oldId.substring(0, 8) + ")");
+                }
             }
             Order old = live.remove(p.oldId);
             gone.put(p.oldId, "заменой (поздно)");
@@ -401,7 +534,9 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
             for (String line : java.nio.file.Files.readAllLines(java.nio.file.Path.of(path))) {
                 String[] p = line.trim().split("\\s+");
                 if (p.length >= 2) {
-                    w.add(new long[]{Long.parseLong(p[0]), Long.parseLong(p[1])});
+                    // третья колонка (23.11.2026) — наибольшая задержка ответа в окне, мс; без неё окно тяжёлое
+                    w.add(new long[]{Long.parseLong(p[0]), Long.parseLong(p[1]),
+                            p.length >= 3 ? Long.parseLong(p[2]) : Long.MAX_VALUE});
                 }
             }
             w.sort(java.util.Comparator.comparingLong(x -> x[0]));
@@ -411,7 +546,59 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         }
     }
 
+    /**
+     * ЛЁГКИЙ ЗАТЫК (23.11.2026). С середины ноября площадка отвечает на замены чуть дольше секунды сплошным
+     * плато: 20.11 — 7375 медленных ответов, медиана 1.12 с, 99% ≤ 1.8 с, дольше 2.5 с всего 9; окна по
+     * расписанию покрыли 37% суток против < 2% в октябре, на котором эффекты затыка калибровались. Живые в
+     * эти часы судьбу заявок видели (fate_unknown 2–3 за трое суток на бота против 480–640 на стенде),
+     * призраков не было. Окно, где наибольшая задержка меньше {@code revx.sim.stall-heavy-ms}, — лёгкое:
+     * замена отвечает с этой задержкой (бот отходит в сторону, как живой), остальных эффектов нет.
+     * 0 — все окна тяжёлые (как до 23.11).
+     */
+    static final long STALL_HEAVY_MS = Long.getLong("revx.sim.stall-heavy-ms", 0L);
+
+    /** Окно расписания, в котором лежит {@code now}, или null. */
+    private long[] scheduleWindow(long now) {
+        if (schedule == null) {
+            return null;
+        }
+        int lo = 0;
+        int hi = schedule.length - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (schedule[mid][1] < now) {
+                lo = mid + 1;
+            } else if (schedule[mid][0] > now) {
+                hi = mid - 1;
+            } else {
+                return schedule[mid];
+            }
+        }
+        return null;
+    }
+
+    private static boolean light(long[] w) {
+        return STALL_HEAVY_MS > 0 && w[2] < STALL_HEAVY_MS;
+    }
+
+    /** Задержка ответа на замену в лёгком окне (0 — окна нет или оно тяжёлое). */
+    private long lightLatency(long now) {
+        long[] w = scheduleWindow(now);
+        if (w == null || !light(w)) {
+            return 0;
+        }
+        // медленно отвечает каждая LIGHT_SLOW_EVERY-я замена окна: у живых на плато медленных 2–7% замен
+        return lightSeen++ % LIGHT_SLOW_EVERY == 0 ? w[2] : 0;
+    }
+    static final long LIGHT_SLOW_EVERY = Math.max(1, Long.getLong("revx.sim.light-slow-every", 1L));
+    private long lightSeen;
+    private long lightReplies;
+
     private boolean inSchedule(long now) {
+        long[] w0 = scheduleWindow(now);
+        if (w0 == null || light(w0)) {
+            return false;
+        }
         if (schedule == null) {
             return false;
         }
@@ -508,6 +695,13 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
      * 137, бот заметил 52» невозможно разложить на «модель считает исполнения
      * событиями, а бот — заявками» и на настоящую потерю.
      */
+    /** Потерянные ботом исполнения (до 40) после последнего {@link #fillDiag()}. */
+    private final List<String> lost = new ArrayList<>();
+
+    public synchronized List<String> lostFills() {
+        return new ArrayList<>(lost);
+    }
+
     public synchronized String fillDiag() {
         // Считается НА КОНЕЦ прогона, а не в момент ухода заявки из книги: после
         // отказа замены (422) бот ещё сверяется с /orders/active и дочитывает
@@ -515,11 +709,16 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         unreadBase = 0;
         unreadOrders = 0;
         Map<String, Long> why = new LinkedHashMap<>();
+        lost.clear();
         for (var e : done.entrySet()) {
             if (!inspected.contains(e.getKey())) {
                 unreadBase += e.getValue()[0];
                 unreadOrders++;
                 why.merge(gone.getOrDefault(e.getKey(), "осталась в книге"), 1L, Long::sum);
+                if (lost.size() < 40) {
+                    lost.add(String.format(Locale.ROOT, "%s %.8g (%s, ушла: %s)", doneNote.get(e.getKey()), e.getValue()[0],
+                            e.getKey().substring(0, 8), gone.getOrDefault(e.getKey(), "осталась в книге")));
+                }
             }
         }
         return String.format(java.util.Locale.ROOT,
@@ -541,6 +740,7 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
      */
     private void advance() {
         watchVolatility();
+        anchorSnapshot();
         probes++;
         for (Order o : live.values()) {
             if (o.buy) {
@@ -594,6 +794,17 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         }
         applied++;
         double qty = Math.min(f.qty(), hit.size);
+        if (FILLS_OUT != null) {
+            // 23.11.2026: настоящее время исполнения (бот узнаёт позже) — для сверки захвата с живыми по tdt
+            try {
+                java.nio.file.Files.writeString(java.nio.file.Path.of(FILLS_OUT + "-" + base + ".txt"),
+                        (anchorTag.isEmpty() ? "" : anchorTag + " ") + String.format(Locale.ROOT, "%d %s %.10g %.10g %s%n", clock.now(), hit.buy ? "BUY" : "SELL",
+                                qty, f.price(), hit.clientId == null ? "-" : hit.clientId.substring(0, 1)),
+                        java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        }
         if (hit.buy) {
             baseTotal += qty;
             quoteTotal -= qty * f.price();
@@ -611,6 +822,7 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         if (acc == null) {
             acc = new double[2];
             done.put(hit.id, acc);
+            doneNote.put(hit.id, java.time.Instant.ofEpochMilli(clock.now()) + " " + (hit.buy ? "BUY" : "SELL"));
             filledOrders++;
         }
         filledBase += qty;
@@ -716,8 +928,15 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         // наследник отложенной замены — пока это предок в книге
         String real = pending.containsKey(id) ? pending.get(id).oldId : id;
         if ((!live.containsKey(real) || hiddenUntil.containsKey(real)) && effect("stale")) {
-            staleMade++;              // в затык судьба ушедшей заявки ещё не видна
-            return new Response(404, "{\"message\":\"Order not found\"}", 50);
+            // 23.11.2026: 404 о судьбе — не дольше STALE_MAX_MS с первого вопроса. Окно затыка склеивает
+            // медленные замены (20.11: полтора часа подряд), и без предела стенд отвечал 404 всё окно —
+            // бот через 30 мин считал исполненную продажу снятой (SOL b, −0.87 SOL), двое суток стоял.
+            // Живые 08–23.11: 182 вопроса, ответ через медиану 49 с, 90% ≤ 61 с, максимум 178 с, 30 мин — ни разу.
+            long first = staleSince.computeIfAbsent(real, k -> clock.now());
+            if (clock.now() - first < STALE_MAX_MS) {
+                staleMade++;              // в затык судьба ушедшей заявки ещё не видна
+                return new Response(404, "{\"message\":\"Order not found\"}", 50);
+            }
         }
         double[] acc = done.get(real);
         if (acc != null) {
@@ -901,6 +1120,34 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
                     "{\"data\":{\"venue_order_id\":\"%s\",\"client_order_id\":\"%s\",\"state\":\"new\"}}",
                     next, p.clientId), p.applyAt - clock.now());
         }
+        if ((REPLACE_DELAY || LATENCY_DIR != null) && live.containsKey(id) && !hiddenUntil.containsKey(id) && !inVolStall()) {
+            // ОБЫЧНАЯ ЗАМЕНА ДОХОДИТ НЕ СРАЗУ (23.11.2026): живьём 20–22.11 медиана 442 мс, 90% ≤ 761 мс, 99% ≤ 1.14 с
+            // (697 тыс. замен). Пока идёт ответ, в книге стоит предок по старой цене и может исполниться.
+            JsonNode n = read(json);
+            if (n == null) {
+                return new Response(400, "{\"message\":\"bad body\"}", 0);
+            }
+            Order old = live.get(id);
+            long lt = LATENCY_DIR != null ? 0 : lightLatency(clock.now());
+            long liveLat = LATENCY_DIR != null ? liveLatency(n.path("client_order_id").asText(old.clientId), clock.now()) : -1;
+            long delay = liveLat >= 0 ? liveLat : lt > 0 ? lt : sampleReplaceDelay();
+            Pending p = new Pending();
+            p.oldId = id;
+            p.clientId = n.path("client_order_id").asText(old.clientId);
+            p.price = n.path("price").asDouble(old.price);
+            p.size = n.path("base_size").asDouble(old.size);
+            p.applyAt = clock.now() + delay;
+            String next = UUID.randomUUID().toString();
+            pending.put(next, p);
+            if (lt > 0) {
+                lightReplies++;
+            }
+            delayedReplaces++;
+            replaces++;
+            return new Response(200, String.format(
+                    "{\"data\":{\"venue_order_id\":\"%s\",\"client_order_id\":\"%s\",\"state\":\"new\"}}",
+                    next, p.clientId), delay);
+        }
         boolean slowOnly = !effect("race") && effect("slow");
         boolean stallRace = live.containsKey(id) && inVolStall() && (effect("race") || slowOnly);
         boolean race = stallRace
@@ -970,9 +1217,13 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
         if (makeFresh()) {
             freshUntil.put(o.id, clock.now() + FRESH_MS);
         }
+        long lightMs = race ? 0 : lightLatency(clock.now());
+        if (lightMs > 0) {
+            lightReplies++;
+        }
         return new Response(200, String.format(
                 "{\"data\":{\"venue_order_id\":\"%s\",\"client_order_id\":\"%s\",\"state\":\"new\"}}",
-                o.id, o.clientId), race ? RACE_MS : 0);
+                o.id, o.clientId), race ? RACE_MS : lightMs);
     }
 
     @Override

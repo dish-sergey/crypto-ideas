@@ -139,6 +139,49 @@ final class HybridFair {
         return !DIR.isBlank();
     }
 
+    /**
+     * ПРОБУЖДЕНИЕ ТИКА ПО ХОДУ БИНАНСА (23.11.2026, {@code revx.sim.bnb-wake=true}): живые с веб-сокетом
+     * ({@code hybrid-ws}) будят тик, когда Бинанс ушёл от цены последнего тика на {@code revx.exec.wake-bp} (2) б.п.,
+     * не раньше {@code wake-min-ms} (400) после тика. Стенд тикал только по ряду опоры, раз в секунду. Здесь в ряд
+     * добавляются такие моменты (свеча секунды s доступна в s + 1 с + задержка), а опору гибрид считает в них заново.
+     * ⚠️ Бинанс стенда посекундный: внутрисекундных ходов он не видит, будит не чаще раза в секунду.
+     */
+    static final boolean BNB_WAKE = Boolean.getBoolean("revx.sim.bnb-wake");
+    static long wakeTicks;
+
+    static List<ReplayFair.Tick> withWakes(List<ReplayFair.Tick> ticks, TreeMap<Long, Double> bnb) {
+        double wakeBp = Double.parseDouble(System.getProperty("revx.exec.wake-bp", "2"));
+        long minMs = Long.getLong("revx.exec.wake-min-ms", 400L);
+        List<ReplayFair.Tick> out = new ArrayList<>(ticks.size() + ticks.size() / 4);
+        long added = 0;
+        for (int i = 0; i < ticks.size(); i++) {
+            ReplayFair.Tick t = ticks.get(i);
+            out.add(t);
+            long lastT = t.tsMs();
+            var e0 = bnb.floorEntry(lastT - LAG_MS - 1000);
+            if (e0 == null || i + 1 >= ticks.size()) {
+                continue;
+            }
+            double lastB = e0.getValue();
+            long next = ticks.get(i + 1).tsMs();
+            for (var e : bnb.subMap(lastT - LAG_MS - 1000, false, next - LAG_MS - 1000, false).entrySet()) {
+                long a = e.getKey() + 1000 + LAG_MS;
+                if (a <= lastT || a >= next) {
+                    continue;
+                }
+                if (Math.abs(e.getValue() / lastB - 1) * 1e4 >= wakeBp && a - lastT >= minMs) {
+                    out.add(new ReplayFair.Tick(a, t.fair(), t.bid(), t.ask(), t.inventory(), t.quotable(), t.reason(), t.pressure()));
+                    lastT = a;
+                    lastB = e.getValue();
+                    added++;
+                }
+            }
+        }
+        wakeTicks += added;
+        log.warn("ГИБРИД: пробуждений по Бинансу добавлено {} к {} тикам", added, ticks.size());
+        return out;
+    }
+
     /** Пересчитывает ряд тиков; без данных Бинанса или книги тик остаётся прежним. */
     static List<ReplayFair.Tick> apply(List<ReplayFair.Tick> ticks, String symbol, MarketData market,
                                        double lotQty) {
@@ -154,6 +197,9 @@ final class HybridFair {
         }
         if (!bnb.isEmpty()) {
             BNB_BY_SYMBOL.put(symbol, bnb);           // для рывка на стенде (revx.exec.jump-bp, док. 245 П5)
+        }
+        if (BNB_WAKE && !bnb.isEmpty()) {
+            ticks = withWakes(ticks, bnb);
         }
         if (bnb.isEmpty() && !LEVEL_BOOK) {
             log.error("ГИБРИД: нет секундных свечей {}USDC в {} — опора прежняя", base, DIR);
