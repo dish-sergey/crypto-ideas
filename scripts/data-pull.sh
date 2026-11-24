@@ -13,7 +13,7 @@ set -u
 ROOT=${DATA_ARCHIVE:-/c/data-archive}
 KEYDIR=${KEYDIR:-$HOME/.ssh/data-keys}
 LOG=$ROOT/checks/pull-$(date +%Y%m%d).log
-mkdir -p "$ROOT"/{bot-accounting,revx-inc,revx-sim-inc,binance-book,kraken-book,journal-archive,crypto-db,checks} "$ROOT"/binance-deriv/{perp,perpbook,spot,oi} "$ROOT"/binance-depth/{spot,perp,spotsnap,perpsnap} "$KEYDIR"
+mkdir -p "$ROOT"/{bot-accounting,bnb-tick,revx-inc,revx-sim-inc,binance-book,kraken-book,journal-archive,crypto-db,checks} "$ROOT"/binance-deriv/{perp,perpbook,spot,oi} "$ROOT"/binance-depth/{spot,perp,spotsnap,perpsnap} "$KEYDIR"
 exec > >(tee -a "$LOG") 2>&1
 
 # Ключи: ssh под Windows не берёт файл с широкими правами, поэтому — копия без CR с chmod 600.
@@ -59,6 +59,9 @@ pull "$KMICRO2" $MICRO2 '~/revx-sim-backups'      'revx-sim-inc-*.db.gz'    "$RO
 pull "$KMICRO"  $MICRO  '~/binance-book'          'book-*.jsonl.gz'         "$ROOT/binance-book"    gz
 pull "$KMICRO"  $MICRO  '~/kraken-book'           'book-*.jsonl.gz'         "$ROOT/kraken-book"     gz
 pull "$KARM"    $ARM    '~/revx-journal-archive'  '*.db.gz'                 "$ROOT/journal-archive" gz
+# цена Бинанса глазами ботов (revx-bnb-feed, bookTicker раз в секунду, время bot-arm): bnb.db держит 3 ч, архив на
+# bot-arm — ~/revx-bnb/bnb-hist.db (30 суток, крон bnb-archive.sh), суточные файлы — сюда (24.11.2026)
+pull "$KARM"    $ARM    '~/revx-bnb/daily'        'bnb-tick-*.csv.gz'       "$ROOT/bnb-tick"        gz
 # Запись деривативов и спота Бинанса (шаг Б док. 197, с 25.10.2026): на micro хранится 45 суток.
 for d in perp perpbook spot oi; do
   pull "$KMICRO" $MICRO "~/binance-deriv/$d" 'book-*.jsonl.gz' "$ROOT/binance-deriv/$d" gz

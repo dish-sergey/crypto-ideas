@@ -51,6 +51,8 @@ R=~/revx/data/revx.db
 fresh "книга Revolut X" $(age_ms $(Q $R "select max(t_recv_ms) from revx_book")) 300
 fresh "лента Revolut X" $(age_ms $(Q $R "select max(ingest_ms) from revx_trade")) 1800
 fresh "цена Бинанса для ботов (bnb.db)" $(age_ms $(Q ~/revx-shared/bnb.db "select max(ts_ms) from bnb_tick")) 300
+fresh "архив цены Бинанса (bnb-hist.db)" $(age_ms $(Q ~/revx-bnb/bnb-hist.db "select max(ts_ms) from bnb_tick")) 1500
+fresh "суточный файл цены Бинанса" $(age_file "$HOME/revx-bnb/daily/bnb-tick-*") 93600
 fresh "читатель площадки (venue.db)" $(age_file "$HOME/revx-shared/venue.db*") 900
 fresh "архив журналов ботов" $(age_file "$HOME/revx-journal-archive/*.db.gz") 93600
 fresh "календарь для ботов" $(age_file "$HOME/revx-shared/calendar.json") 7200
@@ -80,7 +82,7 @@ if [ -z "$lp" ]; then echo "local;FAIL;забор на диск;ни одног�
 elif [ $(( $(date +%s) - $(stat -c %Y "$lp") )) -gt 129600 ]; then echo "local;FAIL;забор на диск;последний $(basename "$lp")"
 elif grep -q 'ОШИБКА' "$lp"; then echo "local;FAIL;забор на диск;$(grep -c 'ОШИБКА' "$lp") ошибок в $(basename "$lp")"
 else echo "local;OK;забор на диск;$(basename "$lp") без ошибок"; fi
-for d in bot-accounting revx-inc revx-sim-inc binance-book kraken-book journal-archive binance-deriv/perp binance-deriv/perpbook binance-deriv/spot binance-deriv/oi binance-depth/spot binance-depth/perp binance-depth/spotsnap binance-depth/perpsnap; do
+for d in bot-accounting bnb-tick revx-inc revx-sim-inc binance-book kraken-book journal-archive binance-deriv/perp binance-deriv/perpbook binance-deriv/spot binance-deriv/oi binance-depth/spot binance-depth/perp binance-depth/spotsnap binance-depth/perpsnap; do
   f=$(ls -t "$ROOT/$d" 2>/dev/null | grep -v sha256 | head -1)
   if [ -z "$f" ]; then echo "local;FAIL;копия $d;пусто"; else a=$(( ($(date +%s) - $(stat -c %Y "$ROOT/$d/$f")) / 3600 )); [ $a -le 50 ] && echo "local;OK;копия $d;свежий файл $a ч назад" || echo "local;FAIL;копия $d;свежий файл $a ч назад"; fi
 done

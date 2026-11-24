@@ -53,10 +53,9 @@ while true; do
 
     "$HOME/bin/websocat" -t -E --ping-interval "$PING_INTERVAL" \
         --ping-timeout "$PING_TIMEOUT" "wss://futures.kraken.com/ws/v1" < "$FIFO" \
-        | while IFS= read -r line; do
-            stamp=$(date -u +"%s%3N %Y-%m-%d")
-            printf '%s %s\n' "${stamp% *}" "$line" >> "$OUT/book-${stamp#* }.jsonl"
-        done
+        | /usr/bin/python3 -u "$HOME/bin/bnb-stamp.py" "$OUT" book-
+    # время приёма ставит python (24.11.2026): `date` на каждое сообщение в бурю
+    # не успевал и сдвигал отметки на десятки секунд — см. bnb-stamp.py
 
     kill "$HOLDER" 2>/dev/null
     wait "$HOLDER" 2>/dev/null

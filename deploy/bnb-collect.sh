@@ -78,12 +78,13 @@ while true; do
     # только нужный при обрыве со стороны Бинанса.
     "$HOME/bin/websocat" -t -E --ping-interval "$PING_INTERVAL" \
         --ping-timeout "$PING_TIMEOUT" "wss://stream.binance.com:9443/ws" < "$FIFO" \
-        | while IFS= read -r line; do
-            # Время ПРИЁМА: у bookTicker спота своей отметки нет, а нам важен
-            # момент, когда мы БЫ узнали. Дата берётся из того же вызова `date`.
-            stamp=$(date -u +"%s%3N %Y-%m-%d")
-            printf '%s %s\n' "${stamp% *}" "$line" >> "$OUT/book-${stamp#* }.jsonl"
-        done
+        | /usr/bin/python3 -u "$HOME/bin/bnb-stamp.py" "$OUT" book-
+    # ⚠️ ВРЕМЯ ПРИЁМА СТАВИТ PYTHON, А НЕ `date` В ЦИКЛЕ (24.11.2026). Прежний
+    # `while read; do stamp=$(date …); done` порождал процесс на каждое сообщение
+    # и в бурю не успевал: сообщения копились в канале и получали время своей
+    # очереди — 20.11 01:07 рывок BTC записан с опозданием 83 с, в бурные часы
+    # медиана 20–50 с. У bookTicker спота своей отметки биржи нет, поэтому время
+    # приёма — единственное время события, и оно обязано быть настоящим.
 
     kill "$HOLDER" 2>/dev/null
     wait "$HOLDER" 2>/dev/null
