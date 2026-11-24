@@ -845,6 +845,47 @@ public final class QuoteLoop implements Runnable {
         return new Quoter.Quotes(Math.max(target.bid(), pulled), target.ask());
     }
 
+    /**
+     * ОТВОД ПО РАСХОДУ СВОИХ ПОСТАНОВОК (24.11.2026, владелец: «когда постановок мало, раздвинуть заявки — до нас реже
+     * будут доходить, и снимать придётся меньше»). {@code revx.exec.place-widen=ОТ:БП}: расход за скользящие сутки
+     * дошёл до доли ОТ своего предела — бид отходит на величину, растущую линейно до БП б.п. к 90% предела (там
+     * начинается распродажа). {@code place-widen-side=both} — и аск. Давление общего ведра аккаунта
+     * ({@link #widenForBudget}) на живых 20–23.11 было нулём всё время: к пределу бота оно не привязано.
+     */
+    static final double[] PLACE_WIDEN = parsePlaceWiden(System.getProperty("revx.exec.place-widen", ""));
+    static final boolean PLACE_WIDEN_BOTH = "both".equalsIgnoreCase(System.getProperty("revx.exec.place-widen-side", "bid"));
+    private long placeWidenAt;
+    private double placeWidenBp;
+    private long placeWidenTicks;
+
+    static double[] parsePlaceWiden(String v) {
+        if (v == null || v.isBlank()) {
+            return null;
+        }
+        String[] p = v.trim().split(":");
+        return new double[]{Double.parseDouble(p[0]), Double.parseDouble(p[1])};
+    }
+
+    private Quoter.Quotes placeWiden(Quoter.Quotes t, double price) {
+        if (PLACE_WIDEN == null || !(price > 0)) {
+            return t;
+        }
+        long now = clock.now();
+        if (now - placeWidenAt >= 15_000) {      // счёт по журналу — не чаще раза в 15 с
+            placeWidenAt = now;
+            double u = (double) placementsLastDay() / Math.max(1, placementCap());
+            double from = PLACE_WIDEN[0], top = Math.max(from + 1e-6, BUDGET_UNWIND_ON);
+            placeWidenBp = PLACE_WIDEN[1] * Math.max(0, Math.min(1, (u - from) / (top - from)));
+        }
+        if (!(placeWidenBp > 0)) {
+            return t;
+        }
+        placeWidenTicks++;
+        double d = price * placeWidenBp / 1e4;
+        return new Quoter.Quotes(t.bid() == null ? null : t.bid() - d,
+                t.ask() == null || !PLACE_WIDEN_BOTH ? t.ask() : t.ask() + d);
+    }
+
     static Quoter.Quotes widenForBudget(Quoter.Quotes target, double price, double pressure) {
         if (!(pressure > 0) || !(price > 0)) {
             return target;
@@ -3071,6 +3112,14 @@ public final class QuoteLoop implements Runnable {
     private long wakeups;
 
     private void onFastPrice(double p) {
+        if (guardThreat(p)) {
+            synchronized (wakeLock) {
+                guardUrgent = true;
+                wakePending = true;
+                wakeLock.notifyAll();
+            }
+            return;
+        }
         double ref = tickFair;
         if (!(ref > 0) || Math.abs(p / ref - 1) * 1e4 >= WAKE_BP) {
             synchronized (wakeLock) {
@@ -3089,6 +3138,11 @@ public final class QuoteLoop implements Runnable {
                 if (now >= deadline) {
                     break;
                 }
+                if (guardUrgent) {
+                    guardWakes++;
+                    guardWokeTick = true;
+                    break;                // страж: Бинанс подошёл к заявке в заморозке — без ожидания
+                }
                 if (wakePending && now >= earliest) {
                     wakeups++;
                     break;
@@ -3096,6 +3150,7 @@ public final class QuoteLoop implements Runnable {
                 wakeLock.wait(Math.max(1, (wakePending ? earliest : deadline) - now));
             }
             wakePending = false;
+            guardUrgent = false;
         }
     }
 
@@ -3981,6 +4036,7 @@ public final class QuoteLoop implements Runnable {
                     // которая УЖЕ в пути, и отмена после первого медленного ответа его
                     // не спасает. Поэтому STALL_FREEZE_MS никаких запросов записи — ни
                     // замен, ни отмен — и продолжаем с теми же заявками.
+                    stallGuard();
                     if (STALL_CANCEL_BID) {
                         // Док. 193 шаг 4.4: замена в затык висит секундами, а отмена проходит
                         // за ~50 мс (живые журналы 20–25.10) — бид снимается отменой, аск стоит.
@@ -4142,6 +4198,7 @@ public final class QuoteLoop implements Runnable {
         double pressure = pressureFromRecord != null
                 ? pressureFromRecord.applyAsDouble(clock.now()) : budgetPressure;
         target = widenForBudget(target, fair.price(), pressure);
+        target = placeWiden(target, fair.price());
         target = freqWiden(target, fair.price());
         if (STALL_NOBID_MS > 0 || REBUY_VEL_K > 0) {
             lastMove60 = move60(fair.price());
@@ -4167,6 +4224,7 @@ public final class QuoteLoop implements Runnable {
         target = crossPause(target, fair.price(),
                 () -> policy.quotes(fair.price(), params.inventoryCap(), driftNow).ask());
         target = jumpGuard(target);
+        target = bnbGuard(target);
         if (QUIET_NOBUY && quietNow && target.hasBid()
                 && inventory >= skewTargetInventory() - 1e-12 && fair.price() > 0) {
             // А: в тишине не покупать сверх цели. Отвод, а не снятие: замена суточных постановок не тратит.
@@ -5032,6 +5090,17 @@ public final class QuoteLoop implements Runnable {
         }
         if (side == Side.BUY && base != null) {
             base = rebuyCap(base);
+        }
+        if (base != null && BNB_CLAMP_BP > 0) {
+            // после функции: функция считает цену заново, правка цели до неё до заявки не дошла бы
+            double[] rr = stand.rawRefs();
+            if (rr != null && rr.length > 1 && rr[1] > 0) {
+                double lim = side == Side.BUY ? rr[1] * (1 - BNB_CLAMP_BP / 1e4) : rr[1] * (1 + BNB_CLAMP_BP / 1e4);
+                if (side == Side.BUY ? base > lim : base < lim) {
+                    base = lim;
+                    bnbClampTicks++;
+                }
+            }
         }
         if (base == null || level == 0 || levelStep <= 0) {
             if (base == null || QA_ON == null) {
@@ -7256,7 +7325,7 @@ public final class QuoteLoop implements Runnable {
      */
     static final long STALL_NOBID_MS = Long.getLong("revx.exec.stall-nobid-sec", 0L) * 1000L;
     static final double REBUY_VEL_K = Double.parseDouble(System.getProperty("revx.exec.rebuy-vel-k", "0"));
-    private long lastStallMs;
+    private volatile long lastStallMs;
     private long lastBuyAnyMs;
     private long noBidUntilMs;
     private double velLastBuy = Double.NaN;
@@ -8988,6 +9057,15 @@ public final class QuoteLoop implements Runnable {
     static final long SLOW_REPLACE_MS = 1_000;
 
     /**
+     * ПОРОГ ЗАМОРОЗКИ ({@code revx.exec.slow-replace-ms}, 24.11.2026; по умолчанию {@link #SLOW_REPLACE_MS}). Живые
+     * 20–23.11, 919 тыс. замен: 1–1.5 с — 2.9% замен, в 56% случаев ни у одного другого бота в ±0.5 с медленной нет, и
+     * следующая своя замена после такого ответа — медиана 534 мс, ни одной дольше 2.5 с. Опасные ~3 с (422, кандидаты
+     * в призраки, 43 за 4 дня) приходят разом у нескольких ботов и почти всегда после БЫСТРОЙ своей замены — заморозка
+     * после 1–1.5 с их не предупреждает. Проверка гонки и подозрение на призрака по-прежнему с порога 1 с.
+     */
+    static final long STALL_TRIGGER_MS = Long.getLong("revx.exec.slow-replace-ms", SLOW_REPLACE_MS);
+
+    /**
      * Сколько стоим в стороне после затыка.
      *
      * Призраки приходят ПАЧКАМИ: 40 штук за двое суток уместились примерно в
@@ -9029,6 +9107,160 @@ public final class QuoteLoop implements Runnable {
      * Вынесено отдельно, чтобы причину можно было проверить тестом, не поднимая
      * весь цикл: обе паузы — про состояние, а не про поток событий.
      */
+    /**
+     * СТРАЖ ЗАМОРОЗКИ (24.11.2026, разбор живых 20–23.11): в заморозке после медленной замены
+     * ({@code stall-freeze-sec}) бот не шлёт ни замен, ни отмен, и заявка стоит, пока рынок идёт на неё. Живьём
+     * 378 сделок из 1399 пришлись на заморозку (5–13% времени) и дали −19.5 $ против +39.4 $ вне её; 181 из них —
+     * когда Бинанс×базис уже был за нашей ценой (медиана 0.7 с до сделки). Отмена в затык идёт ~50 мс, призрака не
+     * рождает, и из 1747 отмен 20–23.11 ни одна заявка не исполнилась после отправки. Поэтому в заморозке заявку,
+     * к которой Бинанс×базис подошёл ближе {@code revx.exec.stall-guard-bp} б.п. (0 — дошёл до цены, отрицательное —
+     * прошёл), снимаем отменой. Замены по-прежнему не шлём; заявка вернётся обычной постановкой после заморозки.
+     * Стенд 20–23.11 с заморозкой по расписанию живых: база +7.7, G=0 +21.7, G=2 +30.9 $. Выключено (NaN) по умолчанию;
+     * {@code revx.exec.stall-guard-side=buy} — только покупки.
+     */
+    /**
+     * НЕ БЛИЖЕ G К БИНАНСУ×БАЗИС ({@code revx.exec.bnb-clamp-bp}, 24.11.2026). Живые 20–23.11: сделки с запасом до
+     * Бинанс×базис меньше 6 б.п. дают ноль и хуже, всё плюсовое — дальше. 24.11 f (пустой) дважды купил выше
+     * Бинанс×базис: своя книга SOL на 6 б.п. выше Бинанса, поводок держал опору на +5, функция пустого бота ставила бид
+     * на 4 б.п. ниже опоры — то есть на 1 б.п. выше Бинанса, и цель в журнале (до функции) этого не показывала. Цена
+     * заявки прижимается после функции. По монете свой (у каждого бота свой юнит). Выключено (0) по умолчанию.
+     */
+    /**
+     * ВТОРОЙ СТРАЖ — В ЛЮБОЕ ВРЕМЯ ({@code revx.exec.bnb-guard-bp}, 24.11.2026). На каждом тике: заявку, к которой
+     * Бинанс×базис подошёл ближе G б.п. (отрицательное — уже прошёл её на |G|), снимаем отменой, цель не пускаем за
+     * эту границу. Живьём — только отрицательный (−6): от резкого скачка, когда Бинанс глубоко за нами. Стенд 20–23.11
+     * (заморозка по живым) поверх стража заморозки G=2: −6 → 35.9 против 32.5 $; G=0/+2 жгут постановки у BTC.
+     */
+    static final double BNB_GUARD_BP = Double.parseDouble(System.getProperty("revx.exec.bnb-guard-bp", "0"));
+    private long bnbGuardCancels, bnbGuardClamps;
+
+    private Quoter.Quotes bnbGuard(Quoter.Quotes t) {
+        if (BNB_GUARD_BP == 0) {
+            return t;
+        }
+        double[] rr = stand.rawRefs();
+        if (rr == null || rr.length < 2 || !(rr[1] > 0)) {
+            return t;
+        }
+        double maxBid = rr[1] * (1 - BNB_GUARD_BP / 1e4), minAsk = rr[1] * (1 + BNB_GUARD_BP / 1e4);
+        for (Resting r : bids) {
+            if (r.venueId != null && r.price > maxBid) {
+                bnbGuardCancels++;
+                cancel(Side.BUY, r, String.format(java.util.Locale.ROOT, "страж Бинанса: бид %.2f, Бинанс×базис %.2f", r.price, rr[1]));
+            }
+        }
+        for (Resting r : asks) {
+            if (r.venueId != null && r.price < minAsk) {
+                bnbGuardCancels++;
+                cancel(Side.SELL, r, String.format(java.util.Locale.ROOT, "страж Бинанса: аск %.2f, Бинанс×базис %.2f", r.price, rr[1]));
+            }
+        }
+        Double bid = t.bid(), ask = t.ask();
+        if (bid != null && bid > maxBid) {
+            bid = maxBid;
+            bnbGuardClamps++;
+        }
+        if (ask != null && ask < minAsk) {
+            ask = minAsk;
+            bnbGuardClamps++;
+        }
+        return bid == t.bid() && ask == t.ask() ? t : new Quoter.Quotes(bid, ask);
+    }
+
+    static final double BNB_CLAMP_BP = Double.parseDouble(System.getProperty("revx.exec.bnb-clamp-bp", "0"));
+    private long bnbClampTicks;
+
+    static final double STALL_GUARD_BP = Double.parseDouble(System.getProperty("revx.exec.stall-guard-bp", "NaN"));
+    static final boolean STALL_GUARD_BUY_ONLY = "buy".equalsIgnoreCase(System.getProperty("revx.exec.stall-guard-side", "both"));
+    private long stallGuardCancels;
+
+    /**
+     * СТРАЖ ОТ ВЕБ-СОКЕТА (24.11.2026, владелец: «чтобы он нигде время не терял»). Тик будится ходом Бинанса не чаще
+     * раза в {@link #WAKE_MIN_MS} (400 мс) и только на {@link #WAKE_BP} (2 б.п.). В заморозке поток котировщика
+     * свободен (запросов записи нет), поэтому обработчик цены сам сравнивает Бинанс×базис, перенесённый на свежую
+     * цену, со снимком стоящих заявок и при угрозе будит тик сразу, мимо обоих порогов; отмену шлёт тик (поток
+     * один — состояние заявок трогает только он). Снимок пишется в заморозке после стража; пока его нет (заморозка
+     * только началась) — будим на первой же цене.
+     */
+    private volatile double gSnapBid = Double.NaN, gSnapAsk = Double.NaN, gSnapAnchor = Double.NaN, gSnapFair = Double.NaN;
+    private volatile long gSnapAt;
+    private volatile boolean guardUrgent;
+    private boolean guardWokeTick;
+    private long guardWakes;
+
+    private void guardSnapshot(double anchor) {
+        double mb = Double.NaN, ma = Double.NaN;
+        for (Resting r : bids) {
+            if (r.venueId != null && !(r.price <= mb)) {
+                mb = r.price;
+            }
+        }
+        for (Resting r : asks) {
+            if (r.venueId != null && !(r.price >= ma)) {
+                ma = r.price;
+            }
+        }
+        gSnapBid = mb;
+        gSnapAsk = ma;
+        gSnapAnchor = anchor;
+        gSnapFair = tickFair;
+        gSnapAt = clock.now();
+    }
+
+    /** Из потока веб-сокета: в заморозке Бинанс подошёл к заявке — будить тик немедленно. */
+    private boolean guardThreat(double p) {
+        long now = clock.now();
+        if (Double.isNaN(STALL_GUARD_BP) || now >= stallUntilMs || now - gLastUrgentMs < 150) {
+            return false;             // не чаще раза в 150 мс: угроза держится, пока тик не снимет заявку
+        }
+        if (gSnapAt < lastStallMs) {
+            gLastUrgentMs = now;
+            return true;                  // заморозка свежая, снимка ещё нет — один тик, он и снимет, и запишет
+        }
+        double f0 = gSnapFair, a0 = gSnapAnchor;
+        if (!(f0 > 0) || !(a0 > 0) || !(p > 0)) {
+            return false;
+        }
+        double a = a0 * p / f0;
+        boolean threat = gSnapBid > a * (1 - STALL_GUARD_BP / 1e4) || (!STALL_GUARD_BUY_ONLY && gSnapAsk < a * (1 + STALL_GUARD_BP / 1e4));
+        if (threat) {
+            gLastUrgentMs = now;
+        }
+        return threat;
+    }
+
+    private volatile long gLastUrgentMs;
+
+    public long guardWakes() {
+        return guardWakes;
+    }
+
+    private void stallGuard() {
+        if (Double.isNaN(STALL_GUARD_BP)) {
+            return;
+        }
+        double[] rr = stand.rawRefs();
+        if (rr == null || rr.length < 2 || !(rr[1] > 0)) {
+            return;
+        }
+        String via = guardWokeTick ? " (от веб-сокета)" : "";
+        guardWokeTick = false;
+        double maxBid = rr[1] * (1 - STALL_GUARD_BP / 1e4), minAsk = rr[1] * (1 + STALL_GUARD_BP / 1e4);
+        for (Resting r : bids) {
+            if (r.venueId != null && r.price > maxBid) {
+                stallGuardCancels++;
+                cancel(Side.BUY, r, String.format(java.util.Locale.ROOT, "страж заморозки: бид %.2f, Бинанс×базис %.2f", r.price, rr[1]) + via);
+            }
+        }
+        for (Resting r : asks) {
+            if (!STALL_GUARD_BUY_ONLY && r.venueId != null && r.price < minAsk) {
+                stallGuardCancels++;
+                cancel(Side.SELL, r, String.format(java.util.Locale.ROOT, "страж заморозки: аск %.2f, Бинанс×базис %.2f", r.price, rr[1]) + via);
+            }
+        }
+        guardSnapshot(rr[1]);
+    }
+
     String venuePauseReason() {
         return venuePause(frozenPaused, clock.now(), stallUntilMs);
     }
@@ -9051,7 +9283,7 @@ public final class QuoteLoop implements Runnable {
     }
 
     private void noteVenueStall(long latencyMs) {
-        if (latencyMs < SLOW_REPLACE_MS) {
+        if (latencyMs < STALL_TRIGGER_MS) {
             return;
         }
         long now = clock.now();
