@@ -59,6 +59,10 @@ pull "$KMICRO2" $MICRO2 '~/revx-sim-backups'      'revx-sim-inc-*.db.gz'    "$RO
 pull "$KMICRO"  $MICRO  '~/binance-book'          'book-*.jsonl.gz'         "$ROOT/binance-book"    gz
 pull "$KMICRO"  $MICRO  '~/kraken-book'           'book-*.jsonl.gz'         "$ROOT/kraken-book"     gz
 pull "$KARM"    $ARM    '~/revx-journal-archive'  '*.db.gz'                 "$ROOT/journal-archive" gz
+# ⚠️ имя архива — дата ЧИСТКИ, данные в нём на 14–15 суток раньше: какой файл какие сутки содержит — INDEX.csv
+# рядом (25.11.2026, scripts/journal-index.js). Выбирать файлы журналов только по нему или по времени внутри.
+NODE=${NODE:-$(command -v node || ls /c/Users/*/AppData/Local/Microsoft/WinGet/Packages/OpenJS.NodeJS*/node-*/node.exe 2>/dev/null | head -1)}
+[ -n "$NODE" ] && "$NODE" "$(dirname "$0")/journal-index.js" "$ROOT/journal-archive" | while read -r l; do note "$l"; done || note "⚠️ индекс архива журналов не построен (нет node)"
 # цена Бинанса глазами ботов (revx-bnb-feed, bookTicker раз в секунду, время bot-arm): bnb.db держит 3 ч, архив на
 # bot-arm — ~/revx-bnb/bnb-hist.db (30 суток, крон bnb-archive.sh), суточные файлы — сюда (24.11.2026)
 pull "$KARM"    $ARM    '~/revx-bnb/daily'        'bnb-tick-*.csv.gz'       "$ROOT/bnb-tick"        gz

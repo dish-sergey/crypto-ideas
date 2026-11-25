@@ -178,7 +178,9 @@ public final class SimVenue implements Venue, org.home.data.revx.exec.StallFeed 
     }
 
     private long sampleReplaceDelay() {
-        if (!"live".equalsIgnoreCase(REPLACE_DELAY_SPEC)) {
+        // 25.11.2026: пустой ключ = распределение живых. Прежде при latency-dir без совпадения по времени сюда приходило
+        // «» → parseLong падал, ронял ТИК, замена не уходила и заявка стояла по старой цене (16–23.11: 15% тиков, 02–16.11: 97%).
+        if (!REPLACE_DELAY_SPEC.isBlank() && !"live".equalsIgnoreCase(REPLACE_DELAY_SPEC)) {
             return Long.parseLong(REPLACE_DELAY_SPEC.trim());
         }
         double u = delayRnd.nextDouble();

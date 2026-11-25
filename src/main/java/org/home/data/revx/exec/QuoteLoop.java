@@ -3066,7 +3066,11 @@ public final class QuoteLoop implements Runnable {
             } catch (Exception e) {
                 // Цикл не должен умирать от единичной ошибки: заявки останутся
                 // висеть, а следующий тик их подхватит. Но молчать нельзя.
-                log.error("тик упал: {}", e.toString());
+                if (tickErrors++ < 3) {
+                    log.error("тик упал (стек первых трёх)", e);   // 25.11.2026: без стека «For input string: ""» не найти
+                } else {
+                    log.error("тик упал: {}", e.toString());
+                }
                 journal.event("tick_error", e.toString());
             }
             if (fast != null) {
@@ -3314,6 +3318,40 @@ public final class QuoteLoop implements Runnable {
             }
         }
         guardSnapshot(rr[1]);
+    }
+
+    /**
+     * СТРАЖ НАДКУШЕННЫХ ({@code revx.exec.partial-guard-bp=G}, 24.11.2026, владелец: «снимать надкушенные по правилу
+     * замороженных»). Надкушенную заявку площадка заменить не даёт, а снимается она только через 60 с и при отставании
+     * от цели больше {@code partial-stale-bp} (у живых 10). Живые 20–23.11: 73 добора надкушенных заявок дали −2.33 $
+     * (первые сделки по заявкам +21.52 $ на 1318), из них 28 «за Бинансом» −3.25 $; от укуса до добора медиана 31 с.
+     * Здесь на каждом тике надкушенную заявку, к которой Бинанс×базис подошёл ближе G б.п., снимаем отменой — как страж
+     * заморозки, но в любое время. Выключено (NaN) по умолчанию.
+     */
+    static final double PARTIAL_GUARD_BP = Double.parseDouble(System.getProperty("revx.exec.partial-guard-bp", "NaN"));
+    private long partialGuardCancels;
+
+    private void partialGuard() {
+        if (Double.isNaN(PARTIAL_GUARD_BP)) {
+            return;
+        }
+        double[] rr = stand.rawRefs();
+        if (rr == null || rr.length < 2 || !(rr[1] > 0)) {
+            return;
+        }
+        double maxBid = rr[1] * (1 - PARTIAL_GUARD_BP / 1e4), minAsk = rr[1] * (1 + PARTIAL_GUARD_BP / 1e4);
+        for (Resting r : bids) {
+            if (r.venueId != null && r.partial() && r.price > maxBid) {
+                partialGuardCancels++;
+                cancel(Side.BUY, r, String.format(java.util.Locale.ROOT, "страж надкушенных: бид %.2f, Бинанс×базис %.2f", r.price, rr[1]));
+            }
+        }
+        for (Resting r : asks) {
+            if (r.venueId != null && r.partial() && r.price < minAsk) {
+                partialGuardCancels++;
+                cancel(Side.SELL, r, String.format(java.util.Locale.ROOT, "страж надкушенных: аск %.2f, Бинанс×базис %.2f", r.price, rr[1]));
+            }
+        }
     }
 
     private Quoter.Quotes bnbGuard(Quoter.Quotes t) {
@@ -4052,6 +4090,7 @@ public final class QuoteLoop implements Runnable {
      */
     static final java.util.NavigableMap<Long, Double> OFFSET_SCHEDULE = loadOffsetSchedule(System.getProperty("revx.sim.offset-schedule"));
     private double scheduledOffset = Double.NaN;
+    private int tickErrors;
 
     static java.util.NavigableMap<Long, Double> loadOffsetSchedule(String path) {
         java.util.TreeMap<Long, Double> m = new java.util.TreeMap<>();
@@ -4422,6 +4461,7 @@ public final class QuoteLoop implements Runnable {
                 () -> policy.quotes(fair.price(), params.inventoryCap(), driftNow).ask());
         target = jumpGuard(target);
         target = bnbGuard(target);
+        partialGuard();
         target = bnbClamp(target);
         if (QUIET_NOBUY && quietNow && target.hasBid()
                 && inventory >= skewTargetInventory() - 1e-12 && fair.price() > 0) {
