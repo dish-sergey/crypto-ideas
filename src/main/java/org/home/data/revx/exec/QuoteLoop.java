@@ -8697,6 +8697,9 @@ public final class QuoteLoop implements Runnable {
                 return;
             }
         }
+        if (isStillProcessing(response) && sameCidAllowed()) {
+            response = sameCidRetry(side, resting, body, heirClientId, response);
+        }
         if (response.ok()) {
             // ⚠️ ПРЕДШЕСТВЕННИКА НАДО ДОПРОСИТЬ, ПОКА ЕГО ЕЩЁ ЕСТЬ О ЧЁМ
             // СПРОСИТЬ. Замена создаёт другую заявку, старый идентификатор
@@ -8832,6 +8835,74 @@ public final class QuoteLoop implements Runnable {
      * на 500 не заводилось, резерв нашёл только общий сторож. Ответ 5xx и потерянный
      * ответ значат «что сделано — неизвестно», и это то же, что 422 в затык.
      */
+    /**
+     * ПОВТОР ЗАМЕНЫ С ТЕМ ЖЕ {@code client_order_id} ПОСЛЕ 400 «STILL BEING PROCESSED» (25.11.2026, решение владельца;
+     * {@code revx.exec.same-cid-retry=true}, по умолчанию выключено).
+     *
+     * <p>Живые 19–25.11: 35 ответов {@code 400 «Previous request is still being processed. Please wait before retrying.»}
+     * на замену покупки, все в затык (0.6–1.8 с), и в каждом площадка СНЯЛА предка ({@code cancelled / replaced}), а
+     * наследника нет ни в активных, ни в истории — резерв заперт (с 24.11 так набралось ~630 из ~810 USDC запертого).
+     * Документация описывает замену как атомарную, а {@code client_order_id} замены — как ключ идемпотентности:
+     * «Retries with the same value will not create duplicate replacements». Значит, повтор ТОГО ЖЕ запроса второго
+     * наследника не создаст, а может вернуть номер первого — и призрак станет видимой заявкой.
+     *
+     * <p>Повтор один, через {@code same-cid-wait-ms} (1 с). Ответ любой — событие {@code same_cid_retry}. Удача (200)
+     * идёт обычным путём успешной замены (номер наследника из ответа); иначе — старая логика отказа. Защита: три
+     * неудачи подряд выключают повтор на {@code same-cid-off-min} (60 мин), не больше {@code same-cid-max-per-hour}
+     * (20) повторов в час.
+     */
+    static final boolean SAME_CID_RETRY = Boolean.getBoolean("revx.exec.same-cid-retry");
+    static final long SAME_CID_WAIT_MS = Long.getLong("revx.exec.same-cid-wait-ms", 1000L);
+    static final long SAME_CID_OFF_MS = Long.getLong("revx.exec.same-cid-off-min", 60L) * 60_000L;
+    static final int SAME_CID_MAX_PER_HOUR = Integer.getInteger("revx.exec.same-cid-max-per-hour", 20);
+    private int sameCidFailsInRow;
+    private long sameCidOffUntil;
+    private final java.util.ArrayDeque<Long> sameCidTimes = new java.util.ArrayDeque<>();
+
+    static boolean isStillProcessing(Venue.Response r) {
+        return r.status() == 400 && r.body() != null && r.body().contains("still being processed");
+    }
+
+    private boolean sameCidAllowed() {
+        if (!SAME_CID_RETRY) {
+            return false;
+        }
+        long now = clock.now();
+        if (now < sameCidOffUntil) {
+            return false;
+        }
+        while (!sameCidTimes.isEmpty() && now - sameCidTimes.peekFirst() > 3_600_000L) {
+            sameCidTimes.pollFirst();
+        }
+        return sameCidTimes.size() < SAME_CID_MAX_PER_HOUR;
+    }
+
+    private Venue.Response sameCidRetry(Side side, Resting resting, String body, String heirClientId, Venue.Response first) {
+        sameCidTimes.addLast(clock.now());
+        if (!pauseMs(SAME_CID_WAIT_MS)) {
+            return first;
+        }
+        Venue.Response r = client.replace(resting.venueId, body);
+        replaces++;
+        replacesThisMinute++;
+        noteVenueStall(r.latencyMs());
+        boolean ok = r.ok();
+        sameCidFailsInRow = ok ? 0 : sameCidFailsInRow + 1;
+        String rb = r.body() == null ? "" : r.body().replaceAll("\\s+", " ");
+        journal.event("same_cid_retry", String.format(java.util.Locale.ROOT,
+                "%s %s: после 400 «still processing» (%d мс) повтор с тем же client_order_id %s → %d за %d мс: %s",
+                side, resting.venueId, first.latencyMs(), heirClientId, r.status(), r.latencyMs(),
+                rb.length() > 300 ? rb.substring(0, 300) : rb));
+        if (!ok && sameCidFailsInRow >= 3) {
+            sameCidOffUntil = clock.now() + SAME_CID_OFF_MS;
+            sameCidFailsInRow = 0;
+            journal.event("same_cid_off", String.format(java.util.Locale.ROOT,
+                    "три повтора с тем же client_order_id подряд не помогли — выключаю на %d мин, дальше старая логика",
+                    SAME_CID_OFF_MS / 60_000L));
+        }
+        return r;
+    }
+
     static boolean replaceMayHaveActed(Venue.Response r) {
         return r.status() == 422 || r.status() >= 500 || r.lost();
     }
